@@ -17,7 +17,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use ragdoll_codec::{FlacDecoder, FlacEncoder, H264Decoder, H264Encoder};
+use ragdoll_codec::{
+    FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, H264Profile, RateControlMode,
+};
 use ragdoll_core::{
     AudioFrame, BitReader, BitWriter, CodecId, ColorRange, Colorimetry, CpuTopology, FramePool,
     HardwareMetrics, MatrixCoefficients, PacketFlags, PacketSlice, PixelFormat, Plane, PowerMode,
@@ -422,6 +424,10 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
     let mut positional = Vec::new();
     let mut opts = TranscodeOptions::default();
     let mut recipe_path: Option<String> = None;
+    let mut crf_opt: Option<f32> = None;
+    let mut bitrate_kbps: Option<u32> = None;
+    let mut maxrate_kbps: Option<u32> = None;
+    let mut bufsize_kb: Option<u32> = None;
     let mut json = false;
 
     let mut i = 0;
@@ -431,6 +437,26 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
             "--video" | "-c:v" if i + 1 < args.len() => {
                 i += 1;
                 opts.video_codec = args[i].clone();
+            }
+            "--profile" | "-profile:v" if i + 1 < args.len() => {
+                i += 1;
+                opts.h264_profile = H264Profile::parse(&args[i]);
+            }
+            "--crf" if i + 1 < args.len() => {
+                i += 1;
+                crf_opt = args[i].parse::<f32>().ok().map(|v| v.clamp(0.0, 51.0));
+            }
+            "--bitrate" | "-b:v" if i + 1 < args.len() => {
+                i += 1;
+                bitrate_kbps = parse_bitrate_kbps(&args[i]);
+            }
+            "--maxrate" if i + 1 < args.len() => {
+                i += 1;
+                maxrate_kbps = parse_bitrate_kbps(&args[i]);
+            }
+            "--bufsize" if i + 1 < args.len() => {
+                i += 1;
+                bufsize_kb = parse_bitrate_kbps(&args[i]);
             }
             "--audio" | "-c:a" if i + 1 < args.len() => {
                 i += 1;
@@ -477,6 +503,20 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
             _ => {}
         }
         i += 1;
+    }
+
+    if let Some(br) = bitrate_kbps {
+        opts.rate_control = Some(RateControlMode::Abr {
+            bitrate_kbps: br,
+            maxrate_kbps,
+            bufsize_kb,
+        });
+    } else if let Some(crf) = crf_opt {
+        opts.rate_control = Some(RateControlMode::Crf {
+            crf,
+            maxrate_kbps,
+            bufsize_kb,
+        });
     }
 
     let tel = if let Some(rp) = recipe_path {
@@ -1690,6 +1730,28 @@ fn parse_dimensions(s: &str) -> Option<(usize, usize)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
+fn parse_bitrate_kbps(s: &str) -> Option<u32> {
+    let trimmed = s.trim().to_ascii_lowercase();
+    if let Some(m) = trimmed
+        .strip_suffix("mbps")
+        .or_else(|| trimmed.strip_suffix('m'))
+    {
+        return Some((m.trim().parse::<f64>().ok()? * 1000.0).round() as u32);
+    }
+    if let Some(k) = trimmed
+        .strip_suffix("kbps")
+        .or_else(|| trimmed.strip_suffix('k'))
+    {
+        return Some(k.trim().parse::<f64>().ok()?.round() as u32);
+    }
+    let val = trimmed.parse::<f64>().ok()?;
+    if val >= 100_000.0 {
+        Some((val / 1000.0).round() as u32)
+    } else {
+        Some(val.round() as u32)
+    }
+}
+
 fn parse_time_seconds(s: &str) -> Option<f64> {
     if let Ok(sec) = s.parse::<f64>() {
         return Some(sec);
@@ -2542,10 +2604,25 @@ mod tests {
         .unwrap();
         assert!(ts_path.exists());
 
-        // 4. transcode MP4 -> scaled Y4M & WAV <-> FLAC
+        // 4. transcode MP4 -> scaled Y4M, High Profile CABAC CRF MP4, & WAV <-> FLAC
+        let high_mp4_path = dir.join("test_high_crf.mp4");
         run_cli(&vec_args(&[
             "transcode",
             mp4_path.to_str().unwrap(),
+            high_mp4_path.to_str().unwrap(),
+            "--profile",
+            "high",
+            "--crf",
+            "23",
+            "--maxrate",
+            "3M",
+        ]))
+        .unwrap();
+        assert!(high_mp4_path.exists());
+
+        run_cli(&vec_args(&[
+            "transcode",
+            high_mp4_path.to_str().unwrap(),
             y4m_path.to_str().unwrap(),
             "--scale",
             "160x120",

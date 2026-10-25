@@ -9,9 +9,10 @@
 //! - [`transcode_file`], [`remux_file`], [`extract_media`], [`synth_media`]: Unified multi-container media engines.
 
 use ragdoll_codec::{
-    FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, NalUnitType, Pps, RagdollIntraDecoder,
+    FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, NalUnitType, RagdollIntraDecoder,
     RagdollIntraEncoder, Sps, convert_audio_frame, parse_nal_rbsp,
 };
+pub use ragdoll_codec::{H264Profile, RateControlMode};
 use ragdoll_core::{
     AlignedBuffer, AudioFrame, AudioTrackParams, ChannelLayout, CodecId, Colorimetry, FramePool,
     NOPTS_VALUE, PacketFlags, PacketSlice, PixelFormat, RagdollError, Rational64, Result,
@@ -263,6 +264,32 @@ impl GopRingPipeline {
         fps: Rational64,
         qp: u8,
     ) -> Result<(Vec<EncodedGop>, GopRingStats)> {
+        self.encode_gops_bounded_with_h264(
+            raw_frames,
+            scale_dims,
+            scale_filter,
+            video_codec,
+            fps,
+            qp,
+            H264Profile::Baseline,
+            RateControlMode::FixedQp(qp),
+        )
+    }
+
+    /// Streams GOP chunks through fused L1 polyphase scaling + parallel GOP encoding with
+    /// configurable H.264 profile (`Baseline` / `Main` / `High`) and [`RateControlMode`] (`0040` / `0041`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gops_bounded_with_h264(
+        &self,
+        raw_frames: &[VideoFrame],
+        scale_dims: Option<(usize, usize)>,
+        scale_filter: ScaleFilter,
+        video_codec: &str,
+        fps: Rational64,
+        qp: u8,
+        h264_profile: H264Profile,
+        rate_control: RateControlMode,
+    ) -> Result<(Vec<EncodedGop>, GopRingStats)> {
         if raw_frames.is_empty() {
             return Ok((Vec::new(), GopRingStats::default()));
         }
@@ -284,8 +311,18 @@ impl GopRingPipeline {
             None
         };
 
-        let max_gop_for_threads = raw_frames.len().div_ceil(self.worker_threads.max(1)).max(1);
-        let gop_size = 15usize.min(max_gop_for_threads);
+        let is_abr = matches!(rate_control, RateControlMode::Abr { .. });
+        let eff_workers = if is_abr {
+            1
+        } else {
+            self.worker_threads.max(1)
+        };
+        let max_gop_for_threads = raw_frames.len().div_ceil(eff_workers).max(1);
+        let gop_size = if is_abr {
+            raw_frames.len().max(1)
+        } else {
+            15usize.min(max_gop_for_threads)
+        };
         let gop_chunks: Vec<&[VideoFrame]> = raw_frames.chunks(gop_size).collect();
         let max_gops_wave = self.max_gops_per_wave(src_w, src_h, dst_w, dst_h, gop_size);
         let use_rgdi = video_codec.eq_ignore_ascii_case("rgdi");
@@ -308,7 +345,7 @@ impl GopRingPipeline {
                 .min(self.memory_budget_bytes);
 
             let wave_encoded: Vec<Vec<(Vec<u8>, bool)>> =
-                parallel_gop_map(wave, self.worker_threads, |_idx, chunk| {
+                parallel_gop_map(wave, eff_workers, |_idx, chunk| {
                     let mut out_pkts = Vec::with_capacity(chunk.len());
                     if use_rgdi {
                         let enc = RagdollIntraEncoder::new(1);
@@ -328,9 +365,12 @@ impl GopRingPipeline {
                             }
                         }
                     } else {
-                        let mut enc = H264Encoder::new(dst_w as u32, dst_h as u32, fps, qp);
-                        enc.keyint = chunk.len() as u32 + 1;
+                        let mut enc = H264Encoder::new(dst_w as u32, dst_h as u32, fps, qp)
+                            .with_profile(h264_profile)
+                            .with_rate_control(rate_control);
+                        enc.keyint = if is_abr { 15 } else { chunk.len() as u32 + 1 };
                         for (i, src) in chunk.iter().enumerate() {
+                            let is_kf = (i as u32).is_multiple_of(enc.keyint.max(1));
                             if let Some((ref hy, ref vy, ref hc, ref vc)) = banks {
                                 let mut dst = self.pool.acquire_scoped(dst_w, dst_h, src.format);
                                 dst.colorimetry = src.colorimetry;
@@ -340,9 +380,9 @@ impl GopRingPipeline {
                                     scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
                                     scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
                                 }
-                                out_pkts.push((enc.encode_frame(&dst).unwrap(), i == 0));
+                                out_pkts.push((enc.encode_frame(&dst).unwrap(), is_kf));
                             } else {
-                                out_pkts.push((enc.encode_frame(src).unwrap(), i == 0));
+                                out_pkts.push((enc.encode_frame(src).unwrap(), is_kf));
                             }
                         }
                     }
@@ -945,6 +985,9 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                     }
                 }
             }
+            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
+                frames.sort_by_key(|f| f.pts.ticks);
+            }
             Ok((frames, fps))
         }
         ContainerFormat::Matroska | ContainerFormat::WebM => {
@@ -975,6 +1018,9 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                     frames.push(f);
                 }
             }
+            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
+                frames.sort_by_key(|f| f.pts.ticks);
+            }
             Ok((frames, fps))
         }
         ContainerFormat::MpegTs => {
@@ -985,6 +1031,9 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                 if let Some(f) = h264_dec.decode_annex_b_packet(pkt.data())? {
                     frames.push(f);
                 }
+            }
+            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
+                frames.sort_by_key(|f| f.pts.ticks);
             }
             Ok((frames, Rational64::FPS_30))
         }
@@ -1129,7 +1178,7 @@ pub fn avcc_config_to_annex_b(avcc: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Options for [`transcode_file_with_options`] (`0036` / `0037`).
+/// Options for [`transcode_file_with_options`] (`0036` / `0037` / `0040` / `0041`).
 #[derive(Clone, Debug)]
 pub struct TranscodeOptions {
     pub scale_dims: Option<(usize, usize)>,
@@ -1139,6 +1188,8 @@ pub struct TranscodeOptions {
     pub subtitle_codec: String,
     pub format_override: Option<String>,
     pub qp: u8,
+    pub h264_profile: H264Profile,
+    pub rate_control: Option<RateControlMode>,
     pub threads: usize,
     pub memory_budget_bytes: Option<usize>,
 }
@@ -1153,6 +1204,8 @@ impl Default for TranscodeOptions {
             subtitle_codec: "copy".into(),
             format_override: None,
             qp: 20,
+            h264_profile: H264Profile::Baseline,
+            rate_control: None,
             threads: 0,
             memory_budget_bytes: None,
         }
@@ -1377,17 +1430,24 @@ pub fn transcode_file_with_options(
         }
         _ => {
             let use_rgdi = opts.video_codec.eq_ignore_ascii_case("rgdi");
-            let sps = Sps::new_baseline(width, height, fps);
-            let pps = Pps::new_baseline(opts.qp);
-            let avcc_extra = build_avcc_from_sps_pps(&sps.to_nal_unit(), &pps.to_nal_unit());
+            let rc = opts
+                .rate_control
+                .unwrap_or(RateControlMode::FixedQp(opts.qp));
+            let hdr_enc = H264Encoder::new(width, height, fps, opts.qp)
+                .with_profile(opts.h264_profile)
+                .with_rate_control(rc);
+            let avcc_extra =
+                build_avcc_from_sps_pps(&hdr_enc.sps.to_nal_unit(), &hdr_enc.pps.to_nal_unit());
 
-            let (encoded_gops, ring_stats) = gop_ring.encode_gops_bounded(
+            let (encoded_gops, ring_stats) = gop_ring.encode_gops_bounded_with_h264(
                 &raw_frames,
                 opts.scale_dims,
                 opts.scale_filter,
                 &opts.video_codec,
                 fps,
                 opts.qp,
+                opts.h264_profile,
+                rc,
             )?;
             gops_processed = ring_stats.gops_processed;
 
@@ -2084,6 +2144,7 @@ pub fn probe_file_detailed(path: impl AsRef<Path>) -> Result<ProbeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ragdoll_codec::Pps;
 
     #[test]
     fn gop_partition_and_parallel_work_stealing_order() {

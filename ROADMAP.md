@@ -101,16 +101,16 @@ Replace full-file in-memory frame buffering with a bounded-memory GOP ring strea
 
 ## m7-video-production — Phase 7 — Production H.264 (Main/High CABAC, 4x4/8x8 Residuals, Qpel, Deblock & CRF Rate Control)
 
-`··········` 0% · 0 of 4 done
+`##########` 100% · 4 of 4 done
 
 Upgrade Ragdoll's pure-Rust H.264/AVC engine from Constrained Baseline skip/DC coding to full production Main and High Profile parity: quantized $4\times4$ and $8\times8$ AC/DC DCT residual coding (`I_4x4` all 9 spatial modes, `I_16x16`, `P_L0_16x16`, `P_8x8`), 6-tap FIR quarter-pel (`qpel`) motion interpolation, ITU-T H.264 8.7 adaptive in-loop deblocking filter, CABAC binary arithmetic coding, B-slice decoding, and perceptual CRF (`--crf`) + VBV bitrate control.
 
-### up next
+### shipped
 
-- [ ] `SIMD-0038` H.264 6-Tap Quarter-Pel Interpolation, In-Loop Deblocking Filter & Intra 4x4 9-Mode NEON/AVX2 Kernels <sup>kernel · p0 · simd</sup>
-- [ ] `0039` Full H.264 Residual Coding (I_4x4, I_16x16, P_L0_16x16, P_8x8 AC/DC CAVLC) & Sub-Pel Motion Refinement <sup>feature · p0 · codec-video</sup>
-- [ ] `0040` H.264 Main & High Profile CABAC Arithmetic Engine, 8x8 Transform & B-Frame Decoding <sup>feature · p0 · codec-video</sup>
-- [ ] `0041` Perceptual CRF (--crf), Variance-Adaptive Quantization (VAQ) & VBV Bitrate Control <sup>feature · p1 · codec-video</sup>
+- [x] `SIMD-0038` H.264 6-Tap Quarter-Pel Interpolation, In-Loop Deblocking Filter & Intra 4x4 9-Mode NEON/AVX2 Kernels <sup>kernel · p0 · simd</sup>
+- [x] `0039` Full H.264 Residual Coding (I_4x4, I_16x16, P_L0_16x16, P_8x8 AC/DC CAVLC) & Sub-Pel Motion Refinement <sup>feature · p0 · codec-video</sup>
+- [x] `0040` H.264 Main & High Profile CABAC Arithmetic Engine, 8x8 Transform & B-Frame Decoding <sup>feature · p0 · codec-video</sup>
+- [x] `0041` Perceptual CRF (--crf), Variance-Adaptive Quantization (VAQ) & VBV Bitrate Control <sup>feature · p1 · codec-video</sup>
 
 ## m8-audio-pro — Phase 8 — Lossy Audio (AAC-LC & Opus), Polyphase Resampler & EBU R128 Loudness
 

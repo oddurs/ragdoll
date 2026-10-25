@@ -7,6 +7,7 @@
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
 pub mod fixed;
+pub mod h264_dsp;
 pub mod metrics;
 pub mod scan;
 
@@ -14,6 +15,13 @@ pub use fixed::{
     Q14_HALF, Q14_ONE, add4x4_idct_u8, clamp_u8, convolve_8tap_q14_u8, convolve_8tap_q14_u8_scalar,
     forward_dct4x4, forward_dct4x4_scalar, forward_dct8x8, hadamard4x4, hadamard4x4_scalar,
     inverse_idct4x4, inverse_idct4x4_scalar, inverse_idct8x8, sub4x4_dct_u8,
+};
+pub use h264_dsp::{
+    H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, h264_deblock_chroma_line,
+    h264_deblock_luma_line, h264_loop_filter_chroma_edge_h_u8, h264_loop_filter_chroma_edge_v_u8,
+    h264_loop_filter_luma_edge_h_u8, h264_loop_filter_luma_edge_v_u8, predict_intra_4x4_u8,
+    predict_intra_4x4_u8_scalar, put_h264_chroma_mc8_u8, put_h264_chroma_mc8_u8_scalar,
+    put_h264_qpel8_mc_u8, put_h264_qpel16_mc_u8, put_h264_qpel16_mc_u8_scalar,
 };
 pub use metrics::{
     SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, flac_eval_fixed_orders_l1,
@@ -322,6 +330,97 @@ mod tests {
                 flac_eval_fixed_orders_l1(&samples),
                 flac_eval_fixed_orders_l1_scalar(&samples),
                 "FLAC fixed L1 mismatch at len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn h264_qpel16_chroma_mc8_deblock_and_intra4x4_neon_vs_scalar() {
+        let width = 32usize;
+        let height = 32usize;
+        let stride = 32usize;
+        let mut plane = vec![0u8; stride * height];
+        for (i, b) in plane.iter_mut().enumerate() {
+            *b = ((i * 97 + (i >> 3) * 53 + 19) & 0xFF) as u8;
+        }
+
+        // 1. All 16 quarter-pel phases `(mx, my) in 0..4 x 0..4` (interior and border clamped)
+        for &(x0, y0) in &[(6isize, 6isize), (-1, 0), (20, 20)] {
+            for my in 0..4u8 {
+                for mx in 0..4u8 {
+                    let mut simd_dst = [0u8; 256];
+                    let mut scalar_dst = [0u8; 256];
+                    put_h264_qpel16_mc_u8(
+                        &plane,
+                        stride,
+                        width,
+                        height,
+                        x0,
+                        y0,
+                        mx,
+                        my,
+                        &mut simd_dst,
+                    );
+                    put_h264_qpel16_mc_u8_scalar(
+                        &plane,
+                        stride,
+                        width,
+                        height,
+                        x0,
+                        y0,
+                        mx,
+                        my,
+                        &mut scalar_dst,
+                    );
+                    assert_eq!(
+                        simd_dst, scalar_dst,
+                        "qpel16 mismatch at ({x0},{y0}) phase ({mx},{my})"
+                    );
+                }
+            }
+        }
+
+        // 2. All 64 1/8-pel chroma phases `(fx, fy) in 0..8 x 0..8`
+        for fy in 0..8u8 {
+            for fx in 0..8u8 {
+                let mut simd_c = [0u8; 64];
+                let mut scalar_c = [0u8; 64];
+                put_h264_chroma_mc8_u8(&plane, stride, width, height, 4, 4, fx, fy, &mut simd_c);
+                put_h264_chroma_mc8_u8_scalar(
+                    &plane,
+                    stride,
+                    width,
+                    height,
+                    4,
+                    4,
+                    fx,
+                    fy,
+                    &mut scalar_c,
+                );
+                assert_eq!(simd_c, scalar_c, "chroma mc8 mismatch at ({fx},{fy})");
+            }
+        }
+
+        // 3. All 9 Intra 4x4 spatial prediction modes (`0..=8`)
+        let top8 = [20u8, 45, 80, 110, 140, 175, 200, 230];
+        let left4 = [30u8, 70, 120, 185];
+        for mode in 0..=8u8 {
+            let mut simd_4x4 = [0u8; 16];
+            let mut scalar_4x4 = [0u8; 16];
+            predict_intra_4x4_u8(mode, Some(&top8), Some(&left4), 15, &mut simd_4x4, 4);
+            predict_intra_4x4_u8_scalar(mode, Some(&top8), Some(&left4), 15, &mut scalar_4x4, 4);
+            assert_eq!(simd_4x4, scalar_4x4, "intra 4x4 mismatch at mode {mode}");
+        }
+
+        // 4. Adaptive In-Loop Deblocking Filter across bS = 1..=4
+        for bs in 1..=4u8 {
+            let mut line = [100u8, 102, 105, 108, 116, 119, 121, 123];
+            let orig_gap = (line[4] as i32 - line[3] as i32).abs();
+            h264_deblock_luma_line(&mut line, 28, bs);
+            let new_gap = (line[4] as i32 - line[3] as i32).abs();
+            assert!(
+                new_gap <= orig_gap,
+                "deblocking bS={bs} must reduce or preserve step gap ({new_gap} vs {orig_gap})"
             );
         }
     }

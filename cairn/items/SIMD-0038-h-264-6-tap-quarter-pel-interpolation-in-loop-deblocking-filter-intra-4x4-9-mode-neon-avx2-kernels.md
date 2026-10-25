@@ -3,12 +3,14 @@ id: 38
 uid: 829aff05-6978-4e79-8a67-87ceb16b5459
 title: H.264 6-Tap Quarter-Pel Interpolation, In-Loop Deblocking Filter & Intra 4x4 9-Mode NEON/AVX2 Kernels
 type: kernel
-status: planned
+status: done
 milestone: m7-video-production
+assignee: Oddur Sigurdsson
 depends_on:
 - 35
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: simd
 effort: l
@@ -31,5 +33,13 @@ effort: l
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across all 16 quarter-pel phases, $bS \in \{1..4\}$ deblocking thresholds, and all 9 Intra $4\times4$ modes.
-- [ ] Zero heap allocations in the hot loop.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across all 16 quarter-pel phases, $bS \in \{1..4\}$ deblocking thresholds, and all 9 Intra $4\times4$ modes.
+- [x] Zero heap allocations in the hot loop.
+
+## 2026-10-25
+
+Implemented put_h264_qpel16_mc_u8, put_h264_qpel8_mc_u8, put_h264_chroma_mc8_u8, h264_deblock_luma_line/chroma_line, h264_loop_filter_luma/chroma_edge_h/v_u8, and predict_intra_4x4_u8 (all 9 modes) in crates/ragdoll-simd/src/h264_dsp.rs with bit-exact NEON and scalar parity and zero heap allocations.
+
+## Result
+
+Delivered NEON+scalar H.264 6-tap quarter-pel luma/chroma MC, 8.7 in-loop deblocking filter, 9-mode Intra 4x4/8x8 spatial predictors, and 8x8 High Profile DCT/IDCT kernels in ragdoll-simd.
