@@ -25,15 +25,16 @@ pub use io::{MmapSource, VectoredWriter};
 pub use mkv::{MkvDemuxer, MkvMuxer};
 pub use mp4::{FourCC, Mp4Demuxer, Mp4Muxer, Mp4TrackIndex};
 pub use mpegts::{
-    MpegTsDemuxer, MpegTsMuxer, PID_BASE_ES, PID_DEFAULT_PMT, PID_PAT, TS_PACKET_SIZE,
-    TS_SYNC_BYTE, build_avcc_from_sps_pps, decode_pes_timestamp, encode_pes_timestamp,
-    h264_avcc_to_annex_b_au,
+    FEC_PACKET_SIZE, M2TS_PACKET_SIZE, MpegTsDemuxer, MpegTsMuxer, PID_BASE_ES, PID_DEFAULT_PMT,
+    PID_PAT, PID_SDT, TS_PACKET_SIZE, TS_SYNC_BYTE, aac_raw_to_adts, build_avcc_from_sps_pps,
+    decode_pes_timestamp, detect_mpegts_stride_and_sync, encode_pes_timestamp,
+    h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, parse_adts_header,
 };
 pub use ppm::{compose_contact_sheet_rgb24, read_pnm_image, write_pnm_image};
 pub use wav::{WavDemuxer, WavMuxer};
 pub use y4m::{Y4mDemuxer, Y4mMuxer};
 
-use ragdoll_core::{RagdollError, Result, TrackInfo};
+use ragdoll_core::{AlignedBuffer, CodecId, PacketSlice, RagdollError, Result, TrackInfo};
 use std::io::Write;
 
 /// Container format family detected by magic bytes.
@@ -71,7 +72,10 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
         return Some(ContainerFormat::Mp4);
     }
     if data.len() >= 8
-        && (&data[4..8] == b"moov" || &data[4..8] == b"mdat" || &data[4..8] == b"wide")
+        && (&data[4..8] == b"moov"
+            || &data[4..8] == b"moof"
+            || &data[4..8] == b"mdat"
+            || &data[4..8] == b"wide")
     {
         return Some(ContainerFormat::Mp4);
     }
@@ -86,7 +90,10 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
     if data.len() >= 10 && &data[0..10] == b"YUV4MPEG2 " {
         return Some(ContainerFormat::Y4m);
     }
-    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+    if data.len() >= 12
+        && (&data[0..4] == b"RIFF" || &data[0..4] == b"RF64" || &data[0..4] == b"BW64")
+        && &data[8..12] == b"WAVE"
+    {
         return Some(ContainerFormat::Wav);
     }
     if data.len() >= 3 && &data[0..2] == b"P6" && data[2].is_ascii_whitespace() {
@@ -95,7 +102,7 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
     if data.len() >= 3 && &data[0..2] == b"P5" && data[2].is_ascii_whitespace() {
         return Some(ContainerFormat::Pgm);
     }
-    if ragdoll_simd::find_mpeg_ts_sync(data).is_some() {
+    if detect_mpegts_stride_and_sync(data).is_some() {
         return Some(ContainerFormat::MpegTs);
     }
     None
@@ -189,6 +196,67 @@ pub fn transmux_mkv_to_mp4<W: Write>(mkv_bytes: &[u8], writer: W) -> Result<u64>
     }
     while let Some(pkt) = demux.next_packet()? {
         mux.write_packet(pkt)?;
+    }
+    mux.finish(writer)
+}
+
+/// Transmuxes an MPEG-2 Transport Stream (`ts_bytes`, 188B TS / 192B M2TS / 204B FEC) into a
+/// Fast-Start MP4 (`.mp4`), automatically converting H.264 Annex-B NAL units into 4-byte
+/// length-prefixed AVCC samples and stripping ADTS headers into raw AAC + `AudioSpecificConfig`.
+pub fn transmux_mpegts_to_mp4<W: Write>(ts_bytes: &[u8], writer: W) -> Result<u64> {
+    let mut demux = MpegTsDemuxer::open(ts_bytes)?;
+    let tracks: Vec<TrackInfo> = demux.tracks().to_vec();
+    let mut mux = Mp4Muxer::new();
+    for t in &tracks {
+        mux.add_track(t.clone());
+    }
+    while let Some(pkt) = demux.next_packet()? {
+        let track = &tracks[pkt.track_index as usize];
+        if track.codec_id == CodecId::H264 {
+            let avcc_au = h264_annex_b_to_avcc_au(pkt.data());
+            let mut owned = PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&avcc_au),
+                pkt.track_index,
+                pkt.pts,
+                pkt.dts,
+                pkt.duration,
+                pkt.flags,
+            );
+            owned.file_offset = pkt.file_offset;
+            mux.write_packet(owned)?;
+        } else {
+            mux.write_packet(pkt)?;
+        }
+    }
+    mux.finish(writer)
+}
+
+/// Transmuxes an MPEG-2 Transport Stream (`ts_bytes`, 188B TS / 192B M2TS / 204B FEC) into a
+/// Matroska (`.mkv`) container with `SeekHead` and `Cues`.
+pub fn transmux_mpegts_to_mkv<W: Write>(ts_bytes: &[u8], writer: W) -> Result<u64> {
+    let mut demux = MpegTsDemuxer::open(ts_bytes)?;
+    let tracks: Vec<TrackInfo> = demux.tracks().to_vec();
+    let mut mux = MkvMuxer::new_matroska();
+    for t in &tracks {
+        mux.add_track(t.clone());
+    }
+    while let Some(pkt) = demux.next_packet()? {
+        let track = &tracks[pkt.track_index as usize];
+        if track.codec_id == CodecId::H264 {
+            let avcc_au = h264_annex_b_to_avcc_au(pkt.data());
+            let mut owned = PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&avcc_au),
+                pkt.track_index,
+                pkt.pts,
+                pkt.dts,
+                pkt.duration,
+                pkt.flags,
+            );
+            owned.file_offset = pkt.file_offset;
+            mux.write_packet(owned)?;
+        } else {
+            mux.write_packet(pkt)?;
+        }
     }
     mux.finish(writer)
 }
@@ -671,7 +739,53 @@ mod tests {
                 transmux_mp4_to_mpegts(&rg_mmap, f).unwrap();
             }
 
-            for p in [&ragdoll_mp4_path, &ragdoll_mkv_path, &ragdoll_ts_path] {
+            // Write Fragmented MP4 (`fMP4`) via Ragdoll `finish_fragmented`
+            let ragdoll_fmp4_path = tmp_dir.join("ragdoll_fmp4.mp4");
+            {
+                let mut r_demux = Mp4Demuxer::open(&rg_mmap).unwrap();
+                let mut f_mux = Mp4Muxer::new();
+                for t in r_demux.tracks() {
+                    f_mux.add_track(t.info.clone());
+                }
+                while let Some(pkt) = r_demux.next_packet().unwrap() {
+                    f_mux.write_packet(pkt).unwrap();
+                }
+                let f = std::fs::File::create(&ragdoll_fmp4_path).unwrap();
+                f_mux.finish_fragmented(f, 5).unwrap();
+            }
+
+            // Write RF64 64-bit WAVE via Ragdoll `finish_rf64`
+            let ragdoll_rf64_path = tmp_dir.join("ragdoll_rf64.wav");
+            {
+                let pcm = vec![0u8; 4800 * 4];
+                let mut w_mux = WavMuxer::new(AudioTrackParams {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_layout: ChannelLayout::Stereo,
+                    sample_format: SampleFormat::F32le,
+                    bits_per_coded_sample: 32,
+                });
+                w_mux.write_pcm_bytes(&pcm);
+                let f = std::fs::File::create(&ragdoll_rf64_path).unwrap();
+                w_mux.finish_rf64(f).unwrap();
+            }
+
+            // Transmux MPEG-TS back to MP4 via Ragdoll `transmux_mpegts_to_mp4`
+            let ts_mmap = MmapSource::open(&ragdoll_ts_path).unwrap();
+            let ragdoll_ts_to_mp4_path = tmp_dir.join("ragdoll_ts_to_mp4.mp4");
+            {
+                let f = std::fs::File::create(&ragdoll_ts_to_mp4_path).unwrap();
+                transmux_mpegts_to_mp4(&ts_mmap, f).unwrap();
+            }
+
+            for p in [
+                &ragdoll_mp4_path,
+                &ragdoll_fmp4_path,
+                &ragdoll_mkv_path,
+                &ragdoll_ts_path,
+                &ragdoll_rf64_path,
+                &ragdoll_ts_to_mp4_path,
+            ] {
                 let out = Command::new("ffprobe")
                     .args([
                         "-v",
@@ -691,8 +805,231 @@ mod tests {
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
+
+            // Also generate an FFmpeg-authored Fragmented MP4 (`-movflags frag_keyframe+empty_moov`)
+            // and verify Ragdoll's Mp4Demuxer parses all `moof`/`traf`/`trun` fragments zero-copy!
+            let ffmpeg_fmp4_path = tmp_dir.join("ffmpeg_fmp4.mp4");
+            let fmp4_status = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    ffmpeg_mp4_path.to_str().unwrap(),
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "frag_keyframe+empty_moov",
+                    ffmpeg_fmp4_path.to_str().unwrap(),
+                ])
+                .status();
+            if let Ok(fst) = fmp4_status
+                && fst.success()
+            {
+                let fmp4_mmap = MmapSource::open(&ffmpeg_fmp4_path).unwrap();
+                let mut fmp4_demux = Mp4Demuxer::open(&fmp4_mmap).unwrap();
+                assert!(fmp4_demux.is_fragmented());
+                assert_eq!(fmp4_demux.total_packets(), demux.total_packets());
+                let first_pkt = fmp4_demux.next_packet().unwrap().unwrap();
+                assert!(first_pkt.payload.is_zero_copy());
+            }
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn fmp4_fragmented_mux_demux_and_mkv_seekhead_log_n_seeking() {
+        let (avcc, idr_pkt, p_pkt) = make_valid_h264_avcc_stream();
+        let tb = Rational64::new(1, 30_000);
+        let frame_dur = 1001i64;
+
+        let mut mux = Mp4Muxer::new();
+        let v_track = mux.add_track(TrackInfo {
+            index: 0,
+            track_type: TrackType::Video,
+            codec_id: CodecId::H264,
+            timebase: tb,
+            duration_ticks: Some(120 * frame_dur),
+            extra_data: avcc.clone(),
+            video: Some(VideoTrackParams {
+                width: 1920,
+                height: 1080,
+                pixel_format: PixelFormat::Yuv420p,
+                colorimetry: Colorimetry::bt709_limited(),
+                frame_rate: Rational64::FPS_29_97,
+                bit_depth: 8,
+                profile: None,
+                level: None,
+            }),
+            audio: None,
+            sample_count: 120,
+            total_bytes: 0,
+        });
+
+        for i in 0..120usize {
+            let is_kf = i.is_multiple_of(15);
+            let dts = (i as i64) * frame_dur;
+            let cts = if is_kf { 0 } else { frame_dur };
+            let pts = dts + cts;
+            let payload = if is_kf { &idr_pkt[..] } else { &p_pkt[..] };
+            let flags = if is_kf {
+                PacketFlags::KEYFRAME
+            } else {
+                PacketFlags::NONE
+            };
+            mux.write_packet(PacketSlice::from_mmap(
+                payload,
+                v_track,
+                Timestamp::new(pts, tb),
+                Timestamp::new(dts, tb),
+                frame_dur,
+                flags,
+                0,
+            ))
+            .unwrap();
+        }
+
+        let mut fmp4_bytes = Vec::new();
+        mux.finish_fragmented(&mut fmp4_bytes, 15).unwrap();
+
+        let mut fmp4_demux = Mp4Demuxer::open(&fmp4_bytes).unwrap();
+        assert!(fmp4_demux.is_fragmented());
+        assert_eq!(fmp4_demux.total_packets(), 120);
+
+        let (kf_idx, kf_entry) = fmp4_demux
+            .seek_to_timestamp(0, Timestamp::new(50 * frame_dur, tb))
+            .unwrap();
+        assert_eq!(kf_idx, 45);
+        assert!(kf_entry.is_keyframe());
+
+        // Transmux fMP4 -> MKV and verify SeekHead + Cues + O(log N) MkvDemuxer::seek_to_timestamp
+        let mut mkv_bytes = Vec::new();
+        transmux_mp4_to_mkv(&fmp4_bytes, &mut mkv_bytes).unwrap();
+
+        let mut mkv_demux = MkvDemuxer::open(&mkv_bytes).unwrap();
+        assert!(mkv_demux.has_seek_head());
+        assert_eq!(mkv_demux.cues_count(), 8); // 120 frames / 15-frame GOP = 8 cue points
+        let (mkv_kf_idx, mkv_kf_entry) = mkv_demux
+            .seek_to_timestamp(0, Timestamp::new(50 * frame_dur, tb))
+            .unwrap();
+        assert_eq!(mkv_kf_idx, 45);
+        assert!(mkv_kf_entry.is_keyframe());
+    }
+
+    #[test]
+    fn m2ts_192_byte_sdt_adts_aac_and_rf64_wave_roundtrip() {
+        let (avcc, idr_pkt, p_pkt) = make_valid_h264_avcc_stream();
+        let tb = Rational64::new(1, 90_000);
+
+        // 1. 192-byte Blu-ray M2TS with H.264 + AAC + DVB SDT
+        let mut m2ts_bytes = Vec::new();
+        {
+            let mut mux = MpegTsMuxer::new_m2ts(&mut m2ts_bytes);
+            let v_idx = mux.add_track(TrackInfo {
+                index: 0,
+                track_type: TrackType::Video,
+                codec_id: CodecId::H264,
+                timebase: tb,
+                duration_ticks: None,
+                extra_data: avcc.clone(),
+                video: Some(VideoTrackParams::default()),
+                audio: None,
+                sample_count: 0,
+                total_bytes: 0,
+            });
+            let a_idx = mux.add_track(TrackInfo {
+                index: 1,
+                track_type: TrackType::Audio,
+                codec_id: CodecId::Aac,
+                timebase: tb,
+                duration_ticks: None,
+                extra_data: vec![0x11, 0x90], // AAC-LC 48kHz stereo
+                video: None,
+                audio: Some(AudioTrackParams {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_layout: ChannelLayout::Stereo,
+                    sample_format: SampleFormat::F32le,
+                    bits_per_coded_sample: 16,
+                }),
+                sample_count: 0,
+                total_bytes: 0,
+            });
+
+            let raw_aac_frame = [0x21u8, 0x10, 0x04, 0x60, 0x8C, 0x1C];
+            for i in 0..10usize {
+                let is_kf = i.is_multiple_of(5);
+                let ts = Timestamp::new((i * 3000) as i64, tb);
+                let v_pay = if is_kf { &idr_pkt[..] } else { &p_pkt[..] };
+                let v_flags = if is_kf {
+                    PacketFlags::KEYFRAME
+                } else {
+                    PacketFlags::NONE
+                };
+                mux.write_packet(&PacketSlice::from_mmap(
+                    v_pay, v_idx, ts, ts, 3000, v_flags, 0,
+                ))
+                .unwrap();
+                mux.write_packet(&PacketSlice::from_mmap(
+                    &raw_aac_frame,
+                    a_idx,
+                    ts,
+                    ts,
+                    1920,
+                    PacketFlags::KEYFRAME,
+                    0,
+                ))
+                .unwrap();
+            }
+            mux.finish().unwrap();
+        }
+
+        assert_eq!(m2ts_bytes.len() % M2TS_PACKET_SIZE, 0);
+        assert_eq!(
+            detect_container_format(&m2ts_bytes),
+            Some(ContainerFormat::MpegTs)
+        );
+        let m2ts_demux = MpegTsDemuxer::open(&m2ts_bytes).unwrap();
+        assert_eq!(m2ts_demux.packet_stride(), M2TS_PACKET_SIZE);
+        assert!(m2ts_demux.has_sdt());
+        assert_eq!(m2ts_demux.tracks().len(), 2);
+        assert_eq!(m2ts_demux.tracks()[1].codec_id, CodecId::Aac);
+        assert_eq!(m2ts_demux.tracks()[1].extra_data, vec![0x11, 0x90]);
+
+        // Transmux M2TS -> MP4 and M2TS -> MKV
+        let mut mp4_from_m2ts = Vec::new();
+        transmux_mpegts_to_mp4(&m2ts_bytes, &mut mp4_from_m2ts).unwrap();
+        let mp4_demux = Mp4Demuxer::open(&mp4_from_m2ts).unwrap();
+        assert_eq!(mp4_demux.tracks().len(), 2);
+        assert_eq!(mp4_demux.total_packets(), 20);
+
+        let mut mkv_from_m2ts = Vec::new();
+        transmux_mpegts_to_mkv(&m2ts_bytes, &mut mkv_from_m2ts).unwrap();
+        let mkv_demux = MkvDemuxer::open(&mkv_from_m2ts).unwrap();
+        assert_eq!(mkv_demux.tracks().len(), 2);
+        assert_eq!(mkv_demux.total_packets(), 20);
+
+        // 2. RF64 64-bit WAVE + IEEE Float `fact` chunk round-trip
+        let f32_pcm: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        let mut rf64_mux = WavMuxer::new(AudioTrackParams {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_layout: ChannelLayout::Stereo,
+            sample_format: SampleFormat::F32le,
+            bits_per_coded_sample: 32,
+        });
+        rf64_mux.write_pcm_bytes(&f32_pcm);
+        let mut rf64_bytes = Vec::new();
+        rf64_mux.finish_rf64(&mut rf64_bytes).unwrap();
+        assert_eq!(&rf64_bytes[0..4], b"RF64");
+        assert_eq!(
+            detect_container_format(&rf64_bytes),
+            Some(ContainerFormat::Wav)
+        );
+        let rf64_demux = WavDemuxer::open(&rf64_bytes).unwrap();
+        assert!(rf64_demux.is_rf64());
+        assert_eq!(rf64_demux.track().codec_id, CodecId::PcmF32Le);
+        assert_eq!(rf64_demux.pcm_data(), &f32_pcm[..]);
     }
 }
