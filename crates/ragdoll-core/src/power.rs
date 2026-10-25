@@ -174,11 +174,13 @@ impl CpuTopology {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let e_cores = total_cores / 2;
+            let p_cores = total_cores.saturating_sub(e_cores).max(1);
             Self {
                 brand: std::env::consts::ARCH.to_string(),
                 total_cores,
-                p_cores: total_cores,
-                e_cores: (total_cores / 2).max(1),
+                p_cores,
+                e_cores,
                 p_l1d_bytes: 65_536,
                 p_l2_bytes: 4 * 1024 * 1024,
                 e_l1d_bytes: 32_768,
@@ -195,7 +197,7 @@ impl CpuTopology {
         }
         match mode {
             PowerMode::Performance | PowerMode::Balanced => self.total_cores.max(1),
-            PowerMode::Efficiency => self.e_cores.max(1),
+            PowerMode::Efficiency => self.e_cores.max((self.total_cores / 2).max(1)),
         }
     }
 }
