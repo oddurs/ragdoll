@@ -140,12 +140,24 @@ Introduce Ragdoll's opinionated workflow upgrades over FFmpeg: frame-accurate Sm
 
 ## m10-production-v1 — Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
 
-`··········` 0% · 0 of 2 done
+`##········` 13% · 1 of 8 done
 
 Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic, zero-unsafe-required Rust library SDK (`ragdoll` crate / builder API), enforce a Zero-Panic Malformed Bitstream Guarantee across all container demuxers and codec decoders via deterministic mutation/fuzz corpus tests, and validate speed, perceptual quality, and E-core battery efficiency across a 12-workload benchmark suite against FFmpeg 9.0.2.
+
+### backlog
+
+- [ ] `BUG-0053` probe on MPEG-TS from stdin reports wrong video dimensions <sup>bug · p2 · format</sup>
+- [ ] `0054` Stream decode through GopRingPipeline so transcode, extract and metrics use bounded memory <sup>feature · p1 · pipeline</sup>
+- [ ] `SIMD-0055` AVX2 kernels for x86_64 <sup>kernel · p1 · simd</sup>
+- [ ] `BENCH-0056` In-tree harness for FFmpeg kernel-level comparisons <sup>benchmark · p2 · bench</sup>
+- [ ] `0057` CLI: reject unknown options and remove or implement no-op flags <sup>chore · p2 · cli</sup>
 
 ### up next
 
 - [ ] `0050` Ergonomic ragdoll Rust Library SDK & Zero-Panic Malformed Bitstream Fuzz Corpus <sup>feature · p0 · arch</sup>
 - [ ] `BENCH-0051` 12-Workload Production v1.0 Benchmark Suite: Ragdoll vs. FFmpeg 9.0.2 (Speed, Quality & Battery Efficiency) <sup>benchmark · p0 · bench</sup>
+
+### shipped
+
+- [x] `0052` Next.js docs & landing site, brand identity, logo and README overhaul <sup>docs · p2 · arch</sup>
 

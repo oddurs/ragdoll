@@ -1,0 +1,68 @@
+export const metadata = { title: "Command line" };
+
+# Command line
+
+`ragdoll` is a single binary with one subcommand per task. Run it with no arguments, `-h` or `help` to print usage and the SIMD level and CPU topology it detected.
+
+```sh
+ragdoll <SUBCOMMAND> [OPTIONS]
+```
+
+## Subcommands
+
+| Command | Purpose |
+| :-- | :-- |
+| [`probe`](/docs/cli/probe/) | Inspect a container: tracks, codecs, colorimetry, GOP structure. No decoding. |
+| [`remux`](/docs/cli/remux/) | Copy packets into a different container without re-encoding. |
+| [`transcode`](/docs/cli/transcode/) | Decode, optionally scale, and re-encode; or run a [TOML recipe](/docs/cli/recipes/). |
+| [`extract`](/docs/cli/extract/) | Write one frame at a timestamp, or a tiled contact sheet. |
+| [`metrics`](/docs/cli/metrics/) | Compare a distorted video with a reference: PSNR, SSIM, MS-SSIM, VMAF-Lite. |
+| [`synth`](/docs/cli/synth/) | Generate procedural test video or audio. |
+| [`bench`](/docs/cli/bench/) | Run the seven end-to-end benchmark workloads, optionally against FFmpeg. |
+| [`self-test`](/docs/cli/self-test/) | Check every SIMD kernel against its scalar reference on this machine. |
+
+## Global options
+
+These are accepted anywhere on the command line, before or after the subcommand.
+
+| Option | Description |
+| :-- | :-- |
+| `--power-mode <MODE>`, `-P <MODE>` | Scheduling profile for worker threads: `performance` (default), `balanced`, or `efficiency`. See [Power modes](/docs/power/). |
+| `--battery-saver`, `--efficiency` | Shorthand for `--power-mode efficiency`. |
+| `-h`, `--help`, `help` | Print usage. |
+| `-V`, `--version`, `version` | Print the version, detected SIMD level and core counts. |
+
+## Conventions
+
+### Paths and pipes
+
+A path of `-` means stdin for inputs and stdout for outputs. Seekable formats are read through a memory map; stdin is buffered into an aligned buffer first. When the output is stdout and no `--format` is given, `transcode` writes MPEG-TS.
+
+```sh
+cat input.ts | ragdoll transcode - - --scale 1280x720 | ragdoll probe -
+```
+
+### Formats follow extensions
+
+The output container is chosen from the output file's extension (`.mp4`, `.mkv`, `.ts`, `.y4m`, `.wav`, `.flac`, `.ppm`, `.rgdi`, `.vtt`, `.srt`). `remux` and `transcode` accept `--format <EXT>` (`-f`) to override it, which you need when writing to stdout. Input containers are detected from their magic bytes, not their names.
+
+### Dimensions and times
+
+- Dimensions are written `WIDTHxHEIGHT`, for example `1920x1080`. Grids use the same form: `4x4` is four columns by four rows.
+- Times are either seconds (`12.5`) or `HH:MM:SS.mmm` (`00:01:12.500`).
+
+### Output and exit status
+
+Commands that process media print a one-line summary to stdout:
+
+```text
+[ragdoll transcode] in.mp4 -> out.mp4 | frames=60 gops=10 threads=10 | in=7844139 B out=2579726 B (3.04:1) | 30.45 ms (1970.6 fps, 0.342 GB/s)
+```
+
+Pass `--json` (`-j`) to any subcommand except `self-test` to get a JSON object instead. When the output is stdout, the summary is suppressed so it does not corrupt the stream.
+
+Errors are printed as `error: <message>` and the process exits with status `1`.
+
+### Unknown options
+
+The argument parser is deliberately small and silently ignores options it does not recognize, so check the spelling if a flag seems to have no effect.

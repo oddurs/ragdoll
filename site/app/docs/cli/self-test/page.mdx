@@ -1,0 +1,53 @@
+export const metadata = { title: "ragdoll self-test" };
+
+# ragdoll self-test
+
+Run every optimized kernel next to its scalar reference on this machine, check that the results are identical, and print the throughput of both.
+
+```sh
+ragdoll self-test
+```
+
+`self-test` is the quickest way to confirm that a build is correct on new hardware. It takes a few seconds and needs no input files.
+
+## Example output
+
+Apple M4, release build:
+
+```text
+================================================================================
+  RAGDOLL v0.1.0 — M1, M2, M3 & M4 SIMD Differential Self-Test
+  Detected Hardware SIMD : aarch64 NEON (128-bit x 32 ASIMD)
+================================================================================
+
+Kernel (4K 3840x2160 Luma / 16 MB Stream)      Scalar         NEON SIMD      Speedup   Check
+----------------------------------------------------------------------------------------------
+4K Plane SAD (sum |a - b|)                     27.79 Gpx/s      36.97 Gpx/s    1.33x    EXACT (49183200)
+4K Plane SSE (sum (a - b)^2)                   16.41 Gpx/s      21.38 Gpx/s    1.30x    EXACT (6295449600)
+4K Plane SSIM 4x4-Reuse (vf_ssim)               6.98 Gpx/s       9.96 Gpx/s    1.43x    EXACT (0.93131 / 11.63 dB)
+H.264 4x4 DCT+IDCT (vtrn1/vtrn2 + vrshr)       96.96 Mblk/s    181.50 Mblk/s   1.87x    EXACT
+Annex-B Start-Code Scan (isolated 0x00s)        5.29 GB/s       29.27 GB/s     5.53x    EXACT
+H.264/HEVC RBSP Unescape (vextq_u8 pair)        1.96 GB/s       10.49 GB/s     5.36x    EXACT
+1080p YUV420p -> RGB24 (BT.709 vst3q_u8)        0.66 Gpx/s       4.45 Gpx/s    6.79x    EXACT
+1080p YUV420p -> RGBA8 (BT.709 vst4q_u8)        0.75 Gpx/s       4.00 Gpx/s    5.35x    EXACT
+1080p NV12 -> RGB24 (BT.709 vld2_u8 UV)         0.64 Gpx/s       4.60 Gpx/s    7.18x    EXACT
+1080p 10-bit -> 8-bit Bayer 16x16 Dither        1.97 Gpx/s      32.43 Gpx/s   16.43x    EXACT
+1080p RGB24 -> YUV420p (BT.709 vld3q_u8)        0.68 Gpx/s       5.57 Gpx/s    8.19x    EXACT
+Lanczos-3 8-Tap H-Scale (4K->1080p vpaddq)      1.38 Gpx/s       3.66 Gpx/s    2.65x    EXACT
+H.264 16x16 Macroblock SAD (vabal_u8 x16)      96.70 Mmb/s     183.19 Mmb/s    1.89x    EXACT
+FLAC 5-Order Fixed L1 Eval (1-pass NEON)        1.67 Gsmp/s      3.31 Gsmp/s   1.99x    EXACT
+----------------------------------------------------------------------------------------------
+[CRC Slicing-by-8] FLAC CRC-16: 3.08 GB/s | MPEG-TS CRC-32: 2.56 GB/s
+[CLZ Bitstream]    512 Exp-Golomb ue(v) + Signed Rice(k=4) + RBSP stop-bit verified in 819 bytes
+[128-bit Time]     48h MPEG-TS 90kHz -> Nanoseconds exact: 48:00:00.000 (172800000000000 ns)
+[M3 Containers]    Zero-Copy MP4 Demux: 708.75 GB/s | MP4->MKV: 17.69 GB/s | MP4->MPEG-TS: 9.41 GB/s
+```
+
+## Reading the table
+
+- **Scalar** is the portable reference implementation, compiled with the same optimization settings. The compiler is free to auto-vectorize it, which is why some speedups are modest.
+- **SIMD** is the hand-written kernel for the detected instruction set. On `x86_64` this column currently runs the scalar path too, because AVX2 kernels have not been written yet.
+- **Check** must read `EXACT`: the two outputs are compared bit for bit, not within a tolerance.
+- The trailing lines cover non-tabular checks: CRC tables, Exp-Golomb and Rice bit I/O round trips, 128-bit timestamp arithmetic, and in-memory container throughput. "Zero-copy demux" measures how fast packet views are produced over a mapped file, which is why it exceeds memory bandwidth.
+
+The same checks run in CI as ordinary unit tests (`cargo test --workspace`), across odd dimensions and unaligned tails that `self-test` does not exercise.

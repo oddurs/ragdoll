@@ -1,0 +1,70 @@
+export const metadata = { title: "Installation" };
+
+# Installation
+
+Ragdoll builds with a stable Rust toolchain and nothing else. There are no system libraries to install, no `pkg-config`, and no configure step.
+
+## Requirements
+
+- **Rust 1.85 or newer** (the workspace uses the 2024 edition). Install it with [rustup](https://rustup.rs).
+- **A 64-bit target.** `aarch64` gets the NEON kernels; `x86_64` runs the scalar reference paths.
+- **Optional:** `ffmpeg` and `ffprobe` on your `PATH` if you want to run [`bench --compare-ffmpeg`](/docs/cli/bench/).
+
+## Install the CLI
+
+Install the `ragdoll` binary straight from the repository:
+
+```sh
+cargo install --git https://github.com/oddurs/ragdoll ragdoll-cli
+```
+
+`ragdoll-cli` is the package name; the binary it installs is called `ragdoll`. Check that it runs and see which SIMD level it detected:
+
+```sh
+ragdoll --version
+```
+
+```text
+ragdoll 0.1.0 (aarch64 NEON (128-bit x 32 ASIMD) | 4 P-cores + 6 E-cores)
+```
+
+## Build from source
+
+Clone the repository if you want to run the tests, the self-test, or work on the code:
+
+```sh
+git clone https://github.com/oddurs/ragdoll.git
+cd ragdoll
+cargo build --release
+./target/release/ragdoll --help
+```
+
+The release profile uses fat LTO and a single codegen unit, so the first build takes a minute or two. For a faster edit-and-run loop you can relax both from the command line:
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --release
+```
+
+## Verify your build
+
+Run the test suite, then the differential self-test. The self-test runs every SIMD kernel against its scalar reference on your hardware and prints throughput for both:
+
+```sh
+cargo test --workspace
+cargo run --release -- self-test
+```
+
+Every row should end in `EXACT`. If one does not, please [open an issue](https://github.com/oddurs/ragdoll/issues) with the output and your CPU model.
+
+## Use the crates as a library
+
+The crates are not yet published to crates.io. Until 1.0, depend on them from git and pin a revision:
+
+```toml title="Cargo.toml"
+[dependencies]
+ragdoll-format = { git = "https://github.com/oddurs/ragdoll", rev = "<commit>" }
+ragdoll-core = { git = "https://github.com/oddurs/ragdoll", rev = "<commit>" }
+```
+
+See [Library usage](/docs/library/) for examples.

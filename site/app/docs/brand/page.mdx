@@ -1,0 +1,65 @@
+export const metadata = { title: "Brand" };
+
+# Brand
+
+Ragdoll's identity is small on purpose: one mark, one wordmark, one accent color. This page explains it and sets out how to use it.
+
+## The mark
+
+<div className="brand-tiles">
+  <div className="brand-tile" style={{ background: "#0e0f12" }}><Img src="/brand/mark.svg" alt="Ragdoll mark on ink" /></div>
+  <div className="brand-tile" style={{ background: "#f4f2ec" }}><Img src="/brand/mark-light.svg" alt="Ragdoll mark on paper" /></div>
+  <div className="brand-tile" style={{ background: "#f4f2ec" }}><Img src="/brand/wordmark-light-bg.svg" alt="Ragdoll wordmark" /></div>
+</div>
+
+The mark is an **R** built from blocks on a 3×3 grid of 12-unit cells with 3-unit gutters, the way a frame is built from macroblocks. The bowl and leg are the only curves and diagonals, and they still sit on the grid.
+
+The top-left block is always **tally red**. It is block zero, the first block of every frame, where every scan starts and the DC coefficient lives. It is also the color of the tally light on a camera that tells you it's live.
+
+## Files
+
+All marks are outlined SVG with no font dependencies, in [`assets/brand`](https://github.com/oddurs/ragdoll/tree/main/assets/brand).
+
+| File | Use |
+| :-- | :-- |
+| `mark.svg` | App icon, favicon, avatars. Ink tile. |
+| `mark-light.svg` | The same on a paper tile. |
+| `glyph.svg` | The mark with no tile, in `currentColor` plus tally red. For inline use. |
+| `wordmark-light-bg.svg` | Mark and wordmark for light backgrounds. |
+| `wordmark-dark-bg.svg` | Mark and wordmark for dark backgrounds. |
+| `generate.py` | Regenerates all of the above from the grid definition and the Geist font. |
+
+## Color
+
+<div className="swatches">
+  <div className="swatch"><i style={{ background: "#0e0f12" }} /><div><strong>Ink</strong><br /><code>#0E0F12</code></div></div>
+  <div className="swatch"><i style={{ background: "#f4f2ec" }} /><div><strong>Paper</strong><br /><code>#F4F2EC</code></div></div>
+  <div className="swatch"><i style={{ background: "#ff4f2e" }} /><div><strong>Tally</strong><br /><code>#FF4F2E</code></div></div>
+  <div className="swatch"><i style={{ background: "#e5401f" }} /><div><strong>Tally on paper</strong><br /><code>#E5401F</code></div></div>
+</div>
+
+Ink and paper do most of the work. Tally is an accent: the first block of the mark, a link underline, a status dot. If a layout has more than a few tally-red elements on screen, it has too many.
+
+## Type
+
+- **Geist** for text and the wordmark, set lowercase in SemiBold with tight tracking (−0.035 em).
+- **Geist Mono** for code, commands, labels and numbers in tables.
+
+The product name is **Ragdoll** in prose and `ragdoll` for the command and in the wordmark.
+
+## Voice
+
+Write the way the code is written: precise, plain and checkable.
+
+- State what something does, then how fast. Put numbers next to the method that produced them.
+- Say what is missing. A known gap stated plainly earns more trust than a feature implied.
+- Prefer verbs to adjectives. "Decodes H.264 Baseline" is better than "blazing-fast H.264."
+
+## Usage
+
+- Keep clear space around the mark of at least one block (a quarter of its height).
+- Don't recolor the mark, except to a single solid color where tally red can't be reproduced.
+- Don't rotate, outline, add effects to, or rearrange the blocks.
+- Don't use the mark in a way that suggests your project is official or endorsed.
+
+The mark and wordmark are part of the repository and covered by its MIT / Apache-2.0 license. Using them to refer to Ragdoll, for example in an article, a talk or a list of tools, needs no permission.

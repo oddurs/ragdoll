@@ -1,0 +1,62 @@
+export const metadata = { title: "ragdoll-simd" };
+
+# ragdoll-simd
+
+Architecture-specific kernels used throughout the workspace, each with a bit-exact scalar twin. Read [SIMD & verification](/docs/architecture/simd/) first for the rules every kernel follows.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-simd)
+
+## Dispatch
+
+```rust
+use ragdoll_simd::SimdLevel;
+
+match SimdLevel::detect() {
+    SimdLevel::Neon => println!("NEON kernels active"),
+    SimdLevel::Avx2 => println!("AVX2 detected; scalar paths in use"),
+    SimdLevel::Scalar => println!("scalar paths in use"),
+}
+```
+
+Public functions dispatch automatically, so you do not need to check the level yourself. Kernels named `foo` generally have a public `foo_scalar` twin you can call directly when you need the reference result.
+
+## Modules
+
+### `scan`: bitstream scanning
+
+| Function | Purpose |
+| :-- | :-- |
+| `find_annex_b_start_code` | Find the next `00 00 01` or `00 00 00 01`. Scans 64 bytes per iteration. |
+| `split_annex_b_nals` | Split an Annex-B stream into NAL unit slices. |
+| `annex_b_to_avcc`, `avcc_to_annex_b` | Convert between start-code and length-prefixed framing. |
+| `find_mpeg_ts_sync` | Find the next `0x47` transport stream sync byte. |
+
+### `metrics`: block and plane statistics
+
+| Function | Purpose |
+| :-- | :-- |
+| `sad_plane_u8`, `sse_plane_u8` | Sum of absolute or squared differences over a full plane. |
+| `sad_16x16_u8`, `sad_block_64_u8`, `sad_block_256_u8` | Macroblock SAD for motion estimation. |
+| `satd_4x4_u8`, `satd_8x8_u8` | Hadamard-transformed SAD, as used by x264 for mode decisions. |
+| `ssim_window_8x8_u8`, `ssim_4x4xn_u8`, `ssim_plane_8bit` | SSIM statistics, including FFmpeg `vf_ssim`'s 4×4 reuse scheme. |
+| `flac_eval_fixed_orders_l1` | Evaluate all five FLAC fixed predictors in one pass. |
+
+### `fixed`: fixed-point transforms
+
+| Function | Purpose |
+| :-- | :-- |
+| `forward_dct4x4`, `inverse_idct4x4` | H.264 4×4 integer transform. |
+| `forward_dct8x8`, `inverse_idct8x8` | H.264 8×8 integer transform. |
+| `hadamard4x4` | 4×4 Hadamard, for DC coefficients. |
+| `sub4x4_dct_u8`, `add4x4_idct_u8` | Fused residual-and-transform helpers. |
+| `convolve_8tap_q14_u8` | 8-tap filter in Q14 fixed point. |
+
+## Adding a kernel
+
+1. Write `foo_scalar` first, and document the fixed-point format and rounding.
+2. Add a private `#[target_feature(enable = "neon")] unsafe fn foo_neon`.
+3. Make `pub fn foo` dispatch between them.
+4. Add a differential test over odd sizes, unaligned tails and extremal values.
+5. Add a row to `ragdoll self-test` if the kernel is on a hot path.
+
+See [Contributing](/docs/contributing/) for the full workflow.

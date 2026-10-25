@@ -1,0 +1,94 @@
+export const metadata = { title: "ragdoll transcode" };
+
+# ragdoll transcode
+
+Decode a video, optionally scale it, and encode it again, keeping audio and subtitle tracks in sync. `transcode` also converts audio between WAV and FLAC, converts subtitles between WebVTT and SRT, and runs [pipeline recipes](/docs/cli/recipes/).
+
+```sh
+ragdoll transcode <IN> <OUT> [OPTIONS]
+ragdoll transcode --recipe <FILE.toml>
+```
+
+## Options
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `<IN>` | | Input file, or `-` for stdin. |
+| `<OUT>` | | Output file, or `-` for stdout (MPEG-TS unless `--format` says otherwise). |
+| `--video <CODEC>`, `-c:v` | `h264` | Video encoder: `h264` or `rgdi`. |
+| `--scale <WxH>`, `-s` | source size | Output dimensions, for example `1280x720`. |
+| `--filter <NAME>` | `lanczos3` | Scaling kernel: `lanczos3`, `spline36`, `mitchell` (alias `bicubic`), or `bilinear`. |
+| `--qp <N>` | `20` | H.264 quantization parameter, `0`–`51`. Lower is higher quality. |
+| `--threads <N>`, `-t` | `0` | Worker threads. `0` picks a count from the CPU topology and [power mode](/docs/power/). |
+| `--audio <CODEC>`, `-c:a` | `copy` | `copy` to keep audio tracks, `none` to drop them. |
+| `--an` | | Same as `--audio none`. |
+| `--subs <CODEC>`, `-c:s` | `copy` | `copy`, `srt`, `vtt`, or `none`. In Matroska output, `srt` / `vtt` set the subtitle codec. |
+| `--sn` | | Same as `--subs none`. |
+| `--format <EXT>`, `-f` | from extension | Override the output container. |
+| `--recipe <FILE>`, `-r` | | Run a TOML recipe instead of positional arguments. |
+| `--json`, `-j` | | Print the summary as JSON. |
+
+## Output formats
+
+| Extension | Result |
+| :-- | :-- |
+| `.mp4`, `.mov` and anything else | H.264 or RGDI video in ISOBMFF, plus copied audio and subtitles. |
+| `.mkv`, `.webm` | H.264 or RGDI video in Matroska, plus copied audio and subtitles. |
+| `.ts` | H.264 video in MPEG-TS, plus copied audio. |
+| `.y4m` | Raw decoded (and scaled) YUV 4:2:0 frames. |
+| `.ppm` | The first frame as an RGB image. |
+| `.rgdi` | The first frame as a single RGDI packet. Use `--video rgdi` with `.mkv` or `.mp4` for a full RGDI stream. |
+| `.flac`, `.wav` | Audio-only conversion; see below. |
+| `.vtt`, `.srt` | Subtitle-only conversion; see below. |
+
+## How it runs
+
+1. The input is memory-mapped and every video frame is decoded.
+2. Frames are grouped into GOPs at keyframe boundaries.
+3. GOPs are scaled and encoded in parallel, in waves sized to fit a memory budget (256 MiB by default, 64 MiB in efficiency mode). Frame buffers are recycled through a pool between waves.
+4. Encoded GOPs are written in presentation order. Audio and subtitle packets are rescaled to the output timebase and interleaved by decode timestamp.
+
+<Callout kind="warning" title="Memory use">
+The wave budget bounds the scale-and-encode stage, but step 1 currently decodes the whole input into memory. Memory use therefore still grows with input length. Streaming decode is tracked on the [roadmap](/docs/roadmap/).
+</Callout>
+
+<Callout kind="status" title="Encoder status">
+The H.264 encoder produces Constrained Baseline streams with CAVLC, using `I_16x16`, `I_PCM`, `P_L0_16x16` and `P_Skip` macroblocks. Output decodes correctly but is large, because blocks that the encoder cannot yet code with residuals fall back to `I_PCM`. Full residual coding, quarter-pel motion, deblocking, CABAC and CRF rate control are the subject of milestone M7.
+</Callout>
+
+## Examples
+
+```sh
+# Downscale to 720p with the default Lanczos-3 kernel.
+ragdoll transcode input.mp4 output.mp4 --scale 1280x720
+
+# Higher quality, eight workers, Spline36.
+ragdoll transcode input.mkv output.mkv --qp 16 --threads 8 --filter spline36
+
+# Drop audio and subtitles.
+ragdoll transcode input.mp4 video-only.mp4 --an --sn
+
+# Encode with the RGDI intra codec for fast editing round-trips.
+ragdoll transcode input.mp4 edit.mkv --video rgdi
+
+# Decode to raw YUV for another tool.
+ragdoll transcode input.mp4 frames.y4m
+
+# Run on the efficiency cores only.
+ragdoll transcode input.mp4 output.mp4 --battery-saver
+```
+
+## Audio and subtitles
+
+If either the input or the output is `.wav` or `.flac`, `transcode` performs an audio conversion:
+
+```sh
+ragdoll transcode master.wav master.flac
+ragdoll transcode master.flac master.wav
+```
+
+If either side is `.vtt` or `.srt`, it converts subtitles:
+
+```sh
+ragdoll transcode captions.srt captions.vtt
+```

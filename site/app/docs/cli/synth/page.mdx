@@ -1,0 +1,39 @@
+export const metadata = { title: "ragdoll synth" };
+
+# ragdoll synth
+
+Generate deterministic test media. `synth` is how the test suite and benchmarks create their inputs, and it is handy for trying the other subcommands without hunting for sample files.
+
+```sh
+ragdoll synth <OUT> [--resolution <WxH>] [--fps <N>] [--duration <SEC>] [--json]
+```
+
+## Options
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `<OUT>` | | Output path. The extension picks the format. |
+| `--resolution <WxH>`, `-s` | `1280x720` | Frame size for video output. |
+| `--fps <N>`, `-r` | `30` | Integer frame rate. |
+| `--duration <SEC>`, `-d` | `2.0` | Length in seconds (minimum `0.05`). |
+| `--json`, `-j` | | Print the summary as JSON. |
+
+## Output formats
+
+| Extension | Content |
+| :-- | :-- |
+| `.mp4`, `.mkv`, `.ts`, other video | Procedural color bars and moving patterns, encoded as H.264 at QP 20. |
+| `.y4m` | The same frames, uncompressed YUV 4:2:0. |
+| `.ppm` | A single frame as an RGB image. |
+| `.wav` | 48 kHz 16-bit stereo: a 440 Hz tone with harmonics, slightly different in each channel. |
+| `.flac` | The same audio, FLAC-encoded. |
+
+Generation is deterministic: the same arguments produce the same frames on every run, so the output works as a fixed test input.
+
+## Examples
+
+```sh
+ragdoll synth sample.mp4
+ragdoll synth uhd.y4m --resolution 3840x2160 --fps 60 --duration 1
+ragdoll synth tone.flac --duration 30
+```

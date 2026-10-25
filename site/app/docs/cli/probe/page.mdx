@@ -1,0 +1,84 @@
+export const metadata = { title: "ragdoll probe" };
+
+# ragdoll probe
+
+Inspect a media file's container and tracks. `probe` parses headers and sample tables only; it never decodes a frame, so it typically finishes in tens to hundreds of microseconds.
+
+```sh
+ragdoll probe <FILE> [--gop-map] [--json]
+```
+
+## Options
+
+| Option | Description |
+| :-- | :-- |
+| `<FILE>` | Input file, or `-` for stdin. The container is detected from its contents. |
+| `--gop-map`, `-g` | Print a per-packet waterfall showing I and P frame sizes grouped by GOP (first 32 packets). |
+| `--json`, `-j` | Print a JSON object instead of the table. |
+
+## What it reports
+
+- **Container** and file size, plus how long the probe took.
+- **GOP count**, computed from keyframe flags in the sample index.
+- **H.264 profile and level**, parsed from the SPS, when the first video track is H.264.
+- **Per track:** codec, dimensions and frame rate (as both a decimal and an exact rational), pixel format, CICP colorimetry (primaries, transfer, matrix, range), sample rate, channel count and layout, sample format, and the number and total size of packets.
+- **Bitrate sparkline** over packet sizes.
+
+## Example
+
+```sh
+ragdoll probe sample.mp4 --gop-map
+```
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ RAGDOLL PROBE : sample.mp4                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Container     : mp4/isobmff        File Size :      7844139 B (7.48 MB)      │
+│ Probe Latency :   112.00 µs         GOP Count :           10                 │
+│ H.264 Profile : Constrained Baseline (level 4.0)                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Track #0  [Video] codec=h264 1280x720 @ 30.000 fps (30/1) fmt=yuv420p        │
+│   Colorimetry : primaries=BT709, transfer=BT709, matrix=BT709, range=Limited
+│   Samples     : 60 packets (7842908 bytes)
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Bitrate Spark : ▇▁▁▁▁▁▆▁▁▁▁▁▇▁▂▁▁▇▁▁▁▂▁▇▁▁▁▁▆▁▁▁▁▁▇▁▁▂▁▁▇▁▁▂▁█▁▁▁▁▁▆▁▁▁▁     │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+ASCII GOP Waterfall (I/P Packet Size Distribution):
+  #000 [GOP 01 I-KEY]  573266 B |███████████████████████████████
+  #001 [GOP 01 P-INT]    7190 B |▒
+  #002 [GOP 01 P-INT]   33834 B |▒
+  #003 [GOP 01 P-INT]   84135 B |▒▒▒▒
+  ...
+```
+
+## JSON output
+
+```sh
+ragdoll probe sample.mp4 --json
+```
+
+```json
+{
+  "path": "sample.mp4",
+  "container": "mp4/isobmff",
+  "file_size": 7844139,
+  "probe_time_us": 42.750,
+  "gop_count": 10,
+  "h264_profile": "Constrained Baseline (level 4.0)",
+  "tracks": [
+    {"index": 0, "type": "video", "codec": "h264", "width": 1280, "height": 720, "fps": 30.0000, "pixel_format": "yuv420p", "samples": 60}
+  ]
+}
+```
+
+Audio tracks carry `sample_rate`, `channels` and `sample_format` in place of the video fields. Subtitle tracks carry only `index`, `type`, `codec` and `samples`.
+
+## Supported inputs
+
+MP4 / MOV, Matroska, WebM, MPEG-TS (188, 192 and 204-byte packets), YUV4MPEG2, WAV / RF64, FLAC, WebVTT and SubRip. See [Formats & codecs](/docs/formats/).
+
+<Callout kind="warning" title="Known issue">
+When an MPEG-TS stream arrives on stdin, `probe -` can report the wrong video dimensions. Probing the same stream from a file is unaffected.
+</Callout>
