@@ -13,15 +13,18 @@
 //! - [`ppm`]: Binary Netpbm `P6` (`Rgb24`) and `P5` (`Gray8`) image I/O and multi-frame contact-sheet composer.
 //! - [`wav`]: Zero-copy RIFF WAVE (`.wav`) PCM & IEEE-Float audio demuxer and muxer.
 
+pub mod flac;
 pub mod io;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegts;
+pub mod ogg;
 pub mod ppm;
 pub mod subtitle;
 pub mod wav;
 pub mod y4m;
 
+pub use flac::{FlacContainerDemuxer, FlacContainerMuxer, FlacSeekPoint, VorbisComments};
 pub use io::{
     MmapSource, OutputSink, STREAM_READ_CHUNK_BYTES, StreamSource, VectoredWriter, is_stdin_path,
     is_stdout_path,
@@ -34,6 +37,7 @@ pub use mpegts::{
     decode_pes_timestamp, detect_mpegts_stride_and_sync, encode_pes_timestamp,
     h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, parse_adts_header,
 };
+pub use ogg::{OggDemuxer, OggMuxer, build_ogg_page};
 pub use ppm::{compose_contact_sheet_rgb24, read_pnm_image, write_pnm_image};
 pub use subtitle::{
     SubtitleCue, SubtitleDemuxer, SubtitleMuxer, format_subtitle_timestamp_ms, is_srt_bytes,
@@ -57,6 +61,8 @@ pub enum ContainerFormat {
     Ppm,
     Pgm,
     Wav,
+    Flac,
+    Ogg,
     WebVtt,
     SubRip,
 }
@@ -72,6 +78,8 @@ impl std::fmt::Display for ContainerFormat {
             Self::Ppm => "ppm",
             Self::Pgm => "pgm",
             Self::Wav => "wav",
+            Self::Flac => "flac",
+            Self::Ogg => "ogg",
             Self::WebVtt => "webvtt",
             Self::SubRip => "subrip",
         };
@@ -108,6 +116,12 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
         && &data[8..12] == b"WAVE"
     {
         return Some(ContainerFormat::Wav);
+    }
+    if data.len() >= 4 && &data[0..4] == b"fLaC" {
+        return Some(ContainerFormat::Flac);
+    }
+    if data.len() >= 4 && &data[0..4] == b"OggS" {
+        return Some(ContainerFormat::Ogg);
     }
     if data.len() >= 3 && &data[0..2] == b"P6" && data[2].is_ascii_whitespace() {
         return Some(ContainerFormat::Ppm);
@@ -154,6 +168,14 @@ pub fn probe_container(data: &[u8]) -> Result<(ContainerFormat, Vec<TrackInfo>)>
         }
         ContainerFormat::Wav => {
             let demux = WavDemuxer::open(data)?;
+            Ok((fmt, vec![demux.track().clone()]))
+        }
+        ContainerFormat::Flac => {
+            let demux = FlacContainerDemuxer::open(data)?;
+            Ok((fmt, vec![demux.track().clone()]))
+        }
+        ContainerFormat::Ogg => {
+            let demux = OggDemuxer::open(data)?;
             Ok((fmt, vec![demux.track().clone()]))
         }
         ContainerFormat::WebVtt | ContainerFormat::SubRip => {
@@ -1096,5 +1118,239 @@ mod tests {
             unwrap_mp4_wvtt_sample(&wvtt),
             ("MP4 ISO 14496-30 cue".into(), "line:90%".into())
         );
+    }
+
+    #[test]
+    fn format_0045_flac_seektable_and_ogg_opus_flac_roundtrip_and_ffmpeg() {
+        // 1. Synthesize a valid minimal FLAC STREAMINFO (34B) + verbatim/constant FLAC audio frames
+        // 48kHz, 2ch, 16-bit, block_size = 1024
+        let mut streaminfo = [0u8; 34];
+        streaminfo[0..2].copy_from_slice(&1024u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&1024u16.to_be_bytes());
+        let sr = 48_000u32;
+        let ch_m1 = 1u8; // 2ch
+        let bps_m1 = 15u8; // 16-bit
+        let total_samples = (10 * 1024) as u64;
+        streaminfo[10] = (sr >> 12) as u8;
+        streaminfo[11] = (sr >> 4) as u8;
+        streaminfo[12] =
+            (((sr & 0x0F) as u8) << 4) | ((ch_m1 & 0x07) << 1) | ((bps_m1 >> 4) & 0x01);
+        streaminfo[13] = ((bps_m1 & 0x0F) << 4) | (((total_samples >> 32) as u8) & 0x0F);
+        streaminfo[14..18].copy_from_slice(&(total_samples as u32).to_be_bytes());
+
+        // Minimal valid FLAC frame header + constant subframes (0xFFF8 ... + CRC8 + 2 constant subframes + CRC16)
+        fn make_minimal_flac_frame(frame_idx: u8) -> Vec<u8> {
+            // Sync 0xFFF8 (fixed blocksize), bs_code=1010 (1024),
+            // sr_code=1010 (48kHz), ch=0001 (2ch L/R), bps=100 (16-bit), res=0
+            let hdr_no_crc = [0xFFu8, 0xF8, 0xAA, 0x18, frame_idx];
+            let crc8 = ragdoll_core::crc8_flac(&hdr_no_crc);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&hdr_no_crc);
+            frame.push(crc8);
+            // Two constant 16-bit subframes: header 0x00 (type=000000 constant, wasted=0), 2 bytes value = 0x0000
+            frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            let crc16 = ragdoll_core::crc16_flac(&frame);
+            frame.extend_from_slice(&crc16.to_be_bytes());
+            frame
+        }
+
+        let mut vc = VorbisComments::new("ragdoll 0.1.0");
+        vc.set_tag("TITLE", "Ragdoll Lossless Suite");
+        vc.set_tag("ARTIST", "Ragdoll Audio DSP");
+        vc.set_tag("ALBUM", "Milestone 8");
+
+        let flac_track_info = TrackInfo {
+            index: 0,
+            track_type: TrackType::Audio,
+            codec_id: CodecId::Flac,
+            timebase: Rational64::new(1, 48_000),
+            duration_ticks: Some(total_samples as i64),
+            extra_data: streaminfo.to_vec(),
+            video: None,
+            audio: Some(AudioTrackParams {
+                sample_rate: 48_000,
+                channels: 2,
+                channel_layout: ChannelLayout::Stereo,
+                sample_format: SampleFormat::S16le,
+                bits_per_coded_sample: 16,
+            }),
+            sample_count: 10,
+            total_bytes: 0,
+        };
+
+        let mut flac_mux = FlacContainerMuxer::new();
+        flac_mux.add_track(flac_track_info.clone());
+        flac_mux.set_comments(vc.clone());
+        for i in 0..10u8 {
+            let f = make_minimal_flac_frame(i);
+            let pts = Timestamp::new((i as i64) * 1024, Rational64::new(1, 48_000));
+            let pkt = PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&f),
+                0,
+                pts,
+                pts,
+                1024,
+                PacketFlags::KEYFRAME,
+            );
+            flac_mux.write_packet(&pkt).unwrap();
+        }
+        let mut flac_bytes = Vec::new();
+        flac_mux.finish(&mut flac_bytes).unwrap();
+
+        assert_eq!(
+            detect_container_format(&flac_bytes),
+            Some(ContainerFormat::Flac)
+        );
+        let (probed_fmt, probed_tracks) = probe_container(&flac_bytes).unwrap();
+        assert_eq!(probed_fmt, ContainerFormat::Flac);
+        assert_eq!(probed_tracks[0].codec_id, CodecId::Flac);
+
+        let mut flac_demux = FlacContainerDemuxer::open(&flac_bytes).unwrap();
+        assert_eq!(flac_demux.track().sample_count, 10);
+        assert!(!flac_demux.seek_table().is_empty());
+        assert_eq!(
+            flac_demux.comments().get_tag("TITLE"),
+            Some("Ragdoll Lossless Suite")
+        );
+        assert_eq!(
+            flac_demux.comments().get_tag("ARTIST"),
+            Some("Ragdoll Audio DSP")
+        );
+        let seek_idx = flac_demux.seek_to_sample(5 * 1024);
+        assert_eq!(seek_idx, 5);
+        let pkt5 = flac_demux.next_packet().unwrap().unwrap();
+        assert_eq!(pkt5.pts.ticks, 5 * 1024);
+
+        // 2. Ogg Opus container mux + demux + O(log N) seeking + VorbisComments
+        let mut opus_head = Vec::with_capacity(19);
+        opus_head.extend_from_slice(b"OpusHead");
+        opus_head.push(1); // version
+        opus_head.push(2); // 2 channels
+        opus_head.extend_from_slice(&0u16.to_le_bytes()); // pre_skip = 0
+        opus_head.extend_from_slice(&48_000u32.to_le_bytes());
+        opus_head.extend_from_slice(&0i16.to_le_bytes());
+        opus_head.push(0);
+
+        let mut ogg_opus_mux = OggMuxer::new();
+        ogg_opus_mux.add_track(TrackInfo {
+            index: 0,
+            track_type: TrackType::Audio,
+            codec_id: CodecId::Opus,
+            timebase: Rational64::new(1, 48_000),
+            duration_ticks: Some(10 * 960),
+            extra_data: opus_head,
+            video: None,
+            audio: Some(AudioTrackParams {
+                sample_rate: 48_000,
+                channels: 2,
+                channel_layout: ChannelLayout::Stereo,
+                sample_format: SampleFormat::F32le,
+                bits_per_coded_sample: 32,
+            }),
+            sample_count: 10,
+            total_bytes: 0,
+        });
+        ogg_opus_mux.set_comments(vc.clone());
+        let dummy_opus_pkt = [0xFEu8, 0x00, 0x00, 0x00];
+        for i in 0..10usize {
+            let pts = Timestamp::new((i as i64) * 960, Rational64::new(1, 48_000));
+            let pkt =
+                PacketSlice::from_mmap(&dummy_opus_pkt, 0, pts, pts, 960, PacketFlags::KEYFRAME, 0);
+            ogg_opus_mux.write_packet(&pkt).unwrap();
+        }
+        let mut ogg_opus_bytes = Vec::new();
+        ogg_opus_mux.finish(&mut ogg_opus_bytes).unwrap();
+
+        assert_eq!(
+            detect_container_format(&ogg_opus_bytes),
+            Some(ContainerFormat::Ogg)
+        );
+        let mut ogg_opus_demux = OggDemuxer::open(&ogg_opus_bytes).unwrap();
+        assert_eq!(ogg_opus_demux.track().codec_id, CodecId::Opus);
+        assert_eq!(ogg_opus_demux.track().sample_count, 10);
+        assert_eq!(
+            ogg_opus_demux.comments().get_tag("TITLE"),
+            Some("Ragdoll Lossless Suite")
+        );
+        let ogg_seek = ogg_opus_demux.seek_to_sample(6 * 960);
+        assert_eq!(ogg_seek, 6);
+        let ogg_pkt6 = ogg_opus_demux.next_packet().unwrap().unwrap();
+        assert_eq!(ogg_pkt6.pts.ticks, 6 * 960);
+
+        // 3. Ogg FLAC container mux + demux
+        let mut ogg_flac_mux = OggMuxer::new();
+        ogg_flac_mux.add_track(flac_track_info);
+        ogg_flac_mux.set_comments(vc);
+        for i in 0..5u8 {
+            let f = make_minimal_flac_frame(i);
+            let pts = Timestamp::new((i as i64) * 1024, Rational64::new(1, 48_000));
+            let pkt = PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&f),
+                0,
+                pts,
+                pts,
+                1024,
+                PacketFlags::KEYFRAME,
+            );
+            ogg_flac_mux.write_packet(&pkt).unwrap();
+        }
+        let mut ogg_flac_bytes = Vec::new();
+        ogg_flac_mux.finish(&mut ogg_flac_bytes).unwrap();
+
+        let ogg_flac_demux = OggDemuxer::open(&ogg_flac_bytes).unwrap();
+        assert_eq!(ogg_flac_demux.track().codec_id, CodecId::Flac);
+        assert_eq!(ogg_flac_demux.track().sample_count, 5);
+        assert_eq!(
+            ogg_flac_demux.comments().get_tag("ALBUM"),
+            Some("Milestone 8")
+        );
+
+        // Optional external ffprobe validation when installed
+        if std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            let tmp_flac = std::env::temp_dir().join("ragdoll_test_0045.flac");
+            let tmp_ogg = std::env::temp_dir().join("ragdoll_test_0045.ogg");
+            std::fs::write(&tmp_flac, &flac_bytes).unwrap();
+            std::fs::write(&tmp_ogg, &ogg_opus_bytes).unwrap();
+
+            let probe_flac = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format_tags=TITLE",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                ])
+                .arg(&tmp_flac)
+                .output()
+                .unwrap();
+            assert!(probe_flac.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&probe_flac.stdout).trim(),
+                "Ragdoll Lossless Suite"
+            );
+
+            let probe_ogg = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                ])
+                .arg(&tmp_ogg)
+                .output()
+                .unwrap();
+            assert!(probe_ogg.status.success());
+            assert_eq!(String::from_utf8_lossy(&probe_ogg.stdout).trim(), "opus");
+
+            let _ = std::fs::remove_file(&tmp_flac);
+            let _ = std::fs::remove_file(&tmp_ogg);
+        }
     }
 }

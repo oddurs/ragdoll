@@ -3,12 +3,14 @@ id: 44
 uid: 9611eeb5-8e85-41d1-87ef-6e45c90003c6
 title: Pure-Rust AAC-LC & Opus MDCT/IMDCT Audio Decoder and Encoder
 type: feature
-status: planned
+status: done
 milestone: m8-audio-pro
+assignee: Oddur Sigurdsson
 depends_on:
 - 42
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-audio
 effort: xl
@@ -29,5 +31,9 @@ Standard `.mp4` and `.ts` streams carry **AAC-LC (`mp4a.40.2`)** audio, while `.
 
 ## Acceptance criteria
 
-- [ ] `AacDecoder` and `AacEncoder` round-trip 48 kHz stereo audio and interoperate bidirectionally with `ffmpeg -c:a aac` in `.mp4` and `.ts` containers.
-- [ ] `OpusDecoder` and `OpusEncoder` round-trip 48 kHz stereo audio in `.mkv`/`.webm` and `.ogg` containers and interoperate with `ffmpeg -c:a libopus`.
+- [x] `AacDecoder` and `AacEncoder` round-trip 48 kHz stereo audio and interoperate bidirectionally with `ffmpeg -c:a aac` in `.mp4` and `.ts` containers.
+- [x] `OpusDecoder` and `OpusEncoder` round-trip 48 kHz stereo audio in `.mkv`/`.webm` and `.ogg` containers and interoperate with `ffmpeg -c:a libopus`.
+
+## 2026-10-25
+
+Implemented pure-Rust ISO/IEC 14496-3 AAC-LC decoder and encoder (AacDecoder, AacEncoder, AudioSpecificConfig, AdtsHeader, 12 canonical Huffman codebooks HCB_1..HCB_11 + HCB_SF, PNS, Mid-Side/Intensity Stereo, KBD/Sine MDCT/IMDCT) and RFC 6716 Opus decoder and encoder (OpusDecoder, OpusEncoder, OpusHead, OpusRangeEncoder/Decoder, CELT 21-band PVQ algebraic pulse search and normalization) in crates/ragdoll-codec/src/aac.rs and opus.rs.

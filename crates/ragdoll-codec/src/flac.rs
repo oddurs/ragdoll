@@ -1621,6 +1621,128 @@ impl FlacEncoder {
         self.encode_frame_slices(&refs, frame_number)
     }
 
+    /// Encodes an [`AudioFrame`] into `(FlacStreamInfo, Vec<(frame_bytes, frame_samples)>)` for container muxers (`.flac`, `.ogg`, `.mkv`, `.mp4`).
+    #[allow(clippy::type_complexity)]
+    pub fn encode_frames(
+        &self,
+        audio: &AudioFrame,
+    ) -> Result<(FlacStreamInfo, Vec<(Vec<u8>, usize)>)> {
+        let (planar, detected_bps) = audio_frame_to_planar_i32(audio)?;
+        let bps = if self.bits_per_sample != 0 {
+            self.bits_per_sample
+        } else {
+            detected_bps
+        };
+        let enc = Self {
+            block_size: self.block_size,
+            sample_rate: audio.sample_rate,
+            channels: audio.channels,
+            bits_per_sample: bps,
+            compute_md5: self.compute_md5,
+        };
+
+        let total_samples = audio.num_samples;
+        let num_frames = if total_samples == 0 {
+            0
+        } else {
+            total_samples.div_ceil(enc.block_size)
+        };
+        let mut packets = Vec::with_capacity(num_frames);
+        let mut min_frame_size = u32::MAX;
+        let mut max_frame_size = 0u32;
+
+        if num_frames >= 8 {
+            let workers = ragdoll_core::CpuTopology::detect()
+                .optimal_threads(ragdoll_core::global_power_mode(), 0)
+                .min(num_frames);
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, usize)>>>> = (0..num_frames)
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        ragdoll_core::apply_current_power_mode_to_thread();
+                        let mut slice_refs = Vec::with_capacity(planar.len());
+                        loop {
+                            let f_idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if f_idx >= num_frames {
+                                break;
+                            }
+                            let offset = f_idx * enc.block_size;
+                            let count = (total_samples - offset).min(enc.block_size);
+                            slice_refs.clear();
+                            for ch in &planar {
+                                slice_refs.push(&ch[offset..offset + count]);
+                            }
+                            let res = enc
+                                .encode_frame_slices(&slice_refs, f_idx as u64)
+                                .map(|b| (b, count));
+                            if let Ok(mut g) = slots[f_idx].lock() {
+                                *g = Some(res);
+                            }
+                        }
+                    });
+                }
+            });
+
+            for slot in slots {
+                let (packet, count) = slot.into_inner().unwrap().unwrap()?;
+                let pkt_len = packet.len() as u32;
+                min_frame_size = min_frame_size.min(pkt_len);
+                max_frame_size = max_frame_size.max(pkt_len);
+                packets.push((packet, count));
+            }
+        } else {
+            let mut offset = 0usize;
+            let mut frame_num = 0u64;
+            let mut slice_refs = Vec::with_capacity(planar.len());
+            while offset < total_samples {
+                let count = (total_samples - offset).min(enc.block_size);
+                slice_refs.clear();
+                for ch in &planar {
+                    slice_refs.push(&ch[offset..offset + count]);
+                }
+                let packet = enc.encode_frame_slices(&slice_refs, frame_num)?;
+                let pkt_len = packet.len() as u32;
+                min_frame_size = min_frame_size.min(pkt_len);
+                max_frame_size = max_frame_size.max(pkt_len);
+                packets.push((packet, count));
+                offset += count;
+                frame_num += 1;
+            }
+        }
+
+        if total_samples == 0 {
+            min_frame_size = 0;
+        }
+        let nominal_bs = (enc.block_size as u16).max(16);
+        let md5_signature = if enc.compute_md5 {
+            if audio.format == ragdoll_core::SampleFormat::S16le && bps == 16 {
+                let byte_len = total_samples * (audio.channels as usize) * 2;
+                md5_digest(&audio.data.as_slice()[..byte_len])
+            } else {
+                compute_flac_pcm_md5_planar(&planar, bps)
+            }
+        } else {
+            [0u8; 16]
+        };
+
+        let stream_info = FlacStreamInfo {
+            min_block_size: nominal_bs,
+            max_block_size: nominal_bs,
+            min_frame_size,
+            max_frame_size,
+            sample_rate: enc.sample_rate,
+            channels: enc.channels,
+            bits_per_sample: enc.bits_per_sample,
+            total_samples: total_samples as u64,
+            md5_signature,
+        };
+        Ok((stream_info, packets))
+    }
+
     /// Encodes a complete `.flac` file (`fLaC` magic + `STREAMINFO` + framed audio packets) from an [`AudioFrame`].
     pub fn encode_stream(&self, audio: &AudioFrame) -> Result<Vec<u8>> {
         let (planar, detected_bps) = audio_frame_to_planar_i32(audio)?;

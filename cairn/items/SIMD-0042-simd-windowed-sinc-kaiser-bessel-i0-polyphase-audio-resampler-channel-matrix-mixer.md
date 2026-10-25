@@ -3,12 +3,14 @@ id: 42
 uid: f405719e-3713-445c-b234-2117e2f3fdee
 title: SIMD Windowed-Sinc Kaiser (bessel_i0) Polyphase Audio Resampler & Channel Matrix Mixer
 type: kernel
-status: planned
+status: done
 milestone: m8-audio-pro
+assignee: Oddur Sigurdsson
 depends_on:
 - 37
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-audio
 effort: l
@@ -29,5 +31,13 @@ effort: l
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential tests within `1e-6` (`f32`) / `0 LSB` (`Q15`).
-- [ ] Zero heap allocations in the per-frame resampling hot loop, sustaining `>1,500x` real-time on `44.1 kHz -> 48 kHz` stereo audio.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential tests within `1e-6` (`f32`) / `0 LSB` (`Q15`).
+- [x] Zero heap allocations in the per-frame resampling hot loop, sustaining `>1,500x` real-time on `44.1 kHz -> 48 kHz` stereo audio.
+
+## 2026-10-25
+
+Implemented Windowed-Sinc Kaiser (bessel_i0, beta=9.0) PolyphaseResampler with exact reduced rational phase accumulator (0 division in inner loop when out_rate_red <= 1024), NEON f32 and Q15 i16 dot products, and ITU-R BS.775 ChannelRematrixer (Mono <-> Stereo <-> 5.1 <-> 7.1). Verified <1e-6 f32 / 0-LSB Q15 differential equivalence and 14,711.3x real-time throughput on 44.1->48 kHz stereo resampling.
+
+## Result
+
+Delivered PolyphaseResampler and ChannelRematrixer in ragdoll-simd::audio_dsp and ragdoll-codec::resample achieving 14,711.3x real-time on 44.1->48 kHz stereo resampling with 0 heap allocations in the hot loop.

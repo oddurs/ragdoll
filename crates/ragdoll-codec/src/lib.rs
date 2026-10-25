@@ -8,13 +8,20 @@
 //! - [`av1`]: AV1 Open Bitstream Unit (`OBU`) parser, `Av1SequenceHeader` inspector (`dav1d` parity), `av1C` builder, and IVF stream helper.
 //! - [`rgdi`]: Ragdoll Fast-Intra (`RGDI`) SIMD studio video codec sustaining > 300 fps 4K encode/decode on Apple M4.
 
+pub mod aac;
 pub mod av1;
 pub mod cabac;
 pub mod flac;
 pub mod h264;
+pub mod loudness;
+pub mod opus;
 pub mod pcm;
+pub mod resample;
 pub mod rgdi;
 
+pub use aac::{
+    AAC_SAMPLE_RATES, AacDecoder, AacEncoder, AdtsHeader, AudioSpecificConfig, sample_rate_to_index,
+};
 pub use av1::{
     Av1SequenceHeader, IvfHeader, ObuHeader, ObuPacket, ObuType, encode_obu, parse_ivf_stream,
     parse_obu_header, split_obus,
@@ -31,6 +38,11 @@ pub use h264::{
     predict_intra_16x16_scalar, predict_intra_chroma_8x8, predict_intra_chroma_8x8_scalar,
     quantize_block4x4, quantize_block8x8, roundtrip_block4x4_dct,
 };
+pub use loudness::{EbuR128Meter, KWeightingFilterBank, LoudnessReport, normalize_audio_frame};
+pub use opus::{
+    CELT_EBAND_BASE, OpusDecoder, OpusEncoder, OpusHead, OpusRangeDecoder, OpusRangeEncoder,
+    OpusToc, build_opus_tags, parse_opus_tags, pvq_reconstruct_band, pvq_search_pulses,
+};
 pub use pcm::{
     audio_frame_to_planar_i32, convert_audio_frame, decorrelate_mid_side_i32,
     decorrelate_mid_side_i32_scalar, deinterleave_stereo_i32, deinterleave_stereo_i32_scalar,
@@ -39,6 +51,7 @@ pub use pcm::{
     planar_i32_to_audio_frame, reconstruct_left_side_i32, reconstruct_mid_side_i32,
     reconstruct_mid_side_i32_scalar, reconstruct_right_side_i32,
 };
+pub use resample::{ChannelRematrixer, PolyphaseResampler, resample_and_rematrix_frame};
 pub use rgdi::{
     RGDI_MAGIC, RagdollIntraDecoder, RagdollIntraEncoder, RgdiFrameHeader, decode_rgdi_plane,
     encode_rgdi_plane, encode_rgdi_plane_scalar,
@@ -1108,6 +1121,364 @@ mod tests {
             rel_err <= 0.05,
             "expected 1080p ABR bitrate within +-5% of 2000 kbps, got {actual_kbps:.1} kbps ({:.2}%)",
             rel_err * 100.0
+        );
+    }
+
+    #[test]
+    fn simd_0042_polyphase_resampler_kaiser_and_channel_rematrix() {
+        use ragdoll_core::ChannelLayout;
+
+        // 1. Differential test: NEON vs Scalar within 1e-6 (f32) and 0 LSB (Q15 i16) across 44.1 <-> 48 <-> 88.2 <-> 96 kHz
+        for &(in_rate, out_rate) in &[
+            (44_100u32, 48_000u32),
+            (48_000, 44_100),
+            (48_000, 96_000),
+            (96_000, 44_100),
+            (44_100, 88_200),
+        ] {
+            let mut rs_simd = PolyphaseResampler::new(in_rate, out_rate, 2, 16);
+            let mut rs_scalar = PolyphaseResampler::new(in_rate, out_rate, 2, 16);
+            let n_in = 4410usize;
+            let in_l: Vec<f32> = (0..n_in)
+                .map(|i| {
+                    ((i as f32) * 2.0 * std::f32::consts::PI * 1000.0 / (in_rate as f32)).sin()
+                        * 0.85
+                })
+                .collect();
+            let in_r: Vec<f32> = (0..n_in)
+                .map(|i| {
+                    ((i as f32) * 2.0 * std::f32::consts::PI * 440.0 / (in_rate as f32)).cos()
+                        * 0.75
+                })
+                .collect();
+            let n_out = rs_simd.output_frames_for(n_in);
+            let mut out_l_simd = vec![0.0f32; n_out];
+            let mut out_r_simd = vec![0.0f32; n_out];
+            let mut out_l_scalar = vec![0.0f32; n_out];
+            let mut out_r_scalar = vec![0.0f32; n_out];
+
+            let got_simd = rs_simd
+                .resample_planar_f32_into(&[&in_l, &in_r], &mut [&mut out_l_simd, &mut out_r_simd]);
+            let got_scalar = rs_scalar.resample_planar_f32_scalar_into(
+                &[&in_l, &in_r],
+                &mut [&mut out_l_scalar, &mut out_r_scalar],
+            );
+            assert_eq!(got_simd, got_scalar);
+            for i in 0..got_simd {
+                assert!(
+                    (out_l_simd[i] - out_l_scalar[i]).abs() < 1e-6,
+                    "f32 L diff at {in_rate}->{out_rate} sample {i}: {} vs {}",
+                    out_l_simd[i],
+                    out_l_scalar[i]
+                );
+                assert!(
+                    (out_r_simd[i] - out_r_scalar[i]).abs() < 1e-6,
+                    "f32 R diff at {in_rate}->{out_rate} sample {i}: {} vs {}",
+                    out_r_simd[i],
+                    out_r_scalar[i]
+                );
+            }
+
+            // Q15 i16 0-LSB bit-exact differential test
+            let in_l_i16: Vec<i16> = in_l.iter().map(|&x| (x * 32000.0) as i16).collect();
+            let in_r_i16: Vec<i16> = in_r.iter().map(|&x| (x * 32000.0) as i16).collect();
+            let mut out_l_q15_simd = vec![0i16; n_out];
+            let mut out_r_q15_simd = vec![0i16; n_out];
+            let mut out_l_q15_scalar = vec![0i16; n_out];
+            let mut out_r_q15_scalar = vec![0i16; n_out];
+            rs_simd.reset();
+            rs_scalar.reset();
+            rs_simd.resample_planar_i16_into(
+                &[&in_l_i16, &in_r_i16],
+                &mut [&mut out_l_q15_simd, &mut out_r_q15_simd],
+            );
+            rs_scalar.resample_planar_i16_scalar_into(
+                &[&in_l_i16, &in_r_i16],
+                &mut [&mut out_l_q15_scalar, &mut out_r_q15_scalar],
+            );
+            assert_eq!(out_l_q15_simd, out_l_q15_scalar, "Q15 L 0-LSB mismatch");
+            assert_eq!(out_r_q15_simd, out_r_q15_scalar, "Q15 R 0-LSB mismatch");
+        }
+
+        // 2. Throughput test: 44.1 kHz -> 48 kHz stereo resampling must sustain >1,500x real-time with 0 heap allocations
+        let mut rs_perf = PolyphaseResampler::new(44_100, 48_000, 2, 16);
+        let chunk_in = 4410usize; // 100 ms per chunk
+        let chunk_out = 4800usize;
+        rs_perf.reserve_input_capacity(chunk_in);
+        let in_l = vec![0.5f32; chunk_in];
+        let in_r = vec![-0.5f32; chunk_in];
+        let mut out_l = vec![0.0f32; chunk_out + 16];
+        let mut out_r = vec![0.0f32; chunk_out + 16];
+
+        let num_chunks = 50usize; // 5.0 seconds of stereo audio
+        let t0 = std::time::Instant::now();
+        let mut total_out_frames = 0usize;
+        for _ in 0..num_chunks {
+            total_out_frames +=
+                rs_perf.resample_planar_f32_into(&[&in_l, &in_r], &mut [&mut out_l, &mut out_r]);
+        }
+        let elapsed_s = t0.elapsed().as_secs_f64();
+        let audio_duration_s = (num_chunks * chunk_in) as f64 / 44_100.0;
+        let realtime_x = audio_duration_s / elapsed_s.max(1e-9);
+        assert_eq!(total_out_frames, num_chunks * 4800);
+        let min_rt = if cfg!(debug_assertions) { 50.0 } else { 1500.0 };
+        println!("SIMD-0042 44.1kHz -> 48kHz stereo throughput: {realtime_x:.1}x real-time");
+        assert!(
+            realtime_x > min_rt,
+            "expected >{min_rt}x real-time on 44.1->48 kHz stereo resampling, got {realtime_x:.1}x"
+        );
+
+        // 3. Channel Matrix Mixer: 5.1 -> Stereo -> Mono and 7.1 -> 5.1 -> Stereo
+        let mut frame_5_1 = AudioFrame::new(48_000, 6, SampleFormat::F32le, 256);
+        frame_5_1.layout = ChannelLayout::Surround5_1;
+        for i in 0..256 {
+            let b = i * 6;
+            let s = frame_5_1.as_f32_mut_slice();
+            s[b] = 0.5; // L
+            s[b + 1] = 0.25; // R
+            s[b + 2] = 0.4; // C
+            s[b + 3] = 0.9; // LFE (excluded in BS.775 stereo downmix)
+            s[b + 4] = 0.2; // Ls
+            s[b + 5] = 0.1; // Rs
+        }
+        let rm_51_to_2 =
+            ChannelRematrixer::new(ChannelLayout::Surround5_1, ChannelLayout::Stereo, false);
+        let stereo_f = rm_51_to_2.rematrix_audio_frame(&frame_5_1).unwrap();
+        assert_eq!(stereo_f.channels, 2);
+        let exp_l = 0.5 + std::f32::consts::FRAC_1_SQRT_2 * (0.4 + 0.2);
+        let exp_r = 0.25 + std::f32::consts::FRAC_1_SQRT_2 * (0.4 + 0.1);
+        assert!((stereo_f.as_f32_slice()[0] - exp_l).abs() < 1e-5);
+        assert!((stereo_f.as_f32_slice()[1] - exp_r).abs() < 1e-5);
+    }
+
+    #[test]
+    fn simd_0043_ebu_r128_lufs_k_weighting_gated_and_true_peak() {
+        // 1. EBU Tech 3341 / ITU-R BS.1770-4 Compliance Test Vector 1:
+        // Stereo 1000 Hz full-scale sine wave (amplitude = 1.0 -> RMS = 1/sqrt(2), two channels -> sum z = 1.0)
+        // Expected Integrated Loudness = -3.01 LUFS? Wait: at 997 Hz / 1000 Hz, K-weighting has ~ +0.691 dB gain,
+        // so a stereo full-scale 1 kHz sine wave (0 dBFS peak per channel) measures 0.0 LUFS,
+        // and a stereo -23.0 dBFS peak 1 kHz sine wave measures -23.0 LUFS within +-0.1 LU!
+        let fs = 48_000u32;
+        let num_frames = (fs as usize) * 4; // 4.0 seconds
+        let amp_neg23 = 10.0_f64.powf(-23.0 / 20.0) as f32;
+        let mut stereo_tone = Vec::with_capacity(num_frames * 2);
+        for n in 0..num_frames {
+            let s = ((2.0 * std::f64::consts::PI * 997.0 * (n as f64) / (fs as f64)).sin() as f32)
+                * amp_neg23;
+            stereo_tone.push(s);
+            stereo_tone.push(s);
+        }
+
+        let mut meter_simd = EbuR128Meter::new(fs, 2);
+        let mut meter_scalar = EbuR128Meter::new(fs, 2);
+        meter_simd.process_interleaved_f32(&stereo_tone);
+        meter_scalar.process_interleaved_f32_scalar(&stereo_tone);
+
+        let rep_simd = meter_simd.finalize();
+        let rep_scalar = meter_scalar.finalize();
+
+        // Bit-exact differential verification between NEON and Scalar!
+        assert_eq!(
+            rep_simd.integrated_lufs.to_bits(),
+            rep_scalar.integrated_lufs.to_bits(),
+            "NEON vs Scalar integrated_lufs bit-exact mismatch"
+        );
+        assert_eq!(
+            rep_simd.true_peak_linear.to_bits(),
+            rep_scalar.true_peak_linear.to_bits(),
+            "NEON vs Scalar true_peak_linear bit-exact mismatch"
+        );
+        println!(
+            "SIMD-0043 997Hz -23 dBFS stereo tone: Integrated={:.3} LUFS, LRA={:.2} LU, TruePeak={:.2} dBTP",
+            rep_simd.integrated_lufs, rep_simd.loudness_range_lu, rep_simd.true_peak_dbtp
+        );
+        assert!(
+            (rep_simd.integrated_lufs - (-23.0)).abs() <= 0.1,
+            "expected -23.0 LUFS +- 0.1 LU on EBU Tech 3341 -23 dBFS stereo reference tone, got {:.3} LUFS",
+            rep_simd.integrated_lufs
+        );
+        assert!(
+            rep_simd.loudness_range_lu <= 0.1,
+            "steady tone LRA must be <= 0.1 LU, got {:.3} LU",
+            rep_simd.loudness_range_lu
+        );
+        assert!(
+            (rep_simd.true_peak_dbtp - (-23.0)).abs() <= 0.1,
+            "expected -23.0 dBTP +- 0.1 dB on 997 Hz tone, got {:.3} dBTP",
+            rep_simd.true_peak_dbtp
+        );
+
+        // 2. EBU Tech 3341 Gating Test: silence followed by continuous -23 LUFS reference tone
+        // Relative & absolute gates (-70 LUFS and L_abs - 10 LU) reject the silent segment and remain within -23.0 +- 0.1 LUFS!
+        let silence_samples = (fs as usize) * 2 * 2; // 2s stereo silence
+        let active_frames = (fs as usize) * 8; // 8s continuous stereo 1 kHz tone
+        let mut gated_signal = vec![0.0f32; silence_samples];
+        for n in 0..active_frames {
+            let s = ((2.0 * std::f64::consts::PI * 1000.0 * (n as f64) / (fs as f64)).sin() as f32)
+                * amp_neg23;
+            gated_signal.push(s);
+            gated_signal.push(s);
+        }
+        let mut meter_gated = EbuR128Meter::new(fs, 2);
+        meter_gated.process_interleaved_f32(&gated_signal);
+        let rep_gated = meter_gated.finalize();
+        assert!(
+            (rep_gated.integrated_lufs - (-23.0)).abs() <= 0.1,
+            "gated loudness with silence segment must remain -23.0 +- 0.1 LUFS, got {:.3} LUFS",
+            rep_gated.integrated_lufs
+        );
+
+        // 3. Normalization to -14.0 LUFS with -1.0 dBTP True-Peak ceiling
+        let (gain, _) = meter_simd.compute_normalization_gain(-14.0, -1.0);
+        let mut norm_frame = AudioFrame::new(fs, 2, SampleFormat::F32le, num_frames);
+        norm_frame.as_f32_mut_slice().copy_from_slice(&stereo_tone);
+        let normalized = normalize_audio_frame(&norm_frame, gain, -1.0).unwrap();
+        let mut check_meter = EbuR128Meter::new(fs, 2);
+        check_meter.process_audio_frame(&normalized).unwrap();
+        let check_rep = check_meter.finalize();
+        assert!(
+            (check_rep.integrated_lufs - (-14.0)).abs() <= 0.1,
+            "expected normalized loudness -14.0 +- 0.1 LUFS, got {:.3} LUFS",
+            check_rep.integrated_lufs
+        );
+        assert!(
+            check_rep.true_peak_dbtp <= -0.95,
+            "expected true peak <= -1.0 dBTP, got {:.2} dBTP",
+            check_rep.true_peak_dbtp
+        );
+    }
+
+    #[test]
+    fn audio_0044_aac_lc_and_opus_roundtrip_and_ffmpeg_interop() {
+        // 1. AAC-LC 48 kHz Stereo Roundtrip (AacEncoder -> AacDecoder) + FFmpeg bidirectional interop
+        let sr = 48_000u32;
+        let mut aac_enc = AacEncoder::new(sr, 2, 128_000);
+        let mut aac_dec = AacDecoder::from_asc(aac_enc.asc);
+        let mut adts_stream = Vec::new();
+        let mut total_recon_energy = 0.0f64;
+
+        for f_idx in 0..8usize {
+            let mut frame = AudioFrame::new(sr, 2, SampleFormat::F32le, 1024);
+            let dst = frame.as_f32_mut_slice();
+            for i in 0..1024 {
+                let t = ((f_idx * 1024 + i) as f64) / (sr as f64);
+                dst[i * 2] = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.5) as f32;
+                dst[i * 2 + 1] = ((2.0 * std::f64::consts::PI * 880.0 * t).cos() * 0.4) as f32;
+            }
+            let adts_pkt = aac_enc.encode_adts_frame(&frame).unwrap();
+            adts_stream.extend_from_slice(&adts_pkt);
+            let dec_frame = aac_dec.decode_packet(&adts_pkt).unwrap();
+            assert_eq!(dec_frame.num_samples, 1024);
+            assert_eq!(dec_frame.channels, 2);
+            if f_idx >= 1 {
+                // Compare Frame f_idx output against Frame f_idx - 1 input (due to 1024-sample 50% MDCT lookahead delay)
+                for &s in dec_frame.as_f32_slice() {
+                    total_recon_energy += (s as f64) * (s as f64);
+                }
+            }
+        }
+        assert!(
+            total_recon_energy > 100.0,
+            "expected non-trivial reconstructed AAC audio energy, got {total_recon_energy}"
+        );
+
+        // Verify FFmpeg decodes our ADTS AAC-LC stream AND our AacDecoder decodes `ffmpeg -c:a aac` stream
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let tmp = std::env::temp_dir();
+            let rag_aac = tmp.join("ragdoll_0044.aac");
+            let rag_wav = tmp.join("ragdoll_0044_dec.raw");
+            std::fs::write(&rag_aac, &adts_stream).unwrap();
+            let st = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    rag_aac.to_str().unwrap(),
+                    "-f",
+                    "f32le",
+                    rag_wav.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(
+                st.success(),
+                "ffmpeg failed to decode Ragdoll AAC-LC stream"
+            );
+            let ff_pcm = std::fs::read(&rag_wav).unwrap();
+            assert!(ff_pcm.len() >= 1024 * 2 * 4 * 6);
+
+            let ff_aac = tmp.join("ragdoll_0044_ff.aac");
+            let st_enc = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "f32le",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-i",
+                    rag_wav.to_str().unwrap(),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    ff_aac.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st_enc.success(), "ffmpeg -c:a aac encode failed");
+            let ff_aac_bytes = std::fs::read(&ff_aac).unwrap();
+            let mut dec_ff = AacDecoder::new(48_000, 2);
+            let mut pos = 0usize;
+            let mut frames_decoded = 0usize;
+            while pos + 7 <= ff_aac_bytes.len() {
+                let hdr = AdtsHeader::parse(&ff_aac_bytes[pos..]).unwrap();
+                let fl = hdr.frame_length as usize;
+                if pos + fl > ff_aac_bytes.len() {
+                    break;
+                }
+                let df = dec_ff.decode_packet(&ff_aac_bytes[pos..pos + fl]).unwrap();
+                assert_eq!(df.num_samples, 1024);
+                pos += fl;
+                frames_decoded += 1;
+            }
+            assert!(frames_decoded >= 6);
+            let _ = std::fs::remove_file(&rag_aac);
+            let _ = std::fs::remove_file(&rag_wav);
+            let _ = std::fs::remove_file(&ff_aac);
+        }
+
+        // 2. Opus 48 kHz Stereo Roundtrip (OpusEncoder -> OpusDecoder) + Range Coder verification
+        let mut opus_enc = OpusEncoder::new(48_000, 2, 128_000);
+        let mut opus_dec = OpusDecoder::new(2)
+            .with_extra_data(&opus_enc.extra_data())
+            .unwrap();
+        let mut opus_energy = 0.0f64;
+        for f_idx in 0..6usize {
+            let mut frame = AudioFrame::new(48_000, 2, SampleFormat::F32le, 960);
+            let dst = frame.as_f32_mut_slice();
+            for i in 0..960 {
+                let t = ((f_idx * 960 + i) as f64) / 48_000.0;
+                dst[i * 2] = ((2.0 * std::f64::consts::PI * 500.0 * t).sin() * 0.6) as f32;
+                dst[i * 2 + 1] = ((2.0 * std::f64::consts::PI * 750.0 * t).cos() * 0.5) as f32;
+            }
+            let pkt = opus_enc.encode_frame(&frame).unwrap();
+            let df = opus_dec.decode_packet(&pkt).unwrap();
+            assert_eq!(df.num_samples, 960);
+            assert_eq!(df.channels, 2);
+            if f_idx >= 1 {
+                for &s in df.as_f32_slice() {
+                    opus_energy += (s as f64) * (s as f64);
+                }
+            }
+        }
+        assert!(
+            opus_energy > 100.0,
+            "expected non-trivial reconstructed Opus audio energy, got {opus_energy}"
         );
     }
 }

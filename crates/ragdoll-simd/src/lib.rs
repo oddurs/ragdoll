@@ -6,10 +6,25 @@
 //! - [`metrics`]: NEON-accelerated block/plane SAD, SSE, and single-pass $8\times8$ SSIM window statistics.
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
+pub mod audio_dsp;
 pub mod fixed;
 pub mod h264_dsp;
 pub mod metrics;
 pub mod scan;
+
+pub use audio_dsp::{
+    BiquadCoeffs, ITU_MIX_MINUS_3DB, MdctPlan, TRUE_PEAK_12X4_TAPS, apply_gain_true_peak_limit_f32,
+    apply_gain_true_peak_limit_f32_scalar, biquad_process_4ch_f32, biquad_process_4ch_f32_scalar,
+    fft_complex_in_place, kbd_window_f32, polyphase_dot_f32, polyphase_dot_f32_scalar,
+    polyphase_dot16_f32, polyphase_dot16_f32_scalar, polyphase_dot16_q15_i16,
+    polyphase_dot16_q15_i16_scalar, polyphase_dot32_f32, polyphase_dot32_f32_scalar,
+    polyphase_dot32_q15_i16, polyphase_dot32_q15_i16_scalar, rematrix_5_1_to_stereo_f32,
+    rematrix_5_1_to_stereo_f32_scalar, rematrix_mono_to_stereo_f32,
+    rematrix_mono_to_stereo_f32_scalar, rematrix_nxm_f32, rematrix_nxm_f32_scalar,
+    rematrix_stereo_to_mono_f32, rematrix_stereo_to_mono_f32_scalar, sine_window_f32,
+    true_peak_4x_12tap_sample_f32, true_peak_4x_12tap_sample_f32_scalar, window_overlap_add_f32,
+    window_overlap_add_f32_scalar,
+};
 
 pub use fixed::{
     Q14_HALF, Q14_ONE, add4x4_idct_u8, clamp_u8, convolve_8tap_q14_u8, convolve_8tap_q14_u8_scalar,
@@ -422,6 +437,174 @@ mod tests {
                 new_gap <= orig_gap,
                 "deblocking bS={bs} must reduce or preserve step gap ({new_gap} vs {orig_gap})"
             );
+        }
+    }
+
+    #[test]
+    fn audio_dsp_polyphase_rematrix_biquad_true_peak_and_mdct_neon_vs_scalar() {
+        // 1. SIMD-0042: Polyphase f32 (within 1e-6) and Q15 i16 (0 LSB bit-exact)
+        let mut src_f32 = [0.0f32; 32];
+        let mut taps16_f32 = [0.0f32; 16];
+        let mut taps32_f32 = [0.0f32; 32];
+        let mut src_i16 = [0i16; 32];
+        let mut taps16_i16 = [0i16; 16];
+        let mut taps32_i16 = [0i16; 32];
+        for i in 0..32 {
+            src_f32[i] = ((i as f32 * 0.37).sin()) * 0.9;
+            taps32_f32[i] = ((i as f32 - 15.5) * 0.25).cos() * 0.0625;
+            src_i16[i] = (src_f32[i] * 32000.0) as i16;
+            taps32_i16[i] = (taps32_f32[i] * 32768.0) as i16;
+            if i < 16 {
+                taps16_f32[i] = taps32_f32[i];
+                taps16_i16[i] = taps32_i16[i];
+            }
+        }
+        let d16_simd = polyphase_dot16_f32(&src_f32[..16], &taps16_f32);
+        let d16_scalar = polyphase_dot16_f32_scalar(&src_f32[..16], &taps16_f32);
+        assert!(
+            (d16_simd - d16_scalar).abs() < 1e-6,
+            "polyphase_dot16_f32 diff: {} vs {}",
+            d16_simd,
+            d16_scalar
+        );
+        let d32_simd = polyphase_dot32_f32(&src_f32, &taps32_f32);
+        let d32_scalar = polyphase_dot32_f32_scalar(&src_f32, &taps32_f32);
+        assert!(
+            (d32_simd - d32_scalar).abs() < 1e-6,
+            "polyphase_dot32_f32 diff: {} vs {}",
+            d32_simd,
+            d32_scalar
+        );
+        assert_eq!(
+            polyphase_dot16_q15_i16(&src_i16[..16], &taps16_i16),
+            polyphase_dot16_q15_i16_scalar(&src_i16[..16], &taps16_i16),
+            "Q15 16-tap must be 0 LSB bit-exact"
+        );
+        assert_eq!(
+            polyphase_dot32_q15_i16(&src_i16, &taps32_i16),
+            polyphase_dot32_q15_i16_scalar(&src_i16, &taps32_i16),
+            "Q15 32-tap must be 0 LSB bit-exact"
+        );
+
+        // 2. SIMD-0042: Channel Matrix Mixing (Mono <-> Stereo, 5.1 -> Stereo, NxM)
+        let src_5_1: Vec<f32> = (0..(23 * 6))
+            .map(|i| ((i as f32) * 0.19).sin() * 0.8)
+            .collect();
+        let mut st_simd = vec![0.0f32; 23 * 2];
+        let mut st_scalar = vec![0.0f32; 23 * 2];
+        rematrix_5_1_to_stereo_f32(
+            &src_5_1,
+            &mut st_simd,
+            ITU_MIX_MINUS_3DB,
+            ITU_MIX_MINUS_3DB,
+            0.0,
+            true,
+        );
+        rematrix_5_1_to_stereo_f32_scalar(
+            &src_5_1,
+            &mut st_scalar,
+            ITU_MIX_MINUS_3DB,
+            ITU_MIX_MINUS_3DB,
+            0.0,
+            true,
+        );
+        for (a, b) in st_simd.iter().zip(st_scalar.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+
+        // 3. SIMD-0043: Biquad 4ch & 4x True-Peak 12-tap bit-exactness
+        let coeffs = BiquadCoeffs {
+            b0: 1.5351248,
+            b1: -2.6916962,
+            b2: 1.1983928,
+            a1: -1.6906593,
+            a2: 0.73248076,
+        };
+        let mut z1_simd = [0.0f32; 4];
+        let mut z2_simd = [0.0f32; 4];
+        let mut z1_scalar = [0.0f32; 4];
+        let mut z2_scalar = [0.0f32; 4];
+        for step in 0..32 {
+            let x = [
+                ((step as f32) * 0.1).sin(),
+                ((step as f32) * 0.2).cos(),
+                ((step as f32) * 0.3).sin() * 0.5,
+                -((step as f32) * 0.15).cos(),
+            ];
+            let mut y_simd = [0.0f32; 4];
+            let mut y_scalar = [0.0f32; 4];
+            biquad_process_4ch_f32(&coeffs, &x, &mut z1_simd, &mut z2_simd, &mut y_simd);
+            biquad_process_4ch_f32_scalar(
+                &coeffs,
+                &x,
+                &mut z1_scalar,
+                &mut z2_scalar,
+                &mut y_scalar,
+            );
+            for c in 0..4 {
+                assert_eq!(
+                    y_simd[c].to_bits(),
+                    y_scalar[c].to_bits(),
+                    "biquad 4ch bit-exact mismatch at step {step} ch {c}"
+                );
+            }
+        }
+
+        let mut hist = [0.0f32; 12];
+        for (k, v) in hist.iter_mut().enumerate() {
+            *v = ((k as f32 - 5.5) * std::f32::consts::FRAC_PI_2).cos();
+        }
+        let tp_simd = true_peak_4x_12tap_sample_f32(&hist);
+        let tp_scalar = true_peak_4x_12tap_sample_f32_scalar(&hist);
+        assert_eq!(
+            tp_simd.to_bits(),
+            tp_scalar.to_bits(),
+            "true-peak 4x 12-tap must be 100% bit-exact"
+        );
+        // fs/4 sine wave at 45 deg phase has sample peaks of 0.7071, but true inter-sample peak ~ 1.0!
+        assert!(
+            tp_simd > 0.98,
+            "expected 4x oversampled true-peak > 0.98 on fs/4 45-deg tone, got {tp_simd}"
+        );
+
+        // 4. 0044: MDCT / IMDCT + Sine/KBD TDAC perfect reconstruction across AAC (256, 2048) & Opus (120, 240, 480, 960)
+        for &n in &[120usize, 240, 256, 480, 960, 2048] {
+            let m = n / 2;
+            let plan = MdctPlan::new(n);
+            let win = if n == 256 || n == 2048 {
+                kbd_window_f32(n, 4.0)
+            } else {
+                sine_window_f32(n)
+            };
+            let signal: Vec<f32> = (0..(3 * m))
+                .map(|i| ((i as f32) * 0.073).sin() * 0.6 + ((i as f32) * 0.21).cos() * 0.25)
+                .collect();
+            let mut overlap = vec![0.0f32; m];
+            let mut coeffs = vec![0.0f32; m];
+            let mut imdct_out = vec![0.0f32; n];
+            let mut recon_mid = vec![0.0f32; m];
+
+            // Frame 0 (primes overlap)
+            let w0: Vec<f32> = (0..n).map(|i| signal[i] * win[i]).collect();
+            plan.mdct(&w0, &mut coeffs);
+            plan.imdct(&coeffs, &mut imdct_out);
+            window_overlap_add_f32(&imdct_out, &win, &mut overlap, &mut recon_mid);
+
+            // Frame 1 (reconstructs signal[m..2*m] via 50% TDAC!)
+            let w1: Vec<f32> = (0..n).map(|i| signal[m + i] * win[i]).collect();
+            plan.mdct(&w1, &mut coeffs);
+            plan.imdct(&coeffs, &mut imdct_out);
+            window_overlap_add_f32(&imdct_out, &win, &mut overlap, &mut recon_mid);
+
+            for i in 0..m {
+                let err = (recon_mid[i] - signal[m + i]).abs();
+                assert!(
+                    err < 1e-4,
+                    "MDCT/IMDCT TDAC N={n} reconstruction error at sample {i}: got {}, expected {} (err={err})",
+                    recon_mid[i],
+                    signal[m + i]
+                );
+            }
         }
     }
 }
