@@ -139,6 +139,16 @@ impl Rational64 {
         Self { num: n, den: 1 }
     }
 
+    /// Returns the multiplicative inverse `den / num` (`av_inv_q`).
+    #[inline]
+    pub const fn recip(self) -> Self {
+        if self.num == 0 {
+            Self { num: 0, den: 1 }
+        } else {
+            Self::new_raw(self.den, self.num)
+        }
+    }
+
     /// Reduces `num / den` to the best rational approximation `p / q` with `|p| <= max` and `1 <= q <= max`
     /// using continued-fraction convergents and semiconvergent clamping (matching FFmpeg `av_reduce`).
     ///

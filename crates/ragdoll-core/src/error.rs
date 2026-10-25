@@ -7,11 +7,26 @@ pub type Result<T> = std::result::Result<T, RagdollError>;
 pub enum RagdollError {
     BitstreamEndOfData,
     InvalidSyntax(&'static str),
+    CorruptBitstream(&'static str),
     InvalidData(String),
+    InvalidHeader(String),
     UnsupportedFeature(&'static str),
-    InvalidDimensions { width: usize, height: usize },
+    Unsupported(String),
+    InvalidDimensions {
+        width: usize,
+        height: usize,
+    },
+    DimensionMismatch {
+        expected_w: usize,
+        expected_h: usize,
+        actual_w: usize,
+        actual_h: usize,
+    },
     InvalidTimestamp(&'static str),
-    ChecksumMismatch { expected: u32, actual: u32 },
+    ChecksumMismatch {
+        expected: u32,
+        actual: u32,
+    },
     Io(io::Error),
 }
 
@@ -20,11 +35,23 @@ impl fmt::Display for RagdollError {
         match self {
             Self::BitstreamEndOfData => write!(f, "unexpected end of bitstream"),
             Self::InvalidSyntax(msg) => write!(f, "invalid bitstream syntax: {msg}"),
+            Self::CorruptBitstream(msg) => write!(f, "corrupt bitstream or container: {msg}"),
             Self::InvalidData(msg) => write!(f, "invalid media data: {msg}"),
+            Self::InvalidHeader(msg) => write!(f, "invalid container header: {msg}"),
             Self::UnsupportedFeature(msg) => write!(f, "unsupported media feature: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported media format: {msg}"),
             Self::InvalidDimensions { width, height } => {
                 write!(f, "invalid frame dimensions: {width}x{height}")
             }
+            Self::DimensionMismatch {
+                expected_w,
+                expected_h,
+                actual_w,
+                actual_h,
+            } => write!(
+                f,
+                "dimension mismatch (expected {expected_w}x{expected_h}, got {actual_w}x{actual_h})"
+            ),
             Self::InvalidTimestamp(msg) => write!(f, "invalid timestamp or timebase: {msg}"),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,

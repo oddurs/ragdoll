@@ -51,15 +51,15 @@ Replace libswscale's multi-pass full-frame memory round-trips with a fused L1-ca
 
 ## m3-format — Phase 3 — Zero-Copy Memory-Mapped Containers & Vectored Muxers
 
-`··········` 0% · 0 of 3 done
+`##########` 100% · 3 of 3 done
 
 Implement zero-copy demuxing over memory-mapped files (`PacketSlice<'mmap>`) and vectored I/O (`writev`) muxing for MP4/ISOBMFF (with flat 24-byte sample tables and O(log N) keyframe seeking), MKV/WebM (SIMD EBML varints), MPEG-TS (16-byte NEON 0x47 sync-byte scanner), Y4M, PPM, and WAV.
 
-### up next
+### shipped
 
-- [ ] `0015` Zero-Copy MP4 / ISOBMFF Demuxer, Flat 24B Sample Index, O(log N) Seeker & Faststart Muxer <sup>feature · p0 · format</sup>
-- [ ] `0016` Zero-Copy Matroska (MKV / WebM) & MPEG-TS Demuxers and Muxers <sup>feature · p1 · format</sup>
-- [ ] `0017` Uncompressed Studio Containers: YUV4MPEG2 (Y4M), Netpbm (PPM/PGM), & RIFF WAV <sup>feature · p1 · format</sup>
+- [x] `0015` Zero-Copy MP4 / ISOBMFF Demuxer, Flat 24B Sample Index, O(log N) Seeker & Faststart Muxer <sup>feature · p0 · format</sup>
+- [x] `0016` Zero-Copy Matroska (MKV / WebM) & MPEG-TS Demuxers and Muxers <sup>feature · p1 · format</sup>
+- [x] `0017` Uncompressed Studio Containers: YUV4MPEG2 (Y4M), Netpbm (PPM/PGM), & RIFF WAV <sup>feature · p1 · format</sup>
 
 ## m4-codec — Phase 4 — Pure-Rust Video & Audio Codecs
 
