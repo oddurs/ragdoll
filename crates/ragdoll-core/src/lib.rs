@@ -14,6 +14,7 @@ pub mod error;
 pub mod format;
 pub mod frame;
 pub mod packet;
+pub mod power;
 pub mod time;
 
 pub use bitstream::{
@@ -37,6 +38,11 @@ pub use frame::{
 pub use packet::{
     AudioTrackParams, CodecId, PacketFlags, PacketPayload, PacketSlice, SampleEntry, TrackInfo,
     TrackType, VideoTrackParams,
+};
+pub use power::{
+    CpuTopology, HardwareMetrics, PowerMode, ProcessRusageSnapshot,
+    apply_current_power_mode_to_thread, apply_power_mode_to_current_thread, global_power_mode,
+    measure_hardware_metrics, parse_macos_time_l_stderr, set_global_power_mode, with_power_mode,
 };
 pub use time::{
     NOPTS_VALUE, Rational64, Rounding, Timestamp, bessel_i0, compare_ts, rescale_delta, rescale_q,

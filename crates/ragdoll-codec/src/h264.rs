@@ -17,8 +17,8 @@ use ragdoll_core::{
     escape_rbsp, unescape_rbsp,
 };
 use ragdoll_simd::{
-    add4x4_idct_u8, clamp_u8, forward_dct4x4, hadamard4x4, inverse_idct4x4, split_annex_b_nals,
-    sub4x4_dct_u8,
+    add4x4_idct_u8, clamp_u8, forward_dct4x4, hadamard4x4, inverse_idct4x4, sad_16x16_u8,
+    sad_block_64_u8, sad_block_256_u8, split_annex_b_nals, sub4x4_dct_u8,
 };
 
 /// H.264 Network Abstraction Layer (NAL) unit type (`nal_unit_type` in bits `0..=4` of byte 0).
@@ -1043,7 +1043,28 @@ pub fn dequantize_idct_chroma_dc2x2(levels: &[i16; 4], qpc: u8) -> [i16; 4] {
 }
 
 /// H.264 Intra $16\times16$ Luma spatial prediction modes (`0` = Vertical, `1` = Horizontal, `2` = DC, `3` = Plane).
+///
+/// Reference-hardened against `libavcodec/aarch64/h264pred_neon.S` (`ff_pred16x16_{vert,hor,dc,plane}_neon`).
+#[inline]
 pub fn predict_intra_16x16(
+    mode: u8,
+    top: Option<&[u8; 16]>,
+    left: Option<&[u8; 16]>,
+    top_left: u8,
+    dst: &mut [u8],
+    stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dst.len() >= 15 * stride + 16 {
+            unsafe { predict_intra_16x16_neon(mode, top, left, top_left, dst, stride) };
+            return;
+        }
+    }
+    predict_intra_16x16_scalar(mode, top, left, top_left, dst, stride);
+}
+
+pub fn predict_intra_16x16_scalar(
     mode: u8,
     top: Option<&[u8; 16]>,
     left: Option<&[u8; 16]>,
@@ -1120,8 +1141,182 @@ pub fn predict_intra_16x16(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn predict_intra_16x16_neon(
+    mode: u8,
+    top: Option<&[u8; 16]>,
+    left: Option<&[u8; 16]>,
+    top_left: u8,
+    dst: &mut [u8],
+    stride: usize,
+) {
+    use std::arch::aarch64::*;
+    let dst_ptr = dst.as_mut_ptr();
+    match mode {
+        0 => {
+            let v_row = match top {
+                Some(t) => unsafe { vld1q_u8(t.as_ptr()) },
+                None => vdupq_n_u8(128),
+            };
+            for y in 0..16 {
+                unsafe { vst1q_u8(dst_ptr.add(y * stride), v_row) };
+            }
+        }
+        1 => {
+            let col_src = left.copied().unwrap_or([128u8; 16]);
+            for (y, &val) in col_src.iter().enumerate() {
+                let v_row = vdupq_n_u8(val);
+                unsafe { vst1q_u8(dst_ptr.add(y * stride), v_row) };
+            }
+        }
+        2 => {
+            let dc = match (top, left) {
+                (Some(t), Some(l)) => {
+                    let vt = unsafe { vld1q_u8(t.as_ptr()) };
+                    let vl = unsafe { vld1q_u8(l.as_ptr()) };
+                    let sum = (vaddlvq_u8(vt) as u32) + (vaddlvq_u8(vl) as u32);
+                    ((sum + 16) >> 5) as u8
+                }
+                (Some(t), None) => {
+                    let vt = unsafe { vld1q_u8(t.as_ptr()) };
+                    (((vaddlvq_u8(vt) as u32) + 8) >> 4) as u8
+                }
+                (None, Some(l)) => {
+                    let vl = unsafe { vld1q_u8(l.as_ptr()) };
+                    (((vaddlvq_u8(vl) as u32) + 8) >> 4) as u8
+                }
+                (None, None) => 128u8,
+            };
+            let v_dc = vdupq_n_u8(dc);
+            for y in 0..16 {
+                unsafe { vst1q_u8(dst_ptr.add(y * stride), v_dc) };
+            }
+        }
+        _ => {
+            let t = top.copied().unwrap_or([128u8; 16]);
+            let l = left.copied().unwrap_or([128u8; 16]);
+            let mut h = 0i32;
+            let mut v = 0i32;
+            for i in 0..8 {
+                let p_top_left = if i == 7 {
+                    top_left as i32
+                } else {
+                    t[6 - i] as i32
+                };
+                let p_left_top = if i == 7 {
+                    top_left as i32
+                } else {
+                    l[6 - i] as i32
+                };
+                h += ((i + 1) as i32) * ((t[8 + i] as i32) - p_top_left);
+                v += ((i + 1) as i32) * ((l[8 + i] as i32) - p_left_top);
+            }
+            let a = 16 * ((t[15] as i32) + (l[15] as i32));
+            let b = ((5 * h + 32) >> 6) as i16;
+            let c = ((5 * v + 32) >> 6) as i16;
+            let base = (a - 7 * (b as i32) - 7 * (c as i32) + 16) as i16;
+
+            let ramp_lo: [i16; 8] = [
+                base,
+                base.wrapping_add(b),
+                base.wrapping_add(b * 2),
+                base.wrapping_add(b * 3),
+                base.wrapping_add(b * 4),
+                base.wrapping_add(b * 5),
+                base.wrapping_add(b * 6),
+                base.wrapping_add(b * 7),
+            ];
+            let mut v_lo = unsafe { vld1q_s16(ramp_lo.as_ptr()) };
+            let mut v_hi = vaddq_s16(v_lo, vdupq_n_s16(b.wrapping_mul(8)));
+            let v_c = vdupq_n_s16(c);
+
+            for y in 0..16 {
+                let out_lo = vqshrun_n_s16::<5>(v_lo);
+                let out_hi = vqshrun_n_s16::<5>(v_hi);
+                unsafe { vst1q_u8(dst_ptr.add(y * stride), vcombine_u8(out_lo, out_hi)) };
+                v_lo = vaddq_s16(v_lo, v_c);
+                v_hi = vaddq_s16(v_hi, v_c);
+            }
+        }
+    }
+}
+
 /// H.264 Intra $8\times8$ Chroma spatial prediction (`0` = DC, `1` = Horizontal, `2` = Vertical, `3` = Plane).
+#[inline]
 pub fn predict_intra_chroma_8x8(
+    mode: u8,
+    top: Option<&[u8; 8]>,
+    left: Option<&[u8; 8]>,
+    top_left: u8,
+    dst: &mut [u8],
+    stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if mode == 3 && dst.len() >= 7 * stride + 8 {
+            unsafe { predict_intra_chroma_8x8_plane_neon(top, left, top_left, dst, stride) };
+            return;
+        }
+    }
+    predict_intra_chroma_8x8_scalar(mode, top, left, top_left, dst, stride);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn predict_intra_chroma_8x8_plane_neon(
+    top: Option<&[u8; 8]>,
+    left: Option<&[u8; 8]>,
+    top_left: u8,
+    dst: &mut [u8],
+    stride: usize,
+) {
+    use std::arch::aarch64::*;
+    let t = top.copied().unwrap_or([128u8; 8]);
+    let l = left.copied().unwrap_or([128u8; 8]);
+    let mut h = 0i32;
+    let mut v = 0i32;
+    for i in 0..4 {
+        let p_tl = if i == 3 {
+            top_left as i32
+        } else {
+            t[2 - i] as i32
+        };
+        let p_lt = if i == 3 {
+            top_left as i32
+        } else {
+            l[2 - i] as i32
+        };
+        h += ((i + 1) as i32) * ((t[4 + i] as i32) - p_tl);
+        v += ((i + 1) as i32) * ((l[4 + i] as i32) - p_lt);
+    }
+    let a = 16 * ((t[7] as i32) + (l[7] as i32));
+    let b = ((17 * h + 16) >> 5) as i16;
+    let c = ((17 * v + 16) >> 5) as i16;
+    let base = (a - 3 * (b as i32) - 3 * (c as i32) + 16) as i16;
+
+    let ramp: [i16; 8] = [
+        base,
+        base.wrapping_add(b),
+        base.wrapping_add(b * 2),
+        base.wrapping_add(b * 3),
+        base.wrapping_add(b * 4),
+        base.wrapping_add(b * 5),
+        base.wrapping_add(b * 6),
+        base.wrapping_add(b * 7),
+    ];
+    let mut v_row = unsafe { vld1q_s16(ramp.as_ptr()) };
+    let v_c = vdupq_n_s16(c);
+    let dst_ptr = dst.as_mut_ptr();
+
+    for y in 0..8 {
+        let out8 = vqshrun_n_s16::<5>(v_row);
+        unsafe { vst1_u8(dst_ptr.add(y * stride), out8) };
+        v_row = vaddq_s16(v_row, v_c);
+    }
+}
+
+pub fn predict_intra_chroma_8x8_scalar(
     mode: u8,
     top: Option<&[u8; 8]>,
     left: Option<&[u8; 8]>,
@@ -1761,10 +1956,14 @@ impl H264Encoder {
         let sad_threshold_chroma = sad_threshold_luma / 2;
 
         let mut skip_run = 0u32;
-        let mut mb_nnz = vec![0u8; mb_w * mb_h];
+        let total_mbs = mb_w * mb_h;
+        let mut mb_nnz = vec![0u8; total_mbs];
+        let mut mb_ref = vec![-2i8; total_mbs]; // 0 = L0 inter, -1 = intra, -2 = unavailable
+        let mut mb_mv = vec![[0i16; 2]; total_mbs]; // quarter-pel [mv_x, mv_y]
 
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
+                let mb_idx = mb_y * mb_w + mb_x;
                 let x0 = mb_x * 16;
                 let y0 = mb_y * 16;
                 let cx0 = mb_x * 8;
@@ -1776,28 +1975,80 @@ impl H264Encoder {
                 let mut src_v = [0u8; 64];
                 extract_mb_planes(frame, x0, y0, &mut src_y, &mut src_u, &mut src_v);
 
-                // In P-slices, check if P_Skip (stationary copy from prev_recon) is within threshold
+                // In P-slices, evaluate P_Skip and diamond motion-estimated P_L0_16x16 against prev_recon
                 if !is_idr && let Some(prev) = &self.prev_recon {
+                    let pskip_mv = pred_pskip_motion_16x16(&mb_ref, &mb_mv, mb_w, mb_x, mb_y);
+                    let mvp = pred_motion_16x16(&mb_ref, &mb_mv, mb_w, mb_x, mb_y);
+
+                    let mut best_mv = pskip_mv;
                     let mut ref_y = [0u8; 256];
                     let mut ref_u = [0u8; 64];
                     let mut ref_v = [0u8; 64];
-                    extract_mb_planes(prev, x0, y0, &mut ref_y, &mut ref_u, &mut ref_v);
+                    extract_inter_mb_planes(
+                        prev, x0, y0, pskip_mv, &mut ref_y, &mut ref_u, &mut ref_v,
+                    );
 
-                    let sad_y: u32 = src_y
-                        .iter()
-                        .zip(ref_y.iter())
-                        .map(|(&a, &b)| a.abs_diff(b) as u32)
-                        .sum();
-                    let sad_uv: u32 = src_u
-                        .iter()
-                        .zip(ref_u.iter())
-                        .chain(src_v.iter().zip(ref_v.iter()))
-                        .map(|(&a, &b)| a.abs_diff(b) as u32)
-                        .sum();
+                    let mut best_sad_y = sad_block_256_u8(&src_y, &ref_y);
+                    let mut best_sad_uv =
+                        sad_block_64_u8(&src_u, &ref_u) + sad_block_64_u8(&src_v, &ref_v);
 
-                    if sad_y <= sad_threshold_luma && sad_uv <= sad_threshold_chroma {
+                    if best_sad_y <= sad_threshold_luma && best_sad_uv <= sad_threshold_chroma {
                         skip_run += 1;
-                        mb_nnz[mb_y * mb_w + mb_x] = 0;
+                        mb_nnz[mb_idx] = 0;
+                        mb_ref[mb_idx] = 0;
+                        mb_mv[mb_idx] = pskip_mv;
+                        store_mb_planes(&mut recon, x0, y0, &ref_y, &ref_u, &ref_v);
+                        continue;
+                    }
+
+                    // Fast even-integer-pel diamond search (`dx, dy in {-8, -6, -4, -2, 0, 2, 4, 6, 8}`)
+                    let cand_mv =
+                        search_inter_motion_16x16(prev, x0, y0, &src_y, mvp, sad_threshold_luma);
+                    if cand_mv != pskip_mv {
+                        let mut cand_y = [0u8; 256];
+                        let mut cand_u = [0u8; 64];
+                        let mut cand_v = [0u8; 64];
+                        extract_inter_mb_planes(
+                            prev,
+                            x0,
+                            y0,
+                            cand_mv,
+                            &mut cand_y,
+                            &mut cand_u,
+                            &mut cand_v,
+                        );
+                        let cy_sad = sad_block_256_u8(&src_y, &cand_y);
+                        let cuv_sad =
+                            sad_block_64_u8(&src_u, &cand_u) + sad_block_64_u8(&src_v, &cand_v);
+                        if cy_sad < best_sad_y || (cy_sad == best_sad_y && cuv_sad < best_sad_uv) {
+                            best_mv = cand_mv;
+                            best_sad_y = cy_sad;
+                            best_sad_uv = cuv_sad;
+                            ref_y = cand_y;
+                            ref_u = cand_u;
+                            ref_v = cand_v;
+                        }
+                    }
+
+                    if best_sad_y <= sad_threshold_luma && best_sad_uv <= sad_threshold_chroma {
+                        if best_mv == pskip_mv {
+                            skip_run += 1;
+                            mb_nnz[mb_idx] = 0;
+                            mb_ref[mb_idx] = 0;
+                            mb_mv[mb_idx] = pskip_mv;
+                            store_mb_planes(&mut recon, x0, y0, &ref_y, &ref_u, &ref_v);
+                            continue;
+                        }
+                        // Emit P_L0_16x16 (`mb_type = 0`, `mvd_l0`, `coded_block_pattern = 0`)
+                        w.write_ue(skip_run as u64);
+                        skip_run = 0;
+                        w.write_ue(0); // mb_type = 0 (P_L0_16x16)
+                        w.write_se((best_mv[0] as i64) - (mvp[0] as i64));
+                        w.write_se((best_mv[1] as i64) - (mvp[1] as i64));
+                        w.write_ue(0); // coded_block_pattern = 0 (no residual blocks)
+                        mb_nnz[mb_idx] = 0;
+                        mb_ref[mb_idx] = 0;
+                        mb_mv[mb_idx] = best_mv;
                         store_mb_planes(&mut recon, x0, y0, &ref_y, &ref_u, &ref_v);
                         continue;
                     }
@@ -1886,11 +2137,7 @@ impl H264Encoder {
                     &mut best_pred_y,
                     16,
                 );
-                let mut best_sad_y: u32 = src_y
-                    .iter()
-                    .zip(best_pred_y.iter())
-                    .map(|(&a, &b)| a.abs_diff(b) as u32)
-                    .sum();
+                let mut best_sad_y = sad_block_256_u8(&src_y, &best_pred_y);
 
                 for cand_mode in [0u8, 1, 3] {
                     if (cand_mode == 0 && top_y.is_none())
@@ -1908,11 +2155,7 @@ impl H264Encoder {
                         &mut cand_pred,
                         16,
                     );
-                    let sad: u32 = src_y
-                        .iter()
-                        .zip(cand_pred.iter())
-                        .map(|(&a, &b)| a.abs_diff(b) as u32)
-                        .sum();
+                    let sad = sad_block_256_u8(&src_y, &cand_pred);
                     if sad < best_sad_y {
                         best_sad_y = sad;
                         best_luma_mode = cand_mode;
@@ -1924,12 +2167,7 @@ impl H264Encoder {
                 let mut pred_v = [128u8; 64];
                 predict_intra_chroma_8x8(0, top_u.as_ref(), left_u.as_ref(), tl_u, &mut pred_u, 8);
                 predict_intra_chroma_8x8(0, top_v.as_ref(), left_v.as_ref(), tl_v, &mut pred_v, 8);
-                let sad_uv: u32 = src_u
-                    .iter()
-                    .zip(pred_u.iter())
-                    .chain(src_v.iter().zip(pred_v.iter()))
-                    .map(|(&a, &b)| a.abs_diff(b) as u32)
-                    .sum();
+                let sad_uv = sad_block_64_u8(&src_u, &pred_u) + sad_block_64_u8(&src_v, &pred_v);
 
                 let intra_offset = if is_idr { 0u64 } else { 5u64 };
 
@@ -1940,7 +2178,9 @@ impl H264Encoder {
                     w.write_ue(0); // intra_chroma_pred_mode = 0 (DC)
                     w.write_se(0); // mb_qp_delta = 0
                     encode_cavlc_block(&mut w, &[0i16; 16], nc, false);
-                    mb_nnz[mb_y * mb_w + mb_x] = 0;
+                    mb_nnz[mb_idx] = 0;
+                    mb_ref[mb_idx] = -1;
+                    mb_mv[mb_idx] = [0, 0];
                     store_mb_planes(&mut recon, x0, y0, &best_pred_y, &pred_u, &pred_v);
                 } else {
                     // Encode as I_PCM (`mb_type = 25` in I-slice, `30` in P-slice) for exact pixel fidelity
@@ -1955,7 +2195,9 @@ impl H264Encoder {
                     for &b in &src_v {
                         w.write_bits(b as u64, 8);
                     }
-                    mb_nnz[mb_y * mb_w + mb_x] = 16;
+                    mb_nnz[mb_idx] = 16;
+                    mb_ref[mb_idx] = -1;
+                    mb_mv[mb_idx] = [0, 0];
                     store_mb_planes(&mut recon, x0, y0, &src_y, &src_u, &src_v);
                 }
             }
@@ -1981,6 +2223,274 @@ impl H264Encoder {
     }
 }
 
+#[inline]
+fn median3(a: i16, b: i16, c: i16) -> i16 {
+    a.max(b).min(a.min(b).max(c))
+}
+
+/// Computes the ITU-T H.264 8.4.1.3 median motion vector predictor `mvp` (in quarter-pel units)
+/// for a $16\times16$ `P_L0_16x16` macroblock at `(mb_x, mb_y)` (`libavcodec/h264_mvpred.h:pred_motion`).
+#[inline]
+fn pred_motion_16x16(
+    mb_ref: &[i8],
+    mb_mv: &[[i16; 2]],
+    mb_w: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i16; 2] {
+    let (left_ref, a) = if mb_x > 0 {
+        let idx = mb_y * mb_w + (mb_x - 1);
+        (mb_ref[idx], mb_mv[idx])
+    } else {
+        (-2, [0, 0])
+    };
+    let (top_ref, b) = if mb_y > 0 {
+        let idx = (mb_y - 1) * mb_w + mb_x;
+        (mb_ref[idx], mb_mv[idx])
+    } else {
+        (-2, [0, 0])
+    };
+    let (diag_ref, c) = if mb_y > 0 && mb_x + 1 < mb_w {
+        let idx = (mb_y - 1) * mb_w + (mb_x + 1);
+        (mb_ref[idx], mb_mv[idx])
+    } else if mb_y > 0 && mb_x > 0 {
+        let idx = (mb_y - 1) * mb_w + (mb_x - 1);
+        (mb_ref[idx], mb_mv[idx])
+    } else {
+        (-2, [0, 0])
+    };
+
+    let match_count = (left_ref == 0) as u8 + (top_ref == 0) as u8 + (diag_ref == 0) as u8;
+    if match_count > 1 {
+        [median3(a[0], b[0], c[0]), median3(a[1], b[1], c[1])]
+    } else if match_count == 1 {
+        if left_ref == 0 {
+            a
+        } else if top_ref == 0 {
+            b
+        } else {
+            c
+        }
+    } else if top_ref == -2 && diag_ref == -2 && left_ref != -2 {
+        a
+    } else {
+        [median3(a[0], b[0], c[0]), median3(a[1], b[1], c[1])]
+    }
+}
+
+/// Computes the ITU-T H.264 8.4.1.1 `P_Skip` motion vector predictor (in quarter-pel units)
+/// at `(mb_x, mb_y)` (`libavcodec/h264_mvpred.h:pred_pskip_motion`).
+#[inline]
+fn pred_pskip_motion_16x16(
+    mb_ref: &[i8],
+    mb_mv: &[[i16; 2]],
+    mb_w: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i16; 2] {
+    if mb_x == 0 || mb_y == 0 {
+        return [0, 0];
+    }
+    let left_idx = mb_y * mb_w + (mb_x - 1);
+    let top_idx = (mb_y - 1) * mb_w + mb_x;
+    if (mb_ref[left_idx] == 0 && mb_mv[left_idx] == [0, 0])
+        || (mb_ref[top_idx] == 0 && mb_mv[top_idx] == [0, 0])
+    {
+        return [0, 0];
+    }
+    pred_motion_16x16(mb_ref, mb_mv, mb_w, mb_x, mb_y)
+}
+
+/// Extracts a motion-compensated $16\times16$ luma and $8\times8$ U/V chroma macroblock from `prev`
+/// at quarter-pel motion vector `mv = [mv_x, mv_y]` (`libavcodec/h264chroma_template.c`).
+fn extract_inter_mb_planes(
+    prev: &VideoFrame,
+    x0: usize,
+    y0: usize,
+    mv: [i16; 2],
+    dst_y: &mut [u8; 256],
+    dst_u: &mut [u8; 64],
+    dst_v: &mut [u8; 64],
+) {
+    let w = prev.width as isize;
+    let h = prev.height as isize;
+    let dx = (mv[0] >> 2) as isize;
+    let dy = (mv[1] >> 2) as isize;
+    let rx0 = (x0 as isize) + dx;
+    let ry0 = (y0 as isize) + dy;
+
+    let py = prev.plane(0);
+    let pu = prev.plane(1);
+    let pv = prev.plane(2);
+    let cw = pu.width() as isize;
+    let ch = pu.height() as isize;
+
+    // Fast path: in-bounds even-integer pixel shift (exact integer luma and 4:2:0 chroma copy)
+    if (mv[0] & 7) == 0
+        && (mv[1] & 7) == 0
+        && rx0 >= 0
+        && rx0 + 16 <= w
+        && ry0 >= 0
+        && ry0 + 16 <= h
+    {
+        let ux0 = rx0 as usize;
+        let uy0 = ry0 as usize;
+        for r in 0..16 {
+            dst_y[r * 16..r * 16 + 16].copy_from_slice(&py.row(uy0 + r)[ux0..ux0 + 16]);
+        }
+        let ucx0 = ux0 / 2;
+        let ucy0 = uy0 / 2;
+        for r in 0..8 {
+            dst_u[r * 8..r * 8 + 8].copy_from_slice(&pu.row(ucy0 + r)[ucx0..ucx0 + 8]);
+            dst_v[r * 8..r * 8 + 8].copy_from_slice(&pv.row(ucy0 + r)[ucx0..ucx0 + 8]);
+        }
+        return;
+    }
+
+    for r in 0..16isize {
+        let sy = (ry0 + r).clamp(0, h - 1) as usize;
+        let row = py.row(sy);
+        for c in 0..16isize {
+            let sx = (rx0 + c).clamp(0, w - 1) as usize;
+            dst_y[(r as usize) * 16 + (c as usize)] = row[sx];
+        }
+    }
+
+    // 4:2:0 1/8-pel bilinear chroma interpolation (`ff_put_h264_chroma_mc8`)
+    let cx_base = ((x0 / 2) as isize) + ((mv[0] >> 3) as isize);
+    let cy_base = ((y0 / 2) as isize) + ((mv[1] >> 3) as isize);
+    let fx = (mv[0].rem_euclid(8)) as u32;
+    let fy = (mv[1].rem_euclid(8)) as u32;
+
+    if fx == 0 && fy == 0 {
+        for r in 0..8isize {
+            let sy = (cy_base + r).clamp(0, ch - 1) as usize;
+            let ru = pu.row(sy);
+            let rv = pv.row(sy);
+            for c in 0..8isize {
+                let sx = (cx_base + c).clamp(0, cw - 1) as usize;
+                dst_u[(r as usize) * 8 + (c as usize)] = ru[sx];
+                dst_v[(r as usize) * 8 + (c as usize)] = rv[sx];
+            }
+        }
+    } else {
+        let wa = (8 - fx) * (8 - fy);
+        let wb = fx * (8 - fy);
+        let wc = (8 - fx) * fy;
+        let wd = fx * fy;
+        for r in 0..8isize {
+            let sy0 = (cy_base + r).clamp(0, ch - 1) as usize;
+            let sy1 = (cy_base + r + 1).clamp(0, ch - 1) as usize;
+            let ru0 = pu.row(sy0);
+            let ru1 = pu.row(sy1);
+            let rv0 = pv.row(sy0);
+            let rv1 = pv.row(sy1);
+            for c in 0..8isize {
+                let sx0 = (cx_base + c).clamp(0, cw - 1) as usize;
+                let sx1 = (cx_base + c + 1).clamp(0, cw - 1) as usize;
+                let u_val = (wa * (ru0[sx0] as u32)
+                    + wb * (ru0[sx1] as u32)
+                    + wc * (ru1[sx0] as u32)
+                    + wd * (ru1[sx1] as u32)
+                    + 32)
+                    >> 6;
+                let v_val = (wa * (rv0[sx0] as u32)
+                    + wb * (rv0[sx1] as u32)
+                    + wc * (rv1[sx0] as u32)
+                    + wd * (rv1[sx1] as u32)
+                    + 32)
+                    >> 6;
+                dst_u[(r as usize) * 8 + (c as usize)] = u_val as u8;
+                dst_v[(r as usize) * 8 + (c as usize)] = v_val as u8;
+            }
+        }
+    }
+}
+
+/// Fast NEON diamond motion search over even integer luma shifts `(dx, dy)` within `[-12, 12]`
+/// using `sad_16x16_u8` directly on `prev`'s luma plane.
+fn search_inter_motion_16x16(
+    prev: &VideoFrame,
+    x0: usize,
+    y0: usize,
+    src_y: &[u8; 256],
+    mvp: [i16; 2],
+    sad_threshold: u32,
+) -> [i16; 2] {
+    let w = prev.width as isize;
+    let h = prev.height as isize;
+    let py = prev.plane(0);
+    let stride = py.stride();
+    let data = py.data();
+
+    let eval_dx_dy = |dx: isize, dy: isize| -> Option<u32> {
+        let rx = (x0 as isize) + dx;
+        let ry = (y0 as isize) + dy;
+        if rx < 0 || rx + 16 > w || ry < 0 || ry + 16 > h {
+            return None;
+        }
+        let offset = (ry as usize) * stride + (rx as usize);
+        Some(sad_16x16_u8(src_y, 16, &data[offset..], stride))
+    };
+
+    let mut best_dx = 0isize;
+    let mut best_dy = 0isize;
+    let mut best_sad = eval_dx_dy(0, 0).unwrap_or(u32::MAX);
+    if best_sad <= sad_threshold {
+        return [0, 0];
+    }
+
+    // Check predicted MV (snapped to nearest even integer pixel)
+    let mvp_dx = (((mvp[0] >> 2) as isize) & !1).clamp(-12, 12);
+    let mvp_dy = (((mvp[1] >> 2) as isize) & !1).clamp(-12, 12);
+    if (mvp_dx != 0 || mvp_dy != 0)
+        && let Some(s) = eval_dx_dy(mvp_dx, mvp_dy)
+        && s < best_sad
+    {
+        best_sad = s;
+        best_dx = mvp_dx;
+        best_dy = mvp_dy;
+        if best_sad <= sad_threshold {
+            return [(best_dx * 4) as i16, (best_dy * 4) as i16];
+        }
+    }
+
+    // 2-stage diamond + diagonal search (step = 4, then step = 2)
+    for step in [4isize, 2isize] {
+        let cx = best_dx;
+        let cy = best_dy;
+        let offsets = [
+            (-step, 0),
+            (step, 0),
+            (0, -step),
+            (0, step),
+            (-step, -step),
+            (step, step),
+            (-step, step),
+            (step, -step),
+        ];
+        for (ox, oy) in offsets {
+            let cand_dx = cx + ox;
+            let cand_dy = cy + oy;
+            if cand_dx.abs() > 16 || cand_dy.abs() > 16 {
+                continue;
+            }
+            if let Some(s) = eval_dx_dy(cand_dx, cand_dy)
+                && s < best_sad
+            {
+                best_sad = s;
+                best_dx = cand_dx;
+                best_dy = cand_dy;
+                if best_sad == 0 {
+                    return [(best_dx * 4) as i16, (best_dy * 4) as i16];
+                }
+            }
+        }
+    }
+
+    [(best_dx * 4) as i16, (best_dy * 4) as i16]
+}
+
 fn extract_mb_planes(
     frame: &VideoFrame,
     x0: usize,
@@ -1992,12 +2502,18 @@ fn extract_mb_planes(
     let w = frame.width;
     let h = frame.height;
     let py = frame.plane(0);
-    for r in 0..16 {
-        let sy = (y0 + r).min(h.saturating_sub(1));
-        let row = py.row(sy);
-        for c in 0..16 {
-            let sx = (x0 + c).min(w.saturating_sub(1));
-            dst_y[r * 16 + c] = row[sx];
+    if x0 + 16 <= w && y0 + 16 <= h {
+        for r in 0..16 {
+            dst_y[r * 16..r * 16 + 16].copy_from_slice(&py.row(y0 + r)[x0..x0 + 16]);
+        }
+    } else {
+        for r in 0..16 {
+            let sy = (y0 + r).min(h.saturating_sub(1));
+            let row = py.row(sy);
+            for c in 0..16 {
+                let sx = (x0 + c).min(w.saturating_sub(1));
+                dst_y[r * 16 + c] = row[sx];
+            }
         }
     }
     let cw = frame.plane(1).width();
@@ -2006,14 +2522,21 @@ fn extract_mb_planes(
     let pv = frame.plane(2);
     let cx0 = x0 / 2;
     let cy0 = y0 / 2;
-    for r in 0..8 {
-        let sy = (cy0 + r).min(ch.saturating_sub(1));
-        let ru = pu.row(sy);
-        let rv = pv.row(sy);
-        for c in 0..8 {
-            let sx = (cx0 + c).min(cw.saturating_sub(1));
-            dst_u[r * 8 + c] = ru[sx];
-            dst_v[r * 8 + c] = rv[sx];
+    if cx0 + 8 <= cw && cy0 + 8 <= ch {
+        for r in 0..8 {
+            dst_u[r * 8..r * 8 + 8].copy_from_slice(&pu.row(cy0 + r)[cx0..cx0 + 8]);
+            dst_v[r * 8..r * 8 + 8].copy_from_slice(&pv.row(cy0 + r)[cx0..cx0 + 8]);
+        }
+    } else {
+        for r in 0..8 {
+            let sy = (cy0 + r).min(ch.saturating_sub(1));
+            let ru = pu.row(sy);
+            let rv = pv.row(sy);
+            for c in 0..8 {
+                let sx = (cx0 + c).min(cw.saturating_sub(1));
+                dst_u[r * 8 + c] = ru[sx];
+                dst_v[r * 8 + c] = rv[sx];
+            }
         }
     }
 }
@@ -2042,7 +2565,7 @@ fn store_mb_planes(
 ///
 /// Decodes Annex-B or length-prefixed NAL packets containing `SPS`, `PPS`, `SEI`, and
 /// `IDR` / `NonIdr` slices (`I_16x16` with CAVLC Luma/Chroma DC + AC $4\times4$ IDCT,
-/// `I_PCM`, and `P_Skip`).
+/// `I_PCM`, `P_Skip`, and `P_L0_16x16`).
 #[derive(Clone, Debug, Default)]
 pub struct H264Decoder {
     pub sps: Option<Sps>,
@@ -2117,6 +2640,8 @@ impl H264Decoder {
         let is_p_slice = sh.pict_type == PictureType::P;
         let mut skip_run: i64 = -1;
         let mut mb_nnz = vec![0u8; total_mbs];
+        let mut mb_ref = vec![-2i8; total_mbs];
+        let mut mb_mv = vec![[0i16; 2]; total_mbs];
 
         for mb_idx in (sh.first_mb_in_slice as usize)..total_mbs {
             let mb_x = mb_idx % mb_w;
@@ -2136,12 +2661,17 @@ impl H264Decoder {
                 }
                 if skip_run > 0 {
                     skip_run -= 1;
+                    let pskip_mv = pred_pskip_motion_16x16(&mb_ref, &mb_mv, mb_w, mb_x, mb_y);
                     mb_nnz[mb_idx] = 0;
+                    mb_ref[mb_idx] = 0;
+                    mb_mv[mb_idx] = pskip_mv;
                     if let Some(prev) = &self.prev_recon {
                         let mut ref_y = [0u8; 256];
                         let mut ref_u = [0u8; 64];
                         let mut ref_v = [0u8; 64];
-                        extract_mb_planes(prev, x0, y0, &mut ref_y, &mut ref_u, &mut ref_v);
+                        extract_inter_mb_planes(
+                            prev, x0, y0, pskip_mv, &mut ref_y, &mut ref_u, &mut ref_v,
+                        );
                         store_mb_planes(&mut recon, x0, y0, &ref_y, &ref_u, &ref_v);
                     }
                     continue;
@@ -2151,9 +2681,35 @@ impl H264Decoder {
 
             let raw_mb_type = r.read_ue()? as u32;
             let intra_mb_type = if is_p_slice {
+                if raw_mb_type == 0 {
+                    // P_L0_16x16 macroblock (`mb_type = 0`)
+                    let mvp = pred_motion_16x16(&mb_ref, &mb_mv, mb_w, mb_x, mb_y);
+                    let mvd_x = r.read_se()? as i16;
+                    let mvd_y = r.read_se()? as i16;
+                    let mv = [mvp[0].wrapping_add(mvd_x), mvp[1].wrapping_add(mvd_y)];
+                    let cbp_code = r.read_ue()? as usize;
+                    if cbp_code != 0 {
+                        return Err(RagdollError::Unsupported(
+                            "P_L0_16x16 with non-zero cbp".into(),
+                        ));
+                    }
+                    mb_nnz[mb_idx] = 0;
+                    mb_ref[mb_idx] = 0;
+                    mb_mv[mb_idx] = mv;
+                    if let Some(prev) = &self.prev_recon {
+                        let mut ref_y = [0u8; 256];
+                        let mut ref_u = [0u8; 64];
+                        let mut ref_v = [0u8; 64];
+                        extract_inter_mb_planes(
+                            prev, x0, y0, mv, &mut ref_y, &mut ref_u, &mut ref_v,
+                        );
+                        store_mb_planes(&mut recon, x0, y0, &ref_y, &ref_u, &ref_v);
+                    }
+                    continue;
+                }
                 if raw_mb_type < 5 {
                     return Err(RagdollError::Unsupported(
-                        "non-skip P macroblock partition".into(),
+                        "non-16x16 P macroblock partition".into(),
                     ));
                 }
                 raw_mb_type - 5
@@ -2177,6 +2733,8 @@ impl H264Decoder {
                     *b = r.read_bits(8)? as u8;
                 }
                 mb_nnz[mb_idx] = 16;
+                mb_ref[mb_idx] = -1;
+                mb_mv[mb_idx] = [0, 0];
                 store_mb_planes(&mut recon, x0, y0, &pcm_y, &pcm_u, &pcm_v);
                 continue;
             }
@@ -2186,6 +2744,8 @@ impl H264Decoder {
                     "H.264 intra mb_type {intra_mb_type} not supported in baseline fast decoder"
                 )));
             }
+            mb_ref[mb_idx] = -1;
+            mb_mv[mb_idx] = [0, 0];
 
             // I_16x16_{pred_mode}_{cbp_chroma}_{cbp_luma}
             let code = intra_mb_type - 1;

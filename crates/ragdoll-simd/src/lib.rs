@@ -16,10 +16,12 @@ pub use fixed::{
     inverse_idct4x4, inverse_idct4x4_scalar, inverse_idct8x8, sub4x4_dct_u8,
 };
 pub use metrics::{
-    SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, sad_plane_u8, sad_plane_u8_scalar, satd_4x4_u8,
-    satd_4x4_u8_scalar, satd_8x8_u8, sse_plane_u8, sse_plane_u8_scalar, ssim_4x4xn_u8,
-    ssim_4x4xn_u8_scalar, ssim_end1_8bit, ssim_plane_8bit, ssim_to_db, ssim_window_8x8_u8,
-    ssim_window_8x8_u8_scalar,
+    SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, flac_eval_fixed_orders_l1,
+    flac_eval_fixed_orders_l1_scalar, sad_16x16_u8, sad_16x16_u8_scalar, sad_block_64_u8,
+    sad_block_64_u8_scalar, sad_block_256_u8, sad_block_256_u8_scalar, sad_plane_u8,
+    sad_plane_u8_scalar, satd_4x4_u8, satd_4x4_u8_scalar, satd_8x8_u8, sse_plane_u8,
+    sse_plane_u8_scalar, ssim_4x4xn_u8, ssim_4x4xn_u8_scalar, ssim_end1_8bit, ssim_plane_8bit,
+    ssim_to_db, ssim_window_8x8_u8, ssim_window_8x8_u8_scalar,
 };
 pub use scan::{
     annex_b_to_avcc, avcc_to_annex_b, find_annex_b_start_code, find_annex_b_start_code_scalar,
@@ -284,5 +286,43 @@ mod tests {
         let coeff8 = forward_dct8x8(&block8);
         let recon8 = inverse_idct8x8(&coeff8);
         assert_eq!(recon8.len(), 64);
+    }
+
+    #[test]
+    fn sad_16x16_256_64_and_flac_fixed_l1_neon_vs_scalar() {
+        let mut a256 = [0u8; 256];
+        let mut b256 = [0u8; 256];
+        for i in 0..256 {
+            a256[i] = ((i * 73 + 19) & 0xFF) as u8;
+            b256[i] = ((i * 29 + 141) & 0xFF) as u8;
+        }
+        assert_eq!(
+            sad_block_256_u8(&a256, &b256),
+            sad_block_256_u8_scalar(&a256, &b256)
+        );
+        assert_eq!(
+            sad_16x16_u8(&a256, 16, &b256, 16),
+            sad_16x16_u8_scalar(&a256, 16, &b256, 16)
+        );
+
+        let mut a64 = [0u8; 64];
+        let mut b64 = [0u8; 64];
+        a64.copy_from_slice(&a256[..64]);
+        b64.copy_from_slice(&b256[..64]);
+        assert_eq!(
+            sad_block_64_u8(&a64, &b64),
+            sad_block_64_u8_scalar(&a64, &b64)
+        );
+
+        for len in [1usize, 3, 4, 7, 8, 15, 64, 513, 4096] {
+            let samples: Vec<i32> = (0..len)
+                .map(|i| (((i * 1103515245 + 12345) as i32) >> 10) + ((i as i32) * 17))
+                .collect();
+            assert_eq!(
+                flac_eval_fixed_orders_l1(&samples),
+                flac_eval_fixed_orders_l1_scalar(&samples),
+                "FLAC fixed L1 mismatch at len={len}"
+            );
+        }
     }
 }

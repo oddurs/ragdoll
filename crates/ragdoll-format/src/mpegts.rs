@@ -163,6 +163,28 @@ pub fn decode_pes_timestamp(b: &[u8; 5]) -> i64 {
         | (((b[4] >> 1) & 0x7F) as i64)
 }
 
+fn is_valid_avcc_packet(buf: &[u8], nal_len_size: usize) -> bool {
+    if buf.len() <= nal_len_size {
+        return false;
+    }
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        if pos + nal_len_size > buf.len() {
+            return false;
+        }
+        let mut nal_len = 0usize;
+        for i in 0..nal_len_size {
+            nal_len = (nal_len << 8) | (buf[pos + i] as usize);
+        }
+        pos += nal_len_size;
+        if nal_len == 0 || pos + nal_len > buf.len() || (buf[pos] & 0x80) != 0 {
+            return false;
+        }
+        pos += nal_len;
+    }
+    pos == buf.len()
+}
+
 /// Converts an ISO `avcC` configuration box + AVCC (4-byte length-prefixed) H.264 access unit
 /// into an Annex-B byte stream (`00 00 00 01` start codes, including `AUD` + `SPS`/`PPS` on keyframes).
 pub fn h264_avcc_to_annex_b_au(
@@ -170,9 +192,17 @@ pub fn h264_avcc_to_annex_b_au(
     avcc_packet: &[u8],
     is_keyframe: bool,
 ) -> Vec<u8> {
-    // Check if packet already starts with Annex-B 00 00 01 or 00 00 00 01
-    if (avcc_packet.len() >= 4 && avcc_packet[0..4] == [0, 0, 0, 1])
-        || (avcc_packet.len() >= 3 && avcc_packet[0..3] == [0, 0, 1])
+    let nal_len_size = if avcc_extra.len() >= 7 && avcc_extra[0] == 1 {
+        ((avcc_extra[4] & 0x03) + 1) as usize
+    } else {
+        4usize
+    };
+
+    // Only treat as pre-formatted Annex-B if it is NOT a valid length-prefixed AVCC packet
+    // (since a 256..511-byte AVCC NAL has 4-byte length prefix `00 00 01 xx`).
+    if !is_valid_avcc_packet(avcc_packet, nal_len_size)
+        && ((avcc_packet.len() >= 4 && avcc_packet[0..4] == [0, 0, 0, 1])
+            || (avcc_packet.len() >= 3 && avcc_packet[0..3] == [0, 0, 1]))
     {
         return avcc_packet.to_vec();
     }
@@ -181,42 +211,37 @@ pub fn h264_avcc_to_annex_b_au(
     // Emit H.264 Access Unit Delimiter (AUD, NAL type 9) required by MPEG-TS broadcast decoders
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0xF0]);
 
-    let mut nal_len_size = 4usize;
-    if avcc_extra.len() >= 7 && avcc_extra[0] == 1 {
-        nal_len_size = ((avcc_extra[4] & 0x03) + 1) as usize;
-        if is_keyframe {
-            let num_sps = (avcc_extra[5] & 0x1F) as usize;
-            let mut pos = 6usize;
-            for _ in 0..num_sps {
+    if avcc_extra.len() >= 7 && avcc_extra[0] == 1 && is_keyframe {
+        let num_sps = (avcc_extra[5] & 0x1F) as usize;
+        let mut pos = 6usize;
+        for _ in 0..num_sps {
+            if pos + 2 > avcc_extra.len() {
+                break;
+            }
+            let sps_len = u16::from_be_bytes([avcc_extra[pos], avcc_extra[pos + 1]]) as usize;
+            pos += 2;
+            if pos + sps_len > avcc_extra.len() {
+                break;
+            }
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(&avcc_extra[pos..pos + sps_len]);
+            pos += sps_len;
+        }
+        if pos < avcc_extra.len() {
+            let num_pps = avcc_extra[pos] as usize;
+            pos += 1;
+            for _ in 0..num_pps {
                 if pos + 2 > avcc_extra.len() {
                     break;
                 }
-                let sps_len = u16::from_be_bytes([avcc_extra[pos], avcc_extra[pos + 1]]) as usize;
+                let pps_len = u16::from_be_bytes([avcc_extra[pos], avcc_extra[pos + 1]]) as usize;
                 pos += 2;
-                if pos + sps_len > avcc_extra.len() {
+                if pos + pps_len > avcc_extra.len() {
                     break;
                 }
                 out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                out.extend_from_slice(&avcc_extra[pos..pos + sps_len]);
-                pos += sps_len;
-            }
-            if pos < avcc_extra.len() {
-                let num_pps = avcc_extra[pos] as usize;
-                pos += 1;
-                for _ in 0..num_pps {
-                    if pos + 2 > avcc_extra.len() {
-                        break;
-                    }
-                    let pps_len =
-                        u16::from_be_bytes([avcc_extra[pos], avcc_extra[pos + 1]]) as usize;
-                    pos += 2;
-                    if pos + pps_len > avcc_extra.len() {
-                        break;
-                    }
-                    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    out.extend_from_slice(&avcc_extra[pos..pos + pps_len]);
-                    pos += pps_len;
-                }
+                out.extend_from_slice(&avcc_extra[pos..pos + pps_len]);
+                pos += pps_len;
             }
         }
     }

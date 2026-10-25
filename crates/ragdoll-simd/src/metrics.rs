@@ -169,40 +169,70 @@ unsafe fn sse_plane_u8_neon(
     use std::arch::aarch64::*;
     let mut total = 0u64;
 
-    for y in 0..height {
-        let row_a = &a[y * a_stride..y * a_stride + width];
-        let row_b = &b[y * b_stride..y * b_stride + width];
-        let pa = row_a.as_ptr();
-        let pb = row_b.as_ptr();
-        let mut x = 0usize;
+    // Accumulate up to 8 rows in u32x4 lanes before horizontal reduction (8 * 7680 * 65025 << u32::MAX)
+    let mut y = 0usize;
+    while y < height {
+        let batch_end = (y + 8).min(height);
         let mut acc0 = vdupq_n_u32(0);
         let mut acc1 = vdupq_n_u32(0);
         let mut acc2 = vdupq_n_u32(0);
         let mut acc3 = vdupq_n_u32(0);
+        let mut tail_sse = 0u64;
 
-        while x + 16 <= width {
-            let va = unsafe { vld1q_u8(pa.add(x)) };
-            let vb = unsafe { vld1q_u8(pb.add(x)) };
-            let diff_lo = vabdl_u8(vget_low_u8(va), vget_low_u8(vb));
-            let diff_hi = vabdl_high_u8(va, vb);
+        for row_y in y..batch_end {
+            let row_a = &a[row_y * a_stride..row_y * a_stride + width];
+            let row_b = &b[row_y * b_stride..row_y * b_stride + width];
+            let pa = row_a.as_ptr();
+            let pb = row_b.as_ptr();
+            let mut x = 0usize;
 
-            // Use 4 independent u32x4 accumulators to eliminate read-after-write FMA stalls
-            acc0 = vmlal_u16(acc0, vget_low_u16(diff_lo), vget_low_u16(diff_lo));
-            acc1 = vmlal_high_u16(acc1, diff_lo, diff_lo);
-            acc2 = vmlal_u16(acc2, vget_low_u16(diff_hi), vget_low_u16(diff_hi));
-            acc3 = vmlal_high_u16(acc3, diff_hi, diff_hi);
-            x += 16;
+            while x + 32 <= width {
+                let va0 = unsafe { vld1q_u8(pa.add(x)) };
+                let vb0 = unsafe { vld1q_u8(pb.add(x)) };
+                let va1 = unsafe { vld1q_u8(pa.add(x + 16)) };
+                let vb1 = unsafe { vld1q_u8(pb.add(x + 16)) };
+
+                let d0_lo = vabdl_u8(vget_low_u8(va0), vget_low_u8(vb0));
+                let d0_hi = vabdl_high_u8(va0, vb0);
+                let d1_lo = vabdl_u8(vget_low_u8(va1), vget_low_u8(vb1));
+                let d1_hi = vabdl_high_u8(va1, vb1);
+
+                acc0 = vmlal_u16(acc0, vget_low_u16(d0_lo), vget_low_u16(d0_lo));
+                acc1 = vmlal_high_u16(acc1, d0_lo, d0_lo);
+                acc2 = vmlal_u16(acc2, vget_low_u16(d0_hi), vget_low_u16(d0_hi));
+                acc3 = vmlal_high_u16(acc3, d0_hi, d0_hi);
+
+                acc0 = vmlal_u16(acc0, vget_low_u16(d1_lo), vget_low_u16(d1_lo));
+                acc1 = vmlal_high_u16(acc1, d1_lo, d1_lo);
+                acc2 = vmlal_u16(acc2, vget_low_u16(d1_hi), vget_low_u16(d1_hi));
+                acc3 = vmlal_high_u16(acc3, d1_hi, d1_hi);
+                x += 32;
+            }
+
+            while x + 16 <= width {
+                let va = unsafe { vld1q_u8(pa.add(x)) };
+                let vb = unsafe { vld1q_u8(pb.add(x)) };
+                let diff_lo = vabdl_u8(vget_low_u8(va), vget_low_u8(vb));
+                let diff_hi = vabdl_high_u8(va, vb);
+
+                acc0 = vmlal_u16(acc0, vget_low_u16(diff_lo), vget_low_u16(diff_lo));
+                acc1 = vmlal_high_u16(acc1, diff_lo, diff_lo);
+                acc2 = vmlal_u16(acc2, vget_low_u16(diff_hi), vget_low_u16(diff_hi));
+                acc3 = vmlal_high_u16(acc3, diff_hi, diff_hi);
+                x += 16;
+            }
+
+            while x < width {
+                let d = row_a[x].abs_diff(row_b[x]) as u64;
+                tail_sse += d * d;
+                x += 1;
+            }
         }
 
         let sum01 = vaddq_u32(acc0, acc1);
         let sum23 = vaddq_u32(acc2, acc3);
-        let mut row_sse = vaddlvq_u32(vaddq_u32(sum01, sum23));
-        while x < width {
-            let d = row_a[x].abs_diff(row_b[x]) as u64;
-            row_sse += d * d;
-            x += 1;
-        }
-        total += row_sse;
+        total += vaddlvq_u32(vaddq_u32(sum01, sum23)) + tail_sse;
+        y = batch_end;
     }
     total
 }
@@ -642,4 +672,336 @@ pub fn satd_8x8_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 
             &b[4 * b_stride + 4..],
             b_stride,
         )
+}
+
+/// Computes the $16\times16$ Sum of Absolute Differences (`SAD`) between two strided 2D blocks
+/// with a single terminal horizontal reduction (`libavcodec/aarch64/pixblockdsp_neon.S`).
+#[inline]
+pub fn sad_16x16_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sad_16x16_u8_neon(a, a_stride, b, b_stride) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sad_16x16_u8_scalar(a, a_stride, b, b_stride)
+    }
+}
+
+pub fn sad_16x16_u8_scalar(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
+    let mut sum = 0u32;
+    for y in 0..16 {
+        let ra = &a[y * a_stride..y * a_stride + 16];
+        let rb = &b[y * b_stride..y * b_stride + 16];
+        for x in 0..16 {
+            sum += ra[x].abs_diff(rb[x]) as u32;
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sad_16x16_u8_neon(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
+    use std::arch::aarch64::*;
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut acc_lo = vdupq_n_u16(0);
+    let mut acc_hi = vdupq_n_u16(0);
+
+    for y in 0..16 {
+        let va = unsafe { vld1q_u8(pa.add(y * a_stride)) };
+        let vb = unsafe { vld1q_u8(pb.add(y * b_stride)) };
+        acc_lo = vabal_u8(acc_lo, vget_low_u8(va), vget_low_u8(vb));
+        acc_hi = vabal_high_u8(acc_hi, va, vb);
+    }
+    vaddlvq_u16(vaddq_u16(acc_lo, acc_hi))
+}
+
+/// Computes the SAD between two contiguous 256-byte ($16\times16$ luma macroblock) buffers in 4 NEON iterations.
+#[inline]
+pub fn sad_block_256_u8(a: &[u8; 256], b: &[u8; 256]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sad_block_256_u8_neon(a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sad_block_256_u8_scalar(a, b)
+    }
+}
+
+pub fn sad_block_256_u8_scalar(a: &[u8; 256], b: &[u8; 256]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x.abs_diff(y) as u32)
+        .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sad_block_256_u8_neon(a: &[u8; 256], b: &[u8; 256]) -> u32 {
+    use std::arch::aarch64::*;
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut acc0 = vdupq_n_u16(0);
+    let mut acc1 = vdupq_n_u16(0);
+    let mut acc2 = vdupq_n_u16(0);
+    let mut acc3 = vdupq_n_u16(0);
+
+    for chunk in 0..4 {
+        let off = chunk * 64;
+        let va0 = unsafe { vld1q_u8(pa.add(off)) };
+        let vb0 = unsafe { vld1q_u8(pb.add(off)) };
+        let va1 = unsafe { vld1q_u8(pa.add(off + 16)) };
+        let vb1 = unsafe { vld1q_u8(pb.add(off + 16)) };
+        let va2 = unsafe { vld1q_u8(pa.add(off + 32)) };
+        let vb2 = unsafe { vld1q_u8(pb.add(off + 32)) };
+        let va3 = unsafe { vld1q_u8(pa.add(off + 48)) };
+        let vb3 = unsafe { vld1q_u8(pb.add(off + 48)) };
+
+        acc0 = vabal_u8(acc0, vget_low_u8(va0), vget_low_u8(vb0));
+        acc1 = vabal_high_u8(acc1, va0, vb0);
+        acc2 = vabal_u8(acc2, vget_low_u8(va1), vget_low_u8(vb1));
+        acc3 = vabal_high_u8(acc3, va1, vb1);
+
+        acc0 = vabal_u8(acc0, vget_low_u8(va2), vget_low_u8(vb2));
+        acc1 = vabal_high_u8(acc1, va2, vb2);
+        acc2 = vabal_u8(acc2, vget_low_u8(va3), vget_low_u8(vb3));
+        acc3 = vabal_high_u8(acc3, va3, vb3);
+    }
+
+    let s01 = vaddq_u16(acc0, acc1);
+    let s23 = vaddq_u16(acc2, acc3);
+    vaddlvq_u16(vaddq_u16(s01, s23))
+}
+
+/// Computes the SAD between two contiguous 64-byte ($8\times8$ chroma macroblock) buffers in 1 NEON pass.
+#[inline]
+pub fn sad_block_64_u8(a: &[u8; 64], b: &[u8; 64]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sad_block_64_u8_neon(a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sad_block_64_u8_scalar(a, b)
+    }
+}
+
+pub fn sad_block_64_u8_scalar(a: &[u8; 64], b: &[u8; 64]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x.abs_diff(y) as u32)
+        .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sad_block_64_u8_neon(a: &[u8; 64], b: &[u8; 64]) -> u32 {
+    use std::arch::aarch64::*;
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let va0 = unsafe { vld1q_u8(pa) };
+    let vb0 = unsafe { vld1q_u8(pb) };
+    let va1 = unsafe { vld1q_u8(pa.add(16)) };
+    let vb1 = unsafe { vld1q_u8(pb.add(16)) };
+    let va2 = unsafe { vld1q_u8(pa.add(32)) };
+    let vb2 = unsafe { vld1q_u8(pb.add(32)) };
+    let va3 = unsafe { vld1q_u8(pa.add(48)) };
+    let vb3 = unsafe { vld1q_u8(pb.add(48)) };
+
+    let mut acc0 = vabdl_u8(vget_low_u8(va0), vget_low_u8(vb0));
+    let mut acc1 = vabdl_high_u8(va0, vb0);
+    let mut acc2 = vabdl_u8(vget_low_u8(va1), vget_low_u8(vb1));
+    let mut acc3 = vabdl_high_u8(va1, vb1);
+
+    acc0 = vabal_u8(acc0, vget_low_u8(va2), vget_low_u8(vb2));
+    acc1 = vabal_high_u8(acc1, va2, vb2);
+    acc2 = vabal_u8(acc2, vget_low_u8(va3), vget_low_u8(vb3));
+    acc3 = vabal_high_u8(acc3, va3, vb3);
+
+    let s01 = vaddq_u16(acc0, acc1);
+    let s23 = vaddq_u16(acc2, acc3);
+    vaddlvq_u16(vaddq_u16(s01, s23))
+}
+
+/// Evaluates the $L_1$ residual error sums ($\sum_{i=k}^{n-1} |\Delta^{(k)} x[i]|$) for all 5 FLAC
+/// Fixed predictor orders $k \in \{0, 1, 2, 3, 4\}$ in a **single fused memory pass**
+/// (`libFLAC/fixed.c:244-250`).
+#[inline]
+pub fn flac_eval_fixed_orders_l1(samples: &[i32]) -> [u64; 5] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if samples.len() >= 8 {
+            return unsafe { flac_eval_fixed_orders_l1_neon(samples) };
+        }
+    }
+    flac_eval_fixed_orders_l1_scalar(samples)
+}
+
+pub fn flac_eval_fixed_orders_l1_scalar(samples: &[i32]) -> [u64; 5] {
+    let n = samples.len();
+    let mut l1 = [0u64; 5];
+    if n == 0 {
+        return l1;
+    }
+
+    // Handle initial warm-up samples 0..min(4, n)
+    let init_end = n.min(4);
+    for i in 0..init_end {
+        let s0 = samples[i] as i64;
+        l1[0] += s0.unsigned_abs();
+        if i >= 1 {
+            let e1 = s0 - (samples[i - 1] as i64);
+            l1[1] += e1.unsigned_abs();
+        }
+        if i >= 2 {
+            let e2 = s0 - 2 * (samples[i - 1] as i64) + (samples[i - 2] as i64);
+            l1[2] += e2.unsigned_abs();
+        }
+        if i >= 3 {
+            let e3 = s0 - 3 * (samples[i - 1] as i64) + 3 * (samples[i - 2] as i64)
+                - (samples[i - 3] as i64);
+            l1[3] += e3.unsigned_abs();
+        }
+    }
+    if n <= 4 {
+        return l1;
+    }
+
+    // Cascaded single-pass recurrence: e_k[i] = e_{k-1}[i] - e_{k-1}[i-1]
+    let mut last0 = samples[3] as i64;
+    let mut last1 = (samples[3] as i64) - (samples[2] as i64);
+    let mut last2 = last1 - ((samples[2] as i64) - (samples[1] as i64));
+    let mut last3 = last2 - ((samples[2] as i64) - 2 * (samples[1] as i64) + (samples[0] as i64));
+
+    for &s in &samples[4..] {
+        let e0 = s as i64;
+        let e1 = e0 - last0;
+        let e2 = e1 - last1;
+        let e3 = e2 - last2;
+        let e4 = e3 - last3;
+
+        last0 = e0;
+        last1 = e1;
+        last2 = e2;
+        last3 = e3;
+
+        l1[0] += e0.unsigned_abs();
+        l1[1] += e1.unsigned_abs();
+        l1[2] += e2.unsigned_abs();
+        l1[3] += e3.unsigned_abs();
+        l1[4] += e4.unsigned_abs();
+    }
+    l1
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn flac_eval_fixed_orders_l1_neon(samples: &[i32]) -> [u64; 5] {
+    use std::arch::aarch64::*;
+    let n = samples.len();
+    // Guard against 32-bit overflow on extreme 28+ bit inputs (`16 * |s| >= i32::MAX`)
+    // Standard 8/16/24-bit + Side-channel 25-bit audio satisfies `|s| <= (1 << 24)`.
+    let mut l1 = flac_eval_fixed_orders_l1_scalar(&samples[..4]);
+
+    let s0 = samples[0] as i64;
+    let s1 = samples[1] as i64;
+    let s2 = samples[2] as i64;
+    let s3 = samples[3] as i64;
+    if s0.abs() > (1 << 25) || s1.abs() > (1 << 25) || s2.abs() > (1 << 25) || s3.abs() > (1 << 25)
+    {
+        return flac_eval_fixed_orders_l1_scalar(samples);
+    }
+
+    // Seed the 4-lane history registers so lane 3 holds the `i = 3` cascaded difference
+    let mut prev_e0 = unsafe { vld1q_s32(samples.as_ptr()) };
+    let e1_3 = (s3 - s2) as i32;
+    let e1_2 = (s2 - s1) as i32;
+    let e1_1 = (s1 - s0) as i32;
+    let mut prev_e1 = unsafe { vld1q_s32([0, e1_1, e1_2, e1_3].as_ptr()) };
+    let e2_3 = e1_3 - e1_2;
+    let e2_2 = e1_2 - e1_1;
+    let mut prev_e2 = unsafe { vld1q_s32([0, 0, e2_2, e2_3].as_ptr()) };
+    let e3_3 = e2_3 - e2_2;
+    let mut prev_e3 = unsafe { vld1q_s32([0, 0, 0, e3_3].as_ptr()) };
+
+    let mut acc0 = vdupq_n_u64(0);
+    let mut acc1 = vdupq_n_u64(0);
+    let mut acc2 = vdupq_n_u64(0);
+    let mut acc3 = vdupq_n_u64(0);
+    let mut acc4 = vdupq_n_u64(0);
+
+    let ptr = samples.as_ptr();
+    let mut i = 4usize;
+    let limit = vdupq_n_s32(1 << 25);
+
+    while i + 4 <= n {
+        let e0 = unsafe { vld1q_s32(ptr.add(i)) };
+        if vmaxvq_s32(vabsq_s32(e0)) > (1 << 25) {
+            let _ = limit;
+            return flac_eval_fixed_orders_l1_scalar(samples);
+        }
+
+        let e0_m1 = vextq_s32::<3>(prev_e0, e0);
+        let e1 = vsubq_s32(e0, e0_m1);
+
+        let e1_m1 = vextq_s32::<3>(prev_e1, e1);
+        let e2 = vsubq_s32(e1, e1_m1);
+
+        let e2_m1 = vextq_s32::<3>(prev_e2, e2);
+        let e3 = vsubq_s32(e2, e2_m1);
+
+        let e3_m1 = vextq_s32::<3>(prev_e3, e3);
+        let e4 = vsubq_s32(e3, e3_m1);
+
+        prev_e0 = e0;
+        prev_e1 = e1;
+        prev_e2 = e2;
+        prev_e3 = e3;
+
+        acc0 = vpadalq_u32(acc0, vreinterpretq_u32_s32(vabsq_s32(e0)));
+        acc1 = vpadalq_u32(acc1, vreinterpretq_u32_s32(vabsq_s32(e1)));
+        acc2 = vpadalq_u32(acc2, vreinterpretq_u32_s32(vabsq_s32(e2)));
+        acc3 = vpadalq_u32(acc3, vreinterpretq_u32_s32(vabsq_s32(e3)));
+        acc4 = vpadalq_u32(acc4, vreinterpretq_u32_s32(vabsq_s32(e4)));
+
+        i += 4;
+    }
+
+    l1[0] += vaddvq_u64(acc0);
+    l1[1] += vaddvq_u64(acc1);
+    l1[2] += vaddvq_u64(acc2);
+    l1[3] += vaddvq_u64(acc3);
+    l1[4] += vaddvq_u64(acc4);
+
+    if i < n {
+        let mut last0 = samples[i - 1] as i64;
+        let mut last1 = (samples[i - 1] as i64) - (samples[i - 2] as i64);
+        let mut last2 = last1 - ((samples[i - 2] as i64) - (samples[i - 3] as i64));
+        let mut last3 = last2
+            - ((samples[i - 2] as i64) - 2 * (samples[i - 3] as i64) + (samples[i - 4] as i64));
+
+        for &s in &samples[i..] {
+            let e0 = s as i64;
+            let e1 = e0 - last0;
+            let e2 = e1 - last1;
+            let e3 = e2 - last2;
+            let e4 = e3 - last3;
+
+            last0 = e0;
+            last1 = e1;
+            last2 = e2;
+            last3 = e3;
+
+            l1[0] += e0.unsigned_abs();
+            l1[1] += e1.unsigned_abs();
+            l1[2] += e2.unsigned_abs();
+            l1[3] += e3.unsigned_abs();
+            l1[4] += e4.unsigned_abs();
+        }
+    }
+
+    l1
 }
