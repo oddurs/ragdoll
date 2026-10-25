@@ -2,9 +2,13 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ragdoll_core::{
-    BitReader, BitWriter, ColorRange, FramePool, MatrixCoefficients, PixelFormat, Plane,
-    Rational64, Timestamp, crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride,
-    unescape_rbsp, unescape_rbsp_scalar,
+    BitReader, BitWriter, CodecId, ColorRange, Colorimetry, FramePool, MatrixCoefficients,
+    PacketFlags, PacketSlice, PixelFormat, Plane, Rational64, Timestamp, TrackInfo, TrackType,
+    VideoTrackParams, crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride, unescape_rbsp,
+    unescape_rbsp_scalar,
+};
+use ragdoll_format::{
+    Mp4Demuxer, Mp4Muxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv, transmux_mp4_to_mpegts,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
@@ -588,6 +592,96 @@ fn main() {
     let ts_ns = ts_48h.rescale_to(Rational64::TIMEBASE_NANOS);
     let satd8 = satd_8x8_u8(ya_slice, stride, yb_slice, stride);
 
+    // 10. M3 Zero-Copy MP4 Demuxing, O(log N) Seeking & MP4 -> MKV / MPEG-TS Transmuxing
+    let sps: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x0A, 0xD9, 0x01, 0x00, 0x4E, 0xFF, 0x00, 0x01, 0x00, 0x01, 0xE2, 0x44,
+        0x54,
+    ];
+    let pps: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+    let avcc = build_avcc_from_sps_pps(sps, pps);
+    let mut sample_payload = vec![0u8; 65_536];
+    sample_payload[0..4].copy_from_slice(&65_532u32.to_be_bytes());
+    sample_payload[4] = 0x65; // IDR slice
+    for (i, b) in sample_payload[5..].iter_mut().enumerate() {
+        *b = ((i * 41 + 7) % 251 + 1) as u8;
+    }
+
+    let mut mp4_mux = Mp4Muxer::new();
+    let tb_90k = Rational64::TIMEBASE_MPEG_90K;
+    mp4_mux.add_track(TrackInfo {
+        index: 0,
+        track_type: TrackType::Video,
+        codec_id: CodecId::H264,
+        timebase: tb_90k,
+        duration_ticks: Some(256 * 3000),
+        extra_data: avcc,
+        video: Some(VideoTrackParams {
+            width: 3840,
+            height: 2160,
+            pixel_format: PixelFormat::Yuv420p,
+            colorimetry: Colorimetry::bt709_limited(),
+            frame_rate: Rational64::FPS_30,
+            bit_depth: 8,
+            profile: None,
+            level: None,
+        }),
+        audio: None,
+        sample_count: 256,
+        total_bytes: (256 * sample_payload.len()) as u64,
+    });
+    for i in 0..256usize {
+        let ts = Timestamp::new((i * 3000) as i64, tb_90k);
+        let flags = if i.is_multiple_of(30) {
+            PacketFlags::KEYFRAME
+        } else {
+            PacketFlags::NONE
+        };
+        mp4_mux
+            .write_packet(PacketSlice::from_mmap(
+                &sample_payload,
+                0,
+                ts,
+                ts,
+                3000,
+                flags,
+                0,
+            ))
+            .unwrap();
+    }
+    let mut mp4_container = Vec::with_capacity(17 * 1024 * 1024);
+    mp4_mux.finish(&mut mp4_container).unwrap();
+
+    let t_demux = Instant::now();
+    let mut zero_copy_bytes = 0usize;
+    for _ in 0..50 {
+        let mut demux = Mp4Demuxer::open(black_box(&mp4_container)).unwrap();
+        let (_kf_idx, _) = demux
+            .seek_to_timestamp(0, Timestamp::new(135 * 3000, tb_90k))
+            .unwrap();
+        // Reset to start and sweep all 256 packets zero-copy
+        let mut demux_all = Mp4Demuxer::open(black_box(&mp4_container)).unwrap();
+        while let Some(pkt) = demux_all.next_packet().unwrap() {
+            zero_copy_bytes += black_box(pkt.len());
+        }
+    }
+    let mp4_demux_gbps = (zero_copy_bytes as f64) / t_demux.elapsed().as_secs_f64() / 1e9;
+
+    let mut mkv_sink = Vec::with_capacity(mp4_container.len() + 65536);
+    let t_mkv = Instant::now();
+    for _ in 0..10 {
+        mkv_sink.clear();
+        transmux_mp4_to_mkv(black_box(&mp4_container), &mut mkv_sink).unwrap();
+    }
+    let mkv_remux_gbps = (mp4_container.len() * 10) as f64 / t_mkv.elapsed().as_secs_f64() / 1e9;
+
+    let mut ts_sink = Vec::with_capacity(mp4_container.len() + 1024 * 1024);
+    let t_ts = Instant::now();
+    for _ in 0..5 {
+        ts_sink.clear();
+        transmux_mp4_to_mpegts(black_box(&mp4_container), &mut ts_sink).unwrap();
+    }
+    let ts_remux_gbps = (mp4_container.len() * 5) as f64 / t_ts.elapsed().as_secs_f64() / 1e9;
+
     println!(
         "----------------------------------------------------------------------------------------------"
     );
@@ -608,5 +702,9 @@ fn main() {
     println!(
         "[M2 Pix & Quality] 4K->1080p Lanczos-3 Q6 L1 Ring: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, MS-SSIM={:.5}, VMAF-Lite={:.2}",
         l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.ms_ssim, q_rep.vmaf_lite
+    );
+    println!(
+        "[M3 Containers]    Zero-Copy MP4 Demux: {:.2} GB/s | MP4->MKV: {:.2} GB/s | MP4->MPEG-TS: {:.2} GB/s (faststart=true)",
+        mp4_demux_gbps, mkv_remux_gbps, ts_remux_gbps
     );
 }

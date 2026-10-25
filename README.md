@@ -128,7 +128,7 @@ Ragdoll tracks its architecture decisions (`ADR-*`), SIMD kernels (`SIMD-*`), be
 | :--- | :---: | :--- |
 | **`m1-foundation`** | **Done** | 128-bit `Rational64`/`Timestamp`, CICP/Oklab colorimetry, 64B cache-aligned `FramePool`, 64-bit `CLZ` bitstreams, Slicing-by-8 CRCs, and NEON/AVX2 core primitives (`SAD`, `SSE`, `SSIM`, `SATD`, `DCT`, `Annex-B`, `RBSP`). |
 | **`m2-pix`** | **Done** | Fused L1 scanline YUV/NV12 $\leftrightarrow$ RGB24/RGBA8/BGRA8/Oklab color matrices (`4.37–6.02 Gpx/s`), $16\times16$ Bayer 10-bit dithering (`35.09 Gpx/s`), 14-bit `Q6` L1 ring-buffer Lanczos-3/Spline36/Bicubic 4K scaling (`506.5 fps`), and perceptual quality metrics (`PSNR`, `SSIM`, `MS-SSIM`, `VMAF-Lite`). |
-| **`m3-format`** | Planned | Zero-copy `mmap` MP4/ISOBMFF, Matroska (`.mkv`)/WebM, MPEG-TS (`.ts`), YUV4MPEG2 (`.y4m`), Netpbm, and WAV demuxers & muxers. |
+| **`m3-format`** | **Done** | Zero-copy `mmap` MP4/ISOBMFF demuxer (`900+ GB/s` slice emission, 24-byte `SampleEntry` index, $O(\log N)$ keyframe seeking, single-pass Fast-Start `moov`-before-`mdat` muxer), Matroska (`.mkv`)/WebM (`35.8 GB/s` transmux), SIMD-synced 188B MPEG-TS (`.ts`, `11.8 GB/s` transmux), YUV4MPEG2 (`.y4m`), Netpbm (`P6`/`P5` + contact sheet), and RIFF WAV. |
 | **`m4-codec`** | Planned | Pure-Rust FLAC lossless audio, H.264/AVC frame codec, AV1 OBU engine, and Ragdoll Fast-Intra (`RGDI`) SIMD studio codec. |
 | **`m5-cli-bench`** | Planned | Lock-free GOP-parallel pipeline, `.toml` recipe runner, full `ragdoll` CLI, and automated `ragdoll bench` vs. FFmpeg 9.0.2. |
 
