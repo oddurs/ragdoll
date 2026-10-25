@@ -1,0 +1,68 @@
+export const metadata = { title: "ragdoll-codec" };
+
+# ragdoll-codec
+
+Video and audio codecs, written from the specifications. See [Formats & codecs](/docs/formats/) for exactly which features are implemented.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-codec)
+
+## H.264 / AVC (`h264`)
+
+**Bitstream layer.** `parse_nal_rbsp` splits NAL units and strips emulation prevention. `Sps`, `Pps`, `SliceHeader` and `SeiMessage` parse and serialize their RBSP payloads, including VUI timing, aspect ratio, colorimetry and cropping.
+
+**Transform and quantization.** The 4×4 forward and inverse integer transform (through `ragdoll-simd`), the 4×4 luma DC and 2×2 chroma DC Hadamard, and the QP 0–51 scaling tables. `quantize_block4x4` and `dequantize_block4x4` follow the reference rounding.
+
+**Prediction.** Intra 16×16 (vertical, horizontal, DC, plane) and 8×8 chroma prediction, with NEON and scalar implementations.
+
+**Entropy coding.** CAVLC `coeff_token`, `total_zeros` and `run_before` (`encode_cavlc_block`, `decode_cavlc_block`).
+
+**Encoder and decoder.** `H264Encoder::new(width, height, fps, qp)` produces Constrained Baseline access units with `I_16x16`, `I_PCM`, `P_L0_16x16` (integer-pel motion search with SAD) and `P_Skip` macroblocks. `H264Decoder` decodes the same subset.
+
+<Callout kind="status" title="In progress (M7)">
+Full 4×4 and 8×8 residual coding, nine-mode intra 4×4, quarter-pel interpolation, the in-loop deblocking filter, CABAC, the 8×8 transform, B-frames, and CRF / VBV rate control.
+</Callout>
+
+## FLAC (`flac`)
+
+A complete RFC 9639 implementation.
+
+- `FlacDecoder::decode_stream(&[u8])` returns the `FlacStreamInfo` and the decoded `AudioFrame`. Frame-level decoding into planar buffers is available for streaming use.
+- `FlacEncoder::new(sample_rate, channels, bits_per_sample)` chooses per subframe between fixed predictors (orders 0–4, evaluated in one SIMD pass) and Levinson-Durbin FIR LPC (orders 1–12), Rice-codes the residual with an estimated optimal parameter, and picks independent, left/side, right/side or mid/side stereo per frame.
+- Frame headers carry CRC-8 and frames carry CRC-16. `compute_flac_pcm_md5_planar` produces the `STREAMINFO` MD5.
+
+## PCM (`pcm`)
+
+Conversion between `u8`, `s16le`, `s24le`, `s32le` and `f32le`; stereo interleaving and deinterleaving; mid/side decorrelation and reconstruction. Hot conversions have NEON kernels with scalar twins.
+
+## RGDI: Ragdoll Fast-Intra (`rgdi`)
+
+An intra-only codec designed for intermediate files: capture, caching and scrubbing, where decode speed matters more than size. It is not a distribution format.
+
+- Each plane is coded with 16-pixel vertical scanline prediction, then zero-run coalescing (up to 2,048 pixels in one byte), 4-bit packed deltas, or 8-bit literal deltas, with an optional 4×4 integer DCT block mode.
+- `RagdollIntraEncoder::new(qstep_shift)`: `0` is bit-exact lossless; `1` or `2` gives more than 45 dB PSNR.
+- On an Apple M4, 4K 4:2:0 encode and decode both run at several hundred frames per second.
+
+## AV1 (`av1`)
+
+Inspection and packaging, not decoding.
+
+- `split_obus` and `parse_obu_header` walk OBU streams; `encode_obu` writes them.
+- `Av1SequenceHeader` parses profile, level, bit depth, chroma subsampling and color description, matching `dav1d`'s parser.
+- Builds `av1C` configuration records for MP4 and Matroska.
+- `parse_ivf_stream` reads IVF files.
+
+## Example: WAV to FLAC in memory
+
+```rust
+use ragdoll_codec::{FlacDecoder, FlacEncoder};
+
+fn roundtrip(audio: &ragdoll_core::AudioFrame) -> ragdoll_core::Result<()> {
+    let encoder = FlacEncoder::new(audio.sample_rate, audio.channels, 16);
+    let flac = encoder.encode_stream(audio)?;
+
+    let (info, decoded) = FlacDecoder::decode_stream(&flac)?;
+    assert_eq!(decoded.num_samples, audio.num_samples);
+    println!("{} Hz, {} bytes", info.sample_rate, flac.len());
+    Ok(())
+}
+```

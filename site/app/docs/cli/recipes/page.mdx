@@ -1,0 +1,87 @@
+export const metadata = { title: "Pipeline recipes" };
+
+# Pipeline recipes
+
+A recipe describes a transcode job in TOML, so it can be checked into a repository, reviewed and rerun. One recipe can write several outputs from the same input.
+
+```sh
+ragdoll transcode --recipe job.toml
+```
+
+## Example
+
+```toml title="job.toml"
+[input]
+path = "master.mp4"
+
+[video]
+codec = "h264"      # h264 | rgdi | copy
+scale = "1280x720"  # or width = 1280 / height = 720
+filter = "lanczos3" # lanczos3 | spline36 | mitchell | bilinear
+qp = 22
+threads = 0         # 0 = choose from CPU topology
+
+[[output]]
+path = "web/720p.mp4"
+
+[[output]]
+path = "archive/720p.mkv"
+```
+
+## Reference
+
+### `[input]`
+
+| Key | Type | Description |
+| :-- | :-- | :-- |
+| `path` | string | **Required.** Input file. |
+| `start` | string | Parsed and kept on the recipe, but not yet applied. |
+| `duration` | string | Parsed and kept on the recipe, but not yet applied. |
+
+### `[video]`
+
+| Key | Type | Default | Description |
+| :-- | :-- | :-- | :-- |
+| `codec` | string | `"h264"` | `h264` or `rgdi`. `copy` remuxes instead of transcoding, as long as no size is set. |
+| `scale` | string | | `"WIDTHxHEIGHT"`. Shorthand for `width` and `height`. |
+| `width`, `height` | integer | | Output size. Both must be set to scale. |
+| `filter` | string | `"lanczos3"` | Scaling kernel. |
+| `qp` | integer | `20` | H.264 quantizer, clamped to `51`. |
+| `threads` | integer | `0` | Worker threads. Also accepted under `[pipeline]`. |
+
+### `[audio]`
+
+| Key | Type | Default | Description |
+| :-- | :-- | :-- | :-- |
+| `codec` | string | `"flac"` | Parsed, but recipe runs currently keep the source audio unchanged. |
+| `sample_rate` | integer | | Parsed and kept on the recipe, but not yet applied. |
+
+### `[[output]]`
+
+Repeat the table once per output. At least one is required.
+
+| Key | Type | Default | Description |
+| :-- | :-- | :-- | :-- |
+| `path` | string | | **Required.** Output file; the extension picks the container. |
+| `faststart` | boolean | `true` | Parsed and kept on the recipe. MP4 output is always fast-start. |
+
+## Parsing rules
+
+The recipe reader is a small, dependency-free subset of TOML:
+
+- Sections are `[input]`, `[video]`, `[audio]`, `[pipeline]` and repeated `[[output]]`. Keys outside any section are read as if they were in the section that owns them, so a flat file with `path`, `codec` and `qp` at the top also works.
+- Values are strings, integers or booleans. Arrays and inline tables are not supported.
+- `#` starts a comment anywhere on a line, including inside quoted strings, so avoid `#` in paths.
+
+## Using recipes from Rust
+
+```rust
+use ragdoll_pipeline::{PipelineRecipe, execute_recipe};
+
+let recipe = PipelineRecipe::from_toml(&std::fs::read_to_string("job.toml")?)?;
+let report = execute_recipe(&recipe)?;
+println!("{} outputs in {:.1} ms", report.output_paths.len(), report.elapsed_ms);
+
+// Recipes round-trip back to canonical TOML.
+println!("{}", recipe.to_toml());
+```

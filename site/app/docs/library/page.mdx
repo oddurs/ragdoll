@@ -1,0 +1,122 @@
+export const metadata = { title: "Library usage" };
+
+# Library usage
+
+Everything the CLI does is available from Rust. The crates are layered, so you can depend on just the part you need: a demuxer without codecs, or color conversion without containers.
+
+<Callout kind="status" title="Unstable API">
+The public API will change before 1.0. A smaller, deliberately stable facade (`Transcoder`, `Prober`, `Editor`, `Packager`) is planned for milestone M10. Until then, pin a git revision.
+</Callout>
+
+```toml title="Cargo.toml"
+[dependencies]
+ragdoll-core = { git = "https://github.com/oddurs/ragdoll", rev = "<commit>" }
+ragdoll-format = { git = "https://github.com/oddurs/ragdoll", rev = "<commit>" }
+ragdoll-pipeline = { git = "https://github.com/oddurs/ragdoll", rev = "<commit>" }
+```
+
+All fallible functions return `ragdoll_core::Result<T>`, with `RagdollError` as the error type.
+
+## Read packets from an MP4
+
+The demuxer borrows from the memory map, so iterating packets does not copy payload bytes.
+
+```rust
+use ragdoll_format::{MmapSource, Mp4Demuxer};
+
+fn main() -> ragdoll_core::Result<()> {
+    let source = MmapSource::open("sample.mp4")?;
+    let mut demuxer = Mp4Demuxer::open(source.as_slice())?;
+
+    for track in demuxer.tracks() {
+        println!(
+            "track {}: {:?}, {} samples",
+            track.track_id,
+            track.info.codec_id,
+            track.samples.len()
+        );
+    }
+
+    while let Some(packet) = demuxer.next_packet()? {
+        println!(
+            "track={} pts={}ns bytes={} key={}",
+            packet.track_index,
+            packet.pts.to_nanos().unwrap_or(0),
+            packet.data().len(),
+            packet.flags.is_keyframe(),
+        );
+    }
+    Ok(())
+}
+```
+
+`MmapSource::open("-")` reads stdin into an aligned buffer instead, so the same code works on pipes.
+
+## Work with timestamps
+
+`Timestamp` pairs a tick count with a `Rational64` timebase. Rescaling is computed in 128-bit arithmetic, so it cannot overflow even for multi-day streams at high clock rates.
+
+```rust
+use ragdoll_core::{Rational64, Timestamp};
+
+// Ten seconds on the 90 kHz MPEG-TS clock...
+let ts = Timestamp::new(900_000, Rational64::new(1, 90_000));
+
+// ...is exactly 480,000 ticks on a 48 kHz audio clock.
+let audio = ts.rescale_to(Rational64::new(1, 48_000));
+assert_eq!(audio.ticks, 480_000);
+
+println!("{}", ts.format_hms()); // 00:00:10.000
+```
+
+## Transcode a file
+
+`ragdoll-pipeline` exposes the same engine the CLI uses. `TranscodeOptions` mirrors the command-line flags.
+
+```rust
+use ragdoll_pipeline::{TranscodeOptions, transcode_file_with_options};
+use ragdoll_pix::ScaleFilter;
+
+fn main() -> ragdoll_core::Result<()> {
+    let opts = TranscodeOptions {
+        scale_dims: Some((1280, 720)),
+        scale_filter: ScaleFilter::Lanczos3,
+        qp: 22,
+        ..TranscodeOptions::default()
+    };
+
+    let report = transcode_file_with_options("input.mp4", "output.mkv", &opts)?;
+    println!(
+        "{} frames in {:.1} ms ({:.0} fps)",
+        report.frames_processed, report.elapsed_ms, report.fps
+    );
+    Ok(())
+}
+```
+
+Other entry points: `remux_file`, `extract_media`, `evaluate_media_metrics`, `synth_media`, `probe_file_detailed`, and `execute_recipe` for [TOML recipes](/docs/cli/recipes/).
+
+## Parallelize your own work
+
+`parallel_gop_map` is the scheduler underneath `transcode`. It runs a closure over a slice on scoped threads with work stealing, and returns results in input order.
+
+```rust
+use ragdoll_pipeline::parallel_gop_map;
+
+let inputs: Vec<u32> = (0..1_000).collect();
+// 0 threads = choose from CPU topology and power mode.
+let squares: Vec<u64> = parallel_gop_map(&inputs, 0, |_index, &x| (x as u64) * (x as u64));
+assert_eq!(squares[999], 998_001);
+```
+
+## Choosing crates
+
+| You want to… | Depend on |
+| :-- | :-- |
+| Parse or write a container | `ragdoll-format` (pulls in `ragdoll-core`, `ragdoll-simd`) |
+| Convert color, scale, or compute PSNR / SSIM | `ragdoll-pix` |
+| Encode or decode FLAC, H.264 or RGDI | `ragdoll-codec` |
+| Do whole-file operations like the CLI | `ragdoll-pipeline` |
+| Use only the SIMD kernels | `ragdoll-simd` |
+
+See the crate pages under [Architecture](/docs/architecture/) for the main types in each.

@@ -1,0 +1,52 @@
+export const metadata = { title: "ragdoll remux" };
+
+# ragdoll remux
+
+Copy every packet from one container into another without decoding or re-encoding. The input is memory-mapped and packets are written with vectored I/O, so a remux is usually limited by memory bandwidth.
+
+```sh
+ragdoll remux <IN> <OUT> [--format <EXT>] [--json]
+```
+
+## Options
+
+| Option | Description |
+| :-- | :-- |
+| `<IN>` | Input file, or `-` for stdin. |
+| `<OUT>` | Output file, or `-` for stdout. The container is chosen from the extension. |
+| `--format <EXT>`, `-f <EXT>` | Override the output container, for example `mkv` or `ts`. Required when `<OUT>` is `-`. |
+| `--json`, `-j` | Print the summary as JSON. |
+| `--faststart` | Accepted for compatibility and has no effect: MP4 output is always written with `moov` before `mdat`. |
+
+## Supported conversions
+
+| From ↓ / To → | MP4 / MOV | Matroska / WebM | MPEG-TS | WebVTT / SRT |
+| :-- | :-: | :-: | :-: | :-: |
+| **MP4 / MOV** | <S v="yes" /> | <S v="yes" /> | <S v="yes" /> | <S v="yes" /> |
+| **Matroska / WebM** | <S v="yes" /> | <S v="yes" /> | <S v="no" /> | <S v="yes" /> |
+| **MPEG-TS** | <S v="yes" /> | <S v="yes" /> | <S v="yes" /> | <S v="yes" /> |
+
+The WebVTT / SRT column extracts the first subtitle track. YUV4MPEG2 → YUV4MPEG2 and WAV → WAV are straight copies.
+
+Any other combination is not a remux. In that case `remux` falls back to [`transcode`](/docs/cli/transcode/) with default settings (H.264, QP 20), and the summary line will say so.
+
+## Examples
+
+```sh
+ragdoll remux input.mp4 output.mkv
+ragdoll remux input.ts output.mp4
+ragdoll remux input.mkv captions.srt
+
+# Remux to stdout and inspect the result.
+ragdoll remux input.mp4 - --format ts | ragdoll probe -
+```
+
+```text
+[ragdoll remux] sample.mp4 -> sample.mkv | frames=60 gops=1 threads=1 | in=7844139 B out=7843927 B (1.00:1) | 1.10 ms (54423.8 fps, 14.230 GB/s)
+```
+
+## What is preserved
+
+- All packets, timestamps and keyframe flags.
+- Codec configuration: H.264 `avcC` is carried into Matroska `CodecPrivate`, and converted to and from Annex-B start codes for MPEG-TS.
+- A `Cues` keyframe index is generated for Matroska output.

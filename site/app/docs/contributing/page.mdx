@@ -1,0 +1,65 @@
+export const metadata = { title: "Contributing" };
+
+# Contributing
+
+Contributions are welcome: kernels, codecs, container fixes, documentation, benchmark reports from hardware we don't have. This page is a summary; [`CONTRIBUTING.md`](https://github.com/oddurs/ragdoll/blob/main/CONTRIBUTING.md) is the authoritative version.
+
+## Ground rules
+
+- **No new dependencies.** The workspace has no third-party crates, and that is intentional. If you need something, write it in the crate where it belongs.
+- **No C, no assembly files.** Use `core::arch` intrinsics from Rust.
+- **Every optimized kernel has a scalar reference and a differential test.** See [SIMD & verification](/docs/architecture/simd/).
+- **No warnings.** CI runs Clippy with `-D warnings`.
+
+## Workflow
+
+Work is tracked with cairn items in `cairn/items/`, not in an external issue tracker. Every branch and pull request is tied to an item.
+
+```sh
+# 1. Find or create the item, and claim it.
+cairn next --view next
+cairn claim <ID>
+cairn prompt <ID>          # the item with all the context it depends on
+
+# 2. Branch from main.
+git checkout main && git pull --ff-only
+git checkout -b <type>/<ID>-<short-slug>   # e.g. kernel/0042-polyphase-resampler
+
+# 3. Make the change, then run the local gate.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cairn render
+cairn check --render --strict
+
+# 4. Record what you learned, and tick what is now true.
+cairn note <ID> "Why this approach, what you tried, what to watch for."
+cairn tick <ID> <N>
+```
+
+Then push and open a pull request using the template in `.github/pull_request_template.md`. CI runs formatting, Clippy and the full test suite on `ubuntu-24.04-arm` in a few minutes.
+
+## Commit messages
+
+```text
+<type>(<area>): <summary> (cairn #<ID>)
+```
+
+- **type** is one of `feature`, `kernel`, `benchmark`, `decision`, `bug`, `chore`, `docs`.
+- **area** is one of `core`, `simd`, `pix`, `format`, `codec-video`, `codec-audio`, `pipeline`, `cli`, `bench`, `arch`.
+
+## Good first contributions
+
+- **AVX2 kernels.** Every NEON kernel has a scalar reference and a differential test already, so an AVX2 port has a precise target. Start with `sad_plane_u8` or `find_annex_b_start_code`.
+- **Benchmark reports** from Linux on Graviton, Ampere, or Raspberry Pi 5, using `ragdoll bench --json`.
+- **Malformed inputs.** Truncated or corrupt files that make a demuxer panic instead of returning an error.
+- **Documentation.** These pages live in [`site/app/docs`](https://github.com/oddurs/ragdoll/tree/main/site/app/docs) as MDX.
+
+## Working on the website
+
+```sh
+cd site
+npm install
+npm run dev       # http://localhost:3000
+npm run build     # static export to site/out
+```

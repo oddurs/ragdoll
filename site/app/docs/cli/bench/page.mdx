@@ -1,0 +1,42 @@
+export const metadata = { title: "ragdoll bench" };
+
+# ragdoll bench
+
+Run the end-to-end benchmark suite. `bench` synthesizes its own inputs in a temporary directory, runs seven workloads in both performance and efficiency [power modes](/docs/power/), and records wall time, throughput and hardware counters for each.
+
+```sh
+ragdoll bench [--compare-ffmpeg] [--json]
+```
+
+## Options
+
+| Option | Description |
+| :-- | :-- |
+| `--compare-ffmpeg`, `-c` | Also run the equivalent `ffmpeg` / `ffprobe` command for each workload and report the speedup. Requires both on your `PATH`. |
+| `--json`, `-j` | Emit the results as JSON. |
+
+## Workloads
+
+| # | Workload | Ragdoll | FFmpeg equivalent |
+| :-- | :-- | :-- | :-- |
+| 1 | Container probe and GOP index of a 300-frame 4K MP4 | `probe` | `ffprobe -show_streams -show_packets -of json` |
+| 2 | Zero-copy remux, MP4 → MKV, 16 MB 4K | `remux` | `ffmpeg -c copy` |
+| 3 | 4K → 1080p Lanczos-3 scaling, 30 frames | `transcode --scale` | `ffmpeg -vf scale=1920:1080:flags=lanczos` |
+| 4 | Lossless FLAC encode and decode, 30 s 48 kHz stereo | `transcode` | `ffmpeg -c:a flac` |
+| 5 | 4×4 contact sheet, 16 thumbnails | `extract --thumbnails` | `ffmpeg -vf ...,tile=4x4` |
+| 6 | 4K PSNR + SSIM, 20 frames | `metrics` | `ffmpeg -lavfi psnr,ssim -f null -` |
+| 7 | 1080p H.264 transcode, 60 frames, Y4M → MP4 | `transcode` | `ffmpeg -c:v libx264` |
+
+## What is measured
+
+- **Wall time** and a workload-specific rate (files/s, GB/s, fps, × real time).
+- **Instructions retired, cycles and IPC**, from `proc_pid_rusage(RUSAGE_INFO_V4)` on macOS.
+- **Estimated energy and average power**, and the share of execution time spent on efficiency cores.
+- **Peak resident memory.**
+- For FFmpeg runs, the same counters are collected by wrapping each process in `/usr/bin/time -l`.
+
+Hardware counters are available on macOS only. On Linux the suite still reports wall time, throughput and RSS.
+
+<Callout title="Read the comparison carefully">
+Ragdoll workloads run in-process. FFmpeg workloads run as child processes, so their timings include process start-up and, for `ffprobe`, JSON serialization of every packet. That overhead dominates the shortest workloads, especially probe. See [Benchmarks](/docs/benchmarks/) for the full methodology and caveats.
+</Callout>

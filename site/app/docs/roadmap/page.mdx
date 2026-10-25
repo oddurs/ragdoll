@@ -1,0 +1,44 @@
+export const metadata = { title: "Roadmap" };
+
+# Roadmap
+
+Ragdoll's roadmap lives in the repository as Markdown files under [`cairn/items`](https://github.com/oddurs/ragdoll/tree/main/cairn/items), one per feature, kernel, benchmark or decision. [`ROADMAP.md`](https://github.com/oddurs/ragdoll/blob/main/ROADMAP.md) is generated from them. This page summarizes the milestones.
+
+## Milestones
+
+| | Milestone | Status | Scope |
+| :-- | :-- | :-- | :-- |
+| **M1** | Foundation | Done | 128-bit timebases, CICP and Oklab color, aligned frame pools, bit I/O, CRCs, core NEON kernels. |
+| **M2** | Pixels | Done | YUV ↔ RGB / NV12 / Oklab conversion, 10-bit dithering, polyphase scaling, PSNR / SSIM / MS-SSIM / VMAF-Lite. |
+| **M3** | Containers | Done | Zero-copy MP4, Matroska / WebM and MPEG-TS; Y4M, Netpbm, WAV. |
+| **M4** | Codecs | Done | FLAC, PCM, H.264 Baseline, AV1 OBU inspection, RGDI. |
+| **M5** | CLI and benchmarks | Done | GOP-parallel pipeline, TOML recipes, seven subcommands, end-to-end benchmark suite. |
+| **M6** | Streaming and A/V sync | Done | Bounded GOP-ring encoding, stdin / stdout pipes, multi-track audio, video and subtitles with 128-bit re-timing. |
+| **M7** | Production video | **In progress** | H.264: full residual coding, intra 4×4, quarter-pel motion, deblocking, Main and High profiles with CABAC, 8×8 transform, B-frames, CRF and VBV rate control. |
+| **M8** | Professional audio | Planned | AAC-LC and Opus, a Kaiser-windowed polyphase resampler, channel remixing, EBU R128 loudness and true-peak, native FLAC and Ogg containers. |
+| **M9** | Editing, images, packaging | Planned | Frame-accurate `ragdoll cut` and `ragdoll concat` that re-encode only boundary GOPs; PNG and JPEG; crop, pad, rotate, overlay and HDR tone mapping; `ragdoll package` for HLS and DASH. |
+| **M10** | 1.0 | Planned | A stable library facade (`Transcoder`, `Prober`, `Editor`, `Packager`), a 10,000-mutation zero-panic fuzz corpus, and a 12-workload release benchmark suite. |
+
+## Known gaps
+
+These are things a careful reader of the code will notice. They are tracked as roadmap work rather than hidden:
+
+- **AVX2** (`SIMD-0055`). `x86_64` currently runs the scalar reference paths. No AVX2 kernels exist yet.
+- **Streaming decode** (`0054`). `transcode`, `extract` and `metrics` decode the entire input before processing, so memory grows with input length even though encoding is bounded.
+- **H.264 compression.** The encoder falls back to `I_PCM` for blocks it cannot yet code with residuals, so files are large. This is the core of M7.
+- **No-op options** (`0057`). Recipe `start`, `duration` and `sample_rate`, `remux --faststart` and `transcode --color` are accepted but have no effect.
+- **FFmpeg kernel harness** (`BENCH-0056`). The FFmpeg side of the kernel benchmarks is not yet reproducible from the repository.
+- **Argument parsing** (`0057`). Unknown CLI options are ignored rather than rejected.
+- **Piped MPEG-TS probe** (`BUG-0053`). `probe -` can report the wrong dimensions for a transport stream on stdin.
+
+## Following along
+
+```sh
+cairn list --view now          # what is in progress
+cairn list --view next         # what is ready to start
+cairn list --view kernels      # SIMD work
+cairn list --view benchmarks   # benchmark items
+cairn list --view decisions    # architecture decision records
+```
+
+[Cairn](https://github.com/oddurs/cairn) is the tool that manages the item files. You don't need it to read them; they are plain Markdown.

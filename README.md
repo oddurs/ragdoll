@@ -1,168 +1,157 @@
-<div align="center">
-  <img src="assets/banner.svg" alt="Ragdoll — FFmpeg Reimagined in Pure SIMD Rust" width="100%" />
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/wordmark-dark-bg.svg">
+    <img src="assets/brand/wordmark-light-bg.svg" alt="ragdoll" height="64">
+  </picture>
+</p>
 
-  <br />
+<p align="center">
+  <strong>Media, from first principles.</strong><br>
+  Containers, codecs, scaling, color and quality metrics in pure Rust, with hand-written SIMD and no C libraries.
+</p>
 
-  [![CI](https://github.com/oddurs/ragdoll/actions/workflows/ci.yml/badge.svg)](https://github.com/oddurs/ragdoll/actions/workflows/ci.yml)
-  [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-38BDF8.svg)](#license)
-  [![Pure Rust](https://img.shields.io/badge/FFI-0%25%20C%20%2F%20100%25%20Rust-10B981.svg)](#architecture--the-libav-alignment)
-  [![SIMD](https://img.shields.io/badge/SIMD-AArch64%20NEON%20%2B%20x86__64%20AVX2-F97316.svg)](#benchmarks-ragdoll-vs-ffmpeg-902-apple-m4)
-  [![Roadmap](https://img.shields.io/badge/roadmap-cairn-7DD3FC.svg)](ROADMAP.md)
-</div>
+<p align="center">
+  <a href="https://github.com/oddurs/ragdoll/actions/workflows/ci.yml"><img src="https://github.com/oddurs/ragdoll/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-0E0F12" alt="License: MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/status-pre--release-FF4F2E" alt="Status: pre-release">
+</p>
 
----
-
-**Ragdoll** is a ground-up reimagining of **FFmpeg** in **100% pure Safe + Explicit SIMD Rust** with **zero C FFI dependencies**.
-
-Where FFmpeg grew over 25 years of C standards, external codec wrappers, and platform-specific assembly glue, Ragdoll asks a single question:
-
-> *How would Fabrice Bellard and Michael Niedermayer architect FFmpeg today if they started from a clean sheet with modern Rust, 64-byte cache-line-aligned arenas, zero-copy memory-mapped I/O, and first-class Apple Silicon NEON & x86_64 AVX2 intrinsics?*
-
----
-
-## Why the Logo? (The DCT Zig-Zag Homage)
-
-<img src="assets/logo.svg" align="right" width="148" height="148" alt="Ragdoll DCT Zig-Zag Logo" />
-
-Every video engineer recognizes FFmpeg's iconic green zig-zag: it is the **JPEG / MPEG / H.264 Discrete Cosine Transform (DCT) zig-zag entropy scan pattern** that orders 2D frequency coefficients from DC `(0,0)` to Nyquist `(3,3)` before run-length and Golomb coding.
-
-Ragdoll's emblem weaves that exact **$4\times4$ DCT zig-zag scan path** (`(0,0) → (1,0) → (0,1) → … → (3,3)`) through the faceted geometric mask and sapphire eyes of a Ragdoll cat—bridging FFmpeg's mathematical DNA with modern SIMD vector registers.
+<p align="center">
+  <a href="https://oddurs.github.io/ragdoll/docs/">Documentation</a> ·
+  <a href="https://oddurs.github.io/ragdoll/docs/quickstart/">Quickstart</a> ·
+  <a href="https://oddurs.github.io/ragdoll/docs/formats/">Formats &amp; codecs</a> ·
+  <a href="https://oddurs.github.io/ragdoll/docs/benchmarks/">Benchmarks</a> ·
+  <a href="ROADMAP.md">Roadmap</a>
+</p>
 
 ---
 
-## Benchmarks: Ragdoll vs. FFmpeg 9.0.2 (Apple M4)
+Ragdoll is a media framework and command-line tool written entirely in Rust. It reads and writes containers, decodes and encodes video and audio, converts color, scales images and measures quality. Every component is built from the bitstream up:
 
-Every kernel in Ragdoll is benchmarked head-to-head against **FFmpeg 9.0.2** (compiled at maximum optimization with `clang -O3 -mcpu=native`) on identical 64-byte-aligned 4K UHD (`3840x2160`) planes and `16 MB` bitstreams, and verified bit-for-bit against scalar reference implementations:
+- **No C libraries and no third-party crates.** `Cargo.lock` lists seven packages, all of them in this repository.
+- **Explicit SIMD, verified.** Hot loops are hand-written NEON intrinsics. Each kernel has a scalar reference, and the tests require the two to match bit for bit.
+- **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file; muxers write with vectored I/O; frames come from aligned, pooled buffers.
+- **A CLI with verbs.** `probe`, `remux`, `transcode`, `extract`, `metrics`. Named options, JSON output, Unix pipes, and TOML recipes.
 
-| Kernel (Apple M4 / `aarch64` NEON) | FFmpeg 9.0.2 (`clang -O3 -mcpu=native`) | **Ragdoll v0.1.0** (`cargo run --release`) | **Speedup vs. FFmpeg** | Micro-Architectural Advantage |
-| :--- | :---: | :---: | :---: | :--- |
-| **Annex-B Start-Code Scan** (`16 MB` stream w/ isolated `0x00`s) | `7.21 GB/s` | **`32.61 GB/s`** | **4.52x faster** | FFmpeg 9.0.2 has **no `aarch64` NEON start-code scanner** (`startcode.c` uses 64-bit scalar SWAR and drops to byte-by-byte on every single `0x00`). `ragdoll-simd` scans 64 bytes/iter in NEON and uses `vextq_u8` + `vandq_u8` adjacent-zero pair detection to stay in SIMD across isolated zeros. |
-| **MPEG-TS / Ogg CRC-32 & FLAC CRC-16** | `0.59 GB/s` | **`2.56 GB/s`** (CRC-32)<br>**`3.09 GB/s`** (CRC-16) | **4.34x faster** | Compile-time `const` **Slicing-by-8** (`8 x 256` lookup tables) issuing 8 independent lookups per 64-bit word (`crc16_flac`, `crc32_mpeg2`). |
-| **4K $\to$ 1080p 8-Tap Lanczos-3 Scale** (`3840x2160` $\to$ `1920x1080`) | `214.8 fps` | **`506.5 fps`** | **2.36x faster** | FFmpeg's `ff_yuv2planeX_8_neon` (`libswscale/aarch64/output.S`) processes only 8 pixels/iter and never skips zero taps. `ragdoll-pix` uses a **14-bit signed `Q6` (`i16`) 8-row L1 ring buffer** with 16-pixel `vscale` (`vqshrun_n_s32::<16>` + `vqshrn_n_u16::<4>`), zero-tap skipping, and `zimg` error-diffusion coefficient quantization. |
-| **H.264 / HEVC RBSP Unescape** (`00 00 03` $\to$ `00 00`) | `5.14 GB/s` | **`10.65 GB/s`** | **2.07x faster** | `unescape_rbsp_into` uses NEON `vceqq_u8` + `vextq_u8` + `vandq_u8` pair detection to copy 16 bytes at a time and immediately re-enters NEON after any `0x00 0x00 0x03` triad. |
-| **4K UHD Plane SSIM** (`3840x2160` $4\times4$-reuse) | `5.04 Gpx/s` | **`10.06 Gpx/s`** | **2.00x faster** | FFmpeg 9.0.2's `libavfilter/vf_ssim.c` has `x86` assembly (`vf_ssim.asm`) **but zero `aarch64` NEON assembly**. `ssim_4x4xn_u8` vectorizes 4 adjacent $4\times4$ sub-blocks (16 pixels wide $\times$ 4 rows) per NEON iteration with Bessel-corrected sample variance $N(N-1) = 64 \times 63$. |
-| **H.264 $4\times4$ Forward DCT + Inverse IDCT** | `125.50 Mblk/s` | **`191.03 Mblk/s`** | **1.52x faster** | Full in-register $4\times4$ `i16` transpose (`vtrn1`/`vtrn2`) and single-instruction rounding shift `vrshr_n_s16::<6>` (`(x + 32) >> 6`). |
-| **1080p `RGB24` $\to$ `YUV420p` (BT.709)** | `4.03 Gpx/s` | **`6.02 Gpx/s`** | **1.49x faster** | FFmpeg's `libswscale/aarch64/input.S` + `output.S` round-trips 15-bit `int16_t` intermediate rows through memory. `ragdoll-pix` fuses 2-row `vld3q_u8` luma with in-register $2\times2$ `vpaddlq_u8` + `vpadalq_u8` chroma box-averaging. |
-| **4K UHD Plane SAD / SSE** (`3840x2160`) | `32.11 Gpx/s` / `14.27 Gpx/s` | **`47.87 Gpx/s`** / **`22.65 Gpx/s`** | **1.49x / 1.59x faster** | 4-way unrolled NEON accumulators (`acc0..acc3`) per scanline saturate all 4 ASIMD execution pipes without FMA latency stalls (~**5,770 4K frames/sec** SAD). |
-| **8-Tap Polyphase H-Scale** (`3840` $\to$ `1920`) | `3.17 Gpx/s` | **`3.78 Gpx/s`** | **1.19x faster** | Unrolled 8-pixel-per-iteration `vmull_s16` + `vmlal_high_s16` + pairwise `vpaddq_s32` reduction (`libswscale/aarch64/hscale.S`) with direct `vst1_u8` / `vst1q_s16` vector stores. |
-| **10-bit `u16le` $\to$ 8-bit `u8` Ordered Bayer Dither** (`zimg` $16\times16$) | — | **`35.09 Gpx/s`** | **15.26x vs. Scalar** | Single-register `vld1q_u16` of the 16-entry row-selected $16\times16$ Bayer threshold table (`zimg/depth/dither.cpp`) + `vqaddq_u16` + `vshrn_n_u16::<2>` + `vshrn_high_n_u16::<2>`. |
+> [!NOTE]
+> Ragdoll is **pre-1.0**. Milestones M1–M6 are complete and production H.264 (M7) is in progress. The H.264 encoder is Constrained Baseline and does not yet compress competitively, `x86_64` runs scalar code paths because AVX2 kernels have not been written yet, and APIs will change. See [Known gaps](https://oddurs.github.io/ragdoll/docs/roadmap/#known-gaps).
 
-### End-to-End Application Speed & Battery Efficiency (`ragdoll bench --compare-ffmpeg`)
+## Install
 
-Ragdoll includes hardware PMU telemetry (`proc_pid_rusage(RUSAGE_INFO_V4)` on Apple Silicon + `/usr/bin/time -l` for external `ffmpeg`/`ffprobe` processes) and an **E-Core Battery-Saver Mode (`--power-mode efficiency` / `--battery-saver`)** that pins worker threads to Efficiency cores (`QOS_CLASS_BACKGROUND`), keeping high-leakage Performance cores power-gated for mobile/laptop battery preservation:
-
-| Flagship Workload (Apple M4: 4 P-Cores + 6 E-Cores) | FFmpeg 9.0.2 (`P-Cores`) | **Ragdoll P-Core Mode** (`QOS_CLASS_USER_INITIATED`) | **Ragdoll E-Core Battery Mode** (`QOS_CLASS_BACKGROUND`) | **Speedup vs. FFmpeg** | **Energy Saved vs. FFmpeg** (`P-Core` / **`E-Core`**) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **1. Container Probe & GOP Index** (`300f` 4K MP4) | `30.54 ms` (`317.2M` inst, `90.23 mJ`) | **`0.05 ms`** (**`18,898 files/s`**, `0.87M` inst, `0.23 mJ`) | **`0.13 ms`** (**`7,575 files/s`**, `100%` E-core, **`0.07 mJ` @ `0.25 W`**) | **577.2x** (`P`)<br>**251.2x** (`E`) | **386.3x less**<br>**1,346.3x less** |
-| **2. Zero-Copy Remux** (`MP4` $\to$ `MKV` `16 MB` 4K) | `36.41 ms` (`434.1M` inst, `131.13 mJ`) | **`15.98 ms`** (**`0.98 GB/s`**, `152.1M` inst, `52.71 mJ`) | **`46.65 ms`** (`143.2M` inst, `100%` E-core, **`13.55 mJ` @ `0.27 W`**) | **2.28x** (`P`) | **2.6x less**<br>**10.3x less** |
-| **3. 4K $\to$ 1080p Lanczos-3 Scaling** (`30` frames) | `90.80 ms` (`4,864.6M` inst, `1,204.4 mJ`) | **`17.37 ms`** (**`1,727.6 fps`**, `2,308.7M` inst, `4.72` IPC, `562.9 mJ`) | **`105.92 ms`** (**`283.2 fps`**, `100%` E-core, **`134.7 mJ` @ `1.27 W`**) | **5.23x** (`P`) | **2.1x less**<br>**8.9x less** |
-| **4. Lossless FLAC Encode + Decode** (`30s` 48 kHz 2ch) | `110.71 ms` (`1,768.0M` inst, `600.7 mJ`) | **`25.42 ms`** (**`1,180.2x RT`**, `571.1M` inst, `211.9 mJ`) | **`101.82 ms`** (**`294.6x RT`**, `100%` E-core, **`44.7 mJ` @ `0.41 W`**) | **4.30x** (`P`)<br>**1.11x** (`E`) | **2.8x less**<br>**13.4x less** |
-| **5. $4\times4$ Contact Sheet Extraction** (`16` Thumbs) | `28.26 ms` (`470.5M` inst, `141.5 mJ`) | **`3.93 ms`** (**`4,067.2 thumbs/s`**, `85.2M` inst, `4.87` IPC, `21.7 mJ`) | **`18.34 ms`** (**`872.4 thumbs/s`**, `99.8%` E-core, **`6.9 mJ` @ `0.29 W`**) | **7.00x** (`P`)<br>**1.35x** (`E`) | **6.3x less**<br>**19.8x less** |
-| **6. 4K Perceptual Quality Metrics** (`PSNR + SSIM`, 20f) | `168.92 ms` (`5,011.0M` inst, `1,591.0 mJ`) | **`7.70 ms`** (**`2,597.5 fps`**, `642.0M` inst, `235.8 mJ`) | **`25.15 ms`** (**`795.2 fps`**, `100%` E-core, **`50.0 mJ` @ `1.22 W`**) | **21.94x** (`P`)<br>**4.14x** (`E`) | **6.7x less**<br>**31.8x less** |
-| **7. 1080p H.264 Inter Transcode** (`60f` `Y4M` $\to$ `MP4`) | `232.98 ms` (`2,604.8M` inst, `1,550.7 mJ`) | **`46.81 ms`** (**`1,281.7 fps`**, `2,086.5M` inst, `1,013.3 mJ`) | **`187.86 ms`** (**`319.4 fps`**, `100%` E-core, **`167.8 mJ` @ `0.76 W`**) | **4.98x** (`P`)<br>**1.06x** (`E`) | **1.5x less**<br>**9.2x less** |
-
----
-
-## Architecture & The `libav*` Alignment
-
-Ragdoll preserves FFmpeg's clean separation of concerns (`libavutil`, `libswscale`, `libavfilter`, `libavformat`, `libavcodec`, `fftools`) as a **7-crate Cargo workspace**, while modernizing every boundary for zero-allocation Rust:
-
-| FFmpeg Subsystem | Ragdoll Crate | Responsibility & Modern Engineering Upgrades |
-| :--- | :--- | :--- |
-| **`libavutil`** | [`ragdoll-core`](crates/ragdoll-core) | **128-bit overflow-safe `Rational64` & `Timestamp`**: Continued-fraction convergent reduction with semiconvergent clamping (`reduce_with_max` / `av_reduce`), IEEE-754 float-to-rational recovery (`from_f64` / `av_d2q`), stateful audio `rescale_delta`, Blair–Edwards minimax $I_0(x)$ (`bessel_i0`), ITU-T H.273 (CICP) + perceptual `Oklab` colorimetry, 64-byte cache-line-aligned `FramePool` with **`dav1d` 1024-byte L1/L2 cache-set de-aliasing** (`+64B` stride padding when `stride % 1024 == 0`), 64-byte zeroed tail safety guards (`INPUT_BUFFER_PADDING_SIZE`), Slicing-by-8 CRC-8/16/32, and branchless 64-bit `CLZ` `BitReader`/`BitWriter`. |
-| **`libavutil` / DSP** | [`ragdoll-simd`](crates/ragdoll-simd) | **Explicit `aarch64` NEON & `x86_64` AVX2 Kernels**: Vectorized Annex-B start-code and MPEG-TS `0x47` sync-byte scanners, AVCC $\leftrightarrow$ Annex-B packet framing, 4K plane SAD/SSE, $4\times4$-reusing SSIM (`vf_ssim`), $4\times4$/$8\times8$ Hadamard SATD (`x264`), Q14 8-tap polyphase dot products, and $4\times4$/$8\times8$ integer DCT/IDCT transforms with bit-exact scalar fallbacks. |
-| **`libswscale` + `libavfilter`** | [`ragdoll-pix`](crates/ragdoll-pix) | **Fused L1 Scanline Strip Engine**: 14-bit signed `Q6` (`i16`) 8-row L1 ring-buffer Lanczos-3 / Spline36 (`zimg`) / Mitchell-Netravali scaling (`506.5 fps` 4K $\to$ 1080p), `zimg` error-diffusion filter tap quantization, BT.601/BT.709/BT.2020/Oklab NEON `vst3q_u8` (`RGB24`), `vst4q_u8` (`RGBA8`/`BGRA8`), and `vld2_u8` (`NV12`) color matrices (`vshrn_high_n_s32` + `vqmovun_high_s16`), $16\times16$ Bayer 10-bit $\to$ 8-bit dithering (`35.09 Gpx/s`), and perceptual metrics (`PSNR`, `SSIM`, 5-scale `MS-SSIM`, `vf_vif` linear-regression `VMAF-Lite`). |
-| **`libavformat`** | [`ragdoll-format`](crates/ragdoll-format) | **Zero-Copy Memory-Mapped Containers**: `mmap`-backed demuxers and vectored `writev` muxers for MP4/ISOBMFF (with flat 24-byte `SampleEntry` index tables), Matroska (`.mkv`)/WebM, MPEG-TS (`.ts`), YUV4MPEG2 (`.y4m`), WAV, and FLAC. |
-| **`libavcodec`** | [`ragdoll-codec`](crates/ragdoll-codec) | **100% Pure-Rust Video & Audio Codecs**: H.264/AVC (`NAL` parser, `SPS`/`PPS`/slice headers, $4\times4$/$8\times8$ integer DCT/Hadamard), AV1 OBU inspector & packetizer, **Ragdoll Fast-Intra (`RGDI`)** ultra-fast SIMD studio codec, and lossless FLAC / PCM / IMA-ADPCM audio. |
-| **`fftools` Threading** | [`ragdoll-pipeline`](crates/ragdoll-pipeline) | **Work-Stealing GOP-Parallel Pipeline**: Bounded lock-free SPSC ring buffers, independent GOP parallel transcode workers, and declarative `.toml` media pipeline recipes. |
-| **`ffmpeg` + `ffprobe`** | [`ragdoll-cli`](crates/ragdoll-cli) | **Unified Modern CLI**: Subcommand-first ergonomics (`ragdoll probe`, `remux`, `transcode`, `extract`, `metrics`, `synth`, `bench`) replacing cryptic positional flag ordering. |
-
----
-
-## Quickstart: CLI & Live Benchmark Suite
+Requires Rust 1.85 or newer. There are no system dependencies.
 
 ```sh
-git clone https://github.com/oddurs/ragdoll.git
-cd ragdoll
-
-# 1. Run head-to-head benchmarks against FFmpeg 9.0.2 across all 6 flagship workloads
-cargo run --release -- bench --compare-ffmpeg
-
-# 2. Run M1-M4 SIMD vs. Scalar bit-exact differential kernel verification
-cargo run --release -- self-test
-
-# 3. Synthesize test media, inspect with ASCII GOP Waterfall, remux, transcode, extract & score
-cargo run --release -- synth sample.mp4 --resolution 1280x720 --fps 30 --duration 2.0
-cargo run --release -- probe sample.mp4 --gop-map
-cargo run --release -- remux sample.mp4 sample.mkv --faststart
-cargo run --release -- extract sample.mp4 -o contact_sheet.ppm --thumbnails 16 --grid 4x4
-cargo run --release -- metrics sample.mp4 sample.mkv
+cargo install --git https://github.com/oddurs/ragdoll ragdoll-cli
+ragdoll --version
 ```
 
-Example output on Apple M4:
+Or build from a clone and check every SIMD kernel against its reference on your machine:
+
+```sh
+git clone https://github.com/oddurs/ragdoll.git && cd ragdoll
+cargo build --release
+cargo run --release -- self-test
+```
+
+## Usage
+
+```sh
+ragdoll synth sample.mp4 --resolution 1280x720 --duration 2   # generate test media
+ragdoll probe sample.mp4 --gop-map                             # inspect, no decoding
+ragdoll remux sample.mp4 sample.mkv                            # change container
+ragdoll transcode sample.mp4 small.mp4 --scale 640x360         # scale and re-encode
+ragdoll transcode master.wav master.flac                       # lossless audio
+ragdoll extract sample.mp4 -o sheet.ppm --thumbnails 16        # contact sheet
+ragdoll metrics sample.mp4 small.mp4                           # PSNR, SSIM, MS-SSIM
+ragdoll transcode in.mp4 - --format ts | ragdoll probe -       # pipes
+```
 
 ```text
-================================================================================
-  RAGDOLL v0.1.0 — M1 Foundation & SIMD Kernel Live Benchmark / Self-Test
-  Detected Hardware SIMD : aarch64 NEON (128-bit x 32 ASIMD)
-================================================================================
-
-[Arena] 4K UHD (3840x2160) YUV420p Frame: Y stride = 3840B (64B aligned = true), 2048px de-aliased stride = 2112B
-
-Kernel (4K 3840x2160 Luma / 16 MB Stream)      Scalar         NEON SIMD      Speedup   Check
-----------------------------------------------------------------------------------------------
-4K Plane SAD (sum |a - b|)                     19.29 Gpx/s      47.92 Gpx/s    2.48x    EXACT (49183200)
-4K Plane SSE (sum (a - b)^2)                   14.12 Gpx/s      22.29 Gpx/s    1.58x    EXACT (6295449600)
-4K Plane SSIM 4x4-Reuse (vf_ssim)               6.97 Gpx/s      10.17 Gpx/s    1.46x    EXACT (0.93131 / 11.63 dB)
-H.264 4x4 DCT+IDCT (vtrn1/vtrn2 + vrshr)       94.28 Mblk/s    187.84 Mblk/s   1.99x    EXACT
-Annex-B Start-Code Scan (isolated 0x00s)        5.21 GB/s       27.84 GB/s     5.34x    EXACT
-H.264/HEVC RBSP Unescape (vextq_u8 pair)        2.02 GB/s       13.09 GB/s     6.48x    EXACT
-1080p YUV420p -> RGB24 (BT.709 vst3q_u8)        0.87 Gpx/s       4.95 Gpx/s    5.67x    EXACT
-1080p YUV420p -> RGBA8 (BT.709 vst4q_u8)        0.79 Gpx/s       4.37 Gpx/s    5.50x    EXACT
-1080p NV12 -> RGB24 (BT.709 vld2_u8+vst3q)      0.79 Gpx/s       4.81 Gpx/s    6.05x    EXACT
-1080p RGB24 -> YUV420p (BT.709 vld3q_u8)        1.64 Gpx/s       6.02 Gpx/s    3.67x    EXACT
-1080p 10-bit -> 8-bit Bayer Dither (zimg)       2.30 Gpx/s      35.09 Gpx/s   15.26x    EXACT
-Lanczos-3 8-Tap H-Scale (4K->1080p vpaddq)      1.44 Gpx/s       3.78 Gpx/s    2.62x    EXACT
-----------------------------------------------------------------------------------------------
-[CRC Slicing-by-8] FLAC CRC-16: 3.12 GB/s | MPEG-TS CRC-32: 2.58 GB/s (crc16=0x0000, crc32=0x00000000)
-[CLZ Bitstream]    512 Exp-Golomb ue(v) + Signed Rice(k=4) + RBSP stop-bit verified in 819 bytes
-[128-bit Time]     48h MPEG-TS 90kHz -> Nanoseconds exact: 48:00:00.000 (172800000000000 ns), 8x8 SATD = 4096
-[M2 Pix & Quality] 4K->1080p Lanczos-3 Q6 L1 Ring-Buffer: 506.5 fps | 4K Quality: PSNR=19.33 dB, SSIM=0.93131, MS-SSIM=0.98505, VMAF-Lite=85.51
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ RAGDOLL PROBE : sample.mp4                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Container     : mp4/isobmff        File Size :      7844139 B (7.48 MB)      │
+│ Probe Latency :    42.75 µs         GOP Count :           10                 │
+│ H.264 Profile : Constrained Baseline (level 4.0)                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Track #0  [Video] codec=h264 1280x720 @ 30.000 fps (30/1) fmt=yuv420p        │
+│   Colorimetry : primaries=BT709, transfer=BT709, matrix=BT709, range=Limited
+│   Samples     : 60 packets (7842908 bytes)
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+The [CLI reference](https://oddurs.github.io/ragdoll/docs/cli/) covers every subcommand and option.
 
-## Roadmap & Project Tracking
+## What it supports
 
-Ragdoll tracks its architecture decisions (`ADR-*`), SIMD kernels (`SIMD-*`), benchmarks (`BENCH-*`), and milestones in-tree using [**Cairn**](https://github.com/oddurs/cairn).
+| | Read / decode | Write / encode |
+| :-- | :-- | :-- |
+| **Containers** | MP4 / MOV, Matroska, WebM, MPEG-TS (188/192/204), Y4M, WAV / RF64, FLAC, Netpbm, WebVTT, SRT | MP4 (fast-start and fragmented), Matroska, MPEG-TS, Y4M, WAV, FLAC, Netpbm, WebVTT, SRT |
+| **Video** | H.264 Constrained Baseline, RGDI | H.264 Constrained Baseline, RGDI |
+| **Audio** | FLAC, PCM (u8 / s16 / s24 / s32 / f32) | FLAC, PCM |
+| **Pass-through** | HEVC, VP9, AV1, AAC, Opus are carried through containers without decoding | |
+| **Pixels** | YUV 4:2:0 / 4:2:2 / 4:4:4, NV12, 10-bit, RGB24, RGBA, BGRA, Oklab; BT.601 / 709 / 2020; Lanczos-3, Spline36, Mitchell, bilinear scaling | |
+| **Metrics** | PSNR, SSIM, MS-SSIM, VMAF-Lite | |
 
-- Browse the generated roadmap in [**`ROADMAP.md`**](ROADMAP.md).
-- Query ready work from the CLI:
-  ```sh
-  cairn list
-  cairn next --view next
-  ```
+The [full matrix](https://oddurs.github.io/ragdoll/docs/formats/) lists every limitation.
 
-| Milestone | Status | Focus |
-| :--- | :---: | :--- |
-| **`m1-foundation`** | **Done** | 128-bit `Rational64`/`Timestamp`, CICP/Oklab colorimetry, 64B cache-aligned `FramePool`, 64-bit `CLZ` bitstreams, Slicing-by-8 CRCs, and NEON/AVX2 core primitives (`SAD`, `SSE`, `SSIM`, `SATD`, `DCT`, `Annex-B`, `RBSP`). |
-| **`m2-pix`** | **Done** | Fused L1 scanline YUV/NV12 $\leftrightarrow$ RGB24/RGBA8/BGRA8/Oklab color matrices (`4.37–6.02 Gpx/s`), $16\times16$ Bayer 10-bit dithering (`35.09 Gpx/s`), 14-bit `Q6` L1 ring-buffer Lanczos-3/Spline36/Bicubic 4K scaling (`506.5 fps`), and perceptual quality metrics (`PSNR`, `SSIM`, `MS-SSIM`, `VMAF-Lite`). |
-| **`m3-format`** | **Done** | Zero-copy `mmap` MP4/ISOBMFF demuxer (`900+ GB/s` slice emission, 24-byte `SampleEntry` index, $O(\log N)$ keyframe seeking, single-pass Fast-Start `moov`-before-`mdat` muxer), Matroska (`.mkv`)/WebM (`35.8 GB/s` transmux), SIMD-synced 188B MPEG-TS (`.ts`, `11.8 GB/s` transmux), YUV4MPEG2 (`.y4m`), Netpbm (`P6`/`P5` + contact sheet), and RIFF WAV. |
-| **`m4-codec`** | **Done** | Pure-Rust SIMD PCM & RFC 9639 lossless FLAC audio (`935x RT`), H.264/AVC RBSP `SPS`/`PPS`/`Slice`/`SEI` + CAVLC Baseline encoder/decoder, AV1 OBU inspector & IVF demuxer, and **Ragdoll Fast-Intra (`RGDI`)** NEON studio codec (`887 fps` 4K encode, `1,017 fps` 4K decode at `51.14 dB` PSNR). |
-| **`m5-cli-bench`** | **Done** | Lock-free work-stealing GOP-parallel pipeline (`parallel_gop_map`), declarative `.toml` recipe runner, 7-subcommand `ragdoll` CLI with ASCII GOP Waterfall & sparkline UI, and automated `ragdoll bench --compare-ffmpeg` suite beating FFmpeg 9.0.2 across all 7 flagship workloads. |
-| **`m6-streaming-av-sync`** | **Planned** | Bounded-memory `GopRingPipeline` (`< 256 MiB` RAM cap for multi-hour 4K streams), `stdin`/`stdout` pipe I/O, and default multi-track Video + Audio + Subtitle (`WebVTT`/`SRT`) preservation with 128-bit `Timestamp` lip-sync. |
-| **`m7-video-production`** | **Planned** | Production H.264/AVC: full $4\times4$ & $8\times8$ AC/DC residual coding (zero `I_PCM` fallback), 6-tap quarter-pel motion refinement, in-loop deblocking, Main/High Profile **CABAC** + B-frame decoding, and perceptual `--crf` + VBV rate control. |
-| **`m8-audio-pro`** | **Planned** | Pure-Rust **AAC-LC** & **Opus** MDCT/IMDCT audio codecs, SIMD windowed-sinc Kaiser (`bessel_i0`) polyphase resampler (`44.1 kHz <-> 48 kHz`), `5.1/7.1 <-> Stereo` matrix mixing, and **EBU R128 (`LUFS`) + True-Peak** loudness normalization. |
-| **`m9-edit-image-package`** | **Planned** | Opinionated **Smart-GOP `ragdoll cut` & `ragdoll concat`** (boundary-only re-encode + zero-copy `mmap` interior GOP splice), pure-Rust `.png`/`.jpg` I/O, fused L1 spatial/HDR filters (`crop`, `pad`, `rotate`, `overlay`, Oklab `tonemap`), and one-command **`ragdoll package`** (CMAF HLS + DASH ABR ladder). |
-| **`m10-production-v1`** | **Planned** | Ergonomic zero-`unsafe` `ragdoll` Rust library SDK (`Transcoder`, `Prober`, `Editor`, `Packager`), 10,000-mutation zero-panic bitstream fuzz suite, and 12-workload `v1.0` head-to-head benchmark vs. FFmpeg 9.0.2. |
+## Workspace
 
----
+| Crate | Role |
+| :-- | :-- |
+| [`ragdoll-core`](crates/ragdoll-core) | 128-bit timebases, CICP colorimetry, aligned frames and pools, packets, bit I/O, CRCs, power modes |
+| [`ragdoll-simd`](crates/ragdoll-simd) | NEON kernels with scalar twins: start-code scanning, SAD / SSE / SATD / SSIM, integer transforms |
+| [`ragdoll-pix`](crates/ragdoll-pix) | Color conversion, polyphase scaling, dithering, quality metrics |
+| [`ragdoll-format`](crates/ragdoll-format) | Memory-mapped demuxers and vectored muxers |
+| [`ragdoll-codec`](crates/ragdoll-codec) | H.264, FLAC, PCM, RGDI; AV1 OBU inspection |
+| [`ragdoll-pipeline`](crates/ragdoll-pipeline) | GOP-parallel scheduling, bounded-memory encoding, A/V sync, TOML recipes |
+| [`ragdoll-cli`](crates/ragdoll-cli) | The `ragdoll` binary |
+
+Read the [architecture overview](https://oddurs.github.io/ragdoll/docs/architecture/) for how they fit together.
+
+## Performance
+
+Selected single-threaded kernels on an Apple M4, against FFmpeg 9.0.2 built with `clang -O3 -mcpu=native`:
+
+| Kernel | FFmpeg 9.0.2 | Ragdoll | |
+| :-- | --: | --: | --: |
+| Annex-B start-code scan | 7.21 GB/s | 32.61 GB/s | 4.52× |
+| 4K → 1080p Lanczos-3 | 214.8 fps | 506.5 fps | 2.36× |
+| H.264 RBSP unescape | 5.14 GB/s | 10.65 GB/s | 2.07× |
+| 4K plane SSIM | 5.04 Gpx/s | 10.06 Gpx/s | 2.00× |
+| H.264 4×4 DCT + IDCT | 125.5 Mblk/s | 191.0 Mblk/s | 1.52× |
+
+These figures come from one machine. The Ragdoll column is reproducible with `ragdoll self-test`; the FFmpeg column was measured out of tree and its harness is not yet in the repository. End-to-end comparisons run with `ragdoll bench --compare-ffmpeg`. Read the [methodology and caveats](https://oddurs.github.io/ragdoll/docs/benchmarks/) before quoting any of them.
+
+## Roadmap
+
+| Milestone | Status | |
+| :-- | :-- | :-- |
+| M1 Foundation · M2 Pixels · M3 Containers · M4 Codecs · M5 CLI & bench · M6 Streaming & sync | Done | |
+| M7 Production video | In progress | Full H.264 residuals, quarter-pel, deblocking, CABAC, B-frames, CRF |
+| M8 Professional audio | Planned | AAC-LC, Opus, resampling, EBU R128 |
+| M9 Edit & package | Planned | Smart-GOP cut / concat, PNG / JPEG, filters, HLS / DASH |
+| M10 1.0 | Planned | Stable SDK, fuzzing, release benchmarks |
+
+Work is tracked as Markdown files in [`cairn/items`](cairn/items), and [`ROADMAP.md`](ROADMAP.md) is generated from them.
+
+## Contributing
+
+Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. The short version:
+
+- No new dependencies and no C. Write it in Rust, in the crate where it belongs.
+- Every optimized kernel needs a scalar reference and a differential test.
+- `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` and `cairn check --render --strict` must pass.
+
+AVX2 ports of the existing NEON kernels are a good place to start: each one already has a reference and tests to match.
+
+The website and docs live in [`site/`](site) (Next.js, static export): `cd site && npm install && npm run dev`.
 
 ## License
 
-Unlike FFmpeg's complex LGPLv2.1+ / GPLv2+ / GPLv3 build-configuration matrix, Ragdoll is dual-licensed under your choice of:
+Dual-licensed under either of
 
-- **MIT License** ([`LICENSE-MIT`](LICENSE-MIT))
-- **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT License ([`LICENSE-MIT`](LICENSE-MIT))
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
 
-at your option, with zero copyleft or patent-encumbered external C library dependencies.
+at your option. Unless you explicitly state otherwise, any contribution you submit for inclusion is dual-licensed as above, without additional terms or conditions.

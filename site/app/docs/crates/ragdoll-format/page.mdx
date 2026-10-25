@@ -1,0 +1,64 @@
+export const metadata = { title: "ragdoll-format" };
+
+# ragdoll-format
+
+Container demuxers and muxers. Demuxers work on a borrowed byte slice, usually a memory map, and return packets that borrow from it. See [Formats & codecs](/docs/formats/) for the support matrix.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-format)
+
+## I/O
+
+| Type | Purpose |
+| :-- | :-- |
+| `MmapSource` | Read-only memory map of a file. `open("-")` reads stdin into an aligned buffer instead. |
+| `StreamSource` | Chunked reader for sequential inputs. |
+| `OutputSink` | Buffered writer to a file or, for `-`, stdout. |
+| `VectoredWriter` | Collects buffers and writes them with `writev`. |
+
+## Modules
+
+### `mp4`: ISOBMFF, MP4, QuickTime
+
+- `Mp4Demuxer::open(&[u8])` parses the box tree and builds one `Mp4TrackIndex` per track, each with a flat `Vec<SampleEntry>`.
+- `next_packet()` iterates in file order; `packet_at(track, sample)` gives random access; `seek_to_timestamp` finds the nearest preceding keyframe by binary search.
+- `Mp4Muxer` writes a fast-start file with `finish(writer)`, or a fragmented one (initialization `moov` plus `moof` / `mdat` pairs) with `finish_fragmented`. It writes `avcC`, `colr`, and WebVTT `wvtt` sample entries.
+
+### `mkv`: Matroska and WebM
+
+- `MkvDemuxer` decodes EBML with branchless count-leading-zeros VINT parsing and reads `SimpleBlock` and `BlockGroup` payloads in place.
+- `MkvMuxer` writes `Info`, `Tracks`, clusters of `SimpleBlock`s and a `Cues` keyframe index.
+
+### `mpegts`: MPEG-2 Transport Stream
+
+- `MpegTsDemuxer` auto-detects 188, 192 and 204-byte packet strides (`detect_mpegts_stride_and_sync`) and finds sync bytes with the SIMD scanner. It parses PAT and PMT, reassembles PES packets, and decodes 33-bit PTS and DTS.
+- `MpegTsMuxer` writes 188-byte TS or 192-byte M2TS packets with PAT, PMT and SDT tables (CRC-32) and PCR clock references. It converts H.264 to Annex-B framing (`h264_avcc_to_annex_b_au`) and wraps AAC in ADTS (`aac_raw_to_adts`).
+
+### `y4m`, `wav`, `ppm`, `subtitle`
+
+- `Y4mDemuxer` / `Y4mMuxer`: YUV4MPEG2 uncompressed video, zero-copy on read.
+- `WavDemuxer` / `WavMuxer`: RIFF, RF64 and BW64 WAVE with PCM and IEEE float.
+- `read_pnm_image` / `write_pnm_image`: Netpbm `P6` and `P5`. `compose_contact_sheet_rgb24` tiles frames into a grid.
+- `SubtitleDemuxer` / `SubtitleMuxer`: WebVTT and SubRip, with millisecond timestamp parsing and formatting, plus `wrap_mp4_wvtt_sample` / `unwrap_mp4_wvtt_sample` for subtitles inside MP4.
+
+## Transmuxing helpers
+
+`transmux_mp4_to_mkv`, `transmux_mp4_to_mpegts`, `transmux_mkv_to_mp4`, `transmux_mpegts_to_mp4` and `transmux_mpegts_to_mkv` each take an input slice and a writer, and are what `ragdoll remux` calls.
+
+`detect_container_format(&[u8])` identifies a container from its first bytes.
+
+## Example
+
+```rust
+use ragdoll_format::{MmapSource, Mp4Demuxer};
+
+let source = MmapSource::open("movie.mp4")?;
+let demuxer = Mp4Demuxer::open(source.as_slice())?;
+let video = &demuxer.tracks()[0];
+
+// The keyframe at or before 60 seconds, in track ticks.
+let target = 60 * video.info.timebase.den / video.info.timebase.num.max(1);
+if let Some(i) = video.seek_keyframe_index(target) {
+    let packet = demuxer.packet_at(0, i)?;
+    println!("keyframe {i} at byte {}", packet.file_offset);
+}
+```

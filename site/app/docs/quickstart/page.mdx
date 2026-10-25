@@ -1,0 +1,119 @@
+export const metadata = { title: "Quickstart" };
+
+# Quickstart
+
+This walkthrough generates its own test media, so you don't need any sample files. It takes about five minutes and touches every subcommand.
+
+## 1. Generate test media
+
+[`synth`](/docs/cli/synth/) writes procedural video (SMPTE-style bars and moving patterns) or audio (a stereo tone). The output format follows the file extension.
+
+```sh
+ragdoll synth sample.mp4 --resolution 1280x720 --fps 30 --duration 2
+ragdoll synth tone.wav --duration 3
+```
+
+```text
+[ragdoll synth] procedural://1280x720@30fps -> sample.mp4 | frames=60 gops=4 threads=10 | ... | 71.74 ms (836.4 fps, 1.266 GB/s)
+[ragdoll synth-audio] procedural://audio -> tone.wav | frames=1 gops=1 threads=1 | ... | 1.45 ms
+```
+
+Every command ends with a one-line report: frames processed, GOPs, worker threads, bytes in and out, and wall time.
+
+## 2. Inspect it
+
+[`probe`](/docs/cli/probe/) reads the container index without decoding anything. Add `--gop-map` to see the keyframe structure.
+
+```sh
+ragdoll probe sample.mp4 --gop-map
+```
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ RAGDOLL PROBE : sample.mp4                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Container     : mp4/isobmff        File Size :      7844139 B (7.48 MB)      │
+│ Probe Latency :   112.00 µs         GOP Count :           10                 │
+│ H.264 Profile : Constrained Baseline (level 4.0)                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Track #0  [Video] codec=h264 1280x720 @ 30.000 fps (30/1) fmt=yuv420p        │
+│   Colorimetry : primaries=BT709, transfer=BT709, matrix=BT709, range=Limited
+│   Samples     : 60 packets (7842908 bytes)
+└──────────────────────────────────────────────────────────────────────────────┘
+
+ASCII GOP Waterfall (I/P Packet Size Distribution):
+  #000 [GOP 01 I-KEY]  573266 B |███████████████████████████████
+  #001 [GOP 01 P-INT]    7190 B |▒
+  #002 [GOP 01 P-INT]   33834 B |▒
+  ...
+```
+
+Use `--json` when you want to script against it.
+
+## 3. Change containers
+
+[`remux`](/docs/cli/remux/) moves packets between containers without decoding. It is limited by memory bandwidth, not by codec work.
+
+```sh
+ragdoll remux sample.mp4 sample.mkv
+ragdoll remux sample.mp4 sample.ts
+```
+
+```text
+[ragdoll remux] sample.mp4 -> sample.mkv | frames=60 | in=7844139 B out=7843927 B | 1.10 ms (14.230 GB/s)
+[ragdoll remux] sample.mp4 -> sample.ts  | frames=60 | in=7844139 B out=8024780 B | 1.45 ms (10.962 GB/s)
+```
+
+## 4. Re-encode
+
+[`transcode`](/docs/cli/transcode/) decodes, optionally scales, and re-encodes across GOP-parallel workers.
+
+```sh
+ragdoll transcode sample.mp4 small.mp4 --scale 640x360 --qp 24
+ragdoll transcode tone.wav tone.flac
+```
+
+```text
+[ragdoll transcode] sample.mp4 -> small.mp4 | frames=60 gops=10 threads=10 | ... | 30.45 ms (1970.6 fps)
+[ragdoll transcode-audio] tone.wav -> tone.flac | ... | in=576044 B out=137827 B (4.18:1) | 0.81 ms
+```
+
+## 5. Pull out frames
+
+[`extract`](/docs/cli/extract/) writes a single frame at a timestamp, or a tiled contact sheet.
+
+```sh
+ragdoll extract sample.mp4 frame.ppm --at 1.0
+ragdoll extract sample.mp4 -o sheet.ppm --thumbnails 16 --grid 4x4
+```
+
+## 6. Measure quality
+
+[`metrics`](/docs/cli/metrics/) compares a distorted file against a reference. A remux is lossless, so this pair scores perfectly:
+
+```sh
+ragdoll metrics sample.mp4 sample.mkv
+```
+
+```text
+│ PSNR (dB)     : Y=inf dB | U=inf dB | V=inf dB | Avg=inf dB (6:1:1=inf dB)
+│ SSIM (8x8)    : Y=1.00000 (inf dB) | Avg=1.00000 | 5-Scale MS-SSIM=1.00000
+│ VMAF-Lite     : 100.00 / 100.0
+```
+
+## 7. Use pipes
+
+Use `-` as a path to read from stdin or write to stdout. When stdout is the output and no format is given, Ragdoll writes MPEG-TS.
+
+```sh
+ragdoll transcode sample.mp4 - --format ts | ragdoll probe -
+```
+
+## Next steps
+
+<Cards>
+  <Card title="CLI overview" href="/docs/cli/">Global options, conventions and output formats.</Card>
+  <Card title="Pipeline recipes" href="/docs/cli/recipes/">Describe a multi-output job in TOML.</Card>
+  <Card title="Formats & codecs" href="/docs/formats/">What each container and codec supports today.</Card>
+  <Card title="Benchmarks" href="/docs/benchmarks/">Run the end-to-end suite on your machine.</Card>
+</Cards>

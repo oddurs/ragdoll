@@ -1,0 +1,69 @@
+export const metadata = { title: "Memory model" };
+
+# Memory model
+
+Media processing is mostly moving bytes. Ragdoll's memory model is designed so that bytes move as few times as possible, land where the CPU wants them, and are reused instead of reallocated.
+
+## Inputs are mapped, not read
+
+`MmapSource` maps an input file read-only and hands out `&[u8]` views of it. Demuxers work directly on that slice. A packet is a `PacketSlice<'mmap>`: its payload is a borrowed sub-slice of the map, and the lifetime ties it to the source so the borrow checker prevents use after unmap.
+
+```rust
+pub struct PacketSlice<'a> {
+    pub payload: PacketPayload<'a>, // Borrowed from the map, or owned after transformation
+    pub track_index: u32,
+    pub pts: Timestamp,
+    pub dts: Timestamp,
+    pub duration: i64,
+    pub flags: PacketFlags,
+    pub file_offset: u64,
+}
+```
+
+When a packet has to be changed (for example, converting H.264 between AVCC and Annex-B framing), the payload becomes an owned `AlignedBuffer`. Everything else stays borrowed.
+
+Non-seekable inputs (stdin and FIFOs) are read once into an aligned buffer, and the same slice-based code runs on that.
+
+## Outputs are gathered, not concatenated
+
+Muxers collect headers, payload slices and trailers as a list of buffers and write them through `VectoredWriter`, which issues vectored `writev` calls instead of first copying everything into one contiguous buffer. Every muxer in `ragdoll-format` (MP4, Matroska, MPEG-TS, Y4M, WAV and Netpbm) writes this way.
+
+## Sample indexes are flat
+
+Containers describe samples in different ways: MP4 uses `stts` / `ctts` / `stsz` / `stco` tables, Matroska uses clusters and block headers. The MP4, Matroska and Y4M demuxers flatten these into one `Vec<SampleEntry>` per track:
+
+```rust
+#[repr(C)]
+pub struct SampleEntry {
+    pub offset: u64,        // Byte offset of the payload in the source
+    pub pts: i64,           // Timestamp in track timebase
+    pub size: u32,          // Payload size
+    pub cts_and_flags: u32, // Bit 31: keyframe; bits 0–30: signed composition offset
+}
+```
+
+At 24 bytes, 2.66 entries fit in a 64-byte cache line. Keyframe seeks are a binary search over this array, and GOP partitioning is a single linear pass.
+
+## Frames are aligned and padded
+
+Every plane lives in an `AlignedBuffer`:
+
+- **64-byte aligned**, the size of a cache line and of four NEON registers.
+- **Zero-padded by 64 bytes** past the logical end (`INPUT_BUFFER_PADDING_SIZE`), so unrolled vector loads and 64-bit bitstream refills at the very end of a plane or packet never read out of bounds.
+- **Strided to avoid cache-set aliasing.** `optimal_plane_stride` rounds each row up to a multiple of 64 bytes, and when the result is an exact multiple of 1024 bytes adds one more cache line. Without that, vertically adjacent pixels in power-of-two-wide frames map to the same L1 set and evict each other during vertical filtering. A 2048-pixel luma row gets a 2112-byte stride.
+
+## Frames are pooled
+
+`FramePool` is a thread-safe recycling arena for frames of a given shape. Releasing a frame returns its buffers to the pool; the next request for the same dimensions reuses them without touching the allocator or faulting in new pages. A pool caches at most a fixed number of frames and bytes (512 MiB by default); frames released beyond that are freed.
+
+## Working sets are bounded
+
+`GopRingPipeline` decides how many GOPs to process at once from the source and destination frame sizes and a memory budget: 256 MiB by default, 64 MiB in [efficiency mode](/docs/power/). Each wave scales and encodes its GOPs in parallel, returns its frames to the pool, and hands encoded packets to the muxer before the next wave starts.
+
+<Callout kind="warning" title="Current limitation">
+Decoding is not yet part of the bounded wave. `transcode`, `extract` and `metrics` decode the full input before processing it, so their peak memory still grows with input length. Moving decode into the ring is the remaining step toward constant-memory transcoding of arbitrarily long inputs.
+</Callout>
+
+## Pixel stages stay in L1
+
+The scaler is separable, with a horizontal and a vertical pass. Instead of writing a whole horizontally-scaled image and reading it back, it keeps a ring buffer of eight horizontally-filtered rows in 14-bit `Q6` fixed point (`i16`). Each output row is produced as soon as its eight input rows are in the ring. For a 4K row the ring is about 60 KB, which fits in L1 on current Apple cores, so the intermediate image never reaches main memory.

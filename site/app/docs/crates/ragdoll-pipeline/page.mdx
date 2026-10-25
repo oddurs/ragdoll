@@ -1,0 +1,58 @@
+export const metadata = { title: "ragdoll-pipeline" };
+
+# ragdoll-pipeline
+
+Parallel scheduling, A/V synchronization, TOML recipes, and the whole-file operations the CLI is built on.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-pipeline)
+
+## Scheduling
+
+### `partition_into_gops`
+
+Splits a `SampleEntry` slice into index ranges at keyframes. Because each GOP starts with an IDR frame, GOPs can be decoded and encoded independently.
+
+### `parallel_gop_map`
+
+```rust
+pub fn parallel_gop_map<T, R, F>(items: &[T], num_threads: usize, worker_fn: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &T) -> R + Sync;
+```
+
+Runs `worker_fn(index, &item)` for every item on `std::thread::scope` threads. Workers claim the next index from a shared `AtomicUsize`, so a slow GOP never holds up a fast thread, and results are returned in input order. `num_threads = 0` chooses a count from the CPU topology and the current [power mode](/docs/power/).
+
+### `GopRingPipeline`
+
+A bounded-memory executor. Given source and destination dimensions, `max_gops_per_wave` works out how many GOPs fit in the memory budget at once. `encode_gops_bounded` then scales and encodes the frames wave by wave, recycling buffers through a `FramePool`, and returns the encoded GOPs together with `GopRingStats` (waves, peak wave memory, pool hits and allocations).
+
+```rust
+use ragdoll_pipeline::GopRingPipeline;
+
+let ring = GopRingPipeline::with_budget_bytes(8, 128 * 1024 * 1024);
+```
+
+## A/V sync
+
+`AvSyncController` rescales audio, subtitle and video packets into an output timebase with 128-bit arithmetic, carrying rounding remainders between audio packets so long runs do not drift. `interleave_packets_dts` orders packets from every track by decode timestamp, and `compute_av_drift_ms` reports the end-to-end offset between tracks.
+
+## Recipes
+
+`PipelineRecipe::from_toml`, `to_toml` and `execute_recipe`. See [Pipeline recipes](/docs/cli/recipes/).
+
+## Whole-file operations
+
+| Function | CLI equivalent |
+| :-- | :-- |
+| `probe_file_detailed(path)` → `ProbeReport` | `probe` |
+| `remux_file(in, out)`, `remux_file_with_format(in, out, format)` | `remux` |
+| `transcode_file_with_options(in, out, &TranscodeOptions)` | `transcode` |
+| `extract_media(in, out, at_seconds, thumbnails)` | `extract` |
+| `evaluate_media_metrics(reference, distorted)` | `metrics` |
+| `synth_media(out, width, height, fps, seconds)` | `synth` |
+
+Each one except `probe_file_detailed` and `evaluate_media_metrics` returns a `PipelineTelemetry` with frame, GOP, thread and byte counts, elapsed time, frame rate, bandwidth and compression ratio.
+
+Lower-level helpers are public too: `decode_video_file`, `decode_video_bytes`, `parallel_scale_frames`, `extract_auxiliary_tracks` and `synth_video_frame`.

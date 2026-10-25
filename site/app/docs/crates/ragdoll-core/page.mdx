@@ -1,0 +1,59 @@
+export const metadata = { title: "ragdoll-core" };
+
+# ragdoll-core
+
+The shared vocabulary of the workspace: time, color, frames, packets, bit I/O, checksums, errors and power management. It has no dependencies.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-core)
+
+## Modules
+
+| Module | Contents |
+| :-- | :-- |
+| `time` | `Rational64`, `Timestamp`, `Rounding`, `rescale_q`, `rescale_delta`, `compare_ts`, `bessel_i0` |
+| `color` | `Colorimetry`, `ColorPrimaries`, `TransferCharacteristics`, `MatrixCoefficients`, `ColorRange`, `ChromaLocation`, `Chromaticities` |
+| `format` | `PixelFormat`, `SampleFormat`, `ChannelLayout` |
+| `frame` | `AlignedBuffer`, `Plane`, `VideoFrame`, `AudioFrame`, `FramePool`, `PooledVideoFrame`, `optimal_plane_stride` |
+| `packet` | `PacketSlice`, `PacketPayload`, `PacketFlags`, `SampleEntry`, `TrackInfo`, `CodecId`, `TrackType` |
+| `bitstream` | `BitReader`, `BitWriter`, RBSP escaping, EBML VINT and LEB128 helpers |
+| `crc` | CRC-8 and CRC-16 (FLAC), CRC-32 (MPEG-2 and Ogg) |
+| `power` | `PowerMode`, `CpuTopology`, `HardwareMetrics`, `measure_hardware_metrics` |
+| `error` | `RagdollError`, `Result` |
+
+## Time
+
+`Rational64` is a reduced `num/den` pair. Reduction uses continued-fraction convergents with semiconvergent clamping (the same algorithm as FFmpeg's `av_reduce`), and `Rational64::from_f64` recovers a rational from a float the way `av_d2q` does.
+
+`Timestamp` pairs `ticks: i64` with a `timebase: Rational64`. `rescale_to` and `rescale_to_rnd` compute `ticks × a / b` in 128-bit arithmetic with explicit rounding modes, so conversions between clocks (90 kHz, 48 kHz, nanoseconds, 1/1001 frame rates) are exact and never overflow. `Timestamp::NONE` marks a missing timestamp.
+
+`rescale_delta` carries the rounding remainder across successive audio packets, so long runs of resampled timestamps do not drift.
+
+```rust
+use ragdoll_core::{Rational64, Timestamp};
+
+let pts = Timestamp::new(172_800 * 90_000, Rational64::new(1, 90_000)); // 48 hours at 90 kHz
+assert_eq!(pts.to_nanos(), Some(172_800_000_000_000));
+assert_eq!(pts.format_hms(), "48:00:00.000");
+```
+
+## Color
+
+`Colorimetry` holds ITU-T H.273 (CICP) code points. The MP4 demuxer and muxer read and write it as `colr` (`nclx`) boxes, the H.264 encoder signals it in the VUI, and `ragdoll-pix` reads it when choosing a conversion matrix. `Chromaticities` provides the CIE xy primaries and white point for each `ColorPrimaries` value.
+
+## Frames and buffers
+
+- `AlignedBuffer`: 64-byte-aligned, zero-initialized, with 64 bytes of zeroed tail padding.
+- `Plane`: a buffer plus width, height and stride.
+- `VideoFrame`: up to four planes, a `PixelFormat`, `Colorimetry`, timestamp and picture type.
+- `AudioFrame`: interleaved samples with rate, channel count, layout and sample format.
+- `FramePool`: thread-safe recycling of `VideoFrame`s with frame-count and byte limits.
+
+See [Memory model](/docs/architecture/memory/) for why these are shaped the way they are.
+
+## Bit I/O
+
+`BitReader` reads big-endian bit fields with a 64-bit cache refilled in one load, and decodes Exp-Golomb (`ue(v)`, `se(v)`) and Rice codes with a single count-leading-zeros instruction. `BitWriter` is the inverse. `unescape_rbsp` and `escape_rbsp` remove and insert H.264 / HEVC emulation-prevention bytes; the unescape path uses a NEON fast path for long runs without `00 00 03`.
+
+## Power
+
+`PowerMode` selects a scheduling profile; `with_power_mode` applies one for the duration of a closure. `CpuTopology::detect()` reports logical, performance and efficiency core counts and cache sizes. `measure_hardware_metrics` wraps a closure and returns wall and CPU time, instructions, cycles, IPC, estimated energy and peak RSS. See [Power modes](/docs/power/).

@@ -1,0 +1,67 @@
+export const metadata = { title: "ragdoll metrics" };
+
+# ragdoll metrics
+
+Measure how closely a distorted video matches a reference. Frames are compared pairwise in decode order, and per-frame scores are averaged.
+
+```sh
+ragdoll metrics <REFERENCE> <DISTORTED> [--json]
+```
+
+The reference comes first. Both inputs must have the same dimensions; scale one with [`transcode --scale`](/docs/cli/transcode/) first if they don't.
+
+## Metrics
+
+| Metric | Planes | Description |
+| :-- | :-- | :-- |
+| **PSNR** | Y, U, V, average, 6:1:1 | Peak signal-to-noise ratio in dB. The 6:1:1 value weights luma six times each chroma plane, as is conventional for codec comparisons. |
+| **SSIM** | Y, average | Structural similarity over 8×8 windows, also reported in dB as `-10·log10(1 − SSIM)`. |
+| **MS-SSIM** | Y | Five-scale multi-scale SSIM with the standard Wang et al. weights. |
+| **VMAF-Lite** | Y | A fast approximation of VMAF built from a VIF-style information-fidelity term. Useful for tracking changes; it is not a substitute for libvmaf scores. |
+
+All metrics operate on 8-bit planes and use SIMD kernels on `aarch64`.
+
+## Example
+
+```sh
+ragdoll transcode sample.mp4 q30.mp4 --qp 30
+ragdoll metrics sample.mp4 q30.mp4
+```
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ RAGDOLL PERCEPTUAL QUALITY METRICS (60 frames in 67.23 ms / 892.4 fps)
+├──────────────────────────────────────────────────────────────────────────────┤
+│ PSNR (dB)     : Y=53.86 dB | U=56.88 dB | V=50.88 dB | Avg=53.45 dB (6:1:1=53.86 dB)
+│ SSIM (8x8)    : Y=0.99778 (26.35 dB) | Avg=0.99756 | 5-Scale MS-SSIM=0.99801
+│ VMAF-Lite     : 95.69 / 100.0
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Identical inputs report `inf` for PSNR and SSIM in dB. In `--json` output, infinite PSNR values are written as `99.99` so the document stays valid JSON.
+
+If the two inputs have different frame counts, only the first `min(a, b)` frames are compared.
+
+## JSON output
+
+```sh
+ragdoll metrics sample.mp4 q30.mp4 --json
+```
+
+```json
+{
+  "frames": 60,
+  "elapsed_ms": 60.395,
+  "fps": 993.46,
+  "psnr_y": 53.8553,
+  "psnr_u": 56.8770,
+  "psnr_v": 50.8780,
+  "psnr_avg": 53.4506,
+  "psnr_yuv_611": 53.8608,
+  "ssim_y": 0.997781,
+  "ssim_avg": 0.997559,
+  "ssim_db": 26.3538,
+  "ms_ssim": 0.998009,
+  "vmaf_lite": 95.6922
+}
+```

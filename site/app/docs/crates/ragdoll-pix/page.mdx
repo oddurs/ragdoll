@@ -1,0 +1,46 @@
+export const metadata = { title: "ragdoll-pix" };
+
+# ragdoll-pix
+
+Pixel processing: color conversion, scaling, dithering and quality measurement. Every hot loop runs as a fused scanline kernel, so intermediate rows stay in cache.
+
+[Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-pix)
+
+## Color conversion
+
+`YuvRgbMatrix::from_colorimetry(matrix, range)` derives Q14 coefficients from the matrix's luma weights, for BT.601, BT.709 or BT.2020 in limited or full range. The conversion functions take it explicitly, so nothing silently assumes BT.709.
+
+| Function | From → to |
+| :-- | :-- |
+| `yuv420p_to_rgb24`, `yuv420p_to_rgba8`, `yuv420p_to_bgra8` | Planar 4:2:0 to packed RGB |
+| `nv12_to_rgb24` | Semi-planar 4:2:0 to RGB |
+| `rgb24_to_yuv420p` | RGB to planar 4:2:0, with 2×2 chroma averaging fused into the luma pass |
+| `rgb24_row_to_oklab`, `oklab_row_to_rgb24` | sRGB ↔ Oklab |
+| `upsample_chroma_420_to_444` | Chroma upsampling |
+| `dither_plane_u16le_to_u8_bayer` | 10-bit to 8-bit with a 16×16 ordered Bayer matrix |
+| `convert_frame`, `convert_frame_into` | Whole-frame conversion between any supported `PixelFormat`s |
+
+## Scaling
+
+`ScaleFilter` selects the kernel: `Lanczos3`, `Spline36`, `MitchellNetravali`, or `Bilinear`. `PolyphaseFilterBank` precomputes the taps for a given source size, destination size and filter, with taps quantized to Q14 using error diffusion so each phase sums to exactly one. Build a bank once and reuse it across frames.
+
+```rust
+use ragdoll_pix::{ScaleFilter, scale_frame};
+
+let small = scale_frame(&frame, 1280, 720, ScaleFilter::Lanczos3);
+```
+
+The scaler is separable. The horizontal pass produces 14-bit Q6 rows into an 8-row ring buffer; the vertical pass consumes the ring as soon as enough rows are present. Taps that are zero are skipped.
+
+## Quality metrics
+
+`evaluate_frame_quality(reference, distorted, previous)` returns a `QualityReport`:
+
+| Field | Meaning |
+| :-- | :-- |
+| `psnr_y`, `psnr_u`, `psnr_v`, `psnr_avg`, `psnr_yuv_611` | PSNR per plane, averaged, and 6:1:1 weighted |
+| `ssim_y`, `ssim_u`, `ssim_v`, `ssim_avg`, `ssim_db` | 8×8 windowed SSIM |
+| `ms_ssim` | Five-scale MS-SSIM (Wang et al. weights) |
+| `vmaf_lite` | Fast VMAF approximation |
+
+Lower-level functions (`psnr_plane_u8`, `ssim_plane_u8`, `ms_ssim_plane_u8`, `vmaf_lite_plane_u8`) operate on single planes.

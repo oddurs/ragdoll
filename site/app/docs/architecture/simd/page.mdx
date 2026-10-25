@@ -1,0 +1,75 @@
+export const metadata = { title: "SIMD & verification" };
+
+# SIMD & verification
+
+Ragdoll does not rely on the compiler to vectorize its hot loops, and it does not link hand-written assembly. Each performance-critical kernel is written with architecture intrinsics in Rust, and each one has a plain scalar implementation that defines what the right answer is.
+
+## The three-tier rule
+
+Every kernel in `ragdoll-simd`, `ragdoll-pix` and `ragdoll-codec` follows the same structure:
+
+1. **A scalar reference**, named with a `_scalar` suffix. It is written for clarity, documents its fixed-point format (`Q14`, `Q6` and so on) and rounding, and is the specification for the kernel.
+2. **An intrinsics implementation**, marked `#[target_feature(enable = "neon")]` and kept private. This is the only place `unsafe` appears.
+3. **A safe public wrapper** that takes ordinary slices and dispatches to the fastest implementation. Kernels re-slice each row with normal bounds-checked indexing before touching raw pointers, so bad dimensions panic instead of reading past a buffer.
+
+```rust
+// Public, safe: the only function callers see.
+pub fn sad_plane_u8(
+    a: &[u8], a_stride: usize,
+    b: &[u8], b_stride: usize,
+    width: usize, height: usize,
+) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is mandatory on aarch64. The kernel slices each row
+        // with checked indexing before loading from it.
+        unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
+    }
+}
+```
+
+This is the real wrapper from `crates/ragdoll-simd/src/metrics.rs`, lightly reformatted and commented.
+
+## Differential testing
+
+For every kernel there is a test that runs both implementations on the same input and requires identical output, bit for bit. The inputs are chosen to break things:
+
+- **Odd dimensions** (`2×2`, `14×6`, `19×11`, `33×17`, …) so the vector loop always leaves a scalar tail.
+- **Unaligned starting offsets and strides** wider than the visible width.
+- **Extremal values:** all zeros, all `255`, alternating patterns, and random data from a fixed seed.
+
+There are no tolerances. If a kernel uses a different rounding order from its reference, the reference is the one that's correct and the kernel is fixed. You can run the same comparison on your own hardware with [`ragdoll self-test`](/docs/cli/self-test/).
+
+## Instruction sets
+
+| ISA | Status |
+| :-- | :-- |
+| `aarch64` NEON (Advanced SIMD) | 28 kernels. NEON is mandatory on 64-bit ARM, so no runtime detection is needed. |
+| `x86_64` AVX2 | Detected at runtime by `SimdLevel::detect()`. No kernels yet; the scalar references run instead. |
+| Everything else | Scalar references. |
+
+Adding a new ISA means adding a sibling to tier 2 and a branch in tier 3. The reference and the tests already exist.
+
+## Techniques worth knowing
+
+A few patterns recur across the kernels:
+
+- **Staying in SIMD across rare events.** The Annex-B start-code scanner looks at 64 bytes per iteration and uses `vextq_u8` with `vandq_u8` to find adjacent zero pairs, so isolated zero bytes don't force a fall back to scalar code.
+- **Saturating the pipes.** Plane SAD and SSE keep four independent accumulators per scanline so that all four ASIMD units on Apple's performance cores stay busy.
+- **Narrow fixed point.** The scaler's vertical pass works on 14-bit signed `Q6` intermediates in `i16`, which doubles lane count over `i32` and keeps an 8-row ring buffer in L1.
+- **Register transposes.** The 4×4 DCT and IDCT transpose in registers with `vtrn1` / `vtrn2` and round with a single `vrshr_n_s16::<6>`.
+- **Table-driven CRCs.** CRC-8, CRC-16 and CRC-32 use compile-time slicing-by-8 tables, eight independent lookups per 64-bit word.
+
+## Safety boundary
+
+`unsafe` in Ragdoll falls into three narrow categories:
+
+- **Intrinsics**, inside private tier-2 functions.
+- **Aligned buffers**: `AlignedBuffer` in `ragdoll-core` allocates 64-byte-aligned memory and reinterprets it as `i16` or `f32` samples.
+- **Operating-system calls**: `mmap` / `munmap` / `madvise`, `writev`, `pthread_set_qos_class_self_np`, `sysctlbyname`, `getrusage` and `proc_pid_rusage`.
+
+Bitstream parsing, entropy coding and container logic are otherwise safe Rust. Malformed input is reported as `RagdollError`, and a 10,000-mutation fuzz corpus to prove they never panic is planned for M10.
