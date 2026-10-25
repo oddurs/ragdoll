@@ -110,8 +110,8 @@ pub fn crc8_flac(data: &[u8]) -> u8 {
 /// Updates a running FLAC CRC-16 (`poly = 0x8005`, MSB-first) using Slicing-by-8 (`libFLAC` algorithm).
 #[inline]
 pub fn crc16_flac_update(mut crc: u16, data: &[u8]) -> u16 {
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for chunk in chunks {
         crc ^= ((chunk[0] as u16) << 8) | (chunk[1] as u16);
         crc = CRC16_SLICE8_TABLE[7][(crc >> 8) as usize]
             ^ CRC16_SLICE8_TABLE[6][(crc & 0xFF) as usize]
@@ -122,7 +122,7 @@ pub fn crc16_flac_update(mut crc: u16, data: &[u8]) -> u16 {
             ^ CRC16_SLICE8_TABLE[1][chunk[6] as usize]
             ^ CRC16_SLICE8_TABLE[0][chunk[7] as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         crc = (crc << 8) ^ CRC16_SLICE8_TABLE[0][((crc >> 8) as u8 ^ b) as usize];
     }
     crc
@@ -137,8 +137,8 @@ pub fn crc16_flac(data: &[u8]) -> u16 {
 /// Updates a running MSB-first CRC-32 (`poly = 0x04C11DB7`) using Slicing-by-8.
 #[inline]
 pub fn crc32_msb_update(mut crc: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for chunk in chunks {
         let w0 = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
         let w1 = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         crc = CRC32_SLICE8_TABLE[7][(w0 >> 24) as usize]
@@ -150,7 +150,7 @@ pub fn crc32_msb_update(mut crc: u32, data: &[u8]) -> u32 {
             ^ CRC32_SLICE8_TABLE[1][((w1 >> 8) & 0xFF) as usize]
             ^ CRC32_SLICE8_TABLE[0][(w1 & 0xFF) as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         crc = (crc << 8) ^ CRC32_SLICE8_TABLE[0][((crc >> 24) as u8 ^ b) as usize];
     }
     crc

@@ -152,9 +152,9 @@ impl Rational64 {
         let mut den = raw_den.unsigned_abs();
 
         let gcd = gcd_u128(num, den);
-        if gcd != 0 {
-            num /= gcd;
-            den /= gcd;
+        if let (Some(n), Some(d)) = (num.checked_div(gcd), den.checked_div(gcd)) {
+            num = n;
+            den = d;
         }
         if num == 0 {
             return (Self { num: 0, den: 1 }, true);
@@ -190,14 +190,13 @@ impl Rational64 {
             let a2_den = x.saturating_mul(a1_den).saturating_add(a0_den);
 
             if a2_num > max_u128 || a2_den > max_u128 {
-                if a1_num != 0 {
-                    x = (max_u128 - a0_num) / a1_num;
+                if let Some(x_num) = (max_u128 - a0_num).checked_div(a1_num) {
+                    x = x_num;
                 }
-                if a1_den != 0 {
-                    let x_den = (max_u128 - a0_den) / a1_den;
-                    if x_den < x {
-                        x = x_den;
-                    }
+                if let Some(x_den) = (max_u128 - a0_den).checked_div(a1_den)
+                    && x_den < x
+                {
+                    x = x_den;
                 }
                 // Semiconvergent optimality test: is (x * a1 + a0) closer to num/den than a1?
                 if den.saturating_mul(2 * x * a1_den + a0_den) > num.saturating_mul(a1_den) {

@@ -60,3 +60,64 @@ Items are numbered: `0012`, and commands accept the bare number too. Write the n
 4. `cairn check` must pass before the work is considered done.
 
 <!-- cairn:end -->
+
+## Git, Branch & Pull Request Workflow
+
+Never commit directly to `main`. All changes must flow through short-lived topic branches tied to a Cairn item ID and merged via Pull Request after passing Light CI.
+
+### 1. Branch Naming Convention
+
+Create a branch named `<type>/<cairn-id>-<short-slug>` (or `milestone/<milestone-id>` when delivering a cohesive multi-item milestone batch):
+
+```sh
+git checkout main && git pull --ff-only
+git checkout -b <type>/<ID>-<slug>
+# Examples:
+#   kernel/0012-bt709-bt2020-oklab-color-matrix
+#   feature/0015-isobmff-mp4-zero-copy-demuxer
+#   chore/0026-git-pr-workflow
+```
+
+### 2. Local Pre-PR Verification Gate
+
+Before pushing or opening a PR, run the full local gate:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cairn render
+cairn check --render --strict
+```
+
+### 3. Opening & Merging Pull Requests (`gh` CLI)
+
+Push the branch, create a Pull Request following `.github/pull_request_template.md`, wait for the fast `ubuntu-24.04-arm` Light CI workflow (`fmt`, `clippy`, `cargo test --workspace`), and squash-merge:
+
+```sh
+git add -A
+git commit -m "<type>(<area>): <summary> (cairn #<ID>)"
+git push -u origin HEAD
+
+gh pr create \
+  --title "<type>(<area>): <summary> (#<ID>)" \
+  --body "## Summary
+- **Cairn Item**: \`cairn/items/<ID>-*.md\`
+- **Milestone**: \`<milestone>\`
+- **Area**: \`<area>\`
+
+### Changes
+- <bullet points>
+
+## Verification Checklist
+- [x] \`cargo fmt --all -- --check\` passes cleanly
+- [x] \`cargo clippy --workspace --all-targets -- -D warnings\` passes with zero warnings
+- [x] \`cargo test --workspace\` passes (including SIMD vs. scalar bit-exact differential tests)
+- [x] \`cairn check --render --strict\` passes (\`ROADMAP.md\` is in sync with \`cairn/items/\`)"
+
+# Wait for Light CI and squash-merge automatically
+gh pr checks --watch
+gh pr merge --squash --delete-branch
+git checkout main && git pull --ff-only
+```
+

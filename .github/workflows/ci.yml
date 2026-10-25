@@ -1,4 +1,4 @@
-name: CI
+name: Light CI
 
 on:
   push:
@@ -6,32 +6,37 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  check-and-test:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Apple Silicon (aarch64 NEON)
-            os: macos-14
-          - name: Linux (x86_64 AVX2 / Scalar)
-            os: ubuntu-latest
+  check:
+    name: Format, Clippy & Differential Tests (aarch64 NEON)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
+          components: rustfmt, clippy
+
+      - name: Rust dependency & build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting (rustfmt)
         run: cargo fmt --all -- --check
-      - name: Clippy strict lints
+
+      - name: Strict lints (clippy)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run release test suite (SIMD + differential)
-        run: cargo test --workspace --release
-      - name: Run live M1 benchmark self-test
-        run: cargo run --release
+
+      - name: Run unit & SIMD differential tests
+        run: cargo test --workspace

@@ -20,7 +20,7 @@ cairn board                  # Kanban view of the entire project
 
 ## m1-foundation — Phase 1 — Foundation, Timebases, Bitstreams & SIMD Primitives
 
-`##########` 100% · 8 of 8 done
+`##########` 100% · 9 of 9 done
 
 Establish the Cargo workspace, 128-bit overflow-safe Rational64 timebases, first-class colorimetry types, 64-byte cache-line-aligned frame arenas, branchless 64-bit CLZ bitstream readers/writers, and the Apple Silicon NEON / x86_64 AVX2 SIMD dispatch layer.
 
@@ -34,6 +34,7 @@ Establish the Cargo workspace, 128-bit overflow-safe Rational64 timebases, first
 - [x] `SIMD-0011` Apple M4 NEON & x86_64 AVX2 Intrinsics Dispatch, Byte Scanners & Fixed-Point Kernels <sup>kernel · p0 · simd</sup>
 - [x] `SIMD-0024` Production-Caliber Hardening of M1 Foundation from FFmpeg, dav1d, x264 & FLAC Reference Audit <sup>kernel · p0 · simd</sup>
 - [x] `0025` Public Repository Setup, DCT Zig-Zag Logo Identity & FFmpeg-Aligned Documentation <sup>docs · p0 · arch</sup>
+- [x] `0026` Agent-Friendly Git Branch/PR Workflow, PR Template & Fast Light CI <sup>chore · p0 · arch</sup>
 
 ## m2-pix — Phase 2 — Fused Scanline Pixel Engine & Perceptual Metrics
 

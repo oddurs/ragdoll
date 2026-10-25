@@ -830,18 +830,18 @@ impl OklabColor {
 
 /// Converts a row of `RGB24` pixels into perceptual `OklabColor` (`[f32; 3]` per pixel).
 pub fn rgb24_row_to_oklab(rgb_row: &[u8], dst: &mut [OklabColor]) {
-    for (px, out) in rgb_row.chunks_exact(3).zip(dst.iter_mut()) {
+    let (pixels, _) = rgb_row.as_chunks::<3>();
+    for (px, out) in pixels.iter().zip(dst.iter_mut()) {
         *out = OklabColor::from_srgb8(px[0], px[1], px[2]);
     }
 }
 
 /// Converts a row of perceptual `OklabColor` values back into `RGB24` (`3` bytes per pixel).
 pub fn oklab_row_to_rgb24(oklab_row: &[OklabColor], dst_rgb: &mut [u8]) {
-    for (ok, px) in oklab_row.iter().zip(dst_rgb.chunks_exact_mut(3)) {
+    let (pixels, _) = dst_rgb.as_chunks_mut::<3>();
+    for (ok, px) in oklab_row.iter().zip(pixels.iter_mut()) {
         let (r, g, b) = ok.to_srgb8();
-        px[0] = r;
-        px[1] = g;
-        px[2] = b;
+        *px = [r, g, b];
     }
 }
 
