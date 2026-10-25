@@ -195,7 +195,7 @@ pub fn yuv420p_to_rgb24(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 unsafe fn yuv420p_to_rgb24_avx2(
     y_plane: &[u8],
     y_stride: usize,

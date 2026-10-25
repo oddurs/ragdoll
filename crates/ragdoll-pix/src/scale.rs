@@ -204,6 +204,7 @@ pub fn hscale_row_8tap_q14(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseF
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
 unsafe fn hscale_row_8tap_q14_avx2(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseFilterBank) {
     use std::arch::x86_64::*;
     let dst_len = bank.dst_len;

@@ -4,6 +4,8 @@
 //! Includes `aarch64` NEON vector kernels (`vcvtq_f32_s32`, `vqmovn_s32`, `vst2q_s32`, `vld2q_s32`)
 //! paired with bit-exact scalar reference functions for differential testing.
 
+#![cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+
 use ragdoll_core::{AudioFrame, RagdollError, Result, SampleFormat};
 
 /// Normalization scale for converting signed 16-bit PCM `[-32768, 32767]` to `f32` `[-1.0, 1.0)`.

@@ -241,20 +241,30 @@ pub fn rematrix_stereo_to_mono_f32_scalar(stereo: &[f32], mono: &mut [f32], gain
 /// Vectorized Stereo to Mono downmix using `aarch64` NEON (`vld2q_f32`).
 pub fn rematrix_stereo_to_mono_f32(stereo: &[f32], mono: &mut [f32], gain: f32) {
     let frames = (stereo.len() / 2).min(mono.len());
-    let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vg = vdupq_n_f32(gain);
-        while i + 4 <= frames {
-            let lr = vld2q_f32(stereo.as_ptr().add(i * 2));
-            let m = vmulq_f32(vaddq_f32(lr.0, lr.1), vg);
-            vst1q_f32(mono.as_mut_ptr().add(i), m);
-            i += 4;
+    {
+        let mut i = 0usize;
+        unsafe {
+            use std::arch::aarch64::*;
+            let vg = vdupq_n_f32(gain);
+            while i + 4 <= frames {
+                let lr = vld2q_f32(stereo.as_ptr().add(i * 2));
+                let m = vmulq_f32(vaddq_f32(lr.0, lr.1), vg);
+                vst1q_f32(mono.as_mut_ptr().add(i), m);
+                i += 4;
+            }
+        }
+        if i < frames {
+            rematrix_stereo_to_mono_f32_scalar(
+                &stereo[i * 2..frames * 2],
+                &mut mono[i..frames],
+                gain,
+            );
         }
     }
-    if i < frames {
-        rematrix_stereo_to_mono_f32_scalar(&stereo[i * 2..frames * 2], &mut mono[i..frames], gain);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rematrix_stereo_to_mono_f32_scalar(&stereo[..frames * 2], &mut mono[..frames], gain);
     }
 }
 
@@ -271,19 +281,29 @@ pub fn rematrix_mono_to_stereo_f32_scalar(mono: &[f32], stereo: &mut [f32], gain
 /// Vectorized Mono to Stereo upmix using `aarch64` NEON (`vst2q_f32`).
 pub fn rematrix_mono_to_stereo_f32(mono: &[f32], stereo: &mut [f32], gain: f32) {
     let frames = mono.len().min(stereo.len() / 2);
-    let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vg = vdupq_n_f32(gain);
-        while i + 4 <= frames {
-            let m = vmulq_f32(vld1q_f32(mono.as_ptr().add(i)), vg);
-            vst2q_f32(stereo.as_mut_ptr().add(i * 2), float32x4x2_t(m, m));
-            i += 4;
+    {
+        let mut i = 0usize;
+        unsafe {
+            use std::arch::aarch64::*;
+            let vg = vdupq_n_f32(gain);
+            while i + 4 <= frames {
+                let m = vmulq_f32(vld1q_f32(mono.as_ptr().add(i)), vg);
+                vst2q_f32(stereo.as_mut_ptr().add(i * 2), float32x4x2_t(m, m));
+                i += 4;
+            }
+        }
+        if i < frames {
+            rematrix_mono_to_stereo_f32_scalar(
+                &mono[i..frames],
+                &mut stereo[i * 2..frames * 2],
+                gain,
+            );
         }
     }
-    if i < frames {
-        rematrix_mono_to_stereo_f32_scalar(&mono[i..frames], &mut stereo[i * 2..frames * 2], gain);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rematrix_mono_to_stereo_f32_scalar(&mono[..frames], &mut stereo[..frames * 2], gain);
     }
 }
 
@@ -333,62 +353,75 @@ pub fn rematrix_5_1_to_stereo_f32(
     normalize: bool,
 ) {
     let frames = (src_5_1.len() / 6).min(dst_stereo.len() / 2);
-    let norm = if normalize {
-        1.0 / (1.0 + c_mix + s_mix + lfe_mix)
-    } else {
-        1.0
-    };
-    let g_lr = norm;
-    let g_c = c_mix * norm;
-    let g_s = s_mix * norm;
-    let g_lfe = lfe_mix * norm;
-
-    let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vg_lr = vdupq_n_f32(g_lr);
-        let vg_c = vdupq_n_f32(g_c);
-        let vg_s = vdupq_n_f32(g_s);
-        let vg_lfe = vdupq_n_f32(g_lfe);
+    {
+        let norm = if normalize {
+            1.0 / (1.0 + c_mix + s_mix + lfe_mix)
+        } else {
+            1.0
+        };
+        let g_lr = norm;
+        let g_c = c_mix * norm;
+        let g_s = s_mix * norm;
+        let g_lfe = lfe_mix * norm;
 
-        while i + 4 <= frames {
-            let mut l_arr = [0.0f32; 4];
-            let mut r_arr = [0.0f32; 4];
-            let mut c_arr = [0.0f32; 4];
-            let mut lfe_arr = [0.0f32; 4];
-            let mut ls_arr = [0.0f32; 4];
-            let mut rs_arr = [0.0f32; 4];
-            for k in 0..4 {
-                let b = (i + k) * 6;
-                l_arr[k] = src_5_1[b];
-                r_arr[k] = src_5_1[b + 1];
-                c_arr[k] = src_5_1[b + 2];
-                lfe_arr[k] = src_5_1[b + 3];
-                ls_arr[k] = src_5_1[b + 4];
-                rs_arr[k] = src_5_1[b + 5];
+        let mut i = 0usize;
+        unsafe {
+            use std::arch::aarch64::*;
+            let vg_lr = vdupq_n_f32(g_lr);
+            let vg_c = vdupq_n_f32(g_c);
+            let vg_s = vdupq_n_f32(g_s);
+            let vg_lfe = vdupq_n_f32(g_lfe);
+
+            while i + 4 <= frames {
+                let mut l_arr = [0.0f32; 4];
+                let mut r_arr = [0.0f32; 4];
+                let mut c_arr = [0.0f32; 4];
+                let mut lfe_arr = [0.0f32; 4];
+                let mut ls_arr = [0.0f32; 4];
+                let mut rs_arr = [0.0f32; 4];
+                for k in 0..4 {
+                    let b = (i + k) * 6;
+                    l_arr[k] = src_5_1[b];
+                    r_arr[k] = src_5_1[b + 1];
+                    c_arr[k] = src_5_1[b + 2];
+                    lfe_arr[k] = src_5_1[b + 3];
+                    ls_arr[k] = src_5_1[b + 4];
+                    rs_arr[k] = src_5_1[b + 5];
+                }
+                let vl = vmulq_f32(vld1q_f32(l_arr.as_ptr()), vg_lr);
+                let vr = vmulq_f32(vld1q_f32(r_arr.as_ptr()), vg_lr);
+                let vc = vmulq_f32(vld1q_f32(c_arr.as_ptr()), vg_c);
+                let vlfe = vmulq_f32(vld1q_f32(lfe_arr.as_ptr()), vg_lfe);
+                let vls = vmulq_f32(vld1q_f32(ls_arr.as_ptr()), vg_s);
+                let vrs = vmulq_f32(vld1q_f32(rs_arr.as_ptr()), vg_s);
+
+                let vcommon = vaddq_f32(vc, vlfe);
+                let out_l = vaddq_f32(vaddq_f32(vl, vcommon), vls);
+                let out_r = vaddq_f32(vaddq_f32(vr, vcommon), vrs);
+                vst2q_f32(
+                    dst_stereo.as_mut_ptr().add(i * 2),
+                    float32x4x2_t(out_l, out_r),
+                );
+                i += 4;
             }
-            let vl = vmulq_f32(vld1q_f32(l_arr.as_ptr()), vg_lr);
-            let vr = vmulq_f32(vld1q_f32(r_arr.as_ptr()), vg_lr);
-            let vc = vmulq_f32(vld1q_f32(c_arr.as_ptr()), vg_c);
-            let vlfe = vmulq_f32(vld1q_f32(lfe_arr.as_ptr()), vg_lfe);
-            let vls = vmulq_f32(vld1q_f32(ls_arr.as_ptr()), vg_s);
-            let vrs = vmulq_f32(vld1q_f32(rs_arr.as_ptr()), vg_s);
-
-            let vcommon = vaddq_f32(vc, vlfe);
-            let out_l = vaddq_f32(vaddq_f32(vl, vcommon), vls);
-            let out_r = vaddq_f32(vaddq_f32(vr, vcommon), vrs);
-            vst2q_f32(
-                dst_stereo.as_mut_ptr().add(i * 2),
-                float32x4x2_t(out_l, out_r),
+        }
+        if i < frames {
+            rematrix_5_1_to_stereo_f32_scalar(
+                &src_5_1[i * 6..frames * 6],
+                &mut dst_stereo[i * 2..frames * 2],
+                c_mix,
+                s_mix,
+                lfe_mix,
+                normalize,
             );
-            i += 4;
         }
     }
-    if i < frames {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
         rematrix_5_1_to_stereo_f32_scalar(
-            &src_5_1[i * 6..frames * 6],
-            &mut dst_stereo[i * 2..frames * 2],
+            &src_5_1[..frames * 6],
+            &mut dst_stereo[..frames * 2],
             c_mix,
             s_mix,
             lfe_mix,
@@ -425,6 +458,7 @@ pub fn rematrix_nxm_f32_scalar(
 
 /// Vectorized $N_{\text{in}} \times M_{\text{out}}$ channel rematrixing over 16-sample blocks in L1 cache.
 #[allow(clippy::needless_range_loop)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
 pub fn rematrix_nxm_f32(
     src: &[f32],
     dst: &mut [f32],
@@ -625,6 +659,7 @@ pub fn apply_gain_true_peak_limit_f32_scalar(samples: &mut [f32], gain: f32, cei
 
 /// Vectorized gain normalizer and ceiling limiter using `aarch64` NEON (`vmulq_f32` + `vminq_f32` + `vmaxq_f32`),
 /// bit-exact with [`apply_gain_true_peak_limit_f32_scalar`].
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
 pub fn apply_gain_true_peak_limit_f32(samples: &mut [f32], gain: f32, ceiling: f32) {
     let n = samples.len();
     let mut i = 0usize;
@@ -924,6 +959,7 @@ pub fn window_overlap_add_f32_scalar(
 
 /// Vectorized IMDCT 50% TDAC windowing and overlap-add synthesis using `aarch64` NEON (`vmulq_f32` + `vaddq_f32`),
 /// bit-exact with [`window_overlap_add_f32_scalar`].
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
 pub fn window_overlap_add_f32(
     imdct_buf: &[f32],
     window: &[f32],
