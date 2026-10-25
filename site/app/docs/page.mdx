@@ -5,7 +5,7 @@ export const metadata = { title: "Introduction" };
 Ragdoll is a media framework and command-line tool written entirely in Rust. It reads and writes containers, decodes and encodes video and audio, converts color and scales images, and measures quality. Every component is built from the bitstream up, with hand-written SIMD in the hot loops and no C libraries.
 
 <Callout kind="status" title="Pre-release software">
-Ragdoll is at `v0.1.0`. Milestones M1–M6 are complete; production-grade H.264 (M7) is in progress. Interfaces will change before 1.0, and the H.264 encoder does not yet produce competitive compression. See [Roadmap](/docs/roadmap/) for what is done and what is next.
+Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, FLAC and Baseline H.264 work today; production-grade H.264 encoding is in active development. Interfaces will change before 1.0, and the H.264 encoder does not yet produce competitive compression. See [Roadmap](/docs/roadmap/) for what is available and what is next.
 </Callout>
 
 ## What it is
@@ -16,7 +16,7 @@ Ragdoll is at `v0.1.0`. Milestones M1–M6 are complete; production-grade H.264 
 
 ## Design rules
 
-Ragdoll holds every component to the same four constraints. They are recorded as architecture decisions in the repository (`ADR-0006`, `ADR-0007`, `ADR-0008`, `ADR-0035`).
+Ragdoll holds every component to the same four constraints.
 
 1. **No C libraries and no third-party crates.** The workspace's `Cargo.lock` contains exactly seven packages, all of them `ragdoll-*`. The only foreign calls are to the operating system (`mmap`, `writev`, QoS and `rusage`).
 2. **Explicit SIMD, verified.** Hot loops use architecture intrinsics directly rather than relying on auto-vectorization. `unsafe` is confined to those kernels, which sit behind safe slice APIs with upfront bounds checks. See [SIMD & verification](/docs/architecture/simd/).

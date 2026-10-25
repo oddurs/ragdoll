@@ -170,7 +170,7 @@ fn print_help() {
     );
     println!();
     println!("  self-test");
-    println!("      Run M1-M5 SIMD vs. scalar bit-exact differential kernel verification.");
+    println!("      Run SIMD vs. scalar bit-exact differential kernel verification.");
 }
 
 /// Renders an 8-level Unicode block sparkline (`▁▂▃▄▅▆▇█`) over packet byte sizes.
@@ -1709,7 +1709,7 @@ fn format_finite(v: f64) -> f64 {
 pub fn run_self_test() {
     let simd = SimdLevel::detect();
     println!("================================================================================");
-    println!("  RAGDOLL v0.1.0 — M1, M2, M3 & M4 SIMD Differential Self-Test");
+    println!("  RAGDOLL v0.1.0 — SIMD Differential Self-Test");
     println!("  Detected Hardware SIMD : {}", simd.name());
     println!("================================================================================\n");
 
@@ -2446,18 +2446,18 @@ pub fn run_self_test() {
         satd8
     );
     println!(
-        "[M2 Pix & Quality] 4K->1080p Lanczos-3 Q6 L1 Ring: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, MS-SSIM={:.5}, VMAF-Lite={:.2}",
+        "[Pixels & Quality] 4K->1080p Lanczos-3 Q6 L1 Ring: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, MS-SSIM={:.5}, VMAF-Lite={:.2}",
         l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.ms_ssim, q_rep.vmaf_lite
     );
     println!(
-        "[M3 Containers]    Zero-Copy MP4 Demux: {:.2} GB/s | MP4->MKV: {:.2} GB/s | MP4->MPEG-TS: {:.2} GB/s (faststart=true, seekhead={})",
+        "[Containers]       Zero-Copy MP4 Demux: {:.2} GB/s | MP4->MKV: {:.2} GB/s | MP4->MPEG-TS: {:.2} GB/s (faststart=true, seekhead={})",
         mp4_demux_gbps,
         mkv_remux_gbps,
         ts_remux_gbps,
         mkv_check.has_seek_head()
     );
     println!(
-        "[M4/M5 Codecs+PMU] H.264 P_L0_16x16 ME: IDR={} B -> P={} B ({:.1}x) | PMU instr={:.1}M, cyc={:.1}M, footprint={:.1} MiB",
+        "[Codecs & PMU]     H.264 P_L0_16x16 ME: IDR={} B -> P={} B ({:.1}x) | PMU instr={:.1}M, cyc={:.1}M, footprint={:.1} MiB",
         au0.len(),
         au1.len(),
         (au0.len() as f64) / (au1.len().max(1) as f64),

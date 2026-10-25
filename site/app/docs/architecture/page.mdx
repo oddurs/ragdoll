@@ -49,9 +49,9 @@ Following one `ragdoll transcode in.mp4 out.mkv --scale 1280x720` from start to 
 
 ## Decisions behind the design
 
-The reasoning is recorded as architecture decision records in [`cairn/items`](https://github.com/oddurs/ragdoll/tree/main/cairn/items):
+Four decisions shape the rest of the design:
 
-- **ADR-0006: Pure Rust with explicit SIMD and no C.** Portability and memory safety come from Rust; speed comes from writing the kernels by hand instead of binding to C or assembly. See [SIMD & verification](/docs/architecture/simd/).
-- **ADR-0007: Zero-copy demuxing and fused scanline processing.** Data is mapped rather than read, and pixel stages are fused so intermediate rows stay in L1 cache. See [Memory model](/docs/architecture/memory/).
-- **ADR-0008: Subcommands and declarative recipes.** The CLI is organized by task, and anything you can type can also be written down as TOML.
-- **ADR-0035: Opinionated production defaults.** Bounded-memory GOP streaming, keeping every track by default, and task-level verbs (`cut`, `concat`, `package`) rather than low-level knobs.
+- **Pure Rust with explicit SIMD and no C.** Portability and memory safety come from Rust; speed comes from writing the kernels by hand instead of binding to C or assembly. See [SIMD & verification](/docs/architecture/simd/).
+- **Zero-copy demuxing and fused scanline processing.** Data is mapped rather than read, and pixel stages are fused so intermediate rows stay in L1 cache. See [Memory model](/docs/architecture/memory/).
+- **Subcommands and declarative recipes.** The CLI is organized by task, and anything you can type can also be written down as TOML.
+- **Opinionated production defaults.** Bounded-memory GOP streaming, keeping every track by default, and task-level verbs (such as the planned `cut`, `concat` and `package`) rather than low-level knobs.

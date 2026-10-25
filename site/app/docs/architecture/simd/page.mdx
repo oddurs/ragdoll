@@ -72,4 +72,4 @@ A few patterns recur across the kernels:
 - **Aligned buffers**: `AlignedBuffer` in `ragdoll-core` allocates 64-byte-aligned memory and reinterprets it as `i16` or `f32` samples.
 - **Operating-system calls**: `mmap` / `munmap` / `madvise`, `writev`, `pthread_set_qos_class_self_np`, `sysctlbyname`, `getrusage` and `proc_pid_rusage`.
 
-Bitstream parsing, entropy coding and container logic are otherwise safe Rust. Malformed input is reported as `RagdollError`, and a 10,000-mutation fuzz corpus to prove they never panic is planned for M10.
+Bitstream parsing, entropy coding and container logic are otherwise safe Rust. Malformed input is reported as `RagdollError`, and a 10,000-mutation fuzz corpus to prove they never panic is planned before 1.0.

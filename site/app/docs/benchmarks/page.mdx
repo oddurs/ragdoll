@@ -35,7 +35,7 @@ Single-threaded throughput of individual kernels on identical inputs.
 | 4K plane SSE | 14.27 Gpx/s | 22.65 Gpx/s | 1.59× | As above. |
 | 8-tap polyphase horizontal scale | 3.17 Gpx/s | 3.78 Gpx/s | 1.19× | 8 pixels per iteration with pairwise reduction. |
 
-**Provenance.** The Ragdoll column is reproducible with [`ragdoll self-test`](/docs/cli/self-test/), which prints these kernels' throughput on your machine. The FFmpeg column was measured during the reference audits recorded in cairn items `SIMD-0024`, `SIMD-0027` and `SIMD-0029`. The harness that drove FFmpeg's internal kernels is not yet in the repository, so that column cannot currently be reproduced from a clean checkout. Bringing it in-tree is tracked as `BENCH-0056`.
+**Provenance.** The Ragdoll column is reproducible with [`ragdoll self-test`](/docs/cli/self-test/), which prints these kernels' throughput on your machine. The FFmpeg column was measured with a separate harness that drives FFmpeg's internal kernels directly. That harness is not yet in the repository, so the FFmpeg column cannot currently be reproduced from a clean checkout; adding it is planned.
 
 ## End-to-end workloads
 
@@ -51,15 +51,15 @@ Whole-command comparisons from [`ragdoll bench --compare-ffmpeg`](/docs/cli/benc
 | 6. 4K PSNR + SSIM, 20 frames | 168.92 ms | 7.70 ms | 21.9× | 25.15 ms |
 | 7. 1080p H.264 transcode, 60 frames | 232.98 ms | 46.81 ms | — | 187.86 ms |
 
-### Reading these numbers honestly
+### Interpreting the results
 
 - **Process start-up is included for FFmpeg and not for Ragdoll.** Ragdoll's workloads run in-process inside `bench`. FFmpeg's run as child processes, so each timing includes exec, dynamic linking and initialization, typically several milliseconds. For workloads that take tens of milliseconds, that is a large share.
 - **Workload 1 is not a fair ratio.** `ffprobe -show_packets -of json` serializes every packet as JSON, while Ragdoll builds its index in memory. The roughly 600× gap is mostly process start-up and output formatting, so no ratio is given.
-- **Workload 7 is not like-for-like.** FFmpeg runs libx264, a mature encoder that spends its time on rate-distortion decisions. Ragdoll's Constrained Baseline encoder makes far fewer decisions and produces much larger files. Until M7 lands, this row measures pipeline overhead, not encoder quality per second.
+- **Workload 7 is not like-for-like.** FFmpeg runs libx264, a mature encoder that spends its time on rate-distortion decisions. Ragdoll's Constrained Baseline encoder makes far fewer decisions and produces much larger files. Until the production encoder lands, this row measures pipeline overhead, not encoder quality per second.
 - **Workload 6 compares different work.** FFmpeg's `psnr,ssim` filters run through the filter graph with format negotiation. Ragdoll computes the same metrics directly on decoded planes.
 - **E-core numbers** show the cost of [efficiency mode](/docs/power/). Restricted to efficiency cores, Ragdoll is slower than FFmpeg on performance cores for remux and scaling, and faster on the other workloads, at an estimated fraction of the energy.
 
-A fairer comparison, with in-process FFmpeg library calls, matched output sizes and quality, and more realistic inputs, is planned as the 12-workload v1.0 suite (`BENCH-0051`).
+A fairer comparison, with in-process FFmpeg library calls, matched output sizes and quality, and more realistic inputs, is planned for the 1.0 release.
 
 ## Reproduce
 

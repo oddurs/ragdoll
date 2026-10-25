@@ -140,7 +140,7 @@ Introduce Ragdoll's opinionated workflow upgrades over FFmpeg: frame-accurate Sm
 
 ## m10-production-v1 — Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
 
-`##········` 13% · 1 of 8 done
+`###·······` 22% · 2 of 9 done
 
 Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic, zero-unsafe-required Rust library SDK (`ragdoll` crate / builder API), enforce a Zero-Panic Malformed Bitstream Guarantee across all container demuxers and codec decoders via deterministic mutation/fuzz corpus tests, and validate speed, perceptual quality, and E-core battery efficiency across a 12-workload benchmark suite against FFmpeg 9.0.2.
 
@@ -160,4 +160,5 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 ### shipped
 
 - [x] `0052` Next.js docs & landing site, brand identity, logo and README overhaul <sup>docs · p2 · arch</sup>
+- [x] `0058` Remove internal process references from site and README <sup>docs · p2 · arch</sup>
 

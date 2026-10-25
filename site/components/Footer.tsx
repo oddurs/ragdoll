@@ -33,7 +33,7 @@ export function Footer() {
             <h3>Source</h3>
             <a href={site.repo}>GitHub</a>
             <a href={repoFile("CONTRIBUTING.md")}>Contributing</a>
-            <a href={repoFile("ROADMAP.md")}>ROADMAP.md</a>
+            <a href={`${site.repo}#license`}>License</a>
             <a href={`${site.repo}/issues`}>Issues</a>
           </div>
         </nav>

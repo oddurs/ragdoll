@@ -65,17 +65,40 @@ const bench = [
   { name: "1080p RGB24 → YUV420p", ours: "6.02 Gpx/s", theirs: "4.03 Gpx/s", x: 1.49 },
 ];
 
-const milestones = [
-  { id: "m1", s: "done", title: "Foundation", body: "Timebases, bitstreams, CRCs, aligned frame pools, core SIMD." },
-  { id: "m2", s: "done", title: "Pixels", body: "Color conversion, scaling, dithering, quality metrics." },
-  { id: "m3", s: "done", title: "Containers", body: "MP4, Matroska/WebM, MPEG-TS, Y4M, Netpbm, WAV." },
-  { id: "m4", s: "done", title: "Codecs", body: "FLAC, H.264 Baseline, AV1 OBU inspection, RGDI." },
-  { id: "m5", s: "done", title: "CLI & bench", body: "GOP-parallel pipeline, seven subcommands, benchmark suite." },
-  { id: "m6", s: "done", title: "Streaming & sync", body: "Bounded-memory GOP ring, pipes, multi-track A/V and subtitles." },
-  { id: "m7", s: "doing", title: "Production video", body: "Full residual coding, quarter-pel, deblocking, CABAC, CRF." },
-  { id: "m8", s: "planned", title: "Pro audio", body: "AAC-LC, Opus, resampling, EBU R128 loudness." },
-  { id: "m9", s: "planned", title: "Edit & package", body: "Smart-GOP cut and concat, PNG/JPEG, filters, HLS and DASH." },
-  { id: "m10", s: "planned", title: "1.0", body: "Stable library SDK, fuzzing, release benchmark suite." },
+const status = [
+  {
+    s: "done",
+    title: "Available today",
+    items: [
+      "MP4, Matroska / WebM, MPEG-TS, Y4M, WAV",
+      "FLAC, PCM, H.264 Baseline, RGDI",
+      "Color conversion, scaling, dithering",
+      "PSNR, SSIM, MS-SSIM, VMAF-Lite",
+      "GOP-parallel pipeline, pipes, multi-track sync",
+    ],
+  },
+  {
+    s: "doing",
+    title: "In development",
+    items: [
+      "H.264 residual coding and intra 4×4",
+      "Quarter-pel motion and deblocking",
+      "Main and High profiles with CABAC",
+      "B-frame decoding",
+      "CRF and VBV rate control",
+    ],
+  },
+  {
+    s: "planned",
+    title: "Planned for 1.0",
+    items: [
+      "AAC-LC and Opus, EBU R128 loudness",
+      "Frame-accurate cut and concat",
+      "PNG / JPEG, filters, HDR tone mapping",
+      "HLS and DASH packaging",
+      "AVX2 kernels, stable library API",
+    ],
+  },
 ];
 
 export default function Home() {
@@ -274,24 +297,30 @@ export default function Home() {
         <section className="section">
           <div className="section__head">
             <p className="eyebrow">Status</p>
-            <h2>Built in the open, one milestone at a time.</h2>
+            <h2>Where things stand.</h2>
             <p>
-              Ragdoll is pre-1.0. Six milestones are done; production-grade H.264 is in progress. The
-              roadmap lives in the repository as plain Markdown.
+              Ragdoll is pre-1.0. The foundations are complete and production-grade H.264 encoding
+              is in active development.
             </p>
           </div>
-          <ol className="milestones">
-            {milestones.map((m) => (
-              <li className="milestone" key={m.id}>
-                <div className="milestone__id">
-                  <span>{m.id}</span>
-                  <span className="dot" data-s={m.s} aria-label={m.s} />
-                </div>
-                <strong>{m.title}</strong>
-                <p>{m.body}</p>
-              </li>
+          <div className="status">
+            {status.map((col) => (
+              <div className="status__col" key={col.title}>
+                <h3>
+                  <span className="dot" data-s={col.s} aria-hidden />
+                  {col.title}
+                </h3>
+                <ul>
+                  {col.items.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
             ))}
-          </ol>
+          </div>
+          <p className="footnote">
+            See the <Link href="/docs/roadmap/">roadmap</Link> for details and known limitations.
+          </p>
         </section>
 
         <section className="cta">
