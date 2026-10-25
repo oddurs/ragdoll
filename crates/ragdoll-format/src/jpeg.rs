@@ -144,6 +144,7 @@ struct JpegBitReader<'a> {
     bit_buf: u32,
     bit_count: u8,
     hit_marker: Option<u8>,
+    eof_pad_bytes: usize,
 }
 
 impl<'a> JpegBitReader<'a> {
@@ -154,12 +155,14 @@ impl<'a> JpegBitReader<'a> {
             bit_buf: 0,
             bit_count: 0,
             hit_marker: None,
+            eof_pad_bytes: 0,
         }
     }
 
     #[inline]
     fn fill_byte(&mut self) -> u8 {
         if self.hit_marker.is_some() || self.pos >= self.data.len() {
+            self.eof_pad_bytes = self.eof_pad_bytes.saturating_add(1);
             return 0;
         }
         let b = self.data[self.pos];
@@ -176,6 +179,7 @@ impl<'a> JpegBitReader<'a> {
                     return 0xFF;
                 } else {
                     self.hit_marker = Some(m);
+                    self.eof_pad_bytes = self.eof_pad_bytes.saturating_add(1);
                     return 0;
                 }
             }
@@ -194,6 +198,7 @@ impl<'a> JpegBitReader<'a> {
 
     #[inline]
     fn get_bits(&mut self, n: u8) -> i32 {
+        let n = n.min(16);
         if n == 0 {
             return 0;
         }
@@ -204,6 +209,9 @@ impl<'a> JpegBitReader<'a> {
 
     #[inline]
     fn decode_huff(&mut self, table: &JpegHuffDecTable) -> Result<u8> {
+        if self.eof_pad_bytes > 8 {
+            return Err(RagdollError::BitstreamEndOfData);
+        }
         let mut code = 0i32;
         for l in 1..=16 {
             let bit = self.get_bits(1);
@@ -221,13 +229,18 @@ impl<'a> JpegBitReader<'a> {
     }
 
     #[inline]
-    fn receive_extend(&mut self, ssss: u8) -> i32 {
+    fn receive_extend(&mut self, ssss: u8) -> Result<i32> {
         if ssss == 0 {
-            return 0;
+            return Ok(0);
+        }
+        if ssss > 15 {
+            return Err(RagdollError::CorruptBitstream(
+                "JPEG Huffman category ssss > 15",
+            ));
         }
         let v = self.get_bits(ssss);
         let vt = 1i32 << (ssss - 1);
-        if v < vt { v + ((-1i32) << ssss) + 1 } else { v }
+        Ok(if v < vt { v + ((-1i32) << ssss) + 1 } else { v })
     }
 
     fn consume_restart_marker(&mut self) {
@@ -690,6 +703,8 @@ pub fn read_jpeg_image(data: &[u8]) -> Result<VideoFrame> {
                 let ncomp = body[5] as usize;
                 if width == 0
                     || height == 0
+                    || width > 8192
+                    || height > 8192
                     || (ncomp != 1 && ncomp != 3)
                     || body.len() < 6 + ncomp * 3
                 {
@@ -832,9 +847,9 @@ pub fn read_jpeg_image(data: &[u8]) -> Result<VideoFrame> {
                     for bx in 0..comp.h_samp {
                         let mut coeffs = [0i32; 64];
                         let ssss = br.decode_huff(dc_tab)?;
-                        let diff = br.receive_extend(ssss);
-                        dc_pred[c_idx] += diff;
-                        coeffs[0] = dc_pred[c_idx] * qtab[0];
+                        let diff = br.receive_extend(ssss)?;
+                        dc_pred[c_idx] = dc_pred[c_idx].saturating_add(diff);
+                        coeffs[0] = dc_pred[c_idx].saturating_mul(qtab[0]);
 
                         let mut k = 1usize;
                         while k < 64 {
@@ -852,9 +867,9 @@ pub fn read_jpeg_image(data: &[u8]) -> Result<VideoFrame> {
                                 if k >= 64 {
                                     break;
                                 }
-                                let ac_val = br.receive_extend(s);
+                                let ac_val = br.receive_extend(s)?;
                                 let nat = ZIGZAG_TO_NATURAL[k];
-                                coeffs[nat] = ac_val * qtab[nat];
+                                coeffs[nat] = ac_val.saturating_mul(qtab[nat]);
                                 k += 1;
                             }
                         }

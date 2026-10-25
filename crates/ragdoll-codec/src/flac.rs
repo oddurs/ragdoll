@@ -464,6 +464,11 @@ fn decode_residual_partitions(
     };
     let partition_order = r.read_bits(4)? as u32;
     let num_partitions = 1usize << partition_order;
+    if !block_size.is_multiple_of(num_partitions) {
+        return Err(RagdollError::InvalidSyntax(
+            "FLAC block_size not divisible by num_partitions",
+        ));
+    }
     let part_samples = block_size >> partition_order;
     if part_samples < predictor_order && num_partitions > 1 {
         return Err(RagdollError::InvalidSyntax(
@@ -490,6 +495,11 @@ fn decode_residual_partitions(
         } else {
             part_samples
         };
+        if idx.saturating_add(count) > dst.len() {
+            return Err(RagdollError::InvalidSyntax(
+                "FLAC residual partition exceeds subframe block_size",
+            ));
+        }
 
         let rice_param = r.read_bits(param_bits)? as u32;
         if rice_param == escape_code {
@@ -590,7 +600,7 @@ fn decode_subframe(
     let type_code = r.read_bits(6)? as u8;
     let has_wasted = r.read_bit()?;
     let wasted_bits = if has_wasted {
-        (r.read_unary_zeros()? as u8) + 1
+        (r.read_unary_zeros()? as u8).saturating_add(1)
     } else {
         0
     };
@@ -661,7 +671,7 @@ fn decode_subframe(
 
     if wasted_bits > 0 {
         for s in &mut dst[..block_size] {
-            *s <<= wasted_bits;
+            *s = s.wrapping_shl(wasted_bits as u32);
         }
     }
     Ok(())
@@ -842,7 +852,7 @@ impl FlacDecoder {
     pub fn decode_stream(data: &[u8]) -> Result<(FlacStreamInfo, AudioFrame)> {
         let (info, mut pos) = parse_flac_stream_header(data)?;
         let dec = Self::new(Some(info.clone()));
-        let init_cap = info.total_samples as usize;
+        let init_cap = (info.total_samples as usize).min(data.len().saturating_mul(8));
         let mut all_planar = vec![vec![0i32; init_cap]; info.channels as usize];
         let mut sample_offset = 0usize;
 

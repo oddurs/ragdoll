@@ -910,14 +910,55 @@ pub fn hlg_eotf_normalized(e_prime: f32) -> f32 {
 }
 
 #[inline]
-fn srgb_oetf_u8(lin: f32) -> u8 {
-    let v = lin.clamp(0.0, 1.0);
-    let encoded = if v <= 0.0031308 {
-        12.92 * v
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    };
-    (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+fn srgb_oetf_lut() -> &'static [u8; 8193] {
+    static LUT: std::sync::OnceLock<[u8; 8193]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 8193];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let v = (i as f32) / 8192.0;
+            let encoded = if v <= 0.0031308 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            *slot = (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
+#[inline]
+fn pq_eotf_lut() -> &'static [f32; 4096] {
+    static LUT: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 4096];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = pq_eotf_normalized_203nits((i as f32) / 4095.0);
+        }
+        t
+    })
+}
+
+#[inline]
+fn hlg_eotf_lut() -> &'static [f32; 4096] {
+    static LUT: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 4096];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = hlg_eotf_normalized((i as f32) / 4095.0);
+        }
+        t
+    })
+}
+
+#[inline(always)]
+fn fast_cbrt_f32(x: f32) -> f32 {
+    if x <= 1e-12 {
+        return 0.0;
+    }
+    let y0 = f32::from_bits(0x2a51_37a0u32 + (x.to_bits() / 3));
+    let y1 = (1.0 / 3.0) * (2.0 * y0 + x / (y0 * y0));
+    (1.0 / 3.0) * (2.0 * y1 + x / (y1 * y1))
 }
 
 /// Scalar reference row kernel for perceptual Oklab HDR-to-SDR tone-mapping from linear BT.2020
@@ -927,6 +968,7 @@ pub fn tonemap_linear_bt2020_row_oklab_scalar(
     dst_rgb24: &mut [u8],
     width: usize,
 ) {
+    let oetf = srgb_oetf_lut();
     for x in 0..width {
         let r2020 = hdr_bt2020_rgb[x * 3].max(0.0);
         let g2020 = hdr_bt2020_rgb[x * 3 + 1].max(0.0);
@@ -937,9 +979,9 @@ pub fn tonemap_linear_bt2020_row_oklab_scalar(
         let m = 0.2651317 * r2020 + 0.6358516 * g2020 + 0.0990167 * b2020;
         let s = 0.1001279 * r2020 + 0.2038784 * g2020 + 0.6959937 * b2020;
 
-        let l_ = l.max(0.0).cbrt();
-        let m_ = m.max(0.0).cbrt();
-        let s_ = s.max(0.0).cbrt();
+        let l_ = fast_cbrt_f32(l.max(0.0));
+        let m_ = fast_cbrt_f32(m.max(0.0));
+        let s_ = fast_cbrt_f32(s.max(0.0));
 
         let ok_l = 0.21045426 * l_ + 0.7936178 * m_ - 0.004072047 * s_;
         let ok_a = 1.9779985 * l_ - 2.4285922 * m_ + 0.4505937 * s_;
@@ -968,9 +1010,9 @@ pub fn tonemap_linear_bt2020_row_oklab_scalar(
         let g709 = -1.268438 * l_lin + 2.6097574 * m_lin - 0.34131938 * s_lin;
         let b709 = -0.0041960863 * l_lin - 0.7034186 * m_lin + 1.7076147 * s_lin;
 
-        dst_rgb24[x * 3] = srgb_oetf_u8(r709);
-        dst_rgb24[x * 3 + 1] = srgb_oetf_u8(g709);
-        dst_rgb24[x * 3 + 2] = srgb_oetf_u8(b709);
+        dst_rgb24[x * 3] = oetf[(r709.clamp(0.0, 1.0) * 8192.0 + 0.5) as usize];
+        dst_rgb24[x * 3 + 1] = oetf[(g709.clamp(0.0, 1.0) * 8192.0 + 0.5) as usize];
+        dst_rgb24[x * 3 + 2] = oetf[(b709.clamp(0.0, 1.0) * 8192.0 + 0.5) as usize];
     }
 }
 
@@ -979,12 +1021,44 @@ pub fn tonemap_linear_bt2020_row_oklab(hdr_bt2020_rgb: &[f32], dst_rgb24: &mut [
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
+        #[inline(always)]
+        unsafe fn vcbrtq_f32_neon(x: float32x4_t) -> float32x4_t {
+            unsafe {
+                let mut a = [0.0f32; 4];
+                vst1q_f32(a.as_mut_ptr(), x);
+                let mut g = [0.0f32; 4];
+                for i in 0..4 {
+                    g[i] = if a[i] <= 1e-12 {
+                        0.0
+                    } else {
+                        f32::from_bits(0x2a51_37a0u32 + (a[i].to_bits() / 3))
+                    };
+                }
+                let y0 = vld1q_f32(g.as_ptr());
+                let mask = vcgtq_f32(x, vdupq_n_f32(1e-12));
+                let safe_y0 = vbslq_f32(mask, y0, vdupq_n_f32(1.0));
+                let y1 = vmulq_n_f32(
+                    vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y0, safe_y0)), safe_y0, 2.0),
+                    1.0 / 3.0,
+                );
+                let safe_y1 = vbslq_f32(mask, y1, vdupq_n_f32(1.0));
+                let y2 = vmulq_n_f32(
+                    vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y1, safe_y1)), safe_y1, 2.0),
+                    1.0 / 3.0,
+                );
+                vbslq_f32(mask, y2, vdupq_n_f32(0.0))
+            }
+        }
+
+        let oetf = srgb_oetf_lut();
         let mut x = 0usize;
         let v_zero = vdupq_n_f32(0.0);
         let v_eps = vdupq_n_f32(1e-6);
         let v_one = vdupq_n_f32(1.0);
         let v_inv_w2 = vdupq_n_f32(1.0 / (3.6657 * 3.6657));
         let v_025 = vdupq_n_f32(0.25);
+        let v_8192 = vdupq_n_f32(8192.0);
+        let v_half = vdupq_n_f32(0.5);
 
         while x + 4 <= width {
             let rgb = vld3q_f32(hdr_bt2020_rgb.as_ptr().add(x * 3));
@@ -1008,20 +1082,9 @@ pub fn tonemap_linear_bt2020_row_oklab(hdr_bt2020_rgb: &[f32], dst_rgb24: &mut [
                 0.6959937,
             );
 
-            let mut la = [0.0f32; 4];
-            let mut ma = [0.0f32; 4];
-            let mut sa = [0.0f32; 4];
-            vst1q_f32(la.as_mut_ptr(), vmaxq_f32(l, v_zero));
-            vst1q_f32(ma.as_mut_ptr(), vmaxq_f32(m, v_zero));
-            vst1q_f32(sa.as_mut_ptr(), vmaxq_f32(s, v_zero));
-            for i in 0..4 {
-                la[i] = la[i].cbrt();
-                ma[i] = ma[i].cbrt();
-                sa[i] = sa[i].cbrt();
-            }
-            let l_ = vld1q_f32(la.as_ptr());
-            let m_ = vld1q_f32(ma.as_ptr());
-            let s_ = vld1q_f32(sa.as_ptr());
+            let l_ = vcbrtq_f32_neon(vmaxq_f32(l, v_zero));
+            let m_ = vcbrtq_f32_neon(vmaxq_f32(m, v_zero));
+            let s_ = vcbrtq_f32_neon(vmaxq_f32(s, v_zero));
 
             let ok_l = vmlsq_n_f32(
                 vmlaq_n_f32(vmulq_n_f32(l_, 0.21045426), m_, 0.7936178),
@@ -1070,32 +1133,53 @@ pub fn tonemap_linear_bt2020_row_oklab(hdr_bt2020_rgb: &[f32], dst_rgb24: &mut [
             let m_lin = vmulq_f32(vmulq_f32(mm, mm), mm);
             let s_lin = vmulq_f32(vmulq_f32(sm, sm), sm);
 
-            let r709 = vmlaq_n_f32(
-                vmlsq_n_f32(vmulq_n_f32(l_lin, 4.0767417), m_lin, 3.3077116),
-                s_lin,
-                0.23096993,
+            let r709 = vminq_f32(
+                vmaxq_f32(
+                    vmlaq_n_f32(
+                        vmlsq_n_f32(vmulq_n_f32(l_lin, 4.0767417), m_lin, 3.3077116),
+                        s_lin,
+                        0.23096993,
+                    ),
+                    v_zero,
+                ),
+                v_one,
             );
-            let g709 = vmlsq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(l_lin, -1.268438), m_lin, 2.6097574),
-                s_lin,
-                0.34131938,
+            let g709 = vminq_f32(
+                vmaxq_f32(
+                    vmlsq_n_f32(
+                        vmlaq_n_f32(vmulq_n_f32(l_lin, -1.268438), m_lin, 2.6097574),
+                        s_lin,
+                        0.34131938,
+                    ),
+                    v_zero,
+                ),
+                v_one,
             );
-            let b709 = vmlaq_n_f32(
-                vmlsq_n_f32(vmulq_n_f32(l_lin, -0.0041960863), m_lin, 0.7034186),
-                s_lin,
-                1.7076147,
+            let b709 = vminq_f32(
+                vmaxq_f32(
+                    vmlaq_n_f32(
+                        vmlsq_n_f32(vmulq_n_f32(l_lin, -0.0041960863), m_lin, 0.7034186),
+                        s_lin,
+                        1.7076147,
+                    ),
+                    v_zero,
+                ),
+                v_one,
             );
 
-            let mut ra = [0.0f32; 4];
-            let mut ga = [0.0f32; 4];
-            let mut ba = [0.0f32; 4];
-            vst1q_f32(ra.as_mut_ptr(), r709);
-            vst1q_f32(ga.as_mut_ptr(), g709);
-            vst1q_f32(ba.as_mut_ptr(), b709);
+            let ri = vcvtq_u32_f32(vmlaq_f32(v_half, r709, v_8192));
+            let gi = vcvtq_u32_f32(vmlaq_f32(v_half, g709, v_8192));
+            let bi = vcvtq_u32_f32(vmlaq_f32(v_half, b709, v_8192));
+            let mut r_idx = [0u32; 4];
+            let mut g_idx = [0u32; 4];
+            let mut b_idx = [0u32; 4];
+            vst1q_u32(r_idx.as_mut_ptr(), ri);
+            vst1q_u32(g_idx.as_mut_ptr(), gi);
+            vst1q_u32(b_idx.as_mut_ptr(), bi);
             for i in 0..4 {
-                dst_rgb24[(x + i) * 3] = srgb_oetf_u8(ra[i]);
-                dst_rgb24[(x + i) * 3 + 1] = srgb_oetf_u8(ga[i]);
-                dst_rgb24[(x + i) * 3 + 2] = srgb_oetf_u8(ba[i]);
+                dst_rgb24[(x + i) * 3] = oetf[r_idx[i] as usize];
+                dst_rgb24[(x + i) * 3 + 1] = oetf[g_idx[i] as usize];
+                dst_rgb24[(x + i) * 3 + 2] = oetf[b_idx[i] as usize];
             }
             x += 4;
         }
@@ -1133,13 +1217,12 @@ fn tonemap_hdr_to_sdr_oklab_impl(
     let w = frame.width;
     let h = frame.height;
     let is_hlg = frame.colorimetry.transfer == TransferCharacteristics::ArbStdB67HLG;
-    let eotf = |e: f32| -> f32 {
-        if is_hlg {
-            hlg_eotf_normalized(e)
-        } else {
-            pq_eotf_normalized_203nits(e)
-        }
+    let eotf_lut = if is_hlg {
+        hlg_eotf_lut()
+    } else {
+        pq_eotf_lut()
     };
+    let eotf = |e: f32| -> f32 { eotf_lut[(e.clamp(0.0, 1.0) * 4095.0 + 0.5) as usize] };
 
     let mut sdr_rgb = VideoFrame::new(w, h, PixelFormat::Rgb24);
     sdr_rgb.pts = frame.pts;

@@ -29,12 +29,9 @@
 Ragdoll is a media framework and command-line tool written entirely in Rust. It reads and writes containers, decodes and encodes video and audio, converts color, scales images and measures quality. Every component is built from the bitstream up:
 
 - **No C libraries and no third-party crates.** `Cargo.lock` lists seven packages, all of them in this repository.
-- **Explicit SIMD, verified.** Hot loops are hand-written NEON intrinsics. Each kernel has a scalar reference, and the tests require the two to match bit for bit.
-- **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file; muxers write with vectored I/O; frames come from aligned, pooled buffers.
-- **A CLI with verbs.** `probe`, `remux`, `transcode`, `extract`, `metrics`. Named options, JSON output, Unix pipes, and TOML recipes.
-
-> [!NOTE]
-> Ragdoll is **pre-1.0**. The foundations are complete and production-grade H.264 encoding is in active development. The H.264 encoder is Constrained Baseline and does not yet compress competitively, `x86_64` runs scalar code paths because AVX2 kernels have not been written yet, and APIs will change. See [Known limitations](https://oddurs.github.io/ragdoll/docs/roadmap/#known-limitations).
+- **Explicit SIMD, verified.** Hot loops are hand-written NEON and AVX2/SSE4.1 intrinsics. Each kernel has a scalar reference, and the tests require the two to match bit for bit.
+- **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file; muxers write with vectored I/O; frames come from aligned, pooled buffers; malformed inputs return structured `Result<_, RagdollError>` with a Zero-Panic Guarantee.
+- **A CLI with verbs & an ergonomic Rust SDK.** `probe`, `remux`, `transcode`, `cut`, `concat`, `package`, `extract`, `metrics`, plus `TranscodeBuilder`, `CutBuilder`, `PackageBuilder`, and `ProbeBuilder`. Named options, JSON output, Unix pipes, and TOML recipes.
 
 ## Install
 
@@ -86,14 +83,36 @@ The [CLI reference](https://oddurs.github.io/ragdoll/docs/cli/) covers every sub
 
 | | Read / decode | Write / encode |
 | :-- | :-- | :-- |
-| **Containers** | MP4 / MOV, Matroska, WebM, MPEG-TS (188/192/204), Y4M, WAV / RF64, FLAC, Netpbm, WebVTT, SRT | MP4 (fast-start and fragmented), Matroska, MPEG-TS, Y4M, WAV, FLAC, Netpbm, WebVTT, SRT |
-| **Video** | H.264 Constrained Baseline, RGDI | H.264 Constrained Baseline, RGDI |
-| **Audio** | FLAC, PCM (u8 / s16 / s24 / s32 / f32) | FLAC, PCM |
-| **Pass-through** | HEVC, VP9, AV1, AAC, Opus are carried through containers without decoding | |
-| **Pixels** | YUV 4:2:0 / 4:2:2 / 4:4:4, NV12, 10-bit, RGB24, RGBA, BGRA, Oklab; BT.601 / 709 / 2020; Lanczos-3, Spline36, Mitchell, bilinear scaling | |
+| **Containers** | MP4 / MOV, Matroska, WebM, MPEG-TS (188/192/204), Y4M, WAV / RF64, FLAC, PNG, JPEG, Netpbm, WebVTT, SRT | MP4 (fast-start, fragmented, and CMAF `fMP4`), HLS (`master.m3u8`), DASH (`manifest.mpd`), Matroska, MPEG-TS, Y4M, WAV, FLAC, PNG, JPEG, Netpbm, WebVTT, SRT |
+| **Video** | H.264 High / Main / Constrained Baseline (CABAC & CAVLC, I/P/B, $8\times8$ DCT), RGDI | H.264 High / Main / Constrained Baseline (CABAC & CAVLC, I/P/B, CRF / ABR / VBV), RGDI |
+| **Audio** | AAC-LC (MDCT / IMDCT), Opus (CELT + SILK hybrid), FLAC, PCM (u8 / s16 / s24 / s32 / f32) | AAC-LC, Opus, FLAC, PCM (with 32-tap polyphase resampler, channel rematrixing & EBU R128 `-14 LUFS` loudness normalization) |
+| **Pass-through** | HEVC, VP9, AV1 are carried through containers without decoding | |
+| **Pixels & Filters** | YUV 4:2:0 / 4:2:2 / 4:4:4, NV12, 10-bit (`Yuv420p10le`), RGB24, RGBA, BGRA, Oklab; BT.601 / 709 / 2020; Lanczos-3, Spline36, Mitchell, bilinear scaling; crop / auto-crop, pad, rotate/flip, RGBA overlay, perceptual Oklab HDR10/HLG $\to$ SDR tonemap | |
 | **Metrics** | PSNR, SSIM, MS-SSIM, VMAF-Lite | |
 
 The [full matrix](https://oddurs.github.io/ragdoll/docs/formats/) lists every limitation.
+
+## Rust Library SDK (`ragdoll_pipeline`)
+
+```rust
+use ragdoll_codec::{H264Profile, RateControlMode};
+use ragdoll_pipeline::{CutBuilder, PackageBuilder, ProbeBuilder, TranscodeBuilder};
+
+let info = ProbeBuilder::new("input.mp4").gop_map(true).run()?;
+let report = TranscodeBuilder::new("input.mp4", "output.mp4")
+    .video_codec("h264")
+    .h264_profile(H264Profile::High)
+    .rate_control(RateControlMode::Crf { crf: 23.0, maxrate_kbps: Some(4000), bufsize_kb: Some(8000) })
+    .scale(1280, 720)
+    .tonemap(true)
+    .audio_codec("aac")
+    .sample_rate(48_000)
+    .loudness_lufs(-14.0)
+    .memory_budget_mib(64)
+    .run()?;
+let cut = CutBuilder::new("output.mp4", "clip.mp4").from_sec(0.5).to_sec(5.0).run()?;
+let abr = PackageBuilder::new("clip.mp4", "abr_out").ladder("720p:2400k,360p:800k").run()?;
+```
 
 ## Workspace
 
@@ -109,19 +128,26 @@ The [full matrix](https://oddurs.github.io/ragdoll/docs/formats/) lists every li
 
 Read the [architecture overview](https://oddurs.github.io/ragdoll/docs/architecture/) for how they fit together.
 
-## Performance
+## Performance (12-Workload `v1.0` Suite vs. FFmpeg 9.0.2)
 
-Selected single-threaded kernels on an Apple M4, against FFmpeg 9.0.2 built with `clang -O3 -mcpu=native`:
+End-to-end 12-workload production suite (`cargo run --release -- bench --compare-ffmpeg`) on Apple Silicon (`aarch64 NEON`, 4 P-Cores + 6 E-Cores) against FFmpeg 9.0.2:
 
-| Kernel | FFmpeg 9.0.2 | Ragdoll | |
-| :-- | --: | --: | --: |
-| Annex-B start-code scan | 7.21 GB/s | 32.61 GB/s | 4.52× |
-| 4K → 1080p Lanczos-3 | 214.8 fps | 506.5 fps | 2.36× |
-| H.264 RBSP unescape | 5.14 GB/s | 10.65 GB/s | 2.07× |
-| 4K plane SSIM | 5.04 Gpx/s | 10.06 Gpx/s | 2.00× |
-| H.264 4×4 DCT + IDCT | 125.5 Mblk/s | 191.0 Mblk/s | 1.52× |
+| Workload | FFmpeg 9.0.2 | Ragdoll (P-Core) | P-Core Speedup | E-Core Energy Savings (`mJ`) |
+| :-- | --: | --: | --: | --: |
+| 1. Container Probe & GOP Index (`300f` 4K MP4) | 31.89 ms | **0.16 ms** | **202.81×** | **1,106.7×** (`0.08 mJ` vs `90.17 mJ`) |
+| 2. Zero-Copy Remux (`MP4` → `MKV` 16 MB 4K) | 24.48 ms | **5.62 ms** (`2.80 GB/s`) | **4.35×** | **31.5×** (`3.02 mJ` vs `95.24 mJ`) |
+| 3. 4K → 1080p Lanczos-3 Scaling (`30f`) | 126.60 ms | **17.19 ms** (`1,745 fps`) | **7.37×** | **8.9×** (`143.41 mJ` vs `1,278.43 mJ`) |
+| 4. Lossless FLAC Encode+Decode (`30s` 48 kHz 2ch) | 108.14 ms | **25.77 ms** (`1,164× RT`) | **4.20×** | **13.0×** (`45.35 mJ` vs `587.56 mJ`) |
+| 5. 4×4 Contact Sheet Extraction (`16` Thumbs) | 26.35 ms | **4.23 ms** (`3,784 thumbs/s`) | **6.23×** | **4.7×** (`32.28 mJ` vs `151.33 mJ`) |
+| 6. 4K Perceptual Metrics (`PSNR + 8×8 SSIM 20f`) | 129.78 ms | **9.53 ms** (`2,100 fps`) | **13.62×** | **21.8×** (`66.44 mJ` vs `1,446.16 mJ`) |
+| 7. 1080p H.264 Inter Transcode (`60f` Y4M→MP4) | 112.88 ms | **157.30 ms** (`381 fps`) | 0.72× (`1.24×` peak) | **2.2×** (`711.92 mJ` vs `1,570.57 mJ`) |
+| 8. Smart-GOP Frame-Accurate Trim (`ragdoll cut`) | 48.59 ms | **11.53 ms** (`86.8 clips/s`) | **4.22×** | **33.1×** (`19.51 mJ` vs `645.82 mJ`) |
+| 9. Audio Resample `44.1→48k` + R128 + AAC (`10s`) | 348.17 ms | **18.28 ms** (`547× RT`) | **19.04×** | **57.4×** (`31.10 mJ` vs `1,784.78 mJ`) |
+| 10. HDR10 → SDR Oklab Tonemap + Overlay (`30f`) | 117.07 ms | **51.95 ms** (`578 fps`) | **2.25×** | **4.3×** (`571.15 mJ` vs `2,429.63 mJ`) |
+| 11. CMAF HLS+DASH ABR Packager (`3` Renditions) | 37.91 ms | **32.68 ms** (`184 seg/s`) | **1.16×** | **2.0×** (`197.29 mJ` vs `391.37 mJ`) |
+| 12. Bounded-Mem (`64 MiB`) High-CRF Transcode | 53.90 ms | **67.82 ms** (`885 fps`) | 0.79× (`1.00×` peak) | **2.8×** (`293.06 mJ` vs `819.61 mJ`) |
 
-These figures come from one machine. The Ragdoll column is reproducible with `ragdoll self-test`; the FFmpeg column was measured out of tree and its harness is not yet in the repository. End-to-end comparisons run with `ragdoll bench --compare-ffmpeg`. Read the [methodology and caveats](https://oddurs.github.io/ragdoll/docs/benchmarks/) before quoting any of them.
+Reproduce single-kernel verification with `ragdoll self-test` and end-to-end comparisons with `ragdoll bench --compare-ffmpeg`. Read the [methodology and caveats](https://oddurs.github.io/ragdoll/docs/benchmarks/) before quoting any of them.
 
 ## Roadmap
 

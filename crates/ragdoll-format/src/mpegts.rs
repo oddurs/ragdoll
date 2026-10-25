@@ -289,6 +289,111 @@ pub fn build_avcc_from_sps_pps(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     avcc
 }
 
+/// Parses active cropped display `(width, height)` from an H.264 `SPS` (`nal_unit_type = 7`) NAL unit.
+fn parse_h264_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
+    if sps_nal.len() < 4 || (sps_nal[0] & 0x1F) != 7 {
+        return None;
+    }
+    let rbsp = ragdoll_core::unescape_rbsp(&sps_nal[1..]);
+    let mut r = ragdoll_core::BitReader::new(&rbsp);
+    let profile_idc = r.read_bits(8).ok()? as u8;
+    let _constraint_flags = r.read_bits(8).ok()?;
+    let _level_idc = r.read_bits(8).ok()?;
+    let sps_id = r.read_ue().ok()?;
+    if sps_id >= 32 {
+        return None;
+    }
+    let mut chroma_format_idc = 1u8;
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = r.read_ue().ok()? as u8;
+        if chroma_format_idc == 3 {
+            let _ = r.read_bit().ok()?;
+        }
+        let _bit_depth_luma = r.read_ue().ok()?;
+        let _bit_depth_chroma = r.read_ue().ok()?;
+        let _qpprime_y_zero = r.read_bit().ok()?;
+        if r.read_bit().ok()? {
+            let num_lists = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..num_lists {
+                if r.read_bit().ok()? {
+                    let size = if i < 6 { 16 } else { 64 };
+                    let mut last_scale = 8i64;
+                    let mut next_scale = 8i64;
+                    for _ in 0..size {
+                        if next_scale != 0 {
+                            let delta = r.read_se().ok()?;
+                            next_scale =
+                                (last_scale.wrapping_add(delta).wrapping_add(256)).rem_euclid(256);
+                        }
+                        last_scale = if next_scale == 0 {
+                            last_scale
+                        } else {
+                            next_scale
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let _log2_max_frame_num = r.read_ue().ok()?;
+    let poc_type = r.read_ue().ok()?;
+    if poc_type == 0 {
+        let _ = r.read_ue().ok()?;
+    } else if poc_type == 1 {
+        let _ = r.read_bit().ok()?;
+        let _ = r.read_se().ok()?;
+        let _ = r.read_se().ok()?;
+        let cycle_len = r.read_ue().ok()?.min(255);
+        for _ in 0..cycle_len {
+            let _ = r.read_se().ok()?;
+        }
+    }
+    let _max_num_ref_frames = r.read_ue().ok()?;
+    let _gaps_allowed = r.read_bit().ok()?;
+    let pic_width_in_mbs = (r.read_ue().ok()? as u32).saturating_add(1);
+    let pic_height_in_map_units = (r.read_ue().ok()? as u32).saturating_add(1);
+    let frame_mbs_only_flag = r.read_bit().ok()?;
+    if !frame_mbs_only_flag {
+        let _ = r.read_bit().ok()?;
+    }
+    let _direct_8x8 = r.read_bit().ok()?;
+    let (mut crop_left, mut crop_right, mut crop_top, mut crop_bottom) = (0u32, 0u32, 0u32, 0u32);
+    if r.read_bit().ok()? {
+        crop_left = r.read_ue().ok()? as u32;
+        crop_right = r.read_ue().ok()? as u32;
+        crop_top = r.read_ue().ok()? as u32;
+        crop_bottom = r.read_ue().ok()? as u32;
+    }
+    let crop_unit_x = if matches!(chroma_format_idc, 0 | 3) {
+        1
+    } else {
+        2
+    };
+    let sub_height_c = if chroma_format_idc == 1 { 2 } else { 1 };
+    let frame_mbs = if frame_mbs_only_flag { 1 } else { 2 };
+    let crop_unit_y = sub_height_c * frame_mbs;
+    let width = pic_width_in_mbs.saturating_mul(16).saturating_sub(
+        crop_left
+            .saturating_add(crop_right)
+            .saturating_mul(crop_unit_x),
+    );
+    let height = pic_height_in_map_units
+        .saturating_mul(16)
+        .saturating_mul(frame_mbs)
+        .saturating_sub(
+            crop_top
+                .saturating_add(crop_bottom)
+                .saturating_mul(crop_unit_y),
+        );
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
+}
+
 enum TsSliceStorage<'a> {
     ZeroCopy(&'a [u8]),
     Reassembled(AlignedBuffer),
@@ -412,6 +517,13 @@ impl<'a> MpegTsDemuxer<'a> {
                             pps = Some(nal);
                         }
                     }
+                }
+                if let Some(s) = sps
+                    && let Some((w, h)) = parse_h264_sps_dimensions(s)
+                    && let Some(vp) = &mut track.video
+                {
+                    vp.width = w;
+                    vp.height = h;
                 }
                 if track.extra_data.is_empty()
                     && let (Some(s), Some(p)) = (sps, pps)
