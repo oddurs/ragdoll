@@ -18,6 +18,8 @@ pub enum PixelFormat {
     Rgb24,
     /// Packed 8-bit RGBA (1 plane, 4 bytes per pixel: R, G, B, A).
     Rgba8,
+    /// Packed 8-bit BGRA (1 plane, 4 bytes per pixel: B, G, R, A).
+    Bgra8,
     /// Planar 8-bit Grayscale / Luma only (1 plane, 1 byte per pixel).
     Gray8,
     /// Packed 32-bit floating-point linear RGB (1 plane, 12 bytes per pixel).
@@ -32,7 +34,12 @@ impl PixelFormat {
         match self {
             Self::Yuv420p | Self::Yuv422p | Self::Yuv444p | Self::Yuv420p10le => 3,
             Self::Nv12 => 2,
-            Self::Rgb24 | Self::Rgba8 | Self::Gray8 | Self::RgbF32 | Self::OklabF32 => 1,
+            Self::Rgb24
+            | Self::Rgba8
+            | Self::Bgra8
+            | Self::Gray8
+            | Self::RgbF32
+            | Self::OklabF32 => 1,
         }
     }
 
@@ -54,6 +61,7 @@ impl PixelFormat {
             Self::Yuv444p
             | Self::Rgb24
             | Self::Rgba8
+            | Self::Bgra8
             | Self::Gray8
             | Self::RgbF32
             | Self::OklabF32 => (0, 0),
@@ -92,7 +100,7 @@ impl PixelFormat {
             }
             Self::Yuv420p10le => 2,
             Self::Rgb24 => 3,
-            Self::Rgba8 => 4,
+            Self::Rgba8 | Self::Bgra8 => 4,
             Self::RgbF32 | Self::OklabF32 => 12,
         }
     }
@@ -129,6 +137,7 @@ impl fmt::Display for PixelFormat {
             Self::Yuv420p10le => "yuv420p10le",
             Self::Rgb24 => "rgb24",
             Self::Rgba8 => "rgba8",
+            Self::Bgra8 => "bgra8",
             Self::Gray8 => "gray8",
             Self::RgbF32 => "rgbf32",
             Self::OklabF32 => "oklabf32",

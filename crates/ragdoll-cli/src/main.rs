@@ -7,9 +7,11 @@ use ragdoll_core::{
     unescape_rbsp, unescape_rbsp_scalar,
 };
 use ragdoll_pix::{
-    PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, evaluate_frame_quality, hscale_row_8tap_q14,
-    hscale_row_8tap_q14_scalar, rgb24_to_yuv420p, rgb24_to_yuv420p_scalar, scale_plane,
-    yuv420p_to_rgb24, yuv420p_to_rgb24_scalar,
+    PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
+    dither_plane_u16le_to_u8_bayer_scalar, evaluate_frame_quality, hscale_row_8tap_q14,
+    hscale_row_8tap_q14_scalar, nv12_to_rgb24, nv12_to_rgb24_scalar, rgb24_to_yuv420p,
+    rgb24_to_yuv420p_scalar, scale_plane, yuv420p_to_rgb24, yuv420p_to_rgb24_scalar,
+    yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
 };
 use ragdoll_simd::{
     SimdLevel, find_annex_b_start_code, find_annex_b_start_code_scalar, forward_dct4x4,
@@ -334,6 +336,137 @@ fn main() {
         dt_y2r_scalar / dt_y2r_simd
     );
 
+    let mut rgba_ref = vec![0u8; w1080 * 4 * h1080];
+    let mut rgba_simd = vec![0u8; w1080 * 4 * h1080];
+    let t0 = Instant::now();
+    for _ in 0..pix_iters {
+        yuv420p_to_rgba8_scalar(
+            black_box(ya_slice),
+            stride,
+            black_box(u_slice),
+            c_stride,
+            black_box(v_slice),
+            c_stride,
+            black_box(&mut rgba_ref),
+            w1080 * 4,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_rgba_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..pix_iters {
+        yuv420p_to_rgba8(
+            black_box(ya_slice),
+            stride,
+            black_box(u_slice),
+            c_stride,
+            black_box(v_slice),
+            c_stride,
+            black_box(&mut rgba_simd),
+            w1080 * 4,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_rgba_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(rgba_ref, rgba_simd);
+    println!(
+        "1080p YUV420p -> RGBA8 (BT.709 vst4q_u8)    {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (px1080 * pix_iters as f64) / dt_rgba_scalar / 1e9,
+        (px1080 * pix_iters as f64) / dt_rgba_simd / 1e9,
+        dt_rgba_scalar / dt_rgba_simd
+    );
+
+    let mut nv12_uv = vec![128u8; w1080 * (h1080 / 2)];
+    for (i, b) in nv12_uv.iter_mut().enumerate() {
+        *b = ((i * 23 + 40) % 200 + 20) as u8;
+    }
+    let mut nv12_ref = vec![0u8; w1080 * 3 * h1080];
+    let mut nv12_simd = vec![0u8; w1080 * 3 * h1080];
+    let t0 = Instant::now();
+    for _ in 0..pix_iters {
+        nv12_to_rgb24_scalar(
+            black_box(ya_slice),
+            stride,
+            black_box(&nv12_uv),
+            w1080,
+            black_box(&mut nv12_ref),
+            w1080 * 3,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_nv12_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..pix_iters {
+        nv12_to_rgb24(
+            black_box(ya_slice),
+            stride,
+            black_box(&nv12_uv),
+            w1080,
+            black_box(&mut nv12_simd),
+            w1080 * 3,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_nv12_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(nv12_ref, nv12_simd);
+    println!(
+        "1080p NV12 -> RGB24 (BT.709 vld2_u8 UV)     {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (px1080 * pix_iters as f64) / dt_nv12_scalar / 1e9,
+        (px1080 * pix_iters as f64) / dt_nv12_simd / 1e9,
+        dt_nv12_scalar / dt_nv12_simd
+    );
+
+    let mut y10_le = vec![0u8; w1080 * 2 * h1080];
+    for (i, chunk) in y10_le.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        *chunk = (((i * 19 + 300) & 1023) as u16).to_le_bytes();
+    }
+    let mut dither_ref = vec![0u8; w1080 * h1080];
+    let mut dither_simd = vec![0u8; w1080 * h1080];
+    let t0 = Instant::now();
+    for _ in 0..pix_iters {
+        dither_plane_u16le_to_u8_bayer_scalar(
+            black_box(&y10_le),
+            w1080 * 2,
+            black_box(&mut dither_ref),
+            w1080,
+            w1080,
+            h1080,
+            10,
+        );
+    }
+    let dt_dith_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..pix_iters {
+        dither_plane_u16le_to_u8_bayer(
+            black_box(&y10_le),
+            w1080 * 2,
+            black_box(&mut dither_simd),
+            w1080,
+            w1080,
+            h1080,
+            10,
+        );
+    }
+    let dt_dith_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(dither_ref, dither_simd);
+    println!(
+        "1080p 10-bit -> 8-bit Bayer 16x16 Dither    {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (px1080 * pix_iters as f64) / dt_dith_scalar / 1e9,
+        (px1080 * pix_iters as f64) / dt_dith_simd / 1e9,
+        dt_dith_scalar / dt_dith_simd
+    );
+
     let mut y_out_ref = vec![0u8; w1080 * h1080];
     let mut u_out_ref = vec![0u8; (w1080 / 2) * (h1080 / 2)];
     let mut v_out_ref = vec![0u8; (w1080 / 2) * (h1080 / 2)];
@@ -473,7 +606,7 @@ fn main() {
         satd8
     );
     println!(
-        "[M2 Pix & Quality] 4K->1080p Lanczos-3 L1 Ring-Buffer: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, VMAF-Lite={:.2}",
-        l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.vmaf_lite
+        "[M2 Pix & Quality] 4K->1080p Lanczos-3 Q6 L1 Ring: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, MS-SSIM={:.5}, VMAF-Lite={:.2}",
+        l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.ms_ssim, q_rep.vmaf_lite
     );
 }
