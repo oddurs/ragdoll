@@ -53,7 +53,7 @@ The wave budget bounds the scale-and-encode stage, but step 1 currently decodes 
 </Callout>
 
 <Callout kind="status" title="Encoder status">
-The H.264 encoder produces Constrained Baseline streams with CAVLC, using `I_16x16`, `I_PCM`, `P_L0_16x16` and `P_Skip` macroblocks. Output decodes correctly but is large, because blocks that the encoder cannot yet code with residuals fall back to `I_PCM`. Full residual coding, quarter-pel motion, deblocking, CABAC and CRF rate control are the subject of milestone M7.
+The H.264 encoder produces Constrained Baseline streams with CAVLC, using `I_16x16`, `I_PCM`, `P_L0_16x16` and `P_Skip` macroblocks. Output decodes correctly but is large, because blocks that the encoder cannot yet code with residuals fall back to `I_PCM`. Full residual coding, quarter-pel motion, deblocking, CABAC and CRF rate control are in development.
 </Callout>
 
 ## Examples

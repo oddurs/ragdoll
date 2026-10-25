@@ -16,19 +16,19 @@ This page lists what Ragdoll supports today, on `main`. It is deliberately conse
 | MPEG-2 Transport Stream | `.ts` `.m2ts` | <S v="yes" /> | <S v="yes" /> | 188, 192 (M2TS) and 204-byte (FEC) packets, auto-detected. PAT/PMT with CRC-32. Annex-B ↔ AVCC conversion for H.264, ADTS framing for AAC. |
 | YUV4MPEG2 | `.y4m` | <S v="yes" /> | <S v="yes" /> | Uncompressed planar YUV. |
 | RIFF WAVE, RF64, BW64 | `.wav` | <S v="yes" /> | <S v="yes" /> | PCM 8/16/24/32-bit and 32-bit float. |
-| FLAC (native) | `.flac` | <S v="yes" /> | <S v="yes" /> | Stream with `STREAMINFO`. Seek tables and Vorbis comments are planned (M8). |
+| FLAC (native) | `.flac` | <S v="yes" /> | <S v="yes" /> | Stream with `STREAMINFO`. Seek tables and Vorbis comments are planned. |
 | Netpbm | `.ppm` `.pgm` | <S v="yes" /> | <S v="yes" /> | Binary `P6` (RGB) and `P5` (gray). Contact-sheet composition. |
 | WebVTT | `.vtt` | <S v="yes" /> | <S v="yes" /> | Standalone files, and `wvtt` samples inside MP4. |
 | SubRip | `.srt` | <S v="yes" /> | <S v="yes" /> | |
 | IVF | `.ivf` | <S v="inspect" /> | <S v="no" /> | Parsed for AV1 OBU inspection through the library. |
-| Ogg | `.ogg` `.opus` | <S v="planned" /> | <S v="planned" /> | M8. |
-| HLS / DASH (CMAF) | `.m3u8` `.mpd` | <S v="no" /> | <S v="planned" /> | `ragdoll package`, M9. |
+| Ogg | `.ogg` `.opus` | <S v="planned" /> | <S v="planned" /> | |
+| HLS / DASH (CMAF) | `.m3u8` `.mpd` | <S v="no" /> | <S v="planned" /> | Planned as `ragdoll package`. |
 
 ## Video codecs
 
 | Codec | Decode | Encode | Notes |
 | :-- | :-: | :-: | :-- |
-| H.264 / AVC | <S v="partial" /> | <S v="partial" /> | Constrained Baseline: CAVLC, `I_16x16`, `I_PCM`, `P_L0_16x16`, `P_Skip`. SPS, PPS, slice header and SEI parsing. Main and High profile (CABAC, 8×8 transform, B-frames), full residual coding, quarter-pel motion and deblocking are M7. |
+| H.264 / AVC | <S v="partial" /> | <S v="partial" /> | Constrained Baseline: CAVLC, `I_16x16`, `I_PCM`, `P_L0_16x16`, `P_Skip`. SPS, PPS, slice header and SEI parsing. Main and High profile (CABAC, 8×8 transform, B-frames), full residual coding, quarter-pel motion and deblocking are in development. |
 | RGDI (Ragdoll Fast-Intra) | <S v="yes" /> | <S v="yes" /> | Ragdoll's own intra-only codec for fast intermediate files. Not intended for distribution. |
 | AV1 | <S v="inspect" /> | <S v="no" /> | OBU parsing, sequence header inspection, `av1C` construction. Carried through MP4, Matroska and MPEG-TS. |
 | HEVC / H.265 | <S v="passthrough" /> | <S v="no" /> | Recognized in containers and copied by `remux`. |
@@ -41,8 +41,8 @@ This page lists what Ragdoll supports today, on `main`. It is deliberately conse
 | :-- | :-: | :-: | :-- |
 | FLAC | <S v="yes" /> | <S v="yes" /> | RFC 9639. Encoder uses fixed and LPC predictors with Rice coding and mid/side stereo; frames carry CRC-8 and CRC-16. |
 | PCM | <S v="yes" /> | <S v="yes" /> | `u8`, `s16le`, `s24le`, `s32le`, `f32le`, with SIMD conversion and interleaving. |
-| AAC-LC | <S v="passthrough" /> | <S v="planned" /> | ADTS framing handled for MPEG-TS. Decode and encode are M8. |
-| Opus | <S v="passthrough" /> | <S v="planned" /> | M8. |
+| AAC-LC | <S v="passthrough" /> | <S v="planned" /> | ADTS framing handled for MPEG-TS. Decode and encode are planned. |
+| Opus | <S v="passthrough" /> | <S v="planned" /> | Decode and encode are planned. |
 
 ## Subtitles
 

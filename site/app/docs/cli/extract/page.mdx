@@ -43,5 +43,5 @@ ragdoll extract talk.mp4 -o strip.ppm --thumbnails 12 --grid 6x2
 ## Notes
 
 - Each thumbnail is the source frame scaled to `width / columns` by `height / rows` (at least 64×36) with the polyphase scaler, then converted to RGB using the track's colorimetry.
-- PPM is the binary Netpbm `P6` format. Most image viewers open it directly; convert it to PNG with any image tool. Native PNG and JPEG output are planned for milestone M9.
+- PPM is the binary Netpbm `P6` format. Most image viewers open it directly; convert it to PNG with any image tool. Native PNG and JPEG output are planned.
 - The whole video is currently decoded before frames are selected. For long inputs this is slower and uses more memory than a keyframe seek would.

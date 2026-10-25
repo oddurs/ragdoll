@@ -2,43 +2,43 @@ export const metadata = { title: "Roadmap" };
 
 # Roadmap
 
-Ragdoll's roadmap lives in the repository as Markdown files under [`cairn/items`](https://github.com/oddurs/ragdoll/tree/main/cairn/items), one per feature, kernel, benchmark or decision. [`ROADMAP.md`](https://github.com/oddurs/ragdoll/blob/main/ROADMAP.md) is generated from them. This page summarizes the milestones.
+Ragdoll is pre-1.0. This page describes what works today, what is being built now, and what is planned before the 1.0 release. Dates are not promised; each area ships when it passes the same verification as the rest of the codebase.
 
-## Milestones
+## Available today
 
-| | Milestone | Status | Scope |
-| :-- | :-- | :-- | :-- |
-| **M1** | Foundation | Done | 128-bit timebases, CICP and Oklab color, aligned frame pools, bit I/O, CRCs, core NEON kernels. |
-| **M2** | Pixels | Done | YUV ↔ RGB / NV12 / Oklab conversion, 10-bit dithering, polyphase scaling, PSNR / SSIM / MS-SSIM / VMAF-Lite. |
-| **M3** | Containers | Done | Zero-copy MP4, Matroska / WebM and MPEG-TS; Y4M, Netpbm, WAV. |
-| **M4** | Codecs | Done | FLAC, PCM, H.264 Baseline, AV1 OBU inspection, RGDI. |
-| **M5** | CLI and benchmarks | Done | GOP-parallel pipeline, TOML recipes, seven subcommands, end-to-end benchmark suite. |
-| **M6** | Streaming and A/V sync | Done | Bounded GOP-ring encoding, stdin / stdout pipes, multi-track audio, video and subtitles with 128-bit re-timing. |
-| **M7** | Production video | **In progress** | H.264: full residual coding, intra 4×4, quarter-pel motion, deblocking, Main and High profiles with CABAC, 8×8 transform, B-frames, CRF and VBV rate control. |
-| **M8** | Professional audio | Planned | AAC-LC and Opus, a Kaiser-windowed polyphase resampler, channel remixing, EBU R128 loudness and true-peak, native FLAC and Ogg containers. |
-| **M9** | Editing, images, packaging | Planned | Frame-accurate `ragdoll cut` and `ragdoll concat` that re-encode only boundary GOPs; PNG and JPEG; crop, pad, rotate, overlay and HDR tone mapping; `ragdoll package` for HLS and DASH. |
-| **M10** | 1.0 | Planned | A stable library facade (`Transcoder`, `Prober`, `Editor`, `Packager`), a 10,000-mutation zero-panic fuzz corpus, and a 12-workload release benchmark suite. |
+- **Foundation.** 128-bit timebases and rescaling, CICP and Oklab colorimetry, 64-byte-aligned frame pools, bit I/O with Exp-Golomb and Rice coding, CRC-8/16/32.
+- **Pixels.** YUV, NV12, RGB and Oklab conversion; 10-bit to 8-bit dithering; Lanczos-3, Spline36, Mitchell and bilinear scaling; PSNR, SSIM, MS-SSIM and VMAF-Lite.
+- **Containers.** Zero-copy MP4, Matroska / WebM and MPEG-TS; Y4M, WAV / RF64, Netpbm, WebVTT and SubRip.
+- **Codecs.** FLAC and PCM; H.264 Constrained Baseline encode and decode; the RGDI intermediate codec; AV1 bitstream inspection.
+- **Pipeline and CLI.** GOP-parallel encoding with a bounded working set, stdin / stdout pipes, multi-track audio, video and subtitles re-timed with 128-bit arithmetic, TOML recipes, and the `probe`, `remux`, `transcode`, `extract`, `metrics`, `synth`, `bench` and `self-test` commands.
 
-## Known gaps
+## In development
 
-These are things a careful reader of the code will notice. They are tracked as roadmap work rather than hidden:
+**Production H.264.** Full 4×4 and 8×8 residual coding, nine-mode intra 4×4 prediction, quarter-pel motion compensation, the in-loop deblocking filter, Main and High profiles with CABAC, the 8×8 transform, B-frame decoding, and CRF and VBV rate control.
 
-- **AVX2** (`SIMD-0055`). `x86_64` currently runs the scalar reference paths. No AVX2 kernels exist yet.
-- **Streaming decode** (`0054`). `transcode`, `extract` and `metrics` decode the entire input before processing, so memory grows with input length even though encoding is bounded.
-- **H.264 compression.** The encoder falls back to `I_PCM` for blocks it cannot yet code with residuals, so files are large. This is the core of M7.
-- **No-op options** (`0057`). Recipe `start`, `duration` and `sample_rate`, `remux --faststart` and `transcode --color` are accepted but have no effect.
-- **FFmpeg kernel harness** (`BENCH-0056`). The FFmpeg side of the kernel benchmarks is not yet reproducible from the repository.
-- **Argument parsing** (`0057`). Unknown CLI options are ignored rather than rejected.
-- **Piped MPEG-TS probe** (`BUG-0053`). `probe -` can report the wrong dimensions for a transport stream on stdin.
+## Planned for 1.0
 
-## Following along
+| Area | Scope |
+| :-- | :-- |
+| **Audio** | AAC-LC and Opus encode and decode; a Kaiser-windowed polyphase resampler; 5.1 / 7.1 ↔ stereo remixing; EBU R128 loudness and true-peak normalization; native FLAC and Ogg containers with seek tables and tags. |
+| **Editing** | Frame-accurate `ragdoll cut` and `ragdoll concat` that re-encode only the GOPs at each boundary and copy everything in between. |
+| **Images and filters** | PNG and baseline JPEG; crop, pad, rotate, frame-rate conversion, overlay, and HDR-to-SDR tone mapping. |
+| **Packaging** | `ragdoll package`: one command from a source file to a CMAF HLS and DASH bitrate ladder. |
+| **x86_64** | AVX2 implementations of every NEON kernel, verified against the same scalar references. |
+| **Library** | A small, stable facade (`Transcoder`, `Prober`, `Editor`, `Packager`) over the current crates. |
+| **Hardening** | A malformed-bitstream fuzz corpus run in CI, with the requirement that no input causes a panic. |
+| **Benchmarks** | A twelve-workload release suite with in-process FFmpeg comparisons and matched output quality. |
 
-```sh
-cairn list --view now          # what is in progress
-cairn list --view next         # what is ready to start
-cairn list --view kernels      # SIMD work
-cairn list --view benchmarks   # benchmark items
-cairn list --view decisions    # architecture decision records
-```
+## Known limitations
 
-[Cairn](https://github.com/oddurs/cairn) is the tool that manages the item files. You don't need it to read them; they are plain Markdown.
+- **No AVX2 kernels yet.** On `x86_64`, Ragdoll runs its scalar reference implementations. They are correct but slower.
+- **Decoding is not yet bounded.** `transcode`, `extract` and `metrics` decode the entire input before processing it, so memory use grows with input length even though encoding is bounded.
+- **H.264 compression.** The encoder falls back to `I_PCM` for blocks it cannot yet code with residuals, so output files are large.
+- **Some options have no effect.** `remux --faststart`, `transcode --color`, and the recipe keys `start`, `duration` and `sample_rate` are accepted but not applied.
+- **Unknown options are ignored** rather than rejected.
+- **Piped transport streams.** `probe -` can report the wrong dimensions for an MPEG-TS stream read from stdin. Probing the same data from a file is correct.
+- **Kernel benchmarks.** The FFmpeg side of the kernel comparison is not yet reproducible from the repository. See [Benchmarks](/docs/benchmarks/).
+
+## Following development
+
+Development happens in the open on [GitHub](https://github.com/oddurs/ragdoll). The [commit history](https://github.com/oddurs/ragdoll/commits/main) and [pull requests](https://github.com/oddurs/ragdoll/pulls) show what has changed. To report a problem or ask a question, [open an issue](https://github.com/oddurs/ragdoll/issues).

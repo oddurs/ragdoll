@@ -21,7 +21,7 @@
   <a href="https://oddurs.github.io/ragdoll/docs/quickstart/">Quickstart</a> ·
   <a href="https://oddurs.github.io/ragdoll/docs/formats/">Formats &amp; codecs</a> ·
   <a href="https://oddurs.github.io/ragdoll/docs/benchmarks/">Benchmarks</a> ·
-  <a href="ROADMAP.md">Roadmap</a>
+  <a href="https://oddurs.github.io/ragdoll/docs/roadmap/">Roadmap</a>
 </p>
 
 ---
@@ -34,7 +34,7 @@ Ragdoll is a media framework and command-line tool written entirely in Rust. It 
 - **A CLI with verbs.** `probe`, `remux`, `transcode`, `extract`, `metrics`. Named options, JSON output, Unix pipes, and TOML recipes.
 
 > [!NOTE]
-> Ragdoll is **pre-1.0**. Milestones M1–M6 are complete and production H.264 (M7) is in progress. The H.264 encoder is Constrained Baseline and does not yet compress competitively, `x86_64` runs scalar code paths because AVX2 kernels have not been written yet, and APIs will change. See [Known gaps](https://oddurs.github.io/ragdoll/docs/roadmap/#known-gaps).
+> Ragdoll is **pre-1.0**. The foundations are complete and production-grade H.264 encoding is in active development. The H.264 encoder is Constrained Baseline and does not yet compress competitively, `x86_64` runs scalar code paths because AVX2 kernels have not been written yet, and APIs will change. See [Known limitations](https://oddurs.github.io/ragdoll/docs/roadmap/#known-limitations).
 
 ## Install
 
@@ -125,15 +125,11 @@ These figures come from one machine. The Ragdoll column is reproducible with `ra
 
 ## Roadmap
 
-| Milestone | Status | |
-| :-- | :-- | :-- |
-| M1 Foundation · M2 Pixels · M3 Containers · M4 Codecs · M5 CLI & bench · M6 Streaming & sync | Done | |
-| M7 Production video | In progress | Full H.264 residuals, quarter-pel, deblocking, CABAC, B-frames, CRF |
-| M8 Professional audio | Planned | AAC-LC, Opus, resampling, EBU R128 |
-| M9 Edit & package | Planned | Smart-GOP cut / concat, PNG / JPEG, filters, HLS / DASH |
-| M10 1.0 | Planned | Stable SDK, fuzzing, release benchmarks |
+- **Available today:** the containers, codecs, pixel processing and metrics above; a GOP-parallel pipeline with pipes and multi-track A/V sync; TOML recipes.
+- **In development:** production H.264, with full residual coding, quarter-pel motion, deblocking, Main and High profiles with CABAC, B-frames, and CRF rate control.
+- **Planned for 1.0:** AAC-LC and Opus, EBU R128 loudness, frame-accurate cut and concat, PNG and JPEG, filters and HDR tone mapping, HLS and DASH packaging, AVX2 kernels, a stable library API, and fuzz hardening.
 
-Work is tracked as Markdown files in [`cairn/items`](cairn/items), and [`ROADMAP.md`](ROADMAP.md) is generated from them.
+The [roadmap page](https://oddurs.github.io/ragdoll/docs/roadmap/) has details and known limitations.
 
 ## Contributing
 
@@ -141,7 +137,7 @@ Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. The 
 
 - No new dependencies and no C. Write it in Rust, in the crate where it belongs.
 - Every optimized kernel needs a scalar reference and a differential test.
-- `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` and `cairn check --render --strict` must pass.
+- `cargo fmt`, `cargo clippy -D warnings` and `cargo test --workspace` must pass.
 
 AVX2 ports of the existing NEON kernels are a good place to start: each one already has a reference and tests to match.
 
