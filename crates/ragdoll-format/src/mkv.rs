@@ -14,6 +14,11 @@ const ID_DOC_TYPE_VERSION: u32 = 0x4287;
 const ID_DOC_TYPE_READ_VERSION: u32 = 0x4285;
 
 const ID_SEGMENT: u32 = 0x1853_8067;
+const ID_SEEK_HEAD: u32 = 0x114D_9B74;
+const ID_SEEK: u32 = 0x4DBB;
+const ID_SEEK_ID: u32 = 0x53AB;
+const ID_SEEK_POSITION: u32 = 0x53AC;
+
 const ID_INFO: u32 = 0x1549_A966;
 const ID_TIMESTAMP_SCALE: u32 = 0x002A_D7B1;
 const ID_DURATION: u32 = 0x4489;
@@ -28,6 +33,8 @@ const ID_TRACK_TYPE: u32 = 0x83;
 const ID_DEFAULT_DURATION: u32 = 0x0023_E383;
 const ID_CODEC_ID: u32 = 0x86;
 const ID_CODEC_PRIVATE: u32 = 0x63A2;
+const ID_CODEC_DELAY: u32 = 0x56AA;
+const ID_SEEK_PRE_ROLL: u32 = 0x56BB;
 
 const ID_VIDEO: u32 = 0xE0;
 const ID_PIXEL_WIDTH: u32 = 0xB0;
@@ -133,6 +140,8 @@ pub struct MkvDemuxer<'a> {
     default_durations_ticks: Vec<i64>,
     packets: Vec<(u32, SampleEntry, i64)>,
     cursor: usize,
+    has_seek_head: bool,
+    cues_count: usize,
 }
 
 impl<'a> MkvDemuxer<'a> {
@@ -146,6 +155,8 @@ impl<'a> MkvDemuxer<'a> {
         let mut track_numbers = Vec::new();
         let mut default_durations_ns = Vec::new();
         let mut packets: Vec<(u32, SampleEntry, i64)> = Vec::new();
+        let mut has_seek_head = false;
+        let mut cues_count = 0usize;
 
         while pos < data.len() {
             let Some((id, payload, consumed)) = next_ebml_element(&data[pos..])? else {
@@ -181,6 +192,8 @@ impl<'a> MkvDemuxer<'a> {
                         &mut track_numbers,
                         &mut default_durations_ns,
                         &mut packets,
+                        &mut has_seek_head,
+                        &mut cues_count,
                     )?;
                 }
                 _ => {}
@@ -230,6 +243,8 @@ impl<'a> MkvDemuxer<'a> {
             default_durations_ticks,
             packets,
             cursor: 0,
+            has_seek_head,
+            cues_count,
         })
     }
 
@@ -243,6 +258,18 @@ impl<'a> MkvDemuxer<'a> {
         self.timestamp_scale_ns
     }
 
+    /// Returns `true` if the `Segment` contains a `SeekHead` (`0x114D9B74`) meta-index.
+    #[inline]
+    pub const fn has_seek_head(&self) -> bool {
+        self.has_seek_head
+    }
+
+    /// Number of `CuePoint` entries parsed from the `Cues` (`0x1C53BB6B`) element.
+    #[inline]
+    pub const fn cues_count(&self) -> usize {
+        self.cues_count
+    }
+
     #[inline]
     pub fn tracks(&self) -> &[TrackInfo] {
         &self.tracks
@@ -251,6 +278,52 @@ impl<'a> MkvDemuxer<'a> {
     #[inline]
     pub fn total_packets(&self) -> usize {
         self.packets.len()
+    }
+
+    /// Seeks to the nearest keyframe at or before `target` on `track_pos` in $O(\log N)$ time,
+    /// repositioning the demuxer's sequential cursor and returning `(packet_cursor_idx, SampleEntry)`.
+    pub fn seek_to_timestamp(
+        &mut self,
+        track_pos: usize,
+        target: Timestamp,
+    ) -> Result<(usize, SampleEntry)> {
+        let track = self
+            .tracks
+            .get(track_pos)
+            .ok_or(RagdollError::CorruptBitstream("invalid track index"))?;
+        let target_ticks = target.rescale_to(track.timebase).ticks;
+        let t_u32 = track_pos as u32;
+
+        // Binary search to the last packet at or before `target_ticks`
+        let upper = self
+            .packets
+            .partition_point(|&(_, entry, _)| entry.pts <= target_ticks);
+        let search_end = if upper == 0 {
+            self.packets.len()
+        } else {
+            upper
+        };
+
+        // Walk backward from `search_end` to find the nearest keyframe on `track_pos`
+        for idx in (0..search_end).rev() {
+            let (pkt_track, entry, _) = self.packets[idx];
+            if pkt_track == t_u32 && entry.is_keyframe() {
+                self.cursor = idx;
+                return Ok((idx, entry));
+            }
+        }
+
+        // Fallback: find the first keyframe on `track_pos` in the entire stream
+        for (idx, &(pkt_track, entry, _)) in self.packets.iter().enumerate() {
+            if pkt_track == t_u32 && entry.is_keyframe() {
+                self.cursor = idx;
+                return Ok((idx, entry));
+            }
+        }
+
+        Err(RagdollError::CorruptBitstream(
+            "no keyframe found on target Matroska/WebM track",
+        ))
     }
 
     /// Emits the next packet as a zero-copy [`PacketSlice<'a>`] borrowing directly from the memory-mapped file.
@@ -305,6 +378,8 @@ impl<'a> MkvDemuxer<'a> {
         track_numbers: &mut Vec<u64>,
         default_durations_ns: &mut Vec<u64>,
         packets: &mut Vec<(u32, SampleEntry, i64)>,
+        has_seek_head: &mut bool,
+        cues_count: &mut usize,
     ) -> Result<()> {
         let seg_end = seg_start + seg_len;
         let mut pos = seg_start;
@@ -317,6 +392,9 @@ impl<'a> MkvDemuxer<'a> {
             pos += consumed;
 
             match id {
+                ID_SEEK_HEAD => {
+                    *has_seek_head = true;
+                }
                 ID_INFO => {
                     let mut p = 0usize;
                     while p < payload.len() {
@@ -364,6 +442,18 @@ impl<'a> MkvDemuxer<'a> {
                         track_numbers,
                         packets,
                     )?;
+                }
+                ID_CUES => {
+                    let mut p = 0usize;
+                    while p < payload.len() {
+                        let Some((cid, _cpay, ccons)) = next_ebml_element(&payload[p..])? else {
+                            break;
+                        };
+                        p += ccons;
+                        if cid == ID_CUE_POINT {
+                            *cues_count += 1;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -873,9 +963,17 @@ impl<'a> MkvMuxer<'a> {
             ));
         }
 
+        // Precompute whether any cluster contains a video keyframe so we know if `Cues` will be emitted,
+        // and build a dummy `SeekHead` (using fixed 8-byte SeekPosition ints so byte length is invariant!)
+        let has_cues = clusters.iter().any(|c| c.blocks.iter().any(|b| b.4));
+        let dummy_seek_head = Self::build_seek_head_element(0, 0, has_cues.then_some(0));
+        let seek_head_len = dummy_seek_head.len() as u64;
+        let info_rel_offset = seek_head_len;
+        let tracks_rel_offset = info_rel_offset + (info_elem.len() as u64);
+
         // Precompute exact byte size of every Cluster and record Cues positions relative to Segment payload start
         let mut cues_body = Vec::new();
-        let mut cluster_rel_offset = (info_elem.len() + tracks_elem.len()) as u64;
+        let mut cluster_rel_offset = tracks_rel_offset + (tracks_elem.len() as u64);
 
         for c in &mut clusters {
             let mut ts_elem = Vec::with_capacity(12);
@@ -923,13 +1021,26 @@ impl<'a> MkvMuxer<'a> {
             Self::wrap_element(ID_CUES, &cues_body)
         };
 
+        let seek_head_elem = Self::build_seek_head_element(
+            info_rel_offset,
+            tracks_rel_offset,
+            (!cues_elem.is_empty()).then_some(cluster_rel_offset),
+        );
+        debug_assert_eq!(dummy_seek_head.len(), seek_head_elem.len());
+
         let segment_payload_len = cluster_rel_offset + (cues_elem.len() as u64);
         let mut seg_hdr = Vec::with_capacity(12);
         Self::push_id(&mut seg_hdr, ID_SEGMENT);
         write_ebml_vint(segment_payload_len, &mut seg_hdr);
 
-        // 6. Write EBML Header + Segment Header + Info + Tracks via vectored I/O
-        vw.write_vectored_all(&[&ebml_header, &seg_hdr, &info_elem, &tracks_elem])?;
+        // 6. Write EBML Header + Segment Header + SeekHead + Info + Tracks via vectored I/O
+        vw.write_vectored_all(&[
+            &ebml_header,
+            &seg_hdr,
+            &seek_head_elem,
+            &info_elem,
+            &tracks_elem,
+        ])?;
 
         // 7. Stream each Cluster and its SimpleBlock payloads zero-copy via vectored I/O
         let mut sb_hdr = Vec::with_capacity(24);
@@ -959,6 +1070,26 @@ impl<'a> MkvMuxer<'a> {
 
         vw.flush()?;
         Ok(vw.bytes_written())
+    }
+
+    /// Builds a deterministic-length `SeekHead` (`0x114D9B74`) indexing `Info`, `Tracks`, and `Cues`
+    /// relative to the `Segment` payload start (using fixed 8-byte `SeekPosition` integers so its byte
+    /// length is invariant before and after computing cluster positions).
+    fn build_seek_head_element(info_pos: u64, tracks_pos: u64, cues_pos: Option<u64>) -> Vec<u8> {
+        let mut sh_body = Vec::with_capacity(72);
+        for &(target_id, pos) in &[
+            (ID_INFO, Some(info_pos)),
+            (ID_TRACKS, Some(tracks_pos)),
+            (ID_CUES, cues_pos),
+        ] {
+            if let Some(p) = pos {
+                let mut seek_entry = Vec::with_capacity(20);
+                Self::push_element(&mut seek_entry, ID_SEEK_ID, &target_id.to_be_bytes());
+                Self::push_element(&mut seek_entry, ID_SEEK_POSITION, &p.to_be_bytes());
+                sh_body.extend_from_slice(&Self::wrap_element(ID_SEEK, &seek_entry));
+            }
+        }
+        Self::wrap_element(ID_SEEK_HEAD, &sh_body)
     }
 
     fn build_tracks_element(&self) -> Result<Vec<u8>> {
@@ -1005,6 +1136,21 @@ impl<'a> MkvMuxer<'a> {
                 } else {
                     Self::push_element(&mut te, ID_CODEC_PRIVATE, &t.extra_data);
                 }
+            }
+
+            if t.codec_id == CodecId::Opus {
+                // RFC 7845 / WebM Opus TrackEntry requirements:
+                // CodecDelay (`0x56AA`) in nanoseconds (from OpusHead pre-skip @ 48 kHz, default 312 samples = 6_500_000 ns)
+                // SeekPreRoll (`0x56BB`) = 80_000_000 ns (80 ms)
+                let preskip_samples =
+                    if t.extra_data.len() >= 12 && &t.extra_data[0..8] == b"OpusHead" {
+                        u16::from_le_bytes([t.extra_data[10], t.extra_data[11]]) as u64
+                    } else {
+                        312
+                    };
+                let codec_delay_ns = (preskip_samples * 1_000_000_000) / 48_000;
+                Self::push_uint(&mut te, ID_CODEC_DELAY, codec_delay_ns);
+                Self::push_uint(&mut te, ID_SEEK_PRE_ROLL, 80_000_000);
             }
 
             if let Some(vp) = &t.video {

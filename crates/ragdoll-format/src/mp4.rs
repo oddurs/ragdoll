@@ -114,9 +114,19 @@ struct RawStblTables {
     stss: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TrexDefaults {
+    track_id: u32,
+    default_duration: u32,
+    default_size: u32,
+    default_flags: u32,
+}
+
 /// Per-track compiled sample index with 24-byte cache-packed [`SampleEntry`] items.
 #[derive(Clone, Debug)]
 pub struct Mp4TrackIndex {
+    /// ISOBMFF `tkhd` 1-based track ID.
+    pub track_id: u32,
     pub info: TrackInfo,
     /// Flat 24-byte-per-sample index (2.66 entries per 64-byte CPU cache line).
     pub samples: Vec<SampleEntry>,
@@ -180,15 +190,19 @@ pub struct Mp4Demuxer<'a> {
     schedule: Vec<PacketRef>,
     cursor: usize,
     moov_before_mdat: bool,
+    fragmented: bool,
 }
 
 impl<'a> Mp4Demuxer<'a> {
-    /// Parses an MP4 / ISOBMFF memory-mapped byte slice and compiles flat 24-byte sample indices.
+    /// Parses an MP4 / ISOBMFF (including Fragmented `fMP4` `moof`+`mdat`) memory-mapped byte slice
+    /// and compiles flat 24-byte sample indices.
     pub fn open(data: &'a [u8]) -> Result<Self> {
         let mut major_brand = FourCC(*b"isom");
         let mut tracks = Vec::new();
+        let mut trex_list = Vec::new();
         let mut moov_offset: Option<usize> = None;
         let mut mdat_offset: Option<usize> = None;
+        let mut fragmented = false;
 
         let mut iter = BoxIter::new(data);
         while let Some(box_res) = iter.next() {
@@ -200,7 +214,17 @@ impl<'a> Mp4Demuxer<'a> {
                 }
                 b"moov" => {
                     moov_offset = Some(box_start);
-                    Self::parse_moov(b.payload, data.len(), &mut tracks)?;
+                    Self::parse_moov(b.payload, data.len(), &mut tracks, &mut trex_list)?;
+                }
+                b"moof" => {
+                    fragmented = true;
+                    Self::parse_moof(
+                        b.payload,
+                        box_start as u64,
+                        data.len(),
+                        &mut tracks,
+                        &trex_list,
+                    )?;
                 }
                 b"mdat" if mdat_offset.is_none() => {
                     mdat_offset = Some(box_start);
@@ -248,10 +272,11 @@ impl<'a> Mp4Demuxer<'a> {
             schedule,
             cursor: 0,
             moov_before_mdat,
+            fragmented,
         })
     }
 
-    /// Major brand from the `ftyp` box (e.g., `isom`, `mp42`).
+    /// Major brand from the `ftyp` box (e.g., `isom`, `mp42`, `iso5`).
     #[inline]
     pub const fn major_brand(&self) -> FourCC {
         self.major_brand
@@ -261,6 +286,12 @@ impl<'a> Mp4Demuxer<'a> {
     #[inline]
     pub const fn is_faststart(&self) -> bool {
         self.moov_before_mdat
+    }
+
+    /// Returns `true` if the file contains `moof` (`MovieFragmentBox`) streaming fragments.
+    #[inline]
+    pub const fn is_fragmented(&self) -> bool {
+        self.fragmented
     }
 
     /// Returns the compiled track indices (`TrackInfo` + flat `Vec<SampleEntry>`).
@@ -368,6 +399,7 @@ impl<'a> Mp4Demuxer<'a> {
         moov_data: &'a [u8],
         file_len: usize,
         tracks: &mut Vec<Mp4TrackIndex>,
+        trex_list: &mut Vec<TrexDefaults>,
     ) -> Result<()> {
         let mut movie_timescale = 1000u32;
         for box_res in BoxIter::new(moov_data) {
@@ -405,9 +437,279 @@ impl<'a> Mp4Demuxer<'a> {
                         tracks.push(track);
                     }
                 }
+                b"mvex" => {
+                    for mvex_res in BoxIter::new(b.payload) {
+                        let mb = mvex_res?;
+                        if &mb.fourcc.0 == b"trex" && mb.payload.len() >= 24 {
+                            let p = mb.payload;
+                            let track_id = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+                            let default_duration = u32::from_be_bytes([p[12], p[13], p[14], p[15]]);
+                            let default_size = u32::from_be_bytes([p[16], p[17], p[18], p[19]]);
+                            let default_flags = u32::from_be_bytes([p[20], p[21], p[22], p[23]]);
+                            trex_list.push(TrexDefaults {
+                                track_id,
+                                default_duration,
+                                default_size,
+                                default_flags,
+                            });
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Parses an ISO/IEC 14496-12 `moof` (`MovieFragmentBox`) and appends fragment samples
+    /// (`traf` -> `tfhd`, `tfdt`, `trun`) directly into the matching track's flat `SampleEntry` table.
+    fn parse_moof(
+        moof_data: &'a [u8],
+        moof_offset: u64,
+        file_len: usize,
+        tracks: &mut [Mp4TrackIndex],
+        trex_list: &[TrexDefaults],
+    ) -> Result<()> {
+        let mut prev_data_end = moof_offset;
+
+        for box_res in BoxIter::new(moof_data) {
+            let b = box_res?;
+            if &b.fourcc.0 != b"traf" {
+                continue;
+            }
+
+            let mut track_id = 1u32;
+            let mut tfhd_flags = 0u32;
+            let mut base_data_offset: Option<u64> = None;
+            let mut default_duration: Option<u32> = None;
+            let mut default_size: Option<u32> = None;
+            let mut default_flags: Option<u32> = None;
+            let mut tfdt_base_dts: Option<i64> = None;
+
+            // Pass 1: parse `tfhd` and `tfdt` inside `traf`
+            for traf_res in BoxIter::new(b.payload) {
+                let tb = traf_res?;
+                match &tb.fourcc.0 {
+                    b"tfhd" if tb.payload.len() >= 8 => {
+                        let p = tb.payload;
+                        tfhd_flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                        track_id = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+                        let mut pos = 8usize;
+                        if (tfhd_flags & 0x0000_0001) != 0 && pos + 8 <= p.len() {
+                            base_data_offset = Some(u64::from_be_bytes([
+                                p[pos],
+                                p[pos + 1],
+                                p[pos + 2],
+                                p[pos + 3],
+                                p[pos + 4],
+                                p[pos + 5],
+                                p[pos + 6],
+                                p[pos + 7],
+                            ]));
+                            pos += 8;
+                        }
+                        if (tfhd_flags & 0x0000_0002) != 0 && pos + 4 <= p.len() {
+                            pos += 4; // sample_description_index
+                        }
+                        if (tfhd_flags & 0x0000_0008) != 0 && pos + 4 <= p.len() {
+                            default_duration = Some(u32::from_be_bytes([
+                                p[pos],
+                                p[pos + 1],
+                                p[pos + 2],
+                                p[pos + 3],
+                            ]));
+                            pos += 4;
+                        }
+                        if (tfhd_flags & 0x0000_0010) != 0 && pos + 4 <= p.len() {
+                            default_size = Some(u32::from_be_bytes([
+                                p[pos],
+                                p[pos + 1],
+                                p[pos + 2],
+                                p[pos + 3],
+                            ]));
+                            pos += 4;
+                        }
+                        if (tfhd_flags & 0x0000_0020) != 0 && pos + 4 <= p.len() {
+                            default_flags = Some(u32::from_be_bytes([
+                                p[pos],
+                                p[pos + 1],
+                                p[pos + 2],
+                                p[pos + 3],
+                            ]));
+                        }
+                    }
+                    b"tfdt" if tb.payload.len() >= 8 => {
+                        let p = tb.payload;
+                        let version = p[0];
+                        if version == 1 && p.len() >= 12 {
+                            tfdt_base_dts = Some(u64::from_be_bytes([
+                                p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+                            ]) as i64);
+                        } else {
+                            tfdt_base_dts =
+                                Some(u32::from_be_bytes([p[4], p[5], p[6], p[7]]) as i64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Locate target track (matching `track_id`, or fallback to first track if only 1 exists)
+            let track_pos = tracks
+                .iter()
+                .position(|t| t.track_id == track_id)
+                .or_else(|| (tracks.len() == 1).then_some(0));
+            let Some(t_pos) = track_pos else {
+                continue;
+            };
+
+            let trex = trex_list
+                .iter()
+                .find(|t| t.track_id == track_id)
+                .copied()
+                .unwrap_or(TrexDefaults {
+                    track_id,
+                    default_duration: 1,
+                    default_size: 0,
+                    default_flags: 0,
+                });
+
+            let eff_default_dur = default_duration.unwrap_or(trex.default_duration).max(1);
+            let eff_default_size = default_size.unwrap_or(trex.default_size);
+            let eff_default_flags = default_flags.unwrap_or(trex.default_flags);
+
+            // Base data offset per ISO 14496-12 Section 8.8.7 (`default-base-is-moof` = 0x020000)
+            let traf_base_offset = if let Some(bdo) = base_data_offset {
+                bdo
+            } else if (tfhd_flags & 0x0002_0000) != 0 {
+                moof_offset
+            } else {
+                prev_data_end
+            };
+
+            let track = &mut tracks[t_pos];
+            if track.default_sample_duration <= 1 && eff_default_dur > 1 {
+                track.default_sample_duration = eff_default_dur as i64;
+            }
+            let mut cur_dts = tfdt_base_dts.unwrap_or_else(|| {
+                track
+                    .samples
+                    .last()
+                    .map(|s| s.dts() + eff_default_dur as i64)
+                    .unwrap_or(0)
+            });
+            let mut cur_data_offset = traf_base_offset;
+
+            // Pass 2: parse all `trun` boxes inside `traf`
+            for traf_res in BoxIter::new(b.payload) {
+                let tb = traf_res?;
+                if &tb.fourcc.0 != b"trun" || tb.payload.len() < 8 {
+                    continue;
+                }
+                let p = tb.payload;
+                let trun_version = p[0];
+                let trun_flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                let sample_count = u32::from_be_bytes([p[4], p[5], p[6], p[7]]) as usize;
+                let mut pos = 8usize;
+
+                if (trun_flags & 0x0000_0001) != 0 && pos + 4 <= p.len() {
+                    let data_offset =
+                        i32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+                    cur_data_offset = (traf_base_offset as i64 + data_offset as i64).max(0) as u64;
+                    pos += 4;
+                }
+                let mut first_sample_flags = None;
+                if (trun_flags & 0x0000_0004) != 0 && pos + 4 <= p.len() {
+                    first_sample_flags = Some(u32::from_be_bytes([
+                        p[pos],
+                        p[pos + 1],
+                        p[pos + 2],
+                        p[pos + 3],
+                    ]));
+                    pos += 4;
+                }
+
+                track.samples.reserve(sample_count.min(65536));
+                for i in 0..sample_count {
+                    let s_dur = if (trun_flags & 0x0000_0100) != 0 && pos + 4 <= p.len() {
+                        let d = u32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+                        pos += 4;
+                        d
+                    } else {
+                        eff_default_dur
+                    };
+
+                    let s_size = if (trun_flags & 0x0000_0200) != 0 && pos + 4 <= p.len() {
+                        let sz = u32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+                        pos += 4;
+                        sz
+                    } else {
+                        eff_default_size
+                    };
+
+                    let s_flags = if (trun_flags & 0x0000_0400) != 0 && pos + 4 <= p.len() {
+                        let fl = u32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+                        pos += 4;
+                        fl
+                    } else if i == 0
+                        && let Some(fsf) = first_sample_flags
+                    {
+                        fsf
+                    } else {
+                        eff_default_flags
+                    };
+
+                    let s_cts_offset = if (trun_flags & 0x0000_0800) != 0 && pos + 4 <= p.len() {
+                        let raw = [p[pos], p[pos + 1], p[pos + 2], p[pos + 3]];
+                        pos += 4;
+                        if trun_version == 0 {
+                            u32::from_be_bytes(raw) as i64 as i32
+                        } else {
+                            i32::from_be_bytes(raw)
+                        }
+                    } else {
+                        0
+                    };
+
+                    if cur_data_offset.saturating_add(s_size as u64) > file_len as u64 {
+                        return Err(RagdollError::CorruptBitstream(
+                            "fMP4 trun sample offset/size exceeds file bounds",
+                        ));
+                    }
+
+                    // ISO 14496-12 sample_flags:
+                    // bit 16 (0x0001_0000): sample_is_non_sync_sample
+                    // bits 24..25 (0x0300_0000): sample_depends_on (1 = depends on others / non-I)
+                    let is_keyframe = (s_flags & (0x0001_0000 | 0x0100_0000)) == 0;
+                    let pts = cur_dts + s_cts_offset as i64;
+                    track.samples.push(SampleEntry::new(
+                        cur_data_offset,
+                        pts,
+                        s_size,
+                        s_cts_offset,
+                        is_keyframe,
+                    ));
+                    track.info.total_bytes += s_size as u64;
+                    cur_data_offset += s_size as u64;
+                    cur_dts += s_dur.max(1) as i64;
+                }
+            }
+
+            prev_data_end = cur_data_offset;
+            track.info.sample_count = track.samples.len();
+            track.info.duration_ticks = Some(cur_dts);
+            if track.info.track_type == TrackType::Video
+                && !track.samples.is_empty()
+                && cur_dts > 0
+                && let Some(vp) = &mut track.info.video
+            {
+                vp.frame_rate = Rational64::new(
+                    track.samples.len() as i64 * track.info.timebase.den.max(1),
+                    cur_dts,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -417,6 +719,7 @@ impl<'a> Mp4Demuxer<'a> {
         movie_timescale: u32,
         file_len: usize,
     ) -> Result<Option<Mp4TrackIndex>> {
+        let mut tkhd_track_id = track_index + 1;
         let mut tkhd_width = 0u32;
         let mut tkhd_height = 0u32;
         let mut elst_media_time = 0i64;
@@ -429,6 +732,18 @@ impl<'a> Mp4Demuxer<'a> {
                     let p = b.payload;
                     if !p.is_empty() {
                         let version = p[0];
+                        let id_offset = if version == 1 { 20 } else { 12 };
+                        if p.len() >= id_offset + 4 {
+                            let tid = u32::from_be_bytes([
+                                p[id_offset],
+                                p[id_offset + 1],
+                                p[id_offset + 2],
+                                p[id_offset + 3],
+                            ]);
+                            if tid > 0 {
+                                tkhd_track_id = tid;
+                            }
+                        }
                         let wh_offset = if version == 1 { 88 } else { 76 };
                         if p.len() >= wh_offset + 8 {
                             tkhd_width = u32::from_be_bytes([
@@ -723,6 +1038,62 @@ impl<'a> Mp4Demuxer<'a> {
                         }
                     }
                 }
+                b"stz2" if b.payload.len() >= 12 => {
+                    // ISO 14496-12 Section 8.7.3.3 CompactSampleSizeBox (`stz2`):
+                    // bytes 0..4: version/flags, 4..7: reserved, 7: field_size (4, 8, 16, or 32), 8..12: sample_count
+                    let field_size = b.payload[7];
+                    tables.stsz_default = 0;
+                    tables.stsz_count = u32::from_be_bytes([
+                        b.payload[8],
+                        b.payload[9],
+                        b.payload[10],
+                        b.payload[11],
+                    ]) as usize;
+                    let entries_buf = &b.payload[12..];
+                    tables.stsz_entries.reserve(tables.stsz_count.min(262_144));
+                    match field_size {
+                        4 => {
+                            for i in 0..tables.stsz_count {
+                                let byte_idx = i / 2;
+                                if byte_idx >= entries_buf.len() {
+                                    break;
+                                }
+                                let nib = if i.is_multiple_of(2) {
+                                    (entries_buf[byte_idx] >> 4) & 0x0F
+                                } else {
+                                    entries_buf[byte_idx] & 0x0F
+                                };
+                                tables.stsz_entries.push(nib as u32);
+                            }
+                        }
+                        8 => {
+                            for &b_sz in entries_buf.iter().take(tables.stsz_count) {
+                                tables.stsz_entries.push(b_sz as u32);
+                            }
+                        }
+                        16 => {
+                            for pair in entries_buf
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .take(tables.stsz_count)
+                            {
+                                tables.stsz_entries.push(u16::from_be_bytes(*pair) as u32);
+                            }
+                        }
+                        32 => {
+                            for quad in entries_buf
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .take(tables.stsz_count)
+                            {
+                                tables.stsz_entries.push(u32::from_be_bytes(*quad));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 b"stco" if b.payload.len() >= 8 => {
                     let count = u32::from_be_bytes([
                         b.payload[4],
@@ -829,6 +1200,7 @@ impl<'a> Mp4Demuxer<'a> {
         };
 
         Ok(Some(Mp4TrackIndex {
+            track_id: tkhd_track_id,
             info,
             samples,
             default_sample_duration,
@@ -1362,6 +1734,217 @@ impl<'a> Mp4Muxer<'a> {
 
         vw.flush()?;
         Ok(vw.bytes_written())
+    }
+
+    /// Finalizes and writes an ISO/IEC 14496-12 / CMAF / DASH / MSE Fragmented MP4 (`fMP4`):
+    /// - `ftyp` (`iso5` / `iso6` / `mp41`)
+    /// - Initialization `moov` (empty `stbl` tables + `mvex`/`trex` track extenders)
+    /// - Streaming `moof` (`mfhd` + `traf` (`tfhd`, `tfdt`, `trun`)) + `mdat` fragments
+    pub fn finish_fragmented<W: Write>(
+        self,
+        writer: W,
+        max_samples_per_fragment: usize,
+    ) -> Result<u64> {
+        let mut vw = VectoredWriter::new(writer);
+        let max_frag = max_samples_per_fragment.max(1);
+
+        // 1. Build `ftyp` (`iso5`) and initialization `moov` (empty `stbl` + `mvex`/`trex`)
+        let mut ftyp_payload = Vec::with_capacity(24);
+        ftyp_payload.extend_from_slice(b"iso5");
+        ftyp_payload.extend_from_slice(&512u32.to_be_bytes());
+        ftyp_payload.extend_from_slice(b"iso5");
+        ftyp_payload.extend_from_slice(b"iso6");
+        ftyp_payload.extend_from_slice(b"avc1");
+        ftyp_payload.extend_from_slice(b"mp41");
+        let ftyp_box = Self::wrap_box(b"ftyp", &ftyp_payload);
+
+        let init_moov = self.build_fragmented_init_moov()?;
+        vw.write_vectored_all(&[&ftyp_box, &init_moov])?;
+
+        // 2. Emit `moof` + `mdat` fragments per track
+        let mut seq_num = 1u32;
+        for (t_idx, track) in self.tracks.iter().enumerate() {
+            if track.packets.is_empty() {
+                continue;
+            }
+            let track_id = (t_idx + 1) as u32;
+            let tb = track.info.timebase;
+            let track_timescale = if tb.den > 0 { tb.den as u32 } else { 90_000 };
+            let target_tb = Rational64::new(1, track_timescale as i64);
+
+            let mut start = 0usize;
+            while start < track.packets.len() {
+                let mut end = (start + max_frag).min(track.packets.len());
+                // If video track, split at an earlier keyframe boundary if one exists inside `(start + 1)..end`
+                if track.info.track_type == TrackType::Video {
+                    for idx in (start + 1)..end {
+                        if track.packets[idx].payload.is_keyframe() {
+                            end = idx;
+                            break;
+                        }
+                    }
+                }
+
+                let frag_slice = &track.packets[start..end];
+                let base_dts = frag_slice[0].payload.dts.rescale_to(target_tb).ticks.max(0) as u64;
+
+                let mut trun_entries = Vec::with_capacity(frag_slice.len());
+                let mut frag_payload_len = 0u64;
+
+                for (local_i, pkt_wrap) in frag_slice.iter().enumerate() {
+                    let global_i = start + local_i;
+                    let pkt = &pkt_wrap.payload;
+                    let pts_ticks = pkt.pts.rescale_to(target_tb).ticks;
+                    let dts_ticks = pkt.dts.rescale_to(target_tb).ticks;
+                    let cts_offset = (pts_ticks - dts_ticks) as i32;
+
+                    let dur = if global_i + 1 < track.packets.len() {
+                        let next_dts = track.packets[global_i + 1]
+                            .payload
+                            .dts
+                            .rescale_to(target_tb)
+                            .ticks;
+                        (next_dts - dts_ticks).max(1) as u32
+                    } else {
+                        rescale_q(pkt.duration.max(1), pkt.dts.timebase, target_tb).max(1) as u32
+                    };
+                    let size = pkt.len() as u32;
+                    // ISO 14496-12 sample_flags:
+                    // Sync/IDR keyframe: `0x0200_0000` (depends_on = 2: does not depend on others)
+                    // Non-sync sample:   `0x0101_0000` (depends_on = 1, is_non_sync = 1)
+                    let flags = if pkt.is_keyframe() {
+                        0x0200_0000u32
+                    } else {
+                        0x0101_0000u32
+                    };
+                    trun_entries.push((dur, size, flags, cts_offset));
+                    frag_payload_len += size as u64;
+                }
+
+                // Dry-run build `moof` with `data_offset = 0` to learn exact `moof` byte size
+                let dummy_moof =
+                    Self::build_moof_box(seq_num, track_id, base_dts, 0, &trun_entries);
+                let data_offset = (dummy_moof.len() as i32) + 8;
+                let moof_box =
+                    Self::build_moof_box(seq_num, track_id, base_dts, data_offset, &trun_entries);
+                debug_assert_eq!(dummy_moof.len(), moof_box.len());
+
+                let mut mdat_header = Vec::with_capacity(8);
+                mdat_header.extend_from_slice(&((frag_payload_len + 8) as u32).to_be_bytes());
+                mdat_header.extend_from_slice(b"mdat");
+
+                vw.write_vectored_all(&[&moof_box, &mdat_header])?;
+
+                let mut slice_batch: Vec<&[u8]> = Vec::with_capacity(8);
+                for pkt_wrap in frag_slice {
+                    slice_batch.push(pkt_wrap.payload.data());
+                    if slice_batch.len() == 8 {
+                        vw.write_vectored_all(&slice_batch)?;
+                        slice_batch.clear();
+                    }
+                }
+                if !slice_batch.is_empty() {
+                    vw.write_vectored_all(&slice_batch)?;
+                }
+
+                seq_num += 1;
+                start = end;
+            }
+        }
+
+        vw.flush()?;
+        Ok(vw.bytes_written())
+    }
+
+    fn build_fragmented_init_moov(&self) -> Result<Vec<u8>> {
+        let movie_timescale = 1000u32;
+        let mut trak_boxes = Vec::with_capacity(self.tracks.len());
+        let mut trex_boxes = Vec::with_capacity(self.tracks.len());
+
+        for (t_idx, track) in self.tracks.iter().enumerate() {
+            let track_id = (t_idx + 1) as u32;
+            let empty_track = MuxTrackState {
+                info: track.info.clone(),
+                packets: Vec::new(),
+            };
+            let (trak_box, _) =
+                self.build_trak_box(track_id, &empty_track, &[], 0, movie_timescale, false)?;
+            trak_boxes.push(trak_box);
+
+            let mut trex = Vec::with_capacity(24);
+            trex.extend_from_slice(&0u32.to_be_bytes()); // version/flags
+            trex.extend_from_slice(&track_id.to_be_bytes());
+            trex.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index = 1
+            trex.extend_from_slice(&1u32.to_be_bytes()); // default_sample_duration = 1
+            trex.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size = 0
+            trex.extend_from_slice(&0u32.to_be_bytes()); // default_sample_flags = 0
+            trex_boxes.push(Self::wrap_box(b"trex", &trex));
+        }
+
+        let mvhd_box = Self::build_mvhd_box(movie_timescale, 0, (self.tracks.len() + 1) as u32);
+        let mut mvex_payload = Vec::new();
+        for tb in &trex_boxes {
+            mvex_payload.extend_from_slice(tb);
+        }
+        let mvex_box = Self::wrap_box(b"mvex", &mvex_payload);
+
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&mvhd_box);
+        for tb in &trak_boxes {
+            moov_payload.extend_from_slice(tb);
+        }
+        moov_payload.extend_from_slice(&mvex_box);
+        Ok(Self::wrap_box(b"moov", &moov_payload))
+    }
+
+    fn build_moof_box(
+        seq_num: u32,
+        track_id: u32,
+        base_dts: u64,
+        data_offset: i32,
+        trun_entries: &[(u32, u32, u32, i32)],
+    ) -> Vec<u8> {
+        let mut mfhd = Vec::with_capacity(8);
+        mfhd.extend_from_slice(&0u32.to_be_bytes()); // version/flags
+        mfhd.extend_from_slice(&seq_num.to_be_bytes());
+        let mfhd_box = Self::wrap_box(b"mfhd", &mfhd);
+
+        // `tfhd`: version 0, flags = 0x020020 (`default-base-is-moof | default-sample-flags-present`)
+        let mut tfhd = Vec::with_capacity(12);
+        tfhd.extend_from_slice(&0x0002_0020u32.to_be_bytes());
+        tfhd.extend_from_slice(&track_id.to_be_bytes());
+        tfhd.extend_from_slice(&0x0101_0000u32.to_be_bytes());
+        let tfhd_box = Self::wrap_box(b"tfhd", &tfhd);
+
+        // `tfdt`: version 1 (64-bit `baseMediaDecodeTime`)
+        let mut tfdt = Vec::with_capacity(12);
+        tfdt.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        tfdt.extend_from_slice(&base_dts.to_be_bytes());
+        let tfdt_box = Self::wrap_box(b"tfdt", &tfdt);
+
+        // `trun`: version 1, flags = 0x000F01 (data-offset + duration + size + flags + cts-offset)
+        let mut trun = Vec::with_capacity(12 + trun_entries.len() * 16);
+        trun.extend_from_slice(&0x0100_0F01u32.to_be_bytes());
+        trun.extend_from_slice(&(trun_entries.len() as u32).to_be_bytes());
+        trun.extend_from_slice(&data_offset.to_be_bytes());
+        for &(dur, size, flags, cts) in trun_entries {
+            trun.extend_from_slice(&dur.to_be_bytes());
+            trun.extend_from_slice(&size.to_be_bytes());
+            trun.extend_from_slice(&flags.to_be_bytes());
+            trun.extend_from_slice(&cts.to_be_bytes());
+        }
+        let trun_box = Self::wrap_box(b"trun", &trun);
+
+        let mut traf_payload = Vec::with_capacity(tfhd_box.len() + tfdt_box.len() + trun_box.len());
+        traf_payload.extend_from_slice(&tfhd_box);
+        traf_payload.extend_from_slice(&tfdt_box);
+        traf_payload.extend_from_slice(&trun_box);
+        let traf_box = Self::wrap_box(b"traf", &traf_payload);
+
+        let mut moof_payload = Vec::with_capacity(mfhd_box.len() + traf_box.len());
+        moof_payload.extend_from_slice(&mfhd_box);
+        moof_payload.extend_from_slice(&traf_box);
+        Self::wrap_box(b"moof", &moof_payload)
     }
 
     fn build_ftyp_box() -> Vec<u8> {

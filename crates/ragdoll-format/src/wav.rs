@@ -9,7 +9,7 @@ const WAVE_FORMAT_PCM: u16 = 0x0001;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
-/// Zero-copy RIFF WAVE (`.wav`) PCM Demuxer (`libavformat/wavdec.c` compatible).
+/// Zero-copy RIFF / RF64 / BW64 WAVE (`.wav`) PCM Demuxer (`libavformat/wavdec.c` compatible).
 pub struct WavDemuxer<'a> {
     data: &'a [u8],
     track: TrackInfo,
@@ -18,6 +18,7 @@ pub struct WavDemuxer<'a> {
     block_align: usize,
     frames_per_packet: usize,
     cursor_bytes: usize,
+    rf64: bool,
 }
 
 impl<'a> WavDemuxer<'a> {
@@ -26,26 +27,46 @@ impl<'a> WavDemuxer<'a> {
     }
 
     pub fn open_with_packet_frames(data: &'a [u8], frames_per_packet: usize) -> Result<Self> {
-        if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        let is_riff = data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE";
+        let is_rf64 = data.len() >= 12
+            && (&data[0..4] == b"RF64" || &data[0..4] == b"BW64")
+            && &data[8..12] == b"WAVE";
+        if !is_riff && !is_rf64 {
             return Err(RagdollError::InvalidHeader(
-                "missing 'RIFF....WAVE' header".to_string(),
+                "missing 'RIFF/RF64/BW64....WAVE' header".to_string(),
             ));
         }
 
         let mut pos = 12usize;
+        let mut ds64_data_size: Option<u64> = None;
         let mut parsed_fmt: Option<(CodecId, AudioTrackParams, usize)> = None;
         let mut data_range: Option<(usize, usize)> = None;
 
         while pos + 8 <= data.len() {
             let chunk_id = &data[pos..pos + 4];
-            let chunk_size =
-                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                    as usize;
+            let chunk_size_u32 =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+            let chunk_size = chunk_size_u32 as usize;
             let payload_start = pos + 8;
             let clamped_size = chunk_size.min(data.len().saturating_sub(payload_start));
             let payload = &data[payload_start..payload_start + clamped_size];
 
             match chunk_id {
+                b"ds64" if payload.len() >= 24 => {
+                    // EBU Tech 3306 / ITU-R BS.2088 `ds64` chunk:
+                    // bytes 0..8: riff_size (u64 LE), 8..16: data_size (u64 LE), 16..24: sample_count (u64 LE)
+                    let dsize = u64::from_le_bytes([
+                        payload[8],
+                        payload[9],
+                        payload[10],
+                        payload[11],
+                        payload[12],
+                        payload[13],
+                        payload[14],
+                        payload[15],
+                    ]);
+                    ds64_data_size = Some(dsize);
+                }
                 b"fmt " => {
                     if payload.len() < 16 {
                         return Err(RagdollError::CorruptBitstream(
@@ -91,7 +112,14 @@ impl<'a> WavDemuxer<'a> {
                     ));
                 }
                 b"data" => {
-                    data_range = Some((payload_start, clamped_size));
+                    let eff_size = if chunk_size_u32 == u32::MAX
+                        && let Some(ds64_sz) = ds64_data_size
+                    {
+                        (ds64_sz as usize).min(data.len().saturating_sub(payload_start))
+                    } else {
+                        clamped_size
+                    };
+                    data_range = Some((payload_start, eff_size));
                     break;
                 }
                 _ => {}
@@ -139,7 +167,14 @@ impl<'a> WavDemuxer<'a> {
             block_align,
             frames_per_packet: fpp,
             cursor_bytes: 0,
+            rf64: is_rf64,
         })
+    }
+
+    /// Returns `true` if the container uses an EBU Tech 3306 / ITU-R BS.2088 64-bit `RF64`/`BW64` header.
+    #[inline]
+    pub const fn is_rf64(&self) -> bool {
+        self.rf64
     }
 
     #[inline]
@@ -179,7 +214,7 @@ impl<'a> WavDemuxer<'a> {
     }
 }
 
-/// Zero-copy / Vectored RIFF WAVE (`.wav`) Muxer (`WAVE_FORMAT_PCM` & `WAVE_FORMAT_IEEE_FLOAT`).
+/// Zero-copy / Vectored RIFF & RF64 WAVE (`.wav`) Muxer (`WAVE_FORMAT_PCM` & `WAVE_FORMAT_IEEE_FLOAT`).
 pub struct WavMuxer<'a> {
     params: AudioTrackParams,
     chunks: Vec<&'a [u8]>,
@@ -203,6 +238,9 @@ impl<'a> WavMuxer<'a> {
     }
 
     pub fn finish<W: Write>(self, writer: W) -> Result<u64> {
+        if self.total_pcm_bytes as u64 > (u32::MAX as u64 - 64) {
+            return self.finish_rf64(writer);
+        }
         let mut vw = VectoredWriter::new(writer);
         let channels = self.params.channels.max(1) as u16;
         let sample_rate = self.params.sample_rate.max(1);
@@ -210,7 +248,8 @@ impl<'a> WavMuxer<'a> {
         let bits_per_sample = bytes_per_sample * 8;
         let block_align = channels * bytes_per_sample;
         let byte_rate = sample_rate * (block_align as u32);
-        let fmt_tag = if self.params.sample_format.is_float() {
+        let is_float = self.params.sample_format.is_float();
+        let fmt_tag = if is_float {
             WAVE_FORMAT_IEEE_FLOAT
         } else {
             WAVE_FORMAT_PCM
@@ -218,22 +257,93 @@ impl<'a> WavMuxer<'a> {
 
         let data_size = self.total_pcm_bytes as u32;
         let pad_byte = (self.total_pcm_bytes & 1) as u32;
-        let riff_size = 4 + (8 + 16) + (8 + data_size + pad_byte);
+        let fact_len = if is_float { 12u32 } else { 0u32 };
+        let riff_size = 4 + (8 + 16) + fact_len + (8 + data_size + pad_byte);
+        let sample_frames = (self.total_pcm_bytes / (block_align.max(1) as usize)) as u32;
 
-        let mut hdr = [0u8; 44];
-        hdr[0..4].copy_from_slice(b"RIFF");
-        hdr[4..8].copy_from_slice(&riff_size.to_le_bytes());
-        hdr[8..12].copy_from_slice(b"WAVE");
-        hdr[12..16].copy_from_slice(b"fmt ");
-        hdr[16..20].copy_from_slice(&16u32.to_le_bytes());
-        hdr[20..22].copy_from_slice(&fmt_tag.to_le_bytes());
-        hdr[22..24].copy_from_slice(&channels.to_le_bytes());
-        hdr[24..28].copy_from_slice(&sample_rate.to_le_bytes());
-        hdr[28..32].copy_from_slice(&byte_rate.to_le_bytes());
-        hdr[32..34].copy_from_slice(&block_align.to_le_bytes());
-        hdr[34..36].copy_from_slice(&bits_per_sample.to_le_bytes());
-        hdr[36..40].copy_from_slice(b"data");
-        hdr[40..44].copy_from_slice(&data_size.to_le_bytes());
+        let mut hdr = Vec::with_capacity(56);
+        hdr.extend_from_slice(b"RIFF");
+        hdr.extend_from_slice(&riff_size.to_le_bytes());
+        hdr.extend_from_slice(b"WAVE");
+        hdr.extend_from_slice(b"fmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&fmt_tag.to_le_bytes());
+        hdr.extend_from_slice(&channels.to_le_bytes());
+        hdr.extend_from_slice(&sample_rate.to_le_bytes());
+        hdr.extend_from_slice(&byte_rate.to_le_bytes());
+        hdr.extend_from_slice(&block_align.to_le_bytes());
+        hdr.extend_from_slice(&bits_per_sample.to_le_bytes());
+        if is_float {
+            // Mandatory 12-byte `fact` chunk for non-PCM WAVE_FORMAT_IEEE_FLOAT per Microsoft WAVE spec & libavformat/wavenc.c
+            hdr.extend_from_slice(b"fact");
+            hdr.extend_from_slice(&4u32.to_le_bytes());
+            hdr.extend_from_slice(&sample_frames.to_le_bytes());
+        }
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&data_size.to_le_bytes());
+
+        vw.write_all_counted(&hdr)?;
+        for batch in self.chunks.chunks(8) {
+            vw.write_vectored_all(batch)?;
+        }
+        if pad_byte != 0 {
+            vw.write_all_counted(&[0u8])?;
+        }
+        vw.flush()?;
+        Ok(vw.bytes_written())
+    }
+
+    /// Writes an EBU Tech 3306 / ITU-R BS.2088 64-bit `RF64` WAVE container with a 28-byte `ds64` chunk.
+    pub fn finish_rf64<W: Write>(self, writer: W) -> Result<u64> {
+        let mut vw = VectoredWriter::new(writer);
+        let channels = self.params.channels.max(1) as u16;
+        let sample_rate = self.params.sample_rate.max(1);
+        let bytes_per_sample = self.params.sample_format.bytes_per_sample() as u16;
+        let bits_per_sample = bytes_per_sample * 8;
+        let block_align = channels * bytes_per_sample;
+        let byte_rate = sample_rate * (block_align as u32);
+        let is_float = self.params.sample_format.is_float();
+        let fmt_tag = if is_float {
+            WAVE_FORMAT_IEEE_FLOAT
+        } else {
+            WAVE_FORMAT_PCM
+        };
+
+        let data_size_u64 = self.total_pcm_bytes as u64;
+        let pad_byte = (self.total_pcm_bytes & 1) as u64;
+        let sample_frames_u64 = (self.total_pcm_bytes / (block_align.max(1) as usize)) as u64;
+        let fact_len = if is_float { 12u64 } else { 0u64 };
+        // RF64 size = 4 ("WAVE") + 36 (8 + 28 ds64) + 24 (8 + 16 fmt) + fact_len + 8 + data_size + pad
+        let rf64_size = 4 + 36 + 24 + fact_len + 8 + data_size_u64 + pad_byte;
+
+        let mut hdr = Vec::with_capacity(92);
+        hdr.extend_from_slice(b"RF64");
+        hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // 0xFFFF_FFFF triggers ds64 lookup
+        hdr.extend_from_slice(b"WAVE");
+        // `ds64` chunk (28 bytes payload)
+        hdr.extend_from_slice(b"ds64");
+        hdr.extend_from_slice(&28u32.to_le_bytes());
+        hdr.extend_from_slice(&rf64_size.to_le_bytes());
+        hdr.extend_from_slice(&data_size_u64.to_le_bytes());
+        hdr.extend_from_slice(&sample_frames_u64.to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // table_length = 0
+        // `fmt ` chunk
+        hdr.extend_from_slice(b"fmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&fmt_tag.to_le_bytes());
+        hdr.extend_from_slice(&channels.to_le_bytes());
+        hdr.extend_from_slice(&sample_rate.to_le_bytes());
+        hdr.extend_from_slice(&byte_rate.to_le_bytes());
+        hdr.extend_from_slice(&block_align.to_le_bytes());
+        hdr.extend_from_slice(&bits_per_sample.to_le_bytes());
+        if is_float {
+            hdr.extend_from_slice(b"fact");
+            hdr.extend_from_slice(&4u32.to_le_bytes());
+            hdr.extend_from_slice(&(sample_frames_u64.min(u32::MAX as u64) as u32).to_le_bytes());
+        }
+        // `data` chunk with 0xFFFF_FFFF 32-bit size sentinel
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&u32::MAX.to_le_bytes());
 
         vw.write_all_counted(&hdr)?;
         for batch in self.chunks.chunks(8) {

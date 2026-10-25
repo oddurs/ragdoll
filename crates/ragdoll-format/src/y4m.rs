@@ -101,6 +101,32 @@ impl<'a> Y4mDemuxer<'a> {
                 } else if range_val.eq_ignore_ascii_case("LIMITED") {
                     colorimetry.range = ColorRange::Limited;
                 }
+            } else if let Some(xyscss) = token.strip_prefix("XYSCSS=") {
+                match xyscss.to_ascii_lowercase().as_str() {
+                    "420" | "420mpeg2" => {
+                        pixel_format = PixelFormat::Yuv420p;
+                        colorimetry.chroma_location = ChromaLocation::Left;
+                    }
+                    "420jpeg" => {
+                        pixel_format = PixelFormat::Yuv420p;
+                        colorimetry.chroma_location = ChromaLocation::Center;
+                    }
+                    "420paldv" => {
+                        pixel_format = PixelFormat::Yuv420p;
+                        colorimetry.chroma_location = ChromaLocation::TopLeft;
+                    }
+                    "422" => {
+                        pixel_format = PixelFormat::Yuv422p;
+                    }
+                    "444" => {
+                        pixel_format = PixelFormat::Yuv444p;
+                    }
+                    "420p10" => {
+                        pixel_format = PixelFormat::Yuv420p10le;
+                        bit_depth = 10;
+                    }
+                    _ => {}
+                }
             }
         }
 

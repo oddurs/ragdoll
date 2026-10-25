@@ -8,7 +8,8 @@ use ragdoll_core::{
     unescape_rbsp_scalar,
 };
 use ragdoll_format::{
-    Mp4Demuxer, Mp4Muxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv, transmux_mp4_to_mpegts,
+    MkvDemuxer, Mp4Demuxer, Mp4Muxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv,
+    transmux_mp4_to_mpegts,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
@@ -27,7 +28,7 @@ use ragdoll_simd::{
 fn main() {
     let simd = SimdLevel::detect();
     println!("================================================================================");
-    println!("  RAGDOLL v0.1.0 — M1 & M2 SIMD Kernel Live Benchmark / Self-Test");
+    println!("  RAGDOLL v0.1.0 — M1, M2 & M3 SIMD & Container Live Benchmark / Self-Test");
     println!("  Detected Hardware SIMD : {}", simd.name());
     println!("================================================================================\n");
 
@@ -682,6 +683,9 @@ fn main() {
     }
     let ts_remux_gbps = (mp4_container.len() * 5) as f64 / t_ts.elapsed().as_secs_f64() / 1e9;
 
+    let mkv_check = MkvDemuxer::open(&mkv_sink).unwrap();
+    assert!(mkv_check.has_seek_head());
+
     println!(
         "----------------------------------------------------------------------------------------------"
     );
@@ -704,7 +708,10 @@ fn main() {
         l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.ms_ssim, q_rep.vmaf_lite
     );
     println!(
-        "[M3 Containers]    Zero-Copy MP4 Demux: {:.2} GB/s | MP4->MKV: {:.2} GB/s | MP4->MPEG-TS: {:.2} GB/s (faststart=true)",
-        mp4_demux_gbps, mkv_remux_gbps, ts_remux_gbps
+        "[M3 Containers]    Zero-Copy MP4 Demux: {:.2} GB/s | MP4->MKV: {:.2} GB/s | MP4->MPEG-TS: {:.2} GB/s (faststart=true, seekhead={})",
+        mp4_demux_gbps,
+        mkv_remux_gbps,
+        ts_remux_gbps,
+        mkv_check.has_seek_head()
     );
 }
