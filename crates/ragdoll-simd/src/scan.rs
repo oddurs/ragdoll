@@ -7,10 +7,70 @@ pub fn find_annex_b_start_code(data: &[u8]) -> Option<(usize, usize)> {
         // Safety: NEON is baseline on all aarch64 CPUs (including Apple Silicon M-series).
         unsafe { find_annex_b_start_code_neon(data) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { find_annex_b_start_code_avx2(data) }
+        } else {
+            find_annex_b_start_code_scalar(data)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         find_annex_b_start_code_scalar(data)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_annex_b_start_code_avx2(data: &[u8]) -> Option<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let len = data.len();
+    if len < 3 {
+        return None;
+    }
+    let mut i = 0usize;
+    let v_zero = _mm256_setzero_si256();
+
+    while i + 2 < len {
+        if i == 0 || unsafe { *data.get_unchecked(i - 1) } != 0 {
+            while i + 32 <= len {
+                let chunk = unsafe { _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i) };
+                let eq_zero = _mm256_cmpeq_epi8(chunk, v_zero);
+                let zmask = _mm256_movemask_epi8(eq_zero) as u32;
+                if zmask == 0 {
+                    i += 32;
+                    continue;
+                }
+                if (zmask & (zmask >> 1)) == 0 && unsafe { *data.get_unchecked(i + 31) } != 0 {
+                    i += 32;
+                } else {
+                    break;
+                }
+            }
+            if i + 2 >= len {
+                break;
+            }
+        }
+
+        if data[i + 1] != 0 {
+            i += 2;
+            continue;
+        }
+        if data[i] == 0 {
+            if data[i + 2] == 1 {
+                if i > 0 && data[i - 1] == 0 {
+                    return Some((i - 1, 4));
+                }
+                return Some((i, 3));
+            }
+            if data[i + 2] == 0 && i + 3 < len && data[i + 3] == 1 {
+                return Some((i, 4));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Scalar reference implementation of Annex-B start-code search (`00 00 01` or `00 00 00 01`).

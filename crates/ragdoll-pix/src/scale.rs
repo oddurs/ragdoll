@@ -192,7 +192,34 @@ pub fn hscale_row_8tap_q14(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseF
             return;
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if src_row.len() >= 8 && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { hscale_row_8tap_q14_avx2(src_row, dst_row, bank) };
+            return;
+        }
+    }
     hscale_row_8tap_q14_scalar(src_row, dst_row, bank);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn hscale_row_8tap_q14_avx2(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseFilterBank) {
+    use std::arch::x86_64::*;
+    let dst_len = bank.dst_len;
+    assert!(dst_row.len() >= dst_len);
+    for x in 0..dst_len {
+        let ws = bank.win_starts[x];
+        let s8 = unsafe { _mm_loadl_epi64(src_row.as_ptr().add(ws) as *const __m128i) };
+        let s16 = _mm_cvtepu8_epi16(s8);
+        let w16 = unsafe { _mm_loadu_si128(bank.weights[x].as_ptr() as *const __m128i) };
+        let prod = _mm_madd_epi16(s16, w16);
+        let sum2 = _mm_hadd_epi32(prod, prod);
+        let sum1 = _mm_hadd_epi32(sum2, sum2);
+        let acc = _mm_cvtsi128_si32(sum1) + Q14_HALF;
+        dst_row[x] = clamp_u8(acc >> 14);
+    }
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -291,9 +318,57 @@ pub fn vscale_row_8tap_q14(rows: [&[u8]; 8], weights: &[i16; 8], dst_row: &mut [
     {
         unsafe { vscale_row_8tap_q14_neon(rows, weights, dst_row, width) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { vscale_row_8tap_q14_avx2(rows, weights, dst_row, width) }
+        } else {
+            vscale_row_8tap_q14_scalar(rows, weights, dst_row, width)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         vscale_row_8tap_q14_scalar(rows, weights, dst_row, width)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vscale_row_8tap_q14_avx2(
+    rows: [&[u8]; 8],
+    weights: &[i16; 8],
+    dst_row: &mut [u8],
+    width: usize,
+) {
+    use std::arch::x86_64::*;
+    let mut x = 0usize;
+    let v_bias = _mm256_set1_epi32(Q14_HALF);
+    while x + 8 <= width {
+        let mut acc = v_bias;
+        for t in 0..8 {
+            let w = weights[t] as i32;
+            if w == 0 {
+                continue;
+            }
+            let r8 = unsafe { _mm_loadl_epi64(rows[t].as_ptr().add(x) as *const __m128i) };
+            let r32 = _mm256_cvtepu8_epi32(r8);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(r32, _mm256_set1_epi32(w)));
+        }
+        let shifted = _mm256_srai_epi32(acc, 14);
+        let mut lanes = [0i32; 8];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, shifted) };
+        for k in 0..8 {
+            dst_row[x + k] = clamp_u8(lanes[k]);
+        }
+        x += 8;
+    }
+    while x < width {
+        let mut acc = Q14_HALF;
+        for t in 0..8 {
+            acc += (rows[t][x] as i32) * (weights[t] as i32);
+        }
+        dst_row[x] = clamp_u8(acc >> 14);
+        x += 1;
     }
 }
 

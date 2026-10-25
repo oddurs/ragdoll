@@ -40,3 +40,25 @@ jobs:
 
       - name: Run unit & SIMD differential tests
         run: cargo test --workspace
+
+  check-x86_64:
+    name: AVX2 Differential Tests (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust dependency & build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Strict lints (clippy x86_64)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run x86_64 AVX2 unit & SIMD differential tests
+        run: cargo test -p ragdoll-core -p ragdoll-simd -p ragdoll-pix

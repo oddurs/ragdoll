@@ -35,8 +35,8 @@ path = "archive/720p.mkv"
 | Key | Type | Description |
 | :-- | :-- | :-- |
 | `path` | string | **Required.** Input file. |
-| `start` | string | Parsed and kept on the recipe, but not yet applied. |
-| `duration` | string | Parsed and kept on the recipe, but not yet applied. |
+| `start` | string | Optional trim start timestamp (`seconds` or `HH:MM:SS.mmm`), applied via Smart-GOP `cut_media` before transcoding. |
+| `duration` | string | Optional trim duration (`seconds` or `HH:MM:SS.mmm`), applied via Smart-GOP `cut_media` before transcoding. |
 
 ### `[video]`
 
@@ -53,8 +53,8 @@ path = "archive/720p.mkv"
 
 | Key | Type | Default | Description |
 | :-- | :-- | :-- | :-- |
-| `codec` | string | `"flac"` | Parsed, but recipe runs currently keep the source audio unchanged. |
-| `sample_rate` | integer | | Parsed and kept on the recipe, but not yet applied. |
+| `codec` | string | `"flac"` | Target audio codec (`aac`, `opus`, `flac`, `copy`, or `none`). |
+| `sample_rate` | integer | | Optional output audio sample rate in Hz (e.g. `48000`), resampled via the 32-tap Kaiser polyphase resampler. |
 
 ### `[[output]]`
 
@@ -63,7 +63,7 @@ Repeat the table once per output. At least one is required.
 | Key | Type | Default | Description |
 | :-- | :-- | :-- | :-- |
 | `path` | string | | **Required.** Output file; the extension picks the container. |
-| `faststart` | boolean | `true` | Parsed and kept on the recipe. MP4 output is always fast-start. |
+| `faststart` | boolean | `true` | Enables fast-start MP4 layout (`moov` before `mdat`). |
 
 ## Parsing rules
 

@@ -3,10 +3,12 @@ id: 54
 uid: e9831b68-c3a0-4bab-aed6-be741d25ce31
 title: Stream decode through GopRingPipeline so transcode, extract and metrics use bounded memory
 type: feature
-status: backlog
+status: done
 milestone: m10-production-v1
+assignee: Oddur Sigurdsson
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p1
 effort: l
 area: pipeline
@@ -22,7 +24,7 @@ Decode per GOP inside each wave: partition the demuxed `SampleEntry` index into 
 
 ## Acceptance criteria
 
-- [ ] Peak RSS of `transcode` on a long synthesized input stays within the configured budget plus a fixed overhead, independent of input length (test with two lengths).
-- [ ] `extract --at` decodes only the GOP containing the target frame.
-- [ ] `metrics` processes reference and distorted inputs in bounded waves.
-- [ ] Memory-limit callouts removed from the transcode and memory-model docs pages.
+- [x] Peak RSS of `transcode` on a long synthesized input stays within the configured budget plus a fixed overhead, independent of input length (test with two lengths).
+- [x] `extract --at` decodes only the GOP containing the target frame.
+- [x] `metrics` processes reference and distorted inputs in bounded waves.
+- [x] Memory-limit callouts removed from the transcode and memory-model docs pages.
