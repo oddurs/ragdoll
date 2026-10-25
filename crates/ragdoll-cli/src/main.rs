@@ -144,13 +144,15 @@ fn print_help() {
     println!("      bitrate sparkline, and ASCII GOP waterfall visualization.");
     println!();
     println!("  remux <IN> <OUT> [--faststart] [--json]");
-    println!("      Zero-copy mmap -> writev remuxing across .mp4, .mkv, .ts, .y4m, and .wav.");
+    println!(
+        "      Zero-copy mmap -> writev remuxing across .mp4, .mkv, .ts, .flac, .ogg, .y4m, and .wav."
+    );
     println!();
     println!(
-        "  transcode <IN> <OUT> [--video h264|rgdi] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]"
+        "  transcode <IN> <OUT> [--video h264|rgdi] [--audio aac|opus|flac|copy|none] [--sample-rate HZ] [--channels N] [--loudness LUFS] [--true-peak DBTP] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]"
     );
     println!(
-        "      Work-stealing GOP-parallel video & audio transcoding or TOML recipe execution."
+        "      Work-stealing GOP-parallel video & audio transcoding, Kaiser polyphase resampling, EBU R128 loudness normalization, or TOML recipe execution."
     );
     println!();
     println!("  extract <IN> [-o <OUT>] [--at <SEC>] [--thumbnails <N> --grid <CxR>] [--json]");
@@ -461,6 +463,22 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
             "--audio" | "-c:a" if i + 1 < args.len() => {
                 i += 1;
                 opts.audio_codec = args[i].clone();
+            }
+            "--sample-rate" | "-ar" if i + 1 < args.len() => {
+                i += 1;
+                opts.sample_rate = args[i].parse::<u32>().ok();
+            }
+            "--channels" | "-ac" if i + 1 < args.len() => {
+                i += 1;
+                opts.channels = args[i].parse::<u8>().ok();
+            }
+            "--loudness" | "--lufs" if i + 1 < args.len() => {
+                i += 1;
+                opts.loudness_lufs = args[i].parse::<f64>().ok();
+            }
+            "--true-peak" | "--dbtp" if i + 1 < args.len() => {
+                i += 1;
+                opts.true_peak_dbtp = args[i].parse::<f64>().ok();
             }
             "--subs" | "--subtitles" | "-c:s" if i + 1 < args.len() => {
                 i += 1;
@@ -2644,9 +2662,26 @@ mod tests {
             "transcode",
             flac_path.to_str().unwrap(),
             wav_rt_path.to_str().unwrap(),
+            "--sample-rate",
+            "44100",
+            "--loudness",
+            "-16.0",
+            "--true-peak",
+            "-1.0",
         ]))
         .unwrap();
         assert!(wav_rt_path.exists());
+
+        let ogg_path = dir.join("audio.ogg");
+        run_cli(&vec_args(&[
+            "transcode",
+            flac_path.to_str().unwrap(),
+            ogg_path.to_str().unwrap(),
+            "--audio",
+            "opus",
+        ]))
+        .unwrap();
+        assert!(ogg_path.exists());
 
         // 5. extract single frame and 2x2 contact sheet
         run_cli(&vec_args(&[

@@ -3,12 +3,14 @@ id: 45
 uid: f3a2d589-3f59-4553-a294-b6b67ec22978
 title: Native Standalone .flac and .ogg Container Demuxers/Muxers with SEEKTABLE & Metadata Tags
 type: feature
-status: planned
+status: done
 milestone: m8-audio-pro
+assignee: Oddur Sigurdsson
 depends_on:
 - 37
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p1
 area: format
 effort: m
@@ -25,5 +27,9 @@ In `v0.1.0`, `ragdoll transcode` reads/writes raw `.flac` streams via `FlacEncod
 
 ## Acceptance criteria
 
-- [ ] `ragdoll probe`, `ragdoll remux`, and `ragdoll transcode` inspect and convert `.flac` and `.ogg` files with `SEEKTABLE` and Vorbis Comment metadata preservation.
-- [ ] `ffprobe` and `ffmpeg` validate all generated `.flac` and `.ogg` files with zero warnings.
+- [x] `ragdoll probe`, `ragdoll remux`, and `ragdoll transcode` inspect and convert `.flac` and `.ogg` files with `SEEKTABLE` and Vorbis Comment metadata preservation.
+- [x] `ffprobe` and `ffmpeg` validate all generated `.flac` and `.ogg` files with zero warnings.
+
+## 2026-10-25
+
+Implemented native standalone .flac (FlacContainerDemuxer, FlacContainerMuxer, FlacSeekPoint 18B SEEKTABLE, VorbisComments) and .ogg (OggDemuxer, OggMuxer supporting Ogg Opus and Ogg FLAC 1.0 mapping with crc32_ogg page framing and O(log N) sample seeking) in crates/ragdoll-format/src/flac.rs and ogg.rs, wired into ragdoll-pipeline and ragdoll-cli.

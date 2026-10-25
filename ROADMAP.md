@@ -114,16 +114,16 @@ Upgrade Ragdoll's pure-Rust H.264/AVC engine from Constrained Baseline skip/DC c
 
 ## m8-audio-pro — Phase 8 — Lossy Audio (AAC-LC & Opus), Polyphase Resampler & EBU R128 Loudness
 
-`··········` 0% · 0 of 4 done
+`##########` 100% · 4 of 4 done
 
 Deliver a complete pure-Rust production audio engine: SIMD windowed-sinc Kaiser (`bessel_i0`) polyphase sample-rate conversion (`44.1/48/88.2/96 kHz`), channel matrix mixing (`5.1/7.1 <-> Stereo/Mono`), EBU R128 (`LUFS`) + True-Peak loudness measurement and normalization, pure-Rust AAC-LC and Opus MDCT/IMDCT lossy audio codecs, and standalone `.flac` / `.ogg` container support with `SEEKTABLE` and metadata tags.
 
-### up next
+### shipped
 
-- [ ] `SIMD-0042` SIMD Windowed-Sinc Kaiser (bessel_i0) Polyphase Audio Resampler & Channel Matrix Mixer <sup>kernel · p0 · codec-audio</sup>
-- [ ] `SIMD-0043` SIMD EBU R128 (LUFS) K-Weighting Filter, Gated Loudness & True-Peak Normalizer <sup>kernel · p1 · codec-audio</sup>
-- [ ] `0044` Pure-Rust AAC-LC & Opus MDCT/IMDCT Audio Decoder and Encoder <sup>feature · p0 · codec-audio</sup>
-- [ ] `0045` Native Standalone .flac and .ogg Container Demuxers/Muxers with SEEKTABLE & Metadata Tags <sup>feature · p1 · format</sup>
+- [x] `SIMD-0042` SIMD Windowed-Sinc Kaiser (bessel_i0) Polyphase Audio Resampler & Channel Matrix Mixer <sup>kernel · p0 · codec-audio</sup>
+- [x] `SIMD-0043` SIMD EBU R128 (LUFS) K-Weighting Filter, Gated Loudness & True-Peak Normalizer <sup>kernel · p1 · codec-audio</sup>
+- [x] `0044` Pure-Rust AAC-LC & Opus MDCT/IMDCT Audio Decoder and Encoder <sup>feature · p0 · codec-audio</sup>
+- [x] `0045` Native Standalone .flac and .ogg Container Demuxers/Muxers with SEEKTABLE & Metadata Tags <sup>feature · p1 · format</sup>
 
 ## m9-edit-image-package — Phase 9 — Smart-GOP Editing (cut/concat), Spatial Filters, PNG/JPEG & ABR Packaging (package)
 

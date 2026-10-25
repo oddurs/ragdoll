@@ -9,10 +9,14 @@
 //! - [`transcode_file`], [`remux_file`], [`extract_media`], [`synth_media`]: Unified multi-container media engines.
 
 use ragdoll_codec::{
-    FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, NalUnitType, RagdollIntraDecoder,
-    RagdollIntraEncoder, Sps, convert_audio_frame, parse_nal_rbsp,
+    AacDecoder, AacEncoder, AdtsHeader, FlacDecoder, FlacEncoder, H264Decoder, H264Encoder,
+    NalUnitType, OpusDecoder, OpusEncoder, RagdollIntraDecoder, RagdollIntraEncoder, Sps,
+    convert_audio_frame, normalize_audio_frame, parse_nal_rbsp, resample_and_rematrix_frame,
 };
-pub use ragdoll_codec::{H264Profile, RateControlMode};
+pub use ragdoll_codec::{
+    ChannelRematrixer, EbuR128Meter, H264Profile, LoudnessReport, PolyphaseResampler,
+    RateControlMode,
+};
 use ragdoll_core::{
     AlignedBuffer, AudioFrame, AudioTrackParams, ChannelLayout, CodecId, Colorimetry, FramePool,
     NOPTS_VALUE, PacketFlags, PacketSlice, PixelFormat, RagdollError, Rational64, Result,
@@ -25,9 +29,10 @@ pub use ragdoll_core::{
     measure_hardware_metrics, parse_macos_time_l_stderr, set_global_power_mode, with_power_mode,
 };
 use ragdoll_format::{
-    ContainerFormat, MkvDemuxer, MkvMuxer, MmapSource, Mp4Demuxer, Mp4Muxer, MpegTsDemuxer,
-    MpegTsMuxer, OutputSink, SubtitleDemuxer, SubtitleMuxer, WavDemuxer, WavMuxer, Y4mDemuxer,
-    Y4mMuxer, build_avcc_from_sps_pps, compose_contact_sheet_rgb24, detect_container_format,
+    ContainerFormat, FlacContainerDemuxer, FlacContainerMuxer, MkvDemuxer, MkvMuxer, MmapSource,
+    Mp4Demuxer, Mp4Muxer, MpegTsDemuxer, MpegTsMuxer, OggDemuxer, OggMuxer, OutputSink,
+    SubtitleDemuxer, SubtitleMuxer, VorbisComments, WavDemuxer, WavMuxer, Y4mDemuxer, Y4mMuxer,
+    build_avcc_from_sps_pps, compose_contact_sheet_rgb24, detect_container_format,
     h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, is_stdout_path, read_pnm_image,
     transmux_mkv_to_mp4, transmux_mp4_to_mpegts, transmux_mpegts_to_mkv, transmux_mpegts_to_mp4,
     write_pnm_image,
@@ -854,6 +859,75 @@ pub fn remux_file_with_format(
             frames_processed = 1;
             data.len() as u64
         }
+        (ContainerFormat::Flac, "flac") => {
+            let mut demux = FlacContainerDemuxer::open(data)?;
+            let mut mux = FlacContainerMuxer::new();
+            mux.add_track(demux.track().clone());
+            mux.set_comments(demux.comments().clone());
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(&pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
+        (ContainerFormat::Flac, "ogg") => {
+            let mut demux = FlacContainerDemuxer::open(data)?;
+            let mut mux = OggMuxer::new();
+            mux.add_track(demux.track().clone());
+            mux.set_comments(demux.comments().clone());
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(&pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
+        (ContainerFormat::Ogg, "ogg" | "opus") => {
+            let mut demux = OggDemuxer::open(data)?;
+            let mut mux = OggMuxer::new();
+            mux.add_track(demux.track().clone());
+            mux.set_comments(demux.comments().clone());
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(&pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
+        (ContainerFormat::Ogg, "flac") => {
+            let mut demux = OggDemuxer::open(data)?;
+            if demux.track().codec_id == CodecId::Flac {
+                let mut mux = FlacContainerMuxer::new();
+                mux.add_track(demux.track().clone());
+                mux.set_comments(demux.comments().clone());
+                while let Some(pkt) = demux.next_packet()? {
+                    frames_processed += 1;
+                    mux.write_packet(&pkt)?;
+                }
+                mux.finish(&mut writer)?
+            } else {
+                drop(writer);
+                return transcode_file(in_p, out_p, None, ScaleFilter::Lanczos3, "h264", 20, 0);
+            }
+        }
+        (ContainerFormat::Ogg, "mkv" | "webm") => {
+            let mut demux = OggDemuxer::open(data)?;
+            let mut mux = MkvMuxer::new_matroska();
+            mux.add_track(demux.track().clone());
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
+        (ContainerFormat::Flac, "mkv") => {
+            let mut demux = FlacContainerDemuxer::open(data)?;
+            let mut mux = MkvMuxer::new_matroska();
+            mux.add_track(demux.track().clone());
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
         _ => {
             // Fallback to transcode if formats require codec conversion
             drop(writer);
@@ -1037,9 +1111,13 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
             }
             Ok((frames, Rational64::FPS_30))
         }
-        ContainerFormat::Wav | ContainerFormat::WebVtt | ContainerFormat::SubRip => Err(
-            RagdollError::Unsupported("audio/subtitle container has no video stream".into()),
-        ),
+        ContainerFormat::Wav
+        | ContainerFormat::Flac
+        | ContainerFormat::Ogg
+        | ContainerFormat::WebVtt
+        | ContainerFormat::SubRip => Err(RagdollError::Unsupported(
+            "audio/subtitle container has no video stream".into(),
+        )),
     }
 }
 
@@ -1178,7 +1256,7 @@ pub fn avcc_config_to_annex_b(avcc: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Options for [`transcode_file_with_options`] (`0036` / `0037` / `0040` / `0041`).
+/// Options for [`transcode_file_with_options`] (`0036` / `0037` / `0040` / `0041` / `SIMD-0042` / `SIMD-0043` / `0044` / `0045`).
 #[derive(Clone, Debug)]
 pub struct TranscodeOptions {
     pub scale_dims: Option<(usize, usize)>,
@@ -1192,6 +1270,10 @@ pub struct TranscodeOptions {
     pub rate_control: Option<RateControlMode>,
     pub threads: usize,
     pub memory_budget_bytes: Option<usize>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u8>,
+    pub loudness_lufs: Option<f64>,
+    pub true_peak_dbtp: Option<f64>,
 }
 
 impl Default for TranscodeOptions {
@@ -1208,6 +1290,388 @@ impl Default for TranscodeOptions {
             rate_control: None,
             threads: 0,
             memory_budget_bytes: None,
+            sample_rate: None,
+            channels: None,
+            loudness_lufs: None,
+            true_peak_dbtp: None,
+        }
+    }
+}
+
+/// Decodes an audio stream from `.flac`, `.wav`, `.ogg`, `.aac` (ADTS), or `.mp4`/`.mkv`/`.ts` into
+/// `(AudioFrame, VorbisComments)`.
+pub fn decode_audio_bytes(data: &[u8]) -> Result<(AudioFrame, VorbisComments)> {
+    if data.starts_with(b"fLaC") {
+        let demux = FlacContainerDemuxer::open(data).ok();
+        let comments = demux.map(|d| d.comments().clone()).unwrap_or_default();
+        let (_info, frame) = FlacDecoder::decode_stream(data)?;
+        return Ok((frame, comments));
+    }
+    if data.len() >= 12
+        && (&data[0..4] == b"RIFF" || &data[0..4] == b"RF64" || &data[0..4] == b"BW64")
+        && &data[8..12] == b"WAVE"
+    {
+        let demux = WavDemuxer::open(data)?;
+        let ap = demux
+            .track()
+            .audio
+            .as_ref()
+            .ok_or_else(|| RagdollError::InvalidData("WAV missing audio params".into()))?;
+        let raw = demux.pcm_data();
+        let bps = ap.sample_format.bytes_per_sample().max(1);
+        let block_align = (ap.channels.max(1) as usize) * bps;
+        let num_samples = raw.len() / block_align;
+        let mut af = AudioFrame::new(ap.sample_rate, ap.channels, ap.sample_format, num_samples);
+        let copy_len = af.data.len().min(raw.len());
+        af.data.as_mut_slice()[..copy_len].copy_from_slice(&raw[..copy_len]);
+        return Ok((af, VorbisComments::default()));
+    }
+    if data.starts_with(b"OggS") {
+        let mut demux = OggDemuxer::open(data)?;
+        let comments = demux.comments().clone();
+        let track = demux.track().clone();
+        let mut raw_pkts = Vec::new();
+        while let Some(pkt) = demux.next_packet()? {
+            raw_pkts.push(pkt.data().to_vec());
+        }
+        if track.codec_id == CodecId::Flac {
+            // Reconstruct fLaC stream header + frames for FlacDecoder::decode_stream
+            let mut full = Vec::with_capacity(42 + raw_pkts.iter().map(|p| p.len()).sum::<usize>());
+            full.extend_from_slice(b"fLaC");
+            full.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+            if track.extra_data.len() >= 34 {
+                full.extend_from_slice(&track.extra_data[0..34]);
+            } else {
+                full.extend_from_slice(&[0u8; 34]);
+            }
+            for p in &raw_pkts {
+                full.extend_from_slice(p);
+            }
+            let (_info, frame) = FlacDecoder::decode_stream(&full)?;
+            return Ok((frame, comments));
+        } else {
+            let ch = track.audio.as_ref().map_or(2, |a| a.channels).clamp(1, 2);
+            let mut dec = OpusDecoder::new(ch).with_extra_data(&track.extra_data)?;
+            let ch_usize = dec.head.channels.clamp(1, 2) as usize;
+            let mut all_samples = Vec::new();
+            for p in &raw_pkts {
+                let f = dec.decode_packet(p)?;
+                all_samples.extend_from_slice(f.as_f32_slice());
+            }
+            let num_samples = all_samples.len() / ch_usize;
+            let mut af = AudioFrame::new(48_000, ch_usize as u8, SampleFormat::F32le, num_samples);
+            af.as_f32_mut_slice()
+                .copy_from_slice(&all_samples[..num_samples * ch_usize]);
+            return Ok((af, comments));
+        }
+    }
+    // Check ADTS AAC stream (0xFFFx syncword)
+    if data.len() >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
+        let mut dec = AacDecoder::new(48_000, 2);
+        let mut all_samples = Vec::new();
+        let mut pos = 0usize;
+        while pos + 7 <= data.len() {
+            let Ok(hdr) = AdtsHeader::parse(&data[pos..]) else {
+                break;
+            };
+            let flen = (hdr.frame_length as usize).max(7);
+            if pos + flen > data.len() {
+                break;
+            }
+            let f = dec.decode_packet(&data[pos..pos + flen])?;
+            all_samples.extend_from_slice(f.as_f32_slice());
+            pos += flen;
+        }
+        let ch = dec.asc.channel_configuration.clamp(1, 2) as usize;
+        let num_samples = all_samples.len() / ch;
+        let mut af = AudioFrame::new(
+            dec.asc.sample_rate,
+            ch as u8,
+            SampleFormat::F32le,
+            num_samples,
+        );
+        af.as_f32_mut_slice()
+            .copy_from_slice(&all_samples[..num_samples * ch]);
+        return Ok((af, VorbisComments::default()));
+    }
+    // Check MP4 / MKV / MpegTS container with an audio track
+    let aux = extract_auxiliary_tracks(data)?;
+    if let Some((a_info, a_pkts)) = aux
+        .into_iter()
+        .find(|(t, _)| t.track_type == TrackType::Audio)
+    {
+        let af = decode_audio_track_packets(&a_info, &a_pkts)?;
+        return Ok((af, VorbisComments::default()));
+    }
+    Err(RagdollError::InvalidHeader(
+        "unrecognized audio input format".into(),
+    ))
+}
+
+/// Decodes a sequence of audio `PacketSlice`s belonging to `track` into a single [`AudioFrame`].
+pub fn decode_audio_track_packets(
+    track: &TrackInfo,
+    packets: &[PacketSlice<'_>],
+) -> Result<AudioFrame> {
+    let raw_pkts: Vec<Vec<u8>> = packets.iter().map(|p| p.data().to_vec()).collect();
+    match track.codec_id {
+        CodecId::Flac => {
+            let mut full = Vec::with_capacity(42 + raw_pkts.iter().map(|p| p.len()).sum::<usize>());
+            full.extend_from_slice(b"fLaC");
+            full.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+            if track.extra_data.len() >= 34 {
+                full.extend_from_slice(&track.extra_data[0..34]);
+            } else {
+                full.extend_from_slice(&[0u8; 34]);
+            }
+            for p in &raw_pkts {
+                if p.starts_with(b"fLaC") && p.len() > 42 {
+                    full.extend_from_slice(&p[42..]);
+                } else {
+                    full.extend_from_slice(p);
+                }
+            }
+            let (_info, af) = FlacDecoder::decode_stream(&full)?;
+            Ok(af)
+        }
+        CodecId::Aac => {
+            let ap = track.audio.clone().unwrap_or_default();
+            let mut dec = AacDecoder::new(ap.sample_rate.max(48_000), ap.channels.clamp(1, 2))
+                .with_extra_data(&track.extra_data)?;
+            let mut all_samples = Vec::new();
+            for p in &raw_pkts {
+                let f = dec.decode_packet(p)?;
+                all_samples.extend_from_slice(f.as_f32_slice());
+            }
+            let ch = dec.asc.channel_configuration.clamp(1, 2) as usize;
+            let num_samples = all_samples.len() / ch;
+            let mut out = AudioFrame::new(
+                dec.asc.sample_rate,
+                ch as u8,
+                SampleFormat::F32le,
+                num_samples,
+            );
+            out.as_f32_mut_slice()
+                .copy_from_slice(&all_samples[..num_samples * ch]);
+            Ok(out)
+        }
+        CodecId::Opus => {
+            let ch = track.audio.as_ref().map_or(2, |a| a.channels).clamp(1, 2);
+            let mut dec = OpusDecoder::new(ch).with_extra_data(&track.extra_data)?;
+            let ch_usize = dec.head.channels.clamp(1, 2) as usize;
+            let mut all_samples = Vec::new();
+            for p in &raw_pkts {
+                let f = dec.decode_packet(p)?;
+                all_samples.extend_from_slice(f.as_f32_slice());
+            }
+            let num_samples = all_samples.len() / ch_usize;
+            let mut out = AudioFrame::new(48_000, ch_usize as u8, SampleFormat::F32le, num_samples);
+            out.as_f32_mut_slice()
+                .copy_from_slice(&all_samples[..num_samples * ch_usize]);
+            Ok(out)
+        }
+        _ => {
+            let ap = track.audio.clone().unwrap_or_default();
+            let bps = ap.sample_format.bytes_per_sample().max(1);
+            let block_align = (ap.channels.max(1) as usize) * bps;
+            let total_bytes: usize = raw_pkts.iter().map(|p| p.len()).sum();
+            let num_samples = total_bytes / block_align;
+            let mut af =
+                AudioFrame::new(ap.sample_rate, ap.channels, ap.sample_format, num_samples);
+            let mut off = 0usize;
+            for p in &raw_pkts {
+                let take = p.len().min(af.data.len().saturating_sub(off));
+                af.data.as_mut_slice()[off..off + take].copy_from_slice(&p[..take]);
+                off += take;
+            }
+            Ok(af)
+        }
+    }
+}
+
+/// Applies Kaiser polyphase resampling, channel matrix mixing, and EBU R128 loudness + True-Peak
+/// normalization (`SIMD-0042` + `SIMD-0043`) when configured in `opts`.
+pub fn apply_audio_dsp(mut frame: AudioFrame, opts: &TranscodeOptions) -> Result<AudioFrame> {
+    let target_sr = opts.sample_rate.unwrap_or(frame.sample_rate);
+    let target_ch = opts.channels.unwrap_or(frame.channels);
+    if target_sr != frame.sample_rate || target_ch != frame.channels {
+        let mut rs = if target_sr != frame.sample_rate {
+            Some(PolyphaseResampler::new(
+                frame.sample_rate,
+                target_sr,
+                target_ch as usize,
+                32,
+            ))
+        } else {
+            None
+        };
+        let rm = if target_ch != frame.channels {
+            Some(ChannelRematrixer::new(
+                ChannelLayout::from_channels(frame.channels),
+                ChannelLayout::from_channels(target_ch),
+                true,
+            ))
+        } else {
+            None
+        };
+        frame = resample_and_rematrix_frame(&frame, rs.as_mut(), rm.as_ref(), frame.format)?;
+    }
+    if let Some(target_lufs) = opts.loudness_lufs {
+        let ceiling_dbtp = opts.true_peak_dbtp.unwrap_or(-1.0);
+        let mut meter = EbuR128Meter::new(frame.sample_rate, frame.channels as usize);
+        meter.process_audio_frame(&frame)?;
+        let (gain, _report) = meter.compute_normalization_gain(target_lufs, ceiling_dbtp);
+        frame = normalize_audio_frame(&frame, gain, ceiling_dbtp)?;
+    }
+    Ok(frame)
+}
+
+/// Encodes an [`AudioFrame`] into `(TrackInfo, Vec<PacketSlice<'static>>)` for `.mp4`, `.mkv`, or `.ts` muxing.
+pub fn encode_audio_track_packets(
+    mut frame: AudioFrame,
+    codec_name: &str,
+    track_index: u32,
+) -> Result<(TrackInfo, Vec<PacketSlice<'static>>)> {
+    let cname = codec_name.trim().to_ascii_lowercase();
+    match cname.as_str() {
+        "opus" => {
+            let out_ch = frame.channels.clamp(1, 2);
+            if frame.sample_rate != 48_000 || frame.channels != out_ch {
+                let mut rs = if frame.sample_rate != 48_000 {
+                    Some(PolyphaseResampler::new(
+                        frame.sample_rate,
+                        48_000,
+                        out_ch as usize,
+                        32,
+                    ))
+                } else {
+                    None
+                };
+                let rm = if frame.channels != out_ch {
+                    Some(ChannelRematrixer::new(
+                        ChannelLayout::from_channels(frame.channels),
+                        ChannelLayout::from_channels(out_ch),
+                        true,
+                    ))
+                } else {
+                    None
+                };
+                frame = resample_and_rematrix_frame(
+                    &frame,
+                    rs.as_mut(),
+                    rm.as_ref(),
+                    SampleFormat::F32le,
+                )?;
+            }
+            let mut enc = OpusEncoder::new(48_000, out_ch, 96_000);
+            let raw_pkts = enc.encode_stream_frames(&frame)?;
+            let tb = Rational64::new(1, 48_000);
+            let mut pkts = Vec::with_capacity(raw_pkts.len());
+            for (p, pts, dur) in raw_pkts {
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(&p),
+                    track_index,
+                    pts,
+                    pts,
+                    dur,
+                    PacketFlags::KEYFRAME,
+                ));
+            }
+            let info = TrackInfo {
+                index: track_index,
+                track_type: TrackType::Audio,
+                codec_id: CodecId::Opus,
+                timebase: tb,
+                duration_ticks: Some((pkts.len() as i64) * 960),
+                extra_data: enc.head.to_bytes().to_vec(),
+                video: None,
+                audio: Some(AudioTrackParams {
+                    sample_rate: 48_000,
+                    channels: out_ch,
+                    channel_layout: ChannelLayout::from_channels(out_ch),
+                    sample_format: SampleFormat::F32le,
+                    bits_per_coded_sample: 32,
+                }),
+                sample_count: pkts.len(),
+                total_bytes: pkts.iter().map(|p| p.len() as u64).sum(),
+            };
+            Ok((info, pkts))
+        }
+        "aac" | "aac-lc" => {
+            let out_ch = frame.channels.clamp(1, 2);
+            let mut enc = AacEncoder::new(frame.sample_rate, out_ch, 128_000);
+            let raw_pkts = enc.encode_stream_frames(&frame)?;
+            let sr = enc.asc.sample_rate;
+            let tb = Rational64::new(1, sr as i64);
+            let mut pkts = Vec::with_capacity(raw_pkts.len());
+            for (p, pts, dur) in raw_pkts {
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(&p),
+                    track_index,
+                    pts,
+                    pts,
+                    dur,
+                    PacketFlags::KEYFRAME,
+                ));
+            }
+            let info = TrackInfo {
+                index: track_index,
+                track_type: TrackType::Audio,
+                codec_id: CodecId::Aac,
+                timebase: tb,
+                duration_ticks: Some((pkts.len() as i64) * 1024),
+                extra_data: enc.extra_data().to_vec(),
+                video: None,
+                audio: Some(AudioTrackParams {
+                    sample_rate: sr,
+                    channels: out_ch,
+                    channel_layout: ChannelLayout::from_channels(out_ch),
+                    sample_format: SampleFormat::F32le,
+                    bits_per_coded_sample: 16,
+                }),
+                sample_count: pkts.len(),
+                total_bytes: pkts.iter().map(|p| p.len() as u64).sum(),
+            };
+            Ok((info, pkts))
+        }
+        _ => {
+            let enc = FlacEncoder::new(frame.sample_rate, frame.channels, 0);
+            let (si, frames) = enc.encode_frames(&frame)?;
+            let tb = Rational64::new(1, frame.sample_rate.max(1) as i64);
+            let mut pkts = Vec::with_capacity(frames.len());
+            let mut pts_ticks = 0i64;
+            for (f_bytes, count) in frames {
+                let pts = Timestamp::new(pts_ticks, tb);
+                let dur = count as i64;
+                pts_ticks += dur;
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(&f_bytes),
+                    track_index,
+                    pts,
+                    pts,
+                    dur,
+                    PacketFlags::KEYFRAME,
+                ));
+            }
+            let info = TrackInfo {
+                index: track_index,
+                track_type: TrackType::Audio,
+                codec_id: CodecId::Flac,
+                timebase: tb,
+                duration_ticks: Some(pts_ticks),
+                extra_data: si.to_bytes().to_vec(),
+                video: None,
+                audio: Some(AudioTrackParams {
+                    sample_rate: si.sample_rate,
+                    channels: si.channels,
+                    channel_layout: ChannelLayout::from_channels(si.channels),
+                    sample_format: SampleFormat::S16le,
+                    bits_per_coded_sample: si.bits_per_sample,
+                }),
+                sample_count: pkts.len(),
+                total_bytes: pkts.iter().map(|p| p.len() as u64).sum(),
+            };
+            Ok((info, pkts))
         }
     }
 }
@@ -1278,54 +1742,112 @@ pub fn transcode_file_with_options(
         return remux_file_with_format(in_p, out_p, Some(&out_ext));
     }
 
-    // Audio-only transcode path (WAV <-> FLAC)
-    if matches!(in_ext.as_str(), "wav" | "flac") || matches!(out_ext.as_str(), "wav" | "flac") {
+    // Audio-only transcode path (WAV / FLAC / Ogg / Opus / AAC / M4A)
+    if matches!(
+        in_ext.as_str(),
+        "wav" | "flac" | "ogg" | "opus" | "aac" | "m4a"
+    ) || matches!(
+        out_ext.as_str(),
+        "wav" | "flac" | "ogg" | "opus" | "aac" | "m4a"
+    ) {
         let mmap = MmapSource::open(in_p)?;
         let bytes_in = mmap.len() as u64;
-        let audio_frame = if mmap.as_slice().starts_with(b"fLaC") {
-            let (_info, frame) = FlacDecoder::decode_stream(mmap.as_slice())?;
-            frame
-        } else {
-            let demux = WavDemuxer::open(mmap.as_slice())?;
-            let ap = demux
-                .track()
-                .audio
-                .as_ref()
-                .ok_or_else(|| RagdollError::InvalidData("WAV missing audio params".into()))?;
-            let raw = demux.pcm_data();
-            let bps = ap.sample_format.bytes_per_sample().max(1);
-            let block_align = (ap.channels.max(1) as usize) * bps;
-            let num_samples = raw.len() / block_align;
-            let mut af =
-                AudioFrame::new(ap.sample_rate, ap.channels, ap.sample_format, num_samples);
-            let copy_len = af.data.len().min(raw.len());
-            af.data.as_mut_slice()[..copy_len].copy_from_slice(&raw[..copy_len]);
-            af
-        };
+        let (raw_audio, comments) = decode_audio_bytes(mmap.as_slice())?;
+        let audio_frame = apply_audio_dsp(raw_audio, opts)?;
 
         let num_samples = audio_frame.num_samples;
         let mut writer = OutputSink::create(out_p)?;
-        let bytes_out = if out_ext == "flac" {
-            let enc = FlacEncoder::new(audio_frame.sample_rate, audio_frame.channels, 0);
-            let flac_bytes = enc.encode_stream(&audio_frame)?;
-            writer.write_all(&flac_bytes)?;
-            writer.flush()?;
-            flac_bytes.len() as u64
-        } else {
-            let pcm16 = if audio_frame.format == SampleFormat::S16le {
-                audio_frame
-            } else {
-                convert_audio_frame(&audio_frame, SampleFormat::S16le)?
-            };
-            let mut mux = WavMuxer::new(AudioTrackParams {
-                sample_rate: pcm16.sample_rate,
-                channels: pcm16.channels,
-                channel_layout: ChannelLayout::from_channels(pcm16.channels),
-                sample_format: pcm16.format,
-                bits_per_coded_sample: (pcm16.format.bytes_per_sample() * 8) as u8,
-            });
-            mux.write_pcm_bytes(pcm16.data.as_slice());
-            mux.finish(&mut writer)?
+        let bytes_out = match out_ext.as_str() {
+            "flac" => {
+                let enc = FlacEncoder::new(audio_frame.sample_rate, audio_frame.channels, 0);
+                let (si, frames) = enc.encode_frames(&audio_frame)?;
+                let mut mux = FlacContainerMuxer::new();
+                mux.add_track(TrackInfo {
+                    index: 0,
+                    track_type: TrackType::Audio,
+                    codec_id: CodecId::Flac,
+                    timebase: Rational64::new(1, si.sample_rate.max(1) as i64),
+                    duration_ticks: Some(si.total_samples as i64),
+                    extra_data: si.to_bytes().to_vec(),
+                    video: None,
+                    audio: Some(AudioTrackParams {
+                        sample_rate: si.sample_rate,
+                        channels: si.channels,
+                        channel_layout: ChannelLayout::from_channels(si.channels),
+                        sample_format: SampleFormat::S16le,
+                        bits_per_coded_sample: si.bits_per_sample,
+                    }),
+                    sample_count: frames.len(),
+                    total_bytes: 0,
+                });
+                mux.set_comments(comments);
+                for (f_bytes, count) in frames {
+                    mux.write_framed_packet(f_bytes, count as u16);
+                }
+                mux.finish(&mut writer)?
+            }
+            "ogg" | "opus" => {
+                let target_codec = if out_ext == "opus"
+                    || opts.audio_codec.eq_ignore_ascii_case("opus")
+                    || opts.audio_codec.eq_ignore_ascii_case("copy")
+                {
+                    "opus"
+                } else if opts.audio_codec.eq_ignore_ascii_case("flac") {
+                    "flac"
+                } else {
+                    "opus"
+                };
+                let (info, pkts) = encode_audio_track_packets(audio_frame, target_codec, 0)?;
+                let mut mux = OggMuxer::new();
+                mux.add_track(info);
+                mux.set_comments(comments);
+                for p in &pkts {
+                    mux.write_packet(p)?;
+                }
+                mux.finish(&mut writer)?
+            }
+            "aac" => {
+                let mut enc = AacEncoder::new(
+                    audio_frame.sample_rate,
+                    audio_frame.channels.clamp(1, 2),
+                    128_000,
+                );
+                let raw_frames = enc.encode_stream_frames(&audio_frame)?;
+                let mut adts = Vec::new();
+                for (raw, _, _) in raw_frames {
+                    let hdr = AdtsHeader::new(&enc.asc, raw.len());
+                    adts.extend_from_slice(&hdr.to_bytes());
+                    adts.extend_from_slice(&raw);
+                }
+                writer.write_all(&adts)?;
+                writer.flush()?;
+                adts.len() as u64
+            }
+            "m4a" => {
+                let (info, pkts) = encode_audio_track_packets(audio_frame, "aac", 0)?;
+                let mut mux = Mp4Muxer::new();
+                mux.add_track(info);
+                for p in pkts {
+                    mux.write_packet(p)?;
+                }
+                mux.finish(&mut writer)?
+            }
+            _ => {
+                let pcm16 = if audio_frame.format == SampleFormat::S16le {
+                    audio_frame
+                } else {
+                    convert_audio_frame(&audio_frame, SampleFormat::S16le)?
+                };
+                let mut mux = WavMuxer::new(AudioTrackParams {
+                    sample_rate: pcm16.sample_rate,
+                    channels: pcm16.channels,
+                    channel_layout: ChannelLayout::from_channels(pcm16.channels),
+                    sample_format: pcm16.format,
+                    bits_per_coded_sample: (pcm16.format.bytes_per_sample() * 8) as u8,
+                });
+                mux.write_pcm_bytes(pcm16.data.as_slice());
+                mux.finish(&mut writer)?
+            }
         };
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1481,6 +2003,33 @@ pub fn transcode_file_with_options(
 
             let keep_audio = !opts.audio_codec.eq_ignore_ascii_case("none");
             let keep_subs = !opts.subtitle_codec.eq_ignore_ascii_case("none");
+            let needs_audio_transcode = keep_audio
+                && (!opts.audio_codec.eq_ignore_ascii_case("copy")
+                    || opts.sample_rate.is_some()
+                    || opts.channels.is_some()
+                    || opts.loudness_lufs.is_some());
+            let mut processed_aux = Vec::with_capacity(aux_tracks.len());
+            for (aux_info, aux_pkts) in aux_tracks {
+                if aux_info.track_type == TrackType::Audio && needs_audio_transcode {
+                    let decoded = decode_audio_track_packets(&aux_info, &aux_pkts)?;
+                    let dsp_frame = apply_audio_dsp(decoded, opts)?;
+                    let target_ac = if opts.audio_codec.eq_ignore_ascii_case("copy") {
+                        match aux_info.codec_id {
+                            CodecId::Aac => "aac",
+                            CodecId::Opus => "opus",
+                            _ => "flac",
+                        }
+                    } else {
+                        opts.audio_codec.as_str()
+                    };
+                    let (new_info, new_pkts) =
+                        encode_audio_track_packets(dsp_frame, target_ac, aux_info.index)?;
+                    processed_aux.push((new_info, new_pkts));
+                } else {
+                    processed_aux.push((aux_info, aux_pkts));
+                }
+            }
+            let aux_tracks = processed_aux;
             let mut av_sync = AvSyncController::new(1 + aux_tracks.len());
 
             let mut writer = OutputSink::create(out_p)?;
@@ -2038,42 +2587,39 @@ pub fn probe_file_detailed(path: impl AsRef<Path>) -> Result<ProbeReport> {
     let data = mmap.as_slice();
     let file_size = data.len() as u64;
 
-    if data.starts_with(b"fLaC") {
-        let (info, _) = ragdoll_codec::parse_flac_stream_header(data)?;
-        let track = TrackInfo {
-            index: 0,
-            track_type: TrackType::Audio,
-            codec_id: CodecId::Flac,
-            timebase: Rational64::new(1, info.sample_rate as i64),
-            duration_ticks: Some(info.total_samples as i64),
-            extra_data: info.to_bytes().to_vec(),
-            video: None,
-            audio: Some(AudioTrackParams {
-                sample_rate: info.sample_rate,
-                channels: info.channels,
-                channel_layout: ChannelLayout::from_channels(info.channels),
-                sample_format: SampleFormat::S16le,
-                bits_per_coded_sample: info.bits_per_sample,
-            }),
-            sample_count: info.total_samples as usize,
-            total_bytes: file_size,
-        };
-        return Ok(ProbeReport {
-            path: p.display().to_string(),
-            container: "flac".into(),
-            file_size,
-            tracks: vec![track],
-            h264_profile: None,
-            gop_count: 1,
-            packet_sizes: vec![(true, file_size as u32)],
-            probe_time_us: t0.elapsed().as_secs_f64() * 1e6,
-        });
-    }
-
     let (fmt, tracks) = ragdoll_format::probe_container(data)?;
     let mut packet_sizes = Vec::new();
     let mut gop_count = 0usize;
     let mut h264_profile = None;
+
+    if fmt == ContainerFormat::Flac {
+        let demux = FlacContainerDemuxer::open(data)?;
+        let packet_sizes: Vec<(bool, u32)> = demux.samples.iter().map(|s| (true, s.size)).collect();
+        return Ok(ProbeReport {
+            path: p.display().to_string(),
+            container: "flac".into(),
+            file_size,
+            tracks: vec![demux.track().clone()],
+            h264_profile: None,
+            gop_count: packet_sizes.len().max(1),
+            packet_sizes,
+            probe_time_us: t0.elapsed().as_secs_f64() * 1e6,
+        });
+    }
+    if fmt == ContainerFormat::Ogg {
+        let demux = OggDemuxer::open(data)?;
+        let packet_sizes: Vec<(bool, u32)> = demux.samples.iter().map(|s| (true, s.size)).collect();
+        return Ok(ProbeReport {
+            path: p.display().to_string(),
+            container: "ogg".into(),
+            file_size,
+            tracks: vec![demux.track().clone()],
+            h264_profile: None,
+            gop_count: packet_sizes.len().max(1),
+            packet_sizes,
+            probe_time_us: t0.elapsed().as_secs_f64() * 1e6,
+        });
+    }
 
     if fmt == ContainerFormat::Mp4 {
         let demux = Mp4Demuxer::open(data)?;
@@ -2454,5 +3000,88 @@ faststart = true
         let _ = std::fs::remove_file(&out_mkv);
         let _ = std::fs::remove_file(&out_mp4);
         let _ = std::fs::remove_file(&out_srt);
+    }
+
+    #[test]
+    fn m8_audio_pro_aac_opus_flac_ogg_resampler_and_ebu_r128_pipeline() {
+        let tmp = std::env::temp_dir();
+        let src_wav = tmp.join("ragdoll_m8_src.wav");
+        let out_flac = tmp.join("ragdoll_m8_out.flac");
+        let out_ogg = tmp.join("ragdoll_m8_out.ogg");
+        let out_m4a = tmp.join("ragdoll_m8_out.m4a");
+        let out_norm_wav = tmp.join("ragdoll_m8_norm.wav");
+
+        // 1. Synthesize 1.0s stereo 48kHz WAV test audio
+        synth_media(&src_wav, 0, 0, 30, 1.0).unwrap();
+
+        // 2. Transcode WAV -> standalone FLAC container (verifying SEEKTABLE)
+        transcode_file_with_options(&src_wav, &out_flac, &TranscodeOptions::default()).unwrap();
+        let flac_bytes = std::fs::read(&out_flac).unwrap();
+        let flac_demux = FlacContainerDemuxer::open(&flac_bytes).unwrap();
+        assert!(!flac_demux.seek_table().is_empty());
+
+        // 3. Transcode FLAC -> Ogg Opus container
+        transcode_file_with_options(
+            &out_flac,
+            &out_ogg,
+            &TranscodeOptions {
+                audio_codec: "opus".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let probe_ogg = probe_file_detailed(&out_ogg).unwrap();
+        assert_eq!(probe_ogg.container, "ogg");
+        assert_eq!(probe_ogg.tracks[0].codec_id, CodecId::Opus);
+
+        // 4. Transcode Ogg Opus -> M4A (MP4 AAC-LC)
+        transcode_file_with_options(
+            &out_ogg,
+            &out_m4a,
+            &TranscodeOptions {
+                audio_codec: "aac".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let probe_m4a = probe_file_detailed(&out_m4a).unwrap();
+        assert_eq!(probe_m4a.tracks[0].codec_id, CodecId::Aac);
+
+        // 5. Transcode FLAC -> normalized 44.1kHz WAV at -14.0 LUFS (-1.0 dBTP ceiling)
+        transcode_file_with_options(
+            &out_flac,
+            &out_norm_wav,
+            &TranscodeOptions {
+                sample_rate: Some(44_100),
+                channels: Some(2),
+                loudness_lufs: Some(-14.0),
+                true_peak_dbtp: Some(-1.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let norm_bytes = std::fs::read(&out_norm_wav).unwrap();
+        let (norm_af, _) = decode_audio_bytes(&norm_bytes).unwrap();
+        assert_eq!(norm_af.sample_rate, 44_100);
+        assert_eq!(norm_af.channels, 2);
+        let mut meter = EbuR128Meter::new(norm_af.sample_rate, norm_af.channels as usize);
+        meter.process_audio_frame(&norm_af).unwrap();
+        let rep = meter.finalize();
+        assert!(
+            (rep.integrated_lufs - (-14.0)).abs() < 0.25,
+            "Expected -14.0 LUFS, got {:.2} LUFS",
+            rep.integrated_lufs
+        );
+        assert!(
+            rep.true_peak_dbtp <= -0.9,
+            "Expected True Peak <= -0.9 dBTP, got {:.2} dBTP",
+            rep.true_peak_dbtp
+        );
+
+        let _ = std::fs::remove_file(&src_wav);
+        let _ = std::fs::remove_file(&out_flac);
+        let _ = std::fs::remove_file(&out_ogg);
+        let _ = std::fs::remove_file(&out_m4a);
+        let _ = std::fs::remove_file(&out_norm_wav);
     }
 }
