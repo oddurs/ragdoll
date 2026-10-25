@@ -3,8 +3,9 @@ id: 22
 uid: 27ed39a6-73e2-4c6e-9e34-a9c0a273a551
 title: 'Modern Ragdoll CLI: probe, remux, transcode, extract, metrics, synth & GOP Waterfall UI'
 type: feature
-status: planned
+status: done
 milestone: m5-cli-bench
+assignee: Oddur Sigurdsson
 depends_on:
 - 8
 - 14
@@ -13,7 +14,8 @@ depends_on:
 - 20
 - 21
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: cli
 effort: l
@@ -36,5 +38,13 @@ Implement `ragdoll-cli` (`ragdoll` binary) with 7 flagship subcommands:
 
 ## Acceptance criteria
 
-- [ ] All 7 CLI subcommands (`probe`, `remux`, `transcode`, `extract`, `metrics`, `synth`, `bench`) run cleanly with rich terminal output and `--json` support.
-- [ ] End-to-end CLI integration tests pass across MP4, MKV, MPEG-TS, Y4M, PPM, WAV, and FLAC formats.
+- [x] All 7 CLI subcommands (`probe`, `remux`, `transcode`, `extract`, `metrics`, `synth`, `bench`) run cleanly with rich terminal output and `--json` support.
+- [x] End-to-end CLI integration tests pass across MP4, MKV, MPEG-TS, Y4M, PPM, WAV, and FLAC formats.
+
+## 2026-10-25
+
+Implemented all 7 flagship CLI subcommands (probe, remux, transcode, extract, metrics, synth, bench) plus self-test in crates/ragdoll-cli/src/main.rs with Unicode bitrate sparklines, ASCII GOP waterfall diagrams, --json structured output, and end-to-end tests across MP4, MKV, MPEG-TS, Y4M, PPM, WAV, and FLAC.
+
+## Result
+
+Shipped ragdoll CLI with 7 flagship subcommands, ASCII GOP waterfall & sparkline UI, and --json support.

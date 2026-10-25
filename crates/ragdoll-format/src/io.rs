@@ -1,6 +1,6 @@
 use ragdoll_core::{AlignedBuffer, RagdollError, Result};
 use std::fs::File;
-use std::io::{IoSlice, Write};
+use std::io::Write;
 use std::ops::Deref;
 use std::path::Path;
 
@@ -35,7 +35,6 @@ mod sys {
     pub const PROT_READ: c_int = 0x01;
     pub const MAP_PRIVATE: c_int = 0x02;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
-    pub const MADV_SEQUENTIAL: c_int = 2;
     pub const MADV_WILLNEED: c_int = 3;
 
     unsafe extern "C" {
@@ -86,10 +85,6 @@ impl MmapSource {
             if raw == sys::MAP_FAILED || raw.is_null() {
                 return Err(RagdollError::Io(std::io::Error::last_os_error()));
             }
-            // Hint the kernel VM subsystem for sequential read-ahead
-            unsafe {
-                let _ = sys::madvise(raw, len, sys::MADV_SEQUENTIAL);
-            }
             Ok(Self {
                 inner: MmapInner::Mapped {
                     ptr: raw as *const u8,
@@ -125,6 +120,13 @@ impl MmapSource {
         Self {
             inner: MmapInner::Buffer(AlignedBuffer::from_slice(bytes)),
         }
+    }
+
+    /// Advises the kernel that the entire mapped file will be streamed (`MADV_WILLNEED`),
+    /// pre-populating page-table entries in a single kernel call.
+    #[inline]
+    pub fn prefetch_all(&self) {
+        self.prefetch_range(0, self.len());
     }
 
     /// Advises the kernel that the byte range `[offset..offset + len]` will be needed soon.
@@ -246,48 +248,16 @@ impl<W: Write> VectoredWriter<W> {
     }
 
     /// Writes multiple disjoint slices (e.g., container framing headers + zero-copy packet payload)
-    /// using OS vectored I/O (`writev`), looping until every byte is written.
+    /// while preserving page-aligned buffered I/O when backed by `BufWriter`.
+    #[inline]
     pub fn write_vectored_all(&mut self, slices: &[&[u8]]) -> Result<()> {
-        // Fast path for up to 8 slices on the stack without heap allocation
-        let total: usize = slices.iter().map(|s| s.len()).sum();
-        if total == 0 {
-            return Ok(());
+        for s in slices {
+            if !s.is_empty() {
+                self.inner.write_all(s)?;
+                self.bytes_written += s.len() as u64;
+            }
         }
-
-        if slices.len() <= 8 {
-            let mut io_slices = [IoSlice::new(&[]); 8];
-            let mut count = 0usize;
-            for s in slices {
-                if !s.is_empty() {
-                    io_slices[count] = IoSlice::new(s);
-                    count += 1;
-                }
-            }
-            let n = self.inner.write_vectored(&io_slices[..count])?;
-            if n == total {
-                self.bytes_written += total as u64;
-                return Ok(());
-            }
-            // Fallback for partial writev: write remaining bytes sequentially
-            self.bytes_written += n as u64;
-            let mut skipped = n;
-            for s in slices {
-                if skipped >= s.len() {
-                    skipped -= s.len();
-                } else {
-                    let rem = &s[skipped..];
-                    skipped = 0;
-                    self.inner.write_all(rem)?;
-                    self.bytes_written += rem.len() as u64;
-                }
-            }
-            Ok(())
-        } else {
-            for s in slices {
-                self.write_all_counted(s)?;
-            }
-            Ok(())
-        }
+        Ok(())
     }
 
     #[inline]

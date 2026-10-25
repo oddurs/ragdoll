@@ -76,13 +76,13 @@ Build 100% pure-Rust, zero-FFI video and audio codecs from scratch: H.264/AVC (N
 
 ## m5-cli-bench — Phase 5 — GOP-Parallel Pipeline, Modern CLI & Marketing Benchmark Suite
 
-`··········` 0% · 0 of 3 done
+`##########` 100% · 3 of 3 done
 
 Unify all engines under a work-stealing GOP-parallel pipeline scheduler, declarative TOML recipe runner, ergonomic CLI (`probe`, `remux`, `transcode`, `extract`, `metrics`, `synth`, `bench`), and a self-contained head-to-head benchmark harness against FFmpeg 9.0.2 on Apple M4.
 
-### up next
+### shipped
 
-- [ ] `0021` Work-Stealing GOP-Parallel Pipeline Engine & Declarative TOML Recipe Runner <sup>feature · p0 · pipeline</sup>
-- [ ] `0022` Modern Ragdoll CLI: probe, remux, transcode, extract, metrics, synth & GOP Waterfall UI <sup>feature · p0 · cli</sup>
-- [ ] `BENCH-0023` Head-to-Head Benchmark Suite: Ragdoll vs. FFmpeg 9.0.2 on Apple M4 across 6 Flagship Workloads <sup>benchmark · p0 · bench</sup>
+- [x] `0021` Work-Stealing GOP-Parallel Pipeline Engine & Declarative TOML Recipe Runner <sup>feature · p0 · pipeline</sup>
+- [x] `0022` Modern Ragdoll CLI: probe, remux, transcode, extract, metrics, synth & GOP Waterfall UI <sup>feature · p0 · cli</sup>
+- [x] `BENCH-0023` Head-to-Head Benchmark Suite: Ragdoll vs. FFmpeg 9.0.2 on Apple M4 across 6 Flagship Workloads <sup>benchmark · p0 · bench</sup>
 

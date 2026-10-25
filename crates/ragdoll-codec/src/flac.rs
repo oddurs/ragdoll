@@ -712,26 +712,29 @@ impl FlacDecoder {
             });
         }
 
-        // Stereo decorrelation reconstruction
+        // Stereo decorrelation reconstruction without intermediate cloning
         match header.channel_mode {
             FlacChannelMode::Independent(_) => {}
             FlacChannelMode::LeftSide => {
-                let ch0 = subframes[0].clone();
-                let ch1 = subframes[1].clone();
-                let (s0, s1) = subframes.split_at_mut(1);
-                reconstruct_left_side_i32(&ch0, &ch1, &mut s0[0], &mut s1[0]);
+                let mut left = vec![0i32; block_size];
+                let mut right = vec![0i32; block_size];
+                reconstruct_left_side_i32(&subframes[0], &subframes[1], &mut left, &mut right);
+                subframes[0] = left;
+                subframes[1] = right;
             }
             FlacChannelMode::RightSide => {
-                let ch0 = subframes[0].clone();
-                let ch1 = subframes[1].clone();
-                let (s0, s1) = subframes.split_at_mut(1);
-                reconstruct_right_side_i32(&ch0, &ch1, &mut s0[0], &mut s1[0]);
+                let mut left = vec![0i32; block_size];
+                let mut right = vec![0i32; block_size];
+                reconstruct_right_side_i32(&subframes[0], &subframes[1], &mut left, &mut right);
+                subframes[0] = left;
+                subframes[1] = right;
             }
             FlacChannelMode::MidSide => {
-                let mid = subframes[0].clone();
-                let side = subframes[1].clone();
-                let (s0, s1) = subframes.split_at_mut(1);
-                reconstruct_mid_side_i32(&mid, &side, &mut s0[0], &mut s1[0]);
+                let mut left = vec![0i32; block_size];
+                let mut right = vec![0i32; block_size];
+                reconstruct_mid_side_i32(&subframes[0], &subframes[1], &mut left, &mut right);
+                subframes[0] = left;
+                subframes[1] = right;
             }
         }
 
@@ -909,10 +912,25 @@ fn optimal_rice_k(residuals: &[i32]) -> u32 {
     }
 }
 
-/// Writes Rice-coded residual partitions (using `partition_order = 0`) into `w`.
-fn write_residual_partition0(w: &mut BitWriter, order: usize, residuals: &[i32]) {
+/// Computes the exact bit length of a `partition_order = 0` Rice-coded residual block,
+/// returning `(optimal_k, total_bits)`.
+#[inline]
+fn rice_partition0_bits(order: usize, residuals: &[i32]) -> (u32, usize) {
     let active = &residuals[order..];
     let k = optimal_rice_k(active);
+    let mut bits = 2 + 4 + 4; // coding_method (2) + partition_order (4) + rice_param (4)
+    for &r in active {
+        let v = r as i64;
+        let u = ((v << 1) ^ (v >> 63)) as u64;
+        bits += ((u >> k) as usize) + 1 + (k as usize);
+    }
+    (k, bits)
+}
+
+/// Writes Rice-coded residual partitions (using `partition_order = 0` and precomputed `k`) into `w`.
+#[inline]
+fn write_residual_partition0_with_k(w: &mut BitWriter, order: usize, k: u32, residuals: &[i32]) {
+    let active = &residuals[order..];
     w.write_bits(0, 2); // coding_method = 0 (4-bit Rice parameter)
     w.write_bits(0, 4); // partition_order = 0 (1 partition)
     w.write_bits(k as u64, 4);
@@ -921,14 +939,23 @@ fn write_residual_partition0(w: &mut BitWriter, order: usize, residuals: &[i32])
     }
 }
 
-/// Encodes a single FLAC subframe (choosing Constant, Fixed 0..=4, FIR LPC 4/8, or Verbatim) into `w`.
+/// Encodes a single FLAC subframe (choosing Constant, Fixed 0..=4, FIR LPC 4/8, or Verbatim) into `w`
+/// in a single bitstream pass without temporary `BitWriter` allocations.
 fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
     let n = raw_samples.len();
     assert!(n > 0);
 
-    // 1. Constant check
+    // 1. Constant check + wasted_bits detection in a single pass
     let first = raw_samples[0];
-    if raw_samples.iter().all(|&s| s == first) {
+    let mut is_constant = true;
+    let mut or_mask = 0u32;
+    for &s in raw_samples {
+        if s != first {
+            is_constant = false;
+        }
+        or_mask |= s as u32;
+    }
+    if is_constant {
         w.write_bit(false); // zero pad
         w.write_bits(0, 6); // Constant (000000)
         w.write_bit(false); // no wasted bits
@@ -936,24 +963,21 @@ fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
         return;
     }
 
-    // 2. Detect wasted low-order zero bits across all samples in this subframe
-    let mut or_mask = 0u32;
-    for &s in raw_samples {
-        or_mask |= s as u32;
-    }
     let wasted_bits = if or_mask == 0 {
         0
     } else {
         (or_mask.trailing_zeros() as u8).min(subframe_bps.saturating_sub(2))
     };
     let effective_bps = subframe_bps - wasted_bits;
-    let samples: Vec<i32> = if wasted_bits > 0 {
-        raw_samples.iter().map(|&s| s >> wasted_bits).collect()
+    let shifted_buf: Vec<i32>;
+    let samples: &[i32] = if wasted_bits > 0 {
+        shifted_buf = raw_samples.iter().map(|&s| s >> wasted_bits).collect();
+        &shifted_buf
     } else {
-        raw_samples.to_vec()
+        raw_samples
     };
 
-    // 3. Evaluate Fixed predictors (order 0..=4) by L1 residual sum
+    // 2. Evaluate Fixed predictors (order 0..=4) by L1 residual sum
     let max_fixed_order = 4.min(n.saturating_sub(1));
     let mut best_fixed_order = 0usize;
     let mut best_residuals = vec![0i32; n];
@@ -961,7 +985,7 @@ fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
 
     let mut cand_res = vec![0i32; n];
     for order in 0..=max_fixed_order {
-        compute_fixed_residuals(order, &samples, &mut cand_res);
+        compute_fixed_residuals(order, samples, &mut cand_res);
         let l1: u64 = cand_res[order..]
             .iter()
             .map(|&r| (r as i64).unsigned_abs())
@@ -973,86 +997,35 @@ fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
         }
     }
 
-    // 4. Also evaluate FIR LPC (order 8) on blocks >= 64 samples
+    // 3. Evaluate FIR LPC (order 8) on blocks >= 64 samples when Fixed order >= 2 is chosen
     let mut best_lpc: Option<(Vec<i32>, i32, Vec<i32>)> = None;
-    for &lpc_order in &[4usize, 8usize] {
-        if let Some((coeffs, shift, lpc_res)) = try_compute_lpc_subframe(&samples, lpc_order) {
-            let l1: u64 = lpc_res[lpc_order..]
-                .iter()
-                .map(|&r| (r as i64).unsigned_abs())
-                .sum();
-            // Require LPC to beat the best Fixed predictor by at least 5% to justify header overhead
-            if l1 + (l1 / 20) < best_l1 {
-                best_l1 = l1;
-                best_lpc = Some((coeffs, shift, lpc_res));
-            }
+    if n >= 64
+        && let Some((coeffs, shift, lpc_res)) = try_compute_lpc_subframe(samples, 8)
+    {
+        let l1: u64 = lpc_res[8..]
+            .iter()
+            .map(|&r| (r as i64).unsigned_abs())
+            .sum();
+        if l1 + (l1 / 20) < best_l1 {
+            best_lpc = Some((coeffs, shift, lpc_res));
         }
     }
 
-    // 5. Encode the winning predictor into a temporary BitWriter and compare against Verbatim
-    let mut pred_w = BitWriter::with_capacity(n * 2);
-    pred_w.write_bit(false);
+    // 4. Compute exact bit cost of the winning predictor vs Verbatim and emit once into `w`
+    let wasted_flag_bits = if wasted_bits > 0 {
+        1 + (wasted_bits as usize)
+    } else {
+        1
+    };
+    let verbatim_bits = 7 + wasted_flag_bits + n * (effective_bps as usize);
+
     if let Some((coeffs, shift, lpc_res)) = best_lpc {
         let order = coeffs.len();
-        pred_w.write_bits((32 + order - 1) as u64, 6);
-        if wasted_bits > 0 {
-            pred_w.write_bit(true);
-            for _ in 0..(wasted_bits - 1) {
-                pred_w.write_bit(false);
-            }
-            pred_w.write_bit(true);
-        } else {
-            pred_w.write_bit(false);
-        }
-        for &s in &samples[..order] {
-            pred_w.write_signed_bits(s as i64, effective_bps as u32);
-        }
-        pred_w.write_bits(12 - 1, 4); // qlp_prec = 12 bits
-        pred_w.write_signed_bits(shift as i64, 5);
-        for &c in &coeffs {
-            pred_w.write_signed_bits(c as i64, 12);
-        }
-        write_residual_partition0(&mut pred_w, order, &lpc_res);
-    } else {
-        pred_w.write_bits((8 + best_fixed_order) as u64, 6);
-        if wasted_bits > 0 {
-            pred_w.write_bit(true);
-            for _ in 0..(wasted_bits - 1) {
-                pred_w.write_bit(false);
-            }
-            pred_w.write_bit(true);
-        } else {
-            pred_w.write_bit(false);
-        }
-        for &s in &samples[..best_fixed_order] {
-            pred_w.write_signed_bits(s as i64, effective_bps as u32);
-        }
-        write_residual_partition0(&mut pred_w, best_fixed_order, &best_residuals);
-    }
-
-    let verbatim_bits =
-        8 + (if wasted_bits > 0 {
-            wasted_bits as usize
-        } else {
-            0
-        }) + n * (effective_bps as usize);
-    if pred_w.bits_written() <= verbatim_bits {
-        // Re-emit the winning predicted subframe directly into `w`
-        // (To preserve exact bit alignment in `w` without byte-aligning early, we replay the write)
-        w.write_bit(false);
-        if let Some((coeffs, shift, lpc_res)) = try_compute_lpc_subframe(&samples, 8)
-            .filter(|(_, _, r)| {
-                let l1: u64 = r[8..].iter().map(|&x| (x as i64).unsigned_abs()).sum();
-                l1 <= best_l1
-            })
-            .or_else(|| {
-                try_compute_lpc_subframe(&samples, 4).filter(|(_, _, r)| {
-                    let l1: u64 = r[4..].iter().map(|&x| (x as i64).unsigned_abs()).sum();
-                    l1 <= best_l1
-                })
-            })
-        {
-            let order = coeffs.len();
+        let (k, r_bits) = rice_partition0_bits(order, &lpc_res);
+        let lpc_bits =
+            7 + wasted_flag_bits + order * (effective_bps as usize) + 4 + 5 + order * 12 + r_bits;
+        if lpc_bits <= verbatim_bits {
+            w.write_bit(false);
             w.write_bits((32 + order - 1) as u64, 6);
             write_wasted_bits_flag(w, wasted_bits);
             for &s in &samples[..order] {
@@ -1063,23 +1036,31 @@ fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
             for &c in &coeffs {
                 w.write_signed_bits(c as i64, 12);
             }
-            write_residual_partition0(w, order, &lpc_res);
-        } else {
+            write_residual_partition0_with_k(w, order, k, &lpc_res);
+            return;
+        }
+    } else {
+        let (k, r_bits) = rice_partition0_bits(best_fixed_order, &best_residuals);
+        let fixed_bits =
+            7 + wasted_flag_bits + best_fixed_order * (effective_bps as usize) + r_bits;
+        if fixed_bits <= verbatim_bits {
+            w.write_bit(false);
             w.write_bits((8 + best_fixed_order) as u64, 6);
             write_wasted_bits_flag(w, wasted_bits);
             for &s in &samples[..best_fixed_order] {
                 w.write_signed_bits(s as i64, effective_bps as u32);
             }
-            write_residual_partition0(w, best_fixed_order, &best_residuals);
+            write_residual_partition0_with_k(w, best_fixed_order, k, &best_residuals);
+            return;
         }
-    } else {
-        // Verbatim fallback when incompressible white noise exceeds raw PCM size
-        w.write_bit(false);
-        w.write_bits(1, 6);
-        write_wasted_bits_flag(w, wasted_bits);
-        for &s in &samples {
-            w.write_signed_bits(s as i64, effective_bps as u32);
-        }
+    }
+
+    // Verbatim fallback when incompressible noise exceeds raw PCM size
+    w.write_bit(false);
+    w.write_bits(1, 6);
+    write_wasted_bits_flag(w, wasted_bits);
+    for &s in samples {
+        w.write_signed_bits(s as i64, effective_bps as u32);
     }
 }
 
@@ -1202,25 +1183,72 @@ impl FlacEncoder {
         };
 
         let total_samples = audio.num_samples;
+        let num_frames = if total_samples == 0 {
+            0
+        } else {
+            total_samples.div_ceil(enc.block_size)
+        };
         let mut frames_encoded = Vec::new();
         let mut min_frame_size = u32::MAX;
         let mut max_frame_size = 0u32;
 
-        let mut offset = 0usize;
-        let mut frame_num = 0u64;
-        while offset < total_samples {
-            let count = (total_samples - offset).min(enc.block_size);
-            let slice_planar: Vec<Vec<i32>> = planar
-                .iter()
-                .map(|ch| ch[offset..offset + count].to_vec())
+        if num_frames >= 8 {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(num_frames);
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..num_frames)
+                .map(|_| std::sync::Mutex::new(None))
                 .collect();
-            let packet = enc.encode_frame_planar(&slice_planar, frame_num)?;
-            let pkt_len = packet.len() as u32;
-            min_frame_size = min_frame_size.min(pkt_len);
-            max_frame_size = max_frame_size.max(pkt_len);
-            frames_encoded.extend_from_slice(&packet);
-            offset += count;
-            frame_num += 1;
+
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        loop {
+                            let f_idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if f_idx >= num_frames {
+                                break;
+                            }
+                            let offset = f_idx * enc.block_size;
+                            let count = (total_samples - offset).min(enc.block_size);
+                            let slice_planar: Vec<Vec<i32>> = planar
+                                .iter()
+                                .map(|ch| ch[offset..offset + count].to_vec())
+                                .collect();
+                            let res = enc.encode_frame_planar(&slice_planar, f_idx as u64);
+                            if let Ok(mut g) = slots[f_idx].lock() {
+                                *g = Some(res);
+                            }
+                        }
+                    });
+                }
+            });
+
+            for slot in slots {
+                let packet = slot.into_inner().unwrap().unwrap()?;
+                let pkt_len = packet.len() as u32;
+                min_frame_size = min_frame_size.min(pkt_len);
+                max_frame_size = max_frame_size.max(pkt_len);
+                frames_encoded.extend_from_slice(&packet);
+            }
+        } else {
+            let mut offset = 0usize;
+            let mut frame_num = 0u64;
+            while offset < total_samples {
+                let count = (total_samples - offset).min(enc.block_size);
+                let slice_planar: Vec<Vec<i32>> = planar
+                    .iter()
+                    .map(|ch| ch[offset..offset + count].to_vec())
+                    .collect();
+                let packet = enc.encode_frame_planar(&slice_planar, frame_num)?;
+                let pkt_len = packet.len() as u32;
+                min_frame_size = min_frame_size.min(pkt_len);
+                max_frame_size = max_frame_size.max(pkt_len);
+                frames_encoded.extend_from_slice(&packet);
+                offset += count;
+                frame_num += 1;
+            }
         }
 
         if total_samples == 0 {

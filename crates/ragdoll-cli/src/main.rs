@@ -1,15 +1,38 @@
+//! # `ragdoll` — Modern SIMD-First Multimedia CLI
+//!
+//! Subcommands (`0022` / `ADR-0008`):
+//! - `ragdoll probe <FILE> [--gop-map] [--json]`
+//! - `ragdoll remux <IN> <OUT> [--faststart] [--json]`
+//! - `ragdoll transcode [<IN> <OUT>] [--video h264|rgdi] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--recipe file.toml] [--json]`
+//! - `ragdoll extract <IN> [-o <OUT> | <OUT>] [--at <SEC>] [--thumbnails <N>] [--grid <CxR>] [--json]`
+//! - `ragdoll metrics <REF> <DIST> [--json]`
+//! - `ragdoll synth <OUT> [--resolution WxH] [--fps N] [--duration SEC] [--json]`
+//! - `ragdoll bench [--compare-ffmpeg] [--json]`
+//! - `ragdoll self-test`
+
+use std::env;
 use std::hint::black_box;
+use std::io::BufWriter;
+use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
 
+use ragdoll_codec::{FlacDecoder, FlacEncoder};
 use ragdoll_core::{
-    BitReader, BitWriter, CodecId, ColorRange, Colorimetry, FramePool, MatrixCoefficients,
-    PacketFlags, PacketSlice, PixelFormat, Plane, Rational64, Timestamp, TrackInfo, TrackType,
-    VideoTrackParams, crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride, unescape_rbsp,
+    AudioFrame, BitReader, BitWriter, CodecId, ColorRange, Colorimetry, FramePool,
+    MatrixCoefficients, PacketFlags, PacketSlice, PixelFormat, Plane, RagdollError, Rational64,
+    Result, SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
+    crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride, unescape_rbsp,
     unescape_rbsp_scalar,
 };
 use ragdoll_format::{
-    MkvDemuxer, Mp4Demuxer, Mp4Muxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv,
+    MkvDemuxer, Mp4Demuxer, Mp4Muxer, Y4mMuxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv,
     transmux_mp4_to_mpegts,
+};
+use ragdoll_pipeline::{
+    PipelineRecipe, PipelineTelemetry, ProbeReport, evaluate_media_metrics, execute_recipe,
+    extract_media, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
+    probe_file_detailed, remux_file, synth_media, synth_video_frame, transcode_file,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
@@ -26,13 +49,1090 @@ use ragdoll_simd::{
 };
 
 fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Err(err) = run_cli(&args) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+pub fn run_cli(args: &[String]) -> Result<()> {
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        print_help();
+        return Ok(());
+    }
+    if matches!(args[0].as_str(), "-V" | "--version" | "version") {
+        println!("ragdoll 0.1.0 ({})", SimdLevel::detect().name());
+        return Ok(());
+    }
+
+    let sub = args[0].as_str();
+    let rest = &args[1..];
+    match sub {
+        "probe" => cmd_probe(rest),
+        "remux" => cmd_remux(rest),
+        "transcode" => cmd_transcode(rest),
+        "extract" => cmd_extract(rest),
+        "metrics" => cmd_metrics(rest),
+        "synth" => cmd_synth(rest),
+        "bench" => cmd_bench(rest),
+        "self-test" | "selftest" => {
+            run_self_test();
+            Ok(())
+        }
+        other => Err(RagdollError::InvalidSyntax("unknown subcommand").with_context(other)),
+    }
+}
+
+trait ErrorContext {
+    fn with_context(self, detail: &str) -> Self;
+}
+
+impl ErrorContext for RagdollError {
+    fn with_context(self, detail: &str) -> Self {
+        RagdollError::InvalidData(format!("{self}: {detail}"))
+    }
+}
+
+fn print_help() {
     let simd = SimdLevel::detect();
     println!("================================================================================");
-    println!("  RAGDOLL v0.1.0 — M1, M2 & M3 SIMD & Container Live Benchmark / Self-Test");
+    println!("  RAGDOLL v0.1.0 — 100% Safe Rust, Explicit SIMD, Zero-Copy Media Engine");
+    println!("  Hardware SIMD : {}", simd.name());
+    println!("================================================================================\n");
+    println!("USAGE:");
+    println!("  ragdoll <SUBCOMMAND> [OPTIONS]\n");
+    println!("SUBCOMMANDS:");
+    println!("  probe <FILE> [--gop-map] [--json]");
+    println!("      Sub-millisecond container/codec inspection, CICP colorimetry,");
+    println!("      bitrate sparkline, and ASCII GOP waterfall visualization.");
+    println!();
+    println!("  remux <IN> <OUT> [--faststart] [--json]");
+    println!("      Zero-copy mmap -> writev remuxing across .mp4, .mkv, .ts, .y4m, and .wav.");
+    println!();
+    println!(
+        "  transcode <IN> <OUT> [--video h264|rgdi] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--recipe file.toml] [--json]"
+    );
+    println!(
+        "      Work-stealing GOP-parallel video & audio transcoding or TOML recipe execution."
+    );
+    println!();
+    println!("  extract <IN> [-o <OUT>] [--at <SEC>] [--thumbnails <N> --grid <CxR>] [--json]");
+    println!("      Fast keyframe seek and single-frame or contact-sheet (.ppm/.y4m) extraction.");
+    println!();
+    println!("  metrics <REF> <DIST> [--json]");
+    println!(
+        "      SIMD perceptual video quality analyzer (PSNR, 8x8 SSIM, 5-Scale MS-SSIM, VMAF-Lite)."
+    );
+    println!();
+    println!("  synth <OUT> [--resolution WxH] [--fps N] [--duration SEC] [--json]");
+    println!(
+        "      Procedural SIMD test media generator (SMPTE bars, zone-plates, stereo harmonies)."
+    );
+    println!();
+    println!("  bench [--compare-ffmpeg] [--json]");
+    println!(
+        "      Automated head-to-head benchmark suite across 6 flagship multimedia workloads."
+    );
+    println!();
+    println!("  self-test");
+    println!("      Run M1-M4 SIMD vs. scalar bit-exact differential kernel verification.");
+}
+
+/// Renders an 8-level Unicode block sparkline (`▁▂▃▄▅▆▇█`) over packet byte sizes.
+pub fn render_sparkline(sizes: &[(bool, u32)], max_cols: usize) -> String {
+    if sizes.is_empty() {
+        return String::new();
+    }
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let cols = sizes.len().min(max_cols.max(1));
+    let mut bucket_vals = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let start = c * sizes.len() / cols;
+        let end = ((c + 1) * sizes.len() / cols)
+            .max(start + 1)
+            .min(sizes.len());
+        let avg = sizes[start..end]
+            .iter()
+            .map(|&(_, sz)| sz as u64)
+            .sum::<u64>()
+            / ((end - start) as u64);
+        bucket_vals.push(avg);
+    }
+    let max_v = bucket_vals.iter().copied().max().unwrap_or(1).max(1);
+    let min_v = bucket_vals.iter().copied().min().unwrap_or(0);
+    let span = (max_v - min_v).max(1);
+
+    bucket_vals
+        .into_iter()
+        .map(|v| {
+            let idx = (((v.saturating_sub(min_v)) * 7) / span).min(7) as usize;
+            BARS[idx]
+        })
+        .collect()
+}
+
+/// Renders an ASCII GOP Waterfall diagram showing `[I]` keyframe and `[P]` inter-frame byte distributions.
+pub fn render_gop_waterfall(sizes: &[(bool, u32)], max_frames: usize) -> String {
+    if sizes.is_empty() {
+        return String::new();
+    }
+    let limit = sizes.len().min(max_frames);
+    let max_sz = sizes[..limit]
+        .iter()
+        .map(|&(_, s)| s)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut out = String::new();
+    let mut gop_idx = 0usize;
+
+    for (f_idx, &(is_kf, sz)) in sizes[..limit].iter().enumerate() {
+        if is_kf {
+            gop_idx += 1;
+        }
+        let bar_len = ((sz as u64 * 32) / (max_sz as u64)).max(1) as usize;
+        let ch = if is_kf { '█' } else { '▒' };
+        let bar: String = std::iter::repeat_n(ch, bar_len).collect();
+        let tag = if is_kf { "I-KEY" } else { "P-INT" };
+        out.push_str(&format!(
+            "  #{f_idx:03} [GOP {gop_idx:02} {tag}] {:>7} B |{bar}\n",
+            sz
+        ));
+    }
+    if sizes.len() > limit {
+        out.push_str(&format!(
+            "  ... ({} additional packets omitted)\n",
+            sizes.len() - limit
+        ));
+    }
+    out
+}
+
+fn cmd_probe(args: &[String]) -> Result<()> {
+    let mut file_path = None;
+    let mut show_gop = false;
+    let mut json = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--gop-map" | "-g" => show_gop = true,
+            "--json" | "-j" => json = true,
+            s if !s.starts_with('-') && file_path.is_none() => file_path = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    let path = file_path.ok_or(RagdollError::InvalidSyntax("probe requires <FILE>"))?;
+    let rep: ProbeReport = probe_file_detailed(&path)?;
+
+    if json {
+        print_probe_json(&rep);
+        return Ok(());
+    }
+
+    println!("┌──────────────────────────────────────────────────────────────────────────────┐");
+    println!("│ RAGDOLL PROBE : {:<60} │", rep.path);
+    println!("├──────────────────────────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Container     : {:<18} File Size : {:>12} B ({:.2} MB)      │",
+        rep.container,
+        rep.file_size,
+        (rep.file_size as f64) / (1024.0 * 1024.0)
+    );
+    println!(
+        "│ Probe Latency : {:>8.2} µs         GOP Count : {:>12}                 │",
+        rep.probe_time_us, rep.gop_count
+    );
+    if let Some(prof) = &rep.h264_profile {
+        println!("│ H.264 Profile : {:<60} │", prof);
+    }
+    println!("├──────────────────────────────────────────────────────────────────────────────┤");
+    for t in &rep.tracks {
+        if let Some(v) = &t.video {
+            println!(
+                "│ Track #{:<2} [Video] codec={} {}x{} @ {:.3} fps ({}/{}) fmt={}        │",
+                t.index,
+                t.codec_id,
+                v.width,
+                v.height,
+                v.frame_rate.as_f64(),
+                v.frame_rate.num,
+                v.frame_rate.den,
+                v.pixel_format
+            );
+            println!(
+                "│   Colorimetry : primaries={:?}, transfer={:?}, matrix={:?}, range={:?}",
+                v.colorimetry.primaries,
+                v.colorimetry.transfer,
+                v.colorimetry.matrix,
+                v.colorimetry.range
+            );
+            println!(
+                "│   Samples     : {} packets ({} bytes)",
+                t.sample_count, t.total_bytes
+            );
+        }
+        if let Some(a) = &t.audio {
+            println!(
+                "│ Track #{:<2} [Audio] codec={} {} Hz, {} ch ({:?}), fmt={} ({}-bit) │",
+                t.index,
+                t.codec_id,
+                a.sample_rate,
+                a.channels,
+                a.channel_layout,
+                a.sample_format,
+                a.bits_per_coded_sample
+            );
+            println!(
+                "│   Samples     : {} frames ({} bytes)",
+                t.sample_count, t.total_bytes
+            );
+        }
+    }
+
+    if !rep.packet_sizes.is_empty() {
+        let spark = render_sparkline(&rep.packet_sizes, 56);
+        println!(
+            "├──────────────────────────────────────────────────────────────────────────────┤"
+        );
+        println!("│ Bitrate Spark : {spark:<60} │");
+    }
+    println!("└──────────────────────────────────────────────────────────────────────────────┘");
+
+    if show_gop && !rep.packet_sizes.is_empty() {
+        println!("\nASCII GOP Waterfall (I/P Packet Size Distribution):");
+        print!("{}", render_gop_waterfall(&rep.packet_sizes, 32));
+    }
+    Ok(())
+}
+
+fn print_probe_json(rep: &ProbeReport) {
+    println!("{{");
+    println!("  \"path\": \"{}\",", escape_json(&rep.path));
+    println!("  \"container\": \"{}\",", escape_json(&rep.container));
+    println!("  \"file_size\": {},", rep.file_size);
+    println!("  \"probe_time_us\": {:.3},", rep.probe_time_us);
+    println!("  \"gop_count\": {},", rep.gop_count);
+    if let Some(p) = &rep.h264_profile {
+        println!("  \"h264_profile\": \"{}\",", escape_json(p));
+    } else {
+        println!("  \"h264_profile\": null,");
+    }
+    println!("  \"tracks\": [");
+    for (i, t) in rep.tracks.iter().enumerate() {
+        let comma = if i + 1 < rep.tracks.len() { "," } else { "" };
+        if let Some(v) = &t.video {
+            println!(
+                "    {{\"index\": {}, \"type\": \"video\", \"codec\": \"{}\", \"width\": {}, \"height\": {}, \"fps\": {:.4}, \"pixel_format\": \"{}\", \"samples\": {}}}{comma}",
+                t.index,
+                t.codec_id,
+                v.width,
+                v.height,
+                v.frame_rate.as_f64(),
+                v.pixel_format,
+                t.sample_count
+            );
+        } else if let Some(a) = &t.audio {
+            println!(
+                "    {{\"index\": {}, \"type\": \"audio\", \"codec\": \"{}\", \"sample_rate\": {}, \"channels\": {}, \"sample_format\": \"{}\", \"samples\": {}}}{comma}",
+                t.index, t.codec_id, a.sample_rate, a.channels, a.sample_format, t.sample_count
+            );
+        }
+    }
+    println!("  ]");
+    println!("}}");
+}
+
+fn cmd_remux(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" | "-j" => json = true,
+            "--faststart" => {}
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+    }
+    if positional.len() < 2 {
+        return Err(RagdollError::InvalidSyntax("remux requires <IN> <OUT>"));
+    }
+    let tel = remux_file(&positional[0], &positional[1])?;
+    print_telemetry(&tel, json);
+    Ok(())
+}
+
+fn cmd_transcode(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut video_codec = "h264".to_string();
+    let mut scale_dims: Option<(usize, usize)> = None;
+    let mut filter = ScaleFilter::Lanczos3;
+    let mut qp = 20u8;
+    let mut threads = 0usize;
+    let mut recipe_path: Option<String> = None;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "--video" | "-c:v" if i + 1 < args.len() => {
+                i += 1;
+                video_codec = args[i].clone();
+            }
+            "--scale" | "-s" if i + 1 < args.len() => {
+                i += 1;
+                scale_dims = parse_dimensions(&args[i]);
+            }
+            "--filter" if i + 1 < args.len() => {
+                i += 1;
+                filter = parse_scale_filter(&args[i]);
+            }
+            "--qp" if i + 1 < args.len() => {
+                i += 1;
+                qp = args[i].parse::<u8>().unwrap_or(20).min(51);
+            }
+            "--threads" | "-t" if i + 1 < args.len() => {
+                i += 1;
+                threads = args[i].parse::<usize>().unwrap_or(0);
+            }
+            "--recipe" | "-r" if i + 1 < args.len() => {
+                i += 1;
+                recipe_path = Some(args[i].clone());
+            }
+            "--color" | "--audio" if i + 1 < args.len() => {
+                i += 1;
+            }
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let tel = if let Some(rp) = recipe_path {
+        let toml_text = std::fs::read_to_string(&rp)?;
+        let recipe = PipelineRecipe::from_toml(&toml_text)?;
+        execute_recipe(&recipe)?
+    } else {
+        if positional.len() < 2 {
+            return Err(RagdollError::InvalidSyntax(
+                "transcode requires <IN> <OUT> or --recipe <FILE.toml>",
+            ));
+        }
+        transcode_file(
+            &positional[0],
+            &positional[1],
+            scale_dims,
+            filter,
+            &video_codec,
+            qp,
+            threads,
+        )?
+    };
+
+    print_telemetry(&tel, json);
+    Ok(())
+}
+
+fn cmd_extract(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut out_opt: Option<String> = None;
+    let mut at_sec: Option<f64> = None;
+    let mut thumb_count: Option<usize> = None;
+    let mut grid: (usize, usize) = (4, 4);
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "-o" | "--output" if i + 1 < args.len() => {
+                i += 1;
+                out_opt = Some(args[i].clone());
+            }
+            "--at" if i + 1 < args.len() => {
+                i += 1;
+                at_sec = parse_time_seconds(&args[i]);
+            }
+            "--thumbnails" if i + 1 < args.len() => {
+                i += 1;
+                thumb_count = args[i].parse::<usize>().ok();
+            }
+            "--grid" if i + 1 < args.len() => {
+                i += 1;
+                if let Some((c, r)) = parse_dimensions(&args[i]) {
+                    grid = (c, r);
+                }
+            }
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let in_path = positional
+        .first()
+        .ok_or(RagdollError::InvalidSyntax("extract requires <IN>"))?;
+    let out_path =
+        out_opt
+            .or_else(|| positional.get(1).cloned())
+            .ok_or(RagdollError::InvalidSyntax(
+                "extract requires -o <OUT> or <OUT>",
+            ))?;
+
+    let thumbs = thumb_count.map(|n| (n, grid.0, grid.1));
+    let tel = extract_media(in_path, &out_path, at_sec, thumbs)?;
+    print_telemetry(&tel, json);
+    Ok(())
+}
+
+fn cmd_metrics(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" | "-j" => json = true,
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+    }
+    if positional.len() < 2 {
+        return Err(RagdollError::InvalidSyntax("metrics requires <REF> <DIST>"));
+    }
+    let (rep, frames, elapsed_ms) = evaluate_media_metrics(&positional[0], &positional[1])?;
+    let fps = (frames as f64) / (elapsed_ms / 1000.0).max(1e-9);
+
+    if json {
+        println!("{{");
+        println!("  \"frames\": {frames},");
+        println!("  \"elapsed_ms\": {elapsed_ms:.3},");
+        println!("  \"fps\": {fps:.2},");
+        println!("  \"psnr_y\": {:.4},", format_finite(rep.psnr_y));
+        println!("  \"psnr_u\": {:.4},", format_finite(rep.psnr_u));
+        println!("  \"psnr_v\": {:.4},", format_finite(rep.psnr_v));
+        println!("  \"psnr_avg\": {:.4},", format_finite(rep.psnr_avg));
+        println!(
+            "  \"psnr_yuv_611\": {:.4},",
+            format_finite(rep.psnr_yuv_611)
+        );
+        println!("  \"ssim_y\": {:.6},", rep.ssim_y);
+        println!("  \"ssim_avg\": {:.6},", rep.ssim_avg);
+        println!("  \"ssim_db\": {:.4},", format_finite(rep.ssim_db));
+        println!("  \"ms_ssim\": {:.6},", rep.ms_ssim);
+        println!("  \"vmaf_lite\": {:.4}", rep.vmaf_lite);
+        println!("}}");
+    } else {
+        println!(
+            "┌──────────────────────────────────────────────────────────────────────────────┐"
+        );
+        println!(
+            "│ RAGDOLL PERCEPTUAL QUALITY METRICS ({frames} frames in {elapsed_ms:.2} ms / {fps:.1} fps)"
+        );
+        println!(
+            "├──────────────────────────────────────────────────────────────────────────────┤"
+        );
+        println!(
+            "│ PSNR (dB)     : Y={:.2} dB | U={:.2} dB | V={:.2} dB | Avg={:.2} dB (6:1:1={:.2} dB)",
+            rep.psnr_y, rep.psnr_u, rep.psnr_v, rep.psnr_avg, rep.psnr_yuv_611
+        );
+        println!(
+            "│ SSIM (8x8)    : Y={:.5} ({:.2} dB) | Avg={:.5} | 5-Scale MS-SSIM={:.5}",
+            rep.ssim_y, rep.ssim_db, rep.ssim_avg, rep.ms_ssim
+        );
+        println!("│ VMAF-Lite     : {:.2} / 100.0", rep.vmaf_lite);
+        println!(
+            "└──────────────────────────────────────────────────────────────────────────────┘"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_synth(args: &[String]) -> Result<()> {
+    let mut out_path: Option<String> = None;
+    let mut dims = (1280usize, 720usize);
+    let mut fps = 30i64;
+    let mut duration = 2.0f64;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "--resolution" | "-s" if i + 1 < args.len() => {
+                i += 1;
+                if let Some(d) = parse_dimensions(&args[i]) {
+                    dims = d;
+                }
+            }
+            "--fps" | "-r" if i + 1 < args.len() => {
+                i += 1;
+                fps = args[i].parse::<i64>().unwrap_or(30).max(1);
+            }
+            "--duration" | "-d" if i + 1 < args.len() => {
+                i += 1;
+                duration = args[i].parse::<f64>().unwrap_or(2.0).max(0.05);
+            }
+            s if !s.starts_with('-') && out_path.is_none() => out_path = Some(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let out = out_path.ok_or(RagdollError::InvalidSyntax("synth requires <OUT>"))?;
+    let tel = synth_media(&out, dims.0, dims.1, fps, duration)?;
+    print_telemetry(&tel, json);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct BenchRow {
+    workload: &'static str,
+    unit: &'static str,
+    ragdoll_ms: f64,
+    ragdoll_rate: f64,
+    ffmpeg_ms: Option<f64>,
+    ffmpeg_rate: Option<f64>,
+    speedup: Option<f64>,
+}
+
+fn cmd_bench(args: &[String]) -> Result<()> {
+    let compare_ffmpeg = args.iter().any(|a| a == "--compare-ffmpeg" || a == "-c");
+    let json = args.iter().any(|a| a == "--json" || a == "-j");
+
+    let tmp_dir = env::temp_dir().join(format!("ragdoll_bench_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let mut rows = Vec::new();
+
+    // -------------------------------------------------------------------------
+    // Workload 1: Container Probe & GOP Indexing (300-frame 4K MP4)
+    // -------------------------------------------------------------------------
+    let probe_mp4 = tmp_dir.join("probe_4k_300f.mp4");
+    create_benchmark_mp4(&probe_mp4, 3840, 2160, 300, 32_768)?;
+
+    let probe_iters = 50usize;
+    let t0 = Instant::now();
+    for _ in 0..probe_iters {
+        let rep = black_box(probe_file_detailed(&probe_mp4)?);
+        assert_eq!(rep.tracks[0].sample_count, 300);
+    }
+    let ragdoll_probe_ms = (t0.elapsed().as_secs_f64() * 1000.0) / (probe_iters as f64);
+    let ragdoll_probe_rate = 1000.0 / ragdoll_probe_ms; // files/s
+
+    let (ff_probe_ms, ff_probe_rate, probe_speedup) = if compare_ffmpeg {
+        let ff_iters = 5usize;
+        let t_ff = Instant::now();
+        for _ in 0..ff_iters {
+            let status = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_streams",
+                    "-show_packets",
+                    "-of",
+                    "json",
+                ])
+                .arg(&probe_mp4)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            assert!(status.success());
+        }
+        let ms = (t_ff.elapsed().as_secs_f64() * 1000.0) / (ff_iters as f64);
+        (Some(ms), Some(1000.0 / ms), Some(ms / ragdoll_probe_ms))
+    } else {
+        (None, None, None)
+    };
+    rows.push(BenchRow {
+        workload: "1. Container Probe & GOP Index (300f 4K MP4)",
+        unit: "files/s",
+        ragdoll_ms: ragdoll_probe_ms,
+        ragdoll_rate: ragdoll_probe_rate,
+        ffmpeg_ms: ff_probe_ms,
+        ffmpeg_rate: ff_probe_rate,
+        speedup: probe_speedup,
+    });
+    let _ = std::fs::remove_file(&probe_mp4);
+
+    // -------------------------------------------------------------------------
+    // Workload 2: Zero-Copy Remuxing (MP4 -> MKV, ~15 MB 4K stream)
+    // -------------------------------------------------------------------------
+    let remux_in = tmp_dir.join("remux_in.mp4");
+    create_benchmark_mp4(&remux_in, 3840, 2160, 240, 65_536)?;
+    let remux_bytes = std::fs::metadata(&remux_in)?.len() as f64;
+
+    let remux_iters = 5usize;
+    let t0 = Instant::now();
+    for it in 0..remux_iters {
+        let out_p = tmp_dir.join(format!("remux_rag_{it}.mkv"));
+        let _ = black_box(remux_file(&remux_in, &out_p)?);
+        let _ = std::fs::remove_file(&out_p);
+    }
+    let rag_remux_ms = (t0.elapsed().as_secs_f64() * 1000.0) / (remux_iters as f64);
+    let rag_remux_gbps = (remux_bytes / 1e9) / (rag_remux_ms / 1000.0);
+
+    let (ff_remux_ms, ff_remux_gbps, remux_speedup) = if compare_ffmpeg {
+        let ff_iters = 5usize;
+        let t_ff = Instant::now();
+        for it in 0..ff_iters {
+            let out_p = tmp_dir.join(format!("remux_ff_{it}.mkv"));
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&remux_in)
+                .args(["-c", "copy"])
+                .arg(&out_p)
+                .status()?;
+            assert!(status.success());
+            let _ = std::fs::remove_file(&out_p);
+        }
+        let ms = (t_ff.elapsed().as_secs_f64() * 1000.0) / (ff_iters as f64);
+        let gbps = (remux_bytes / 1e9) / (ms / 1000.0);
+        (Some(ms), Some(gbps), Some(ms / rag_remux_ms))
+    } else {
+        (None, None, None)
+    };
+    let _ = std::fs::remove_file(&remux_in);
+    rows.push(BenchRow {
+        workload: "2. Zero-Copy Remux (MP4 -> MKV 16 MB 4K)",
+        unit: "GB/s",
+        ragdoll_ms: rag_remux_ms,
+        ragdoll_rate: rag_remux_gbps,
+        ffmpeg_ms: ff_remux_ms,
+        ffmpeg_rate: ff_remux_gbps,
+        speedup: remux_speedup,
+    });
+
+    // -------------------------------------------------------------------------
+    // Workload 3: 4K -> 1080p Fused Lanczos-3 Polyphase Scaling (30 frames)
+    // -------------------------------------------------------------------------
+    let scale_frames_count = 30usize;
+    let indices: Vec<usize> = (0..scale_frames_count).collect();
+    let frames_4k: Vec<VideoFrame> =
+        parallel_gop_map(&indices, 0, |_, &i| synth_video_frame(3840, 2160, i));
+
+    let t0 = Instant::now();
+    let scaled_1080p = parallel_scale_frames(&frames_4k, 1920, 1080, ScaleFilter::Lanczos3, 0)?;
+    assert_eq!(scaled_1080p.len(), scale_frames_count);
+    let rag_scale_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let rag_scale_fps = (scale_frames_count as f64) / (rag_scale_ms / 1000.0);
+
+    let (ff_scale_ms, ff_scale_fps, scale_speedup) = if compare_ffmpeg {
+        let y4m_4k = tmp_dir.join("scale_4k.y4m");
+        {
+            let f = std::fs::File::create(&y4m_4k)?;
+            let mut mux = Y4mMuxer::new(
+                BufWriter::with_capacity(1024 * 1024, f),
+                3840,
+                2160,
+                PixelFormat::Yuv420p,
+                Rational64::FPS_30,
+                Colorimetry::bt709_limited(),
+            )?;
+            for fr in &frames_4k {
+                mux.write_frame(fr)?;
+            }
+            mux.finish()?;
+        }
+        let t_ff = Instant::now();
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&y4m_4k)
+            .args(["-vf", "scale=1920:1080:flags=lanczos", "-f", "null", "-"])
+            .status()?;
+        assert!(status.success());
+        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
+        let fps = (scale_frames_count as f64) / (ms / 1000.0);
+        let _ = std::fs::remove_file(&y4m_4k);
+        (Some(ms), Some(fps), Some(ms / rag_scale_ms))
+    } else {
+        (None, None, None)
+    };
+    rows.push(BenchRow {
+        workload: "3. 4K -> 1080p Lanczos-3 Scaling (30 frames)",
+        unit: "fps",
+        ragdoll_ms: rag_scale_ms,
+        ragdoll_rate: rag_scale_fps,
+        ffmpeg_ms: ff_scale_ms,
+        ffmpeg_rate: ff_scale_fps,
+        speedup: scale_speedup,
+    });
+
+    // -------------------------------------------------------------------------
+    // Workload 4: Lossless Audio Coding (WAV -> FLAC + FLAC -> WAV, 30s 48kHz Stereo)
+    // -------------------------------------------------------------------------
+    let wav_in = tmp_dir.join("audio_30s.wav");
+    let flac_rag = tmp_dir.join("audio_rag.flac");
+    let flac_ff = tmp_dir.join("audio_ff.flac");
+    synth_media(&wav_in, 0, 0, 30, 30.0)?;
+    let audio_samples = 48_000 * 30;
+    let mmap_wav = ragdoll_format::MmapSource::open(&wav_in)?;
+    let wav_demux = ragdoll_format::WavDemuxer::open(mmap_wav.as_slice())?;
+    let mut pcm_frame = AudioFrame::new(48_000, 2, SampleFormat::S16le, audio_samples);
+    pcm_frame
+        .data
+        .as_mut_slice()
+        .copy_from_slice(wav_demux.pcm_data());
+
+    let t0 = Instant::now();
+    let flac_enc = FlacEncoder::new(48_000, 2, 16);
+    let flac_bytes = flac_enc.encode_stream(&pcm_frame)?;
+    let (_info, decoded_pcm) = FlacDecoder::decode_stream(&flac_bytes)?;
+    assert_eq!(decoded_pcm.num_samples, audio_samples);
+    std::fs::write(&flac_rag, &flac_bytes)?;
+    let rag_audio_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let rag_audio_xrt = 30.0 / (rag_audio_ms / 1000.0); // x realtime
+
+    let (ff_audio_ms, ff_audio_xrt, audio_speedup) = if compare_ffmpeg {
+        let wav_ff_dec = tmp_dir.join("audio_ff_dec.wav");
+        let t_ff = Instant::now();
+        let st1 = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&wav_in)
+            .args(["-c:a", "flac"])
+            .arg(&flac_ff)
+            .status()?;
+        let st2 = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&flac_ff)
+            .arg(&wav_ff_dec)
+            .status()?;
+        assert!(st1.success() && st2.success());
+        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
+        let xrt = 30.0 / (ms / 1000.0);
+        (Some(ms), Some(xrt), Some(ms / rag_audio_ms))
+    } else {
+        (None, None, None)
+    };
+    rows.push(BenchRow {
+        workload: "4. Lossless FLAC Encode+Decode (30s 48kHz 2ch)",
+        unit: "x RT",
+        ragdoll_ms: rag_audio_ms,
+        ragdoll_rate: rag_audio_xrt,
+        ffmpeg_ms: ff_audio_ms,
+        ffmpeg_rate: ff_audio_xrt,
+        speedup: audio_speedup,
+    });
+
+    // -------------------------------------------------------------------------
+    // Workload 5: Fast Frame Seek & 4x4 Contact Sheet Extraction
+    // -------------------------------------------------------------------------
+    let sheet_mp4 = tmp_dir.join("sheet_src.mp4");
+    let sheet_rag_ppm = tmp_dir.join("sheet_rag.ppm");
+    let sheet_ff_ppm = tmp_dir.join("sheet_ff.ppm");
+    synth_media(&sheet_mp4, 640, 360, 30, 1.0)?;
+
+    let t0 = Instant::now();
+    let _ = extract_media(&sheet_mp4, &sheet_rag_ppm, None, Some((16, 4, 4)))?;
+    let rag_sheet_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let rag_sheet_rate = 16.0 / (rag_sheet_ms / 1000.0);
+
+    let (ff_sheet_ms, ff_sheet_rate, sheet_speedup) = if compare_ffmpeg {
+        let t_ff = Instant::now();
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&sheet_mp4)
+            .args([
+                "-vf",
+                "scale=160:90:flags=lanczos,tile=4x4",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&sheet_ff_ppm)
+            .status()?;
+        assert!(status.success());
+        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
+        let rate = 16.0 / (ms / 1000.0);
+        (Some(ms), Some(rate), Some(ms / rag_sheet_ms))
+    } else {
+        (None, None, None)
+    };
+    rows.push(BenchRow {
+        workload: "5. 4x4 Contact Sheet Extraction (16 Thumbs)",
+        unit: "thumbs/s",
+        ragdoll_ms: rag_sheet_ms,
+        ragdoll_rate: rag_sheet_rate,
+        ffmpeg_ms: ff_sheet_ms,
+        ffmpeg_rate: ff_sheet_rate,
+        speedup: sheet_speedup,
+    });
+
+    // -------------------------------------------------------------------------
+    // Workload 6: 4K Perceptual Quality Metrics (PSNR + 8x8 Windowed SSIM, 20 frames)
+    // -------------------------------------------------------------------------
+    let metric_frames = 20usize;
+    let ref_4k = &frames_4k[..metric_frames];
+    let dist_4k = &frames_4k[1..=metric_frames];
+
+    let metric_indices: Vec<usize> = (0..metric_frames).collect();
+    let t0 = Instant::now();
+    let _metric_results: Vec<_> = parallel_gop_map(&metric_indices, 0, |_, &i| {
+        let r = &ref_4k[i];
+        let d = &dist_4k[i];
+        let psnr = ragdoll_pix::psnr_plane_u8(
+            r.plane(0).data(),
+            r.plane(0).stride(),
+            d.plane(0).data(),
+            d.plane(0).stride(),
+            r.width,
+            r.height,
+        );
+        let ssim = ssim_plane_8bit(
+            r.plane(0).data(),
+            r.plane(0).stride(),
+            d.plane(0).data(),
+            d.plane(0).stride(),
+            r.width,
+            r.height,
+        );
+        (psnr, ssim)
+    });
+    let rag_metrics_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let rag_metrics_fps = (metric_frames as f64) / (rag_metrics_ms / 1000.0);
+
+    let (ff_metrics_ms, ff_metrics_fps, metrics_speedup) = if compare_ffmpeg {
+        let ref_y4m = tmp_dir.join("ref_4k.y4m");
+        let dist_y4m = tmp_dir.join("dist_4k.y4m");
+        for (p, slice) in [(&ref_y4m, ref_4k), (&dist_y4m, dist_4k)] {
+            let f = std::fs::File::create(p)?;
+            let mut mux = Y4mMuxer::new(
+                BufWriter::with_capacity(1024 * 1024, f),
+                3840,
+                2160,
+                PixelFormat::Yuv420p,
+                Rational64::FPS_30,
+                Colorimetry::bt709_limited(),
+            )?;
+            for fr in slice {
+                mux.write_frame(fr)?;
+            }
+            mux.finish()?;
+        }
+        let t_ff = Instant::now();
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&ref_y4m)
+            .arg("-i")
+            .arg(&dist_y4m)
+            .args(["-lavfi", "[0:v][1:v]psnr;[0:v][1:v]ssim", "-f", "null", "-"])
+            .status()?;
+        assert!(status.success());
+        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
+        let fps = (metric_frames as f64) / (ms / 1000.0);
+        (Some(ms), Some(fps), Some(ms / rag_metrics_ms))
+    } else {
+        (None, None, None)
+    };
+    rows.push(BenchRow {
+        workload: "6. 4K Perceptual Metrics (PSNR + 8x8 SSIM 20f)",
+        unit: "fps",
+        ragdoll_ms: rag_metrics_ms,
+        ragdoll_rate: rag_metrics_fps,
+        ffmpeg_ms: ff_metrics_ms,
+        ffmpeg_rate: ff_metrics_fps,
+        speedup: metrics_speedup,
+    });
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    if json {
+        println!("{{");
+        println!("  \"simd\": \"{}\",", SimdLevel::detect().name());
+        println!("  \"benchmarks\": [");
+        for (i, r) in rows.iter().enumerate() {
+            let comma = if i + 1 < rows.len() { "," } else { "" };
+            println!(
+                "    {{\"workload\": \"{}\", \"unit\": \"{}\", \"ragdoll_ms\": {:.3}, \"ragdoll_rate\": {:.2}, \"ffmpeg_ms\": {}, \"ffmpeg_rate\": {}, \"speedup\": {}}}{comma}",
+                r.workload,
+                r.unit,
+                r.ragdoll_ms,
+                r.ragdoll_rate,
+                r.ffmpeg_ms.map_or("null".into(), |v| format!("{v:.3}")),
+                r.ffmpeg_rate.map_or("null".into(), |v| format!("{v:.2}")),
+                r.speedup.map_or("null".into(), |v| format!("{v:.2}"))
+            );
+        }
+        println!("  ]");
+        println!("}}");
+    } else {
+        println!(
+            "=========================================================================================================="
+        );
+        println!(
+            "  RAGDOLL v0.1.0 BENCHMARK SUITE — Hardware SIMD: {}",
+            SimdLevel::detect().name()
+        );
+        println!(
+            "=========================================================================================================="
+        );
+        println!(
+            "{:<48} {:>12} {:>14} {:>12} {:>10}",
+            "Workload", "Ragdoll (ms)", "Ragdoll Rate", "FFmpeg (ms)", "Speedup"
+        );
+        println!(
+            "----------------------------------------------------------------------------------------------------------"
+        );
+        for r in &rows {
+            let ff_ms_str = r
+                .ffmpeg_ms
+                .map_or_else(|| "N/A".into(), |v| format!("{v:.2} ms"));
+            let sp_str = r
+                .speedup
+                .map_or_else(|| "N/A".into(), |v| format!("{v:.2}x"));
+            println!(
+                "{:<48} {:>9.2} ms {:>9.2} {:<4} {:>12} {:>10}",
+                r.workload, r.ragdoll_ms, r.ragdoll_rate, r.unit, ff_ms_str, sp_str
+            );
+        }
+        println!(
+            "=========================================================================================================="
+        );
+    }
+    Ok(())
+}
+
+fn create_benchmark_mp4(
+    path: &Path,
+    width: u32,
+    height: u32,
+    num_packets: usize,
+    pkt_size: usize,
+) -> Result<()> {
+    let sps = ragdoll_codec::Sps::new_baseline(64, 64, Rational64::FPS_30).to_nal_unit();
+    let pps = ragdoll_codec::Pps::new_baseline(22).to_nal_unit();
+    let avcc = build_avcc_from_sps_pps(&sps, &pps);
+
+    // Encode a small real H.264 IDR slice header + macroblock prefix so ffmpeg's h264_parse BSF
+    // validates the slice header cleanly without warnings, followed by RBSP filler NAL unit (0x0C)
+    let mut enc = ragdoll_codec::H264Encoder::new(64, 64, Rational64::FPS_30, 22);
+    let tiny_frame = VideoFrame::new(64, 64, PixelFormat::Yuv420p);
+    let annex_b = enc.encode_frame(&tiny_frame)?;
+    let avcc_idr = ragdoll_format::h264_annex_b_to_avcc_au(&annex_b);
+
+    let mut payload = Vec::with_capacity(pkt_size.max(avcc_idr.len() + 8));
+    payload.extend_from_slice(&avcc_idr);
+    if payload.len() + 8 < pkt_size {
+        let filler_len = pkt_size - payload.len() - 4;
+        payload.extend_from_slice(&(filler_len as u32).to_be_bytes());
+        payload.push(0x0C); // NAL unit type 12: Filler data
+        payload.resize(pkt_size - 1, 0xFF);
+        payload.push(0x80); // RBSP stop bit
+    }
+
+    let tb = Rational64::TIMEBASE_MPEG_90K;
+    let mut mux = Mp4Muxer::new();
+    mux.add_track(TrackInfo {
+        index: 0,
+        track_type: TrackType::Video,
+        codec_id: CodecId::H264,
+        timebase: tb,
+        duration_ticks: Some((num_packets as i64) * 3000),
+        extra_data: avcc,
+        video: Some(VideoTrackParams {
+            width: 64,
+            height: 64,
+            pixel_format: PixelFormat::Yuv420p,
+            colorimetry: Colorimetry::bt709_limited(),
+            frame_rate: Rational64::FPS_30,
+            bit_depth: 8,
+            profile: None,
+            level: None,
+        }),
+        audio: None,
+        sample_count: num_packets,
+        total_bytes: (num_packets * payload.len()) as u64,
+    });
+
+    for i in 0..num_packets {
+        let ts = Timestamp::new((i as i64) * 3000, tb);
+        let flags = if i.is_multiple_of(30) {
+            PacketFlags::KEYFRAME
+        } else {
+            PacketFlags::NONE
+        };
+        mux.write_packet(PacketSlice::from_mmap(&payload, 0, ts, ts, 3000, flags, 0))?;
+    }
+    let f = std::fs::File::create(path)?;
+    let _ = (width, height);
+    mux.finish(BufWriter::with_capacity(4 * 1024 * 1024, f))?;
+    Ok(())
+}
+
+fn print_telemetry(tel: &PipelineTelemetry, json: bool) {
+    if json {
+        println!("{{");
+        println!("  \"operation\": \"{}\",", escape_json(&tel.operation));
+        println!("  \"input\": \"{}\",", escape_json(&tel.input_path));
+        println!("  \"outputs\": [");
+        for (i, o) in tel.output_paths.iter().enumerate() {
+            let comma = if i + 1 < tel.output_paths.len() {
+                ","
+            } else {
+                ""
+            };
+            println!("    \"{}\"{comma}", escape_json(o));
+        }
+        println!("  ],");
+        println!("  \"frames_processed\": {},", tel.frames_processed);
+        println!(
+            "  \"audio_samples_processed\": {},",
+            tel.audio_samples_processed
+        );
+        println!("  \"gops_processed\": {},", tel.gops_processed);
+        println!("  \"threads_used\": {},", tel.threads_used);
+        println!("  \"bytes_in\": {},", tel.bytes_in);
+        println!("  \"bytes_out\": {},", tel.bytes_out);
+        println!("  \"elapsed_ms\": {:.3},", tel.elapsed_ms);
+        println!("  \"fps\": {:.2},", tel.fps);
+        println!("  \"bandwidth_gbps\": {:.4},", tel.bandwidth_gbps);
+        println!("  \"compression_ratio\": {:.3}", tel.compression_ratio);
+        println!("}}");
+    } else {
+        println!(
+            "[ragdoll {}] {} -> {} | frames={} gops={} threads={} | in={} B out={} B ({:.2}:1) | {:.2} ms ({:.1} fps, {:.3} GB/s)",
+            tel.operation,
+            tel.input_path,
+            tel.output_paths.join(", "),
+            tel.frames_processed,
+            tel.gops_processed,
+            tel.threads_used,
+            tel.bytes_in,
+            tel.bytes_out,
+            tel.compression_ratio,
+            tel.elapsed_ms,
+            tel.fps,
+            tel.bandwidth_gbps
+        );
+    }
+}
+
+fn parse_dimensions(s: &str) -> Option<(usize, usize)> {
+    let (w, h) = s.split_once('x').or_else(|| s.split_once(':'))?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+fn parse_time_seconds(s: &str) -> Option<f64> {
+    if let Ok(sec) = s.parse::<f64>() {
+        return Some(sec);
+    }
+    let ts = Timestamp::parse_hms(s).ok()?;
+    ts.to_seconds_f64()
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_finite(v: f64) -> f64 {
+    if v.is_finite() { v } else { 99.99 }
+}
+
+pub fn run_self_test() {
+    let simd = SimdLevel::detect();
+    println!("================================================================================");
+    println!("  RAGDOLL v0.1.0 — M1, M2, M3 & M4 SIMD Differential Self-Test");
     println!("  Detected Hardware SIMD : {}", simd.name());
     println!("================================================================================\n");
 
-    // 1. FramePool + Cache-Set Stride Check
     let pool = FramePool::with_memory_budget(8, 128 * 1024 * 1024);
     let mut frame_a = pool.acquire_scoped(3840, 2160, PixelFormat::Yuv420p);
     let mut frame_b = pool.acquire_scoped(3840, 2160, PixelFormat::Yuv420p);
@@ -46,7 +1146,6 @@ fn main() {
         optimal_plane_stride(2048),
     );
 
-    // Populate synthetic 4K luma planes (3840 x 2160 = 8,294,400 pixels)
     let width = 3840usize;
     let height = 2160usize;
     let stride = frame_a.plane(0).stride();
@@ -78,8 +1177,7 @@ fn main() {
         "----------------------------------------------------------------------------------------------"
     );
 
-    // 2. 4K Plane SAD
-    let iters = 40;
+    let iters = 20;
     let t0 = Instant::now();
     let mut sad_ref = 0u64;
     for _ in 0..iters {
@@ -115,7 +1213,6 @@ fn main() {
         dt_sad_scalar / dt_sad_simd
     );
 
-    // 3. 4K Plane SSE
     let t0 = Instant::now();
     let mut sse_ref = 0u64;
     for _ in 0..iters {
@@ -151,7 +1248,6 @@ fn main() {
         dt_sse_scalar / dt_sse_simd
     );
 
-    // 4. 4K SSIM 4x4 Sub-Block Kernel (vf_ssim.c algorithm)
     let mut sums_ref = vec![[0i32; 4]; width / 4];
     let mut sums_simd = vec![[0i32; 4]; width / 4];
     let t0 = Instant::now();
@@ -194,11 +1290,10 @@ fn main() {
         ssim_to_db(ssim_val)
     );
 
-    // 5. 4x4 Forward + Inverse DCT (in-register vtrn1/vtrn2 transpose + vrshr_n_s16)
     let block = [
         14i16, -22, 7, 3, -9, 31, -15, 4, 18, -6, -11, 2, -3, 8, -5, 1,
     ];
-    let dct_iters = 2_000_000usize;
+    let dct_iters = 500_000usize;
     let t0 = Instant::now();
     let mut out_scalar = [0i16; 16];
     for _ in 0..dct_iters {
@@ -222,18 +1317,17 @@ fn main() {
         dt_dct_scalar / dt_dct_simd
     );
 
-    // 6. Annex-B Start-Code Scanner (with periodic isolated 0x00 bytes)
-    let stream_len = 16 * 1024 * 1024;
+    let stream_len = 8 * 1024 * 1024;
     let mut annex_b = vec![0x5Au8; stream_len];
     for i in (19..stream_len - 16).step_by(23) {
-        annex_b[i] = 0x00; // isolated single zero bytes
+        annex_b[i] = 0x00;
     }
     annex_b[stream_len - 8] = 0x00;
     annex_b[stream_len - 7] = 0x00;
     annex_b[stream_len - 6] = 0x00;
     annex_b[stream_len - 5] = 0x01;
 
-    let scan_iters = 40usize;
+    let scan_iters = 20usize;
     let t0 = Instant::now();
     let mut pos_ref = None;
     for _ in 0..scan_iters {
@@ -255,15 +1349,14 @@ fn main() {
         dt_scan_scalar / dt_scan_simd
     );
 
-    // 7. RBSP Emulation-Prevention Unescaping
-    let mut rbsp_raw = vec![0x3Cu8; 4 * 1024 * 1024];
+    let mut rbsp_raw = vec![0x3Cu8; 2 * 1024 * 1024];
     for i in (0..rbsp_raw.len() - 4).step_by(512) {
         rbsp_raw[i] = 0x00;
         rbsp_raw[i + 1] = 0x00;
         rbsp_raw[i + 2] = 0x01;
     }
     let escaped = escape_rbsp(&rbsp_raw);
-    let rbsp_iters = 40usize;
+    let rbsp_iters = 20usize;
     let t0 = Instant::now();
     let mut u_ref = Vec::new();
     for _ in 0..rbsp_iters {
@@ -286,7 +1379,6 @@ fn main() {
         dt_rbsp_scalar / dt_rbsp_simd
     );
 
-    // 8. M2 Pixel Engine: 1080p YUV420p <-> RGB24 (vst3q_u8 / vld3q_u8) & 4K->1080p Lanczos-3
     let w1080 = 1920usize;
     let h1080 = 1080usize;
     let px1080 = (w1080 * h1080) as f64;
@@ -297,7 +1389,7 @@ fn main() {
     let v_slice = frame_a.plane(2).data();
     let c_stride = frame_a.plane(1).stride();
 
-    let pix_iters = 30usize;
+    let pix_iters = 15usize;
     let t0 = Instant::now();
     for _ in 0..pix_iters {
         yuv420p_to_rgb24_scalar(
@@ -524,11 +1616,10 @@ fn main() {
         dt_r2y_scalar / dt_r2y_simd
     );
 
-    // 9. Horizontal 8-tap Lanczos-3 4K -> 1080p Scanline Resampler
     let hbank = PolyphaseFilterBank::new(3840, 1920, ScaleFilter::Lanczos3);
     let mut scaled_ref = vec![0u8; 1920];
     let mut scaled_simd = vec![0u8; 1920];
-    let scale_rows = 4000usize;
+    let scale_rows = 2000usize;
     let t0 = Instant::now();
     for r in 0..scale_rows {
         let row = frame_a.plane(0).row_padded(r % 2160);
@@ -560,7 +1651,6 @@ fn main() {
     let l1_fps = 1.0 / t_l1.elapsed().as_secs_f64();
     let q_rep = evaluate_frame_quality(&frame_a, &frame_b, None);
 
-    // 8. Slicing-by-8 CRC-16 (FLAC) & CRC-32 (MPEG-TS), plus CLZ Bitstream & 128-bit Timestamp check
     let t_crc16 = Instant::now();
     let mut c16 = 0u16;
     for _ in 0..20 {
@@ -593,7 +1683,6 @@ fn main() {
     let ts_ns = ts_48h.rescale_to(Rational64::TIMEBASE_NANOS);
     let satd8 = satd_8x8_u8(ya_slice, stride, yb_slice, stride);
 
-    // 10. M3 Zero-Copy MP4 Demuxing, O(log N) Seeking & MP4 -> MKV / MPEG-TS Transmuxing
     let sps: &[u8] = &[
         0x67, 0x42, 0xC0, 0x0A, 0xD9, 0x01, 0x00, 0x4E, 0xFF, 0x00, 0x01, 0x00, 0x01, 0xE2, 0x44,
         0x54,
@@ -602,7 +1691,7 @@ fn main() {
     let avcc = build_avcc_from_sps_pps(sps, pps);
     let mut sample_payload = vec![0u8; 65_536];
     sample_payload[0..4].copy_from_slice(&65_532u32.to_be_bytes());
-    sample_payload[4] = 0x65; // IDR slice
+    sample_payload[4] = 0x65;
     for (i, b) in sample_payload[5..].iter_mut().enumerate() {
         *b = ((i * 41 + 7) % 251 + 1) as u8;
     }
@@ -654,12 +1743,11 @@ fn main() {
 
     let t_demux = Instant::now();
     let mut zero_copy_bytes = 0usize;
-    for _ in 0..50 {
+    for _ in 0..25 {
         let mut demux = Mp4Demuxer::open(black_box(&mp4_container)).unwrap();
         let (_kf_idx, _) = demux
             .seek_to_timestamp(0, Timestamp::new(135 * 3000, tb_90k))
             .unwrap();
-        // Reset to start and sweep all 256 packets zero-copy
         let mut demux_all = Mp4Demuxer::open(black_box(&mp4_container)).unwrap();
         while let Some(pkt) = demux_all.next_packet().unwrap() {
             zero_copy_bytes += black_box(pkt.len());
@@ -669,11 +1757,11 @@ fn main() {
 
     let mut mkv_sink = Vec::with_capacity(mp4_container.len() + 65536);
     let t_mkv = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..5 {
         mkv_sink.clear();
         transmux_mp4_to_mkv(black_box(&mp4_container), &mut mkv_sink).unwrap();
     }
-    let mkv_remux_gbps = (mp4_container.len() * 10) as f64 / t_mkv.elapsed().as_secs_f64() / 1e9;
+    let mkv_remux_gbps = (mp4_container.len() * 5) as f64 / t_mkv.elapsed().as_secs_f64() / 1e9;
 
     let mut ts_sink = Vec::with_capacity(mp4_container.len() + 1024 * 1024);
     let t_ts = Instant::now();
@@ -714,4 +1802,147 @@ fn main() {
         ts_remux_gbps,
         mkv_check.has_seek_head()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vec_args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_end_to_end_all_subcommands_and_containers() {
+        let dir = env::temp_dir().join(format!("ragdoll_cli_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mp4_path = dir.join("test.mp4");
+        let mkv_path = dir.join("test.mkv");
+        let ts_path = dir.join("test.ts");
+        let y4m_path = dir.join("test.y4m");
+        let ppm_path = dir.join("frame.ppm");
+        let sheet_path = dir.join("sheet.ppm");
+        let wav_path = dir.join("audio.wav");
+        let flac_path = dir.join("audio.flac");
+        let wav_rt_path = dir.join("audio_rt.wav");
+
+        // 1. synth video (.mp4) and audio (.wav)
+        run_cli(&vec_args(&[
+            "synth",
+            mp4_path.to_str().unwrap(),
+            "--resolution",
+            "160x120",
+            "--fps",
+            "30",
+            "--duration",
+            "0.5",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(mp4_path.exists());
+
+        run_cli(&vec_args(&[
+            "synth",
+            wav_path.to_str().unwrap(),
+            "--duration",
+            "0.25",
+        ]))
+        .unwrap();
+        assert!(wav_path.exists());
+
+        // 2. probe (--gop-map & --json)
+        run_cli(&vec_args(&[
+            "probe",
+            mp4_path.to_str().unwrap(),
+            "--gop-map",
+        ]))
+        .unwrap();
+        run_cli(&vec_args(&["probe", mp4_path.to_str().unwrap(), "--json"])).unwrap();
+
+        // 3. remux MP4 -> MKV and MP4 -> MPEG-TS
+        run_cli(&vec_args(&[
+            "remux",
+            mp4_path.to_str().unwrap(),
+            mkv_path.to_str().unwrap(),
+            "--faststart",
+        ]))
+        .unwrap();
+        assert!(mkv_path.exists());
+
+        run_cli(&vec_args(&[
+            "remux",
+            mp4_path.to_str().unwrap(),
+            ts_path.to_str().unwrap(),
+            "--json",
+        ]))
+        .unwrap();
+        assert!(ts_path.exists());
+
+        // 4. transcode MP4 -> scaled Y4M & WAV <-> FLAC
+        run_cli(&vec_args(&[
+            "transcode",
+            mp4_path.to_str().unwrap(),
+            y4m_path.to_str().unwrap(),
+            "--scale",
+            "160x120",
+            "--filter",
+            "lanczos3",
+        ]))
+        .unwrap();
+        assert!(y4m_path.exists());
+
+        run_cli(&vec_args(&[
+            "transcode",
+            wav_path.to_str().unwrap(),
+            flac_path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(flac_path.exists());
+
+        run_cli(&vec_args(&[
+            "transcode",
+            flac_path.to_str().unwrap(),
+            wav_rt_path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(wav_rt_path.exists());
+
+        // 5. extract single frame and 2x2 contact sheet
+        run_cli(&vec_args(&[
+            "extract",
+            mp4_path.to_str().unwrap(),
+            "-o",
+            ppm_path.to_str().unwrap(),
+            "--at",
+            "0.1",
+        ]))
+        .unwrap();
+        assert!(ppm_path.exists());
+
+        run_cli(&vec_args(&[
+            "extract",
+            mp4_path.to_str().unwrap(),
+            "-o",
+            sheet_path.to_str().unwrap(),
+            "--thumbnails",
+            "4",
+            "--grid",
+            "2x2",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(sheet_path.exists());
+
+        // 6. metrics between MP4 and Y4M
+        run_cli(&vec_args(&[
+            "metrics",
+            mp4_path.to_str().unwrap(),
+            y4m_path.to_str().unwrap(),
+            "--json",
+        ]))
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

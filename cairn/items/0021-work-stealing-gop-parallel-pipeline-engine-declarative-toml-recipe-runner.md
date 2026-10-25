@@ -3,15 +3,17 @@ id: 21
 uid: d25fb4cd-7a02-4dbd-814d-2ab7ad504e17
 title: Work-Stealing GOP-Parallel Pipeline Engine & Declarative TOML Recipe Runner
 type: feature
-status: planned
+status: done
 milestone: m5-cli-bench
+assignee: Oddur Sigurdsson
 depends_on:
 - 13
 - 15
 - 18
 - 19
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: pipeline
 effort: m
@@ -29,5 +31,13 @@ Traditional frame-by-frame transcoding pipelines serialize on entropy decoding/e
 
 ## Acceptance criteria
 
-- [ ] GOP-parallel transcoding scales across available CPU cores with deterministic frame ordering.
-- [ ] Declarative `.toml` pipeline recipes execute end-to-end transcode and remux jobs accurately.
+- [x] GOP-parallel transcoding scales across available CPU cores with deterministic frame ordering.
+- [x] Declarative `.toml` pipeline recipes execute end-to-end transcode and remux jobs accurately.
+
+## 2026-10-25
+
+Implemented work-stealing GOP-parallel pipeline scheduler (partition_into_gops, parallel_gop_map over std::thread::scope + AtomicUsize, parallel_scale_frames with shared Q14 PolyphaseFilterBank tables), declarative TOML recipe parser/runner (PipelineRecipe), and unified multi-container remux/transcode/extract/metrics/synth engines in ragdoll-pipeline.
+
+## Result
+
+Implemented ragdoll-pipeline with lock-free GOP-parallel work-stealing scheduler, declarative TOML recipe runner, and unified multi-container media engines.
