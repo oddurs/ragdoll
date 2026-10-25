@@ -284,7 +284,7 @@ impl<'a> FlacContainerDemuxer<'a> {
                 }
                 // SEEKTABLE
                 3 => {
-                    for chunk in body.chunks_exact(18) {
+                    for chunk in body.as_chunks::<18>().0 {
                         let sp = FlacSeekPoint::from_bytes(chunk);
                         if sp.sample_number != FlacSeekPoint::PLACEHOLDER_SAMPLE {
                             seek_table.push(sp);

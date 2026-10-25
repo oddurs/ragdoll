@@ -783,8 +783,8 @@ pub fn read_png_image(data: &[u8]) -> Result<VideoFrame> {
                 have_ihdr = true;
             }
             b"PLTE" => {
-                for rgb in body.chunks_exact(3) {
-                    palette.push([rgb[0], rgb[1], rgb[2]]);
+                for &rgb in body.as_chunks::<3>().0 {
+                    palette.push(rgb);
                 }
             }
             b"tRNS" => {
