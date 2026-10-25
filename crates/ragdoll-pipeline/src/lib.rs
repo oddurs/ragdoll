@@ -2228,9 +2228,16 @@ faststart = true
         let a_tb = Rational64::new(1, 48_000);
         let flac_enc = FlacEncoder::new(48_000, 2, 0);
         let mut af = AudioFrame::new(48_000, 2, SampleFormat::S16le, 4800);
-        for (i, chunk) in af.data.as_mut_slice().chunks_exact_mut(2).enumerate() {
+        for (i, chunk) in af
+            .data
+            .as_mut_slice()
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             let s = (((i as f64) * 0.05).sin() * 8000.0) as i16;
-            chunk.copy_from_slice(&s.to_le_bytes());
+            *chunk = s.to_le_bytes();
         }
         let flac_stream = flac_enc.encode_stream(&af).unwrap();
         let a_tid = mux.add_track(TrackInfo {
