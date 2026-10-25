@@ -49,7 +49,7 @@ Items are numbered: `0012`, and commands accept the bare number too. Write the n
 - **`area`**: one of core, simd, pix, format, codec-video, codec-audio, pipeline, cli, bench, arch — Crate or subsystem boundary in the Ragdoll workspace
 - **`due`**: date, YYYY-MM-DD — Optional target date (YYYY-MM-DD); releases are gated by verification evidence
 - **`part_of`**: names any items, by id, several allowed — Parent epic or subsystem item this work rolls up into
-- **Milestones**: `m1-foundation`, `m2-pix`, `m3-format`, `m4-codec`, `m5-cli-bench`
+- **Milestones**: `m1-foundation`, `m2-pix`, `m3-format`, `m4-codec`, `m5-cli-bench`, `m6-streaming-av-sync`, `m7-video-production`, `m8-audio-pro`, `m9-edit-image-package`, `m10-production-v1`
 - **Saved views** (`cairn list --view NAME`): `now`, `next`, `dependencies`, `kernels`, `benchmarks`, `decisions`, `triage`, `history`
 
 ### Rules
