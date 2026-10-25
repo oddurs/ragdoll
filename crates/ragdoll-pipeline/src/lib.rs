@@ -14,8 +14,9 @@ use ragdoll_codec::{
 };
 use ragdoll_core::{
     AlignedBuffer, AudioFrame, AudioTrackParams, ChannelLayout, CodecId, Colorimetry, FramePool,
-    PacketFlags, PacketSlice, PixelFormat, RagdollError, Rational64, Result, SampleEntry,
-    SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
+    NOPTS_VALUE, PacketFlags, PacketSlice, PixelFormat, RagdollError, Rational64, Result,
+    SampleEntry, SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
+    compare_ts, rescale_delta, rescale_q,
 };
 pub use ragdoll_core::{
     CpuTopology, HardwareMetrics, PowerMode, ProcessRusageSnapshot,
@@ -24,10 +25,11 @@ pub use ragdoll_core::{
 };
 use ragdoll_format::{
     ContainerFormat, MkvDemuxer, MkvMuxer, MmapSource, Mp4Demuxer, Mp4Muxer, MpegTsDemuxer,
-    MpegTsMuxer, WavDemuxer, WavMuxer, Y4mDemuxer, Y4mMuxer, build_avcc_from_sps_pps,
-    compose_contact_sheet_rgb24, detect_container_format, h264_annex_b_to_avcc_au,
-    h264_avcc_to_annex_b_au, read_pnm_image, transmux_mkv_to_mp4, transmux_mp4_to_mpegts,
-    transmux_mpegts_to_mkv, transmux_mpegts_to_mp4, write_pnm_image,
+    MpegTsMuxer, OutputSink, SubtitleDemuxer, SubtitleMuxer, WavDemuxer, WavMuxer, Y4mDemuxer,
+    Y4mMuxer, build_avcc_from_sps_pps, compose_contact_sheet_rgb24, detect_container_format,
+    h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, is_stdout_path, read_pnm_image,
+    transmux_mkv_to_mp4, transmux_mp4_to_mpegts, transmux_mpegts_to_mkv, transmux_mpegts_to_mp4,
+    write_pnm_image,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, QualityReport, ScaleFilter, convert_frame, evaluate_frame_quality,
@@ -177,6 +179,259 @@ pub fn parallel_scale_frames(
     });
 
     Ok(scaled)
+}
+
+/// Default memory budget (`256 MiB`) for [`GopRingPipeline`] in `PowerMode::Performance` / `PowerMode::Auto`.
+pub const DEFAULT_PIPELINE_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Battery-saver memory budget (`64 MiB`) for [`GopRingPipeline`] in `PowerMode::Efficiency`.
+pub const EFFICIENCY_PIPELINE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Bounded-memory GOP window streaming executor (`0036` / `ADR-0035`).
+///
+/// Instead of materializing an entire feature film's scaled/filtered `Vec<VideoFrame>` in RAM,
+/// `GopRingPipeline` processes video streams in bounded waves of at most `max_gops_in_flight` GOPs,
+/// recycling frame planes through a memory-capped [`FramePool`] so resident frame memory stays
+/// strictly within `memory_budget_bytes` (`256 MiB` default, `64 MiB` in `--battery-saver`).
+pub struct GopRingPipeline {
+    pub worker_threads: usize,
+    pub memory_budget_bytes: usize,
+    pub pool: FramePool,
+}
+
+/// An encoded Group of Pictures (each entry is `(packet_bytes, is_keyframe)`).
+pub type EncodedGop = Vec<(Vec<u8>, bool)>;
+
+/// Statistics recorded by a [`GopRingPipeline`] execution pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GopRingStats {
+    pub waves_processed: usize,
+    pub gops_processed: usize,
+    pub frames_processed: usize,
+    pub max_gops_per_wave: usize,
+    pub peak_wave_memory_bytes: usize,
+    pub pool_allocations: usize,
+    pub pool_recycled_hits: usize,
+}
+
+impl GopRingPipeline {
+    /// Creates a [`GopRingPipeline`] sized for the active [`PowerMode`] (`256 MiB` default, `64 MiB` in `PowerMode::Efficiency`).
+    pub fn new(threads: usize) -> Self {
+        let budget = match global_power_mode() {
+            PowerMode::Efficiency => EFFICIENCY_PIPELINE_MEMORY_BUDGET,
+            _ => DEFAULT_PIPELINE_MEMORY_BUDGET,
+        };
+        Self::with_budget_bytes(threads, budget)
+    }
+
+    /// Creates a [`GopRingPipeline`] with an explicit memory cap in bytes.
+    pub fn with_budget_bytes(threads: usize, memory_budget_bytes: usize) -> Self {
+        let worker_threads = resolve_thread_count(threads).max(1);
+        let budget = memory_budget_bytes.max(4 * 1024 * 1024);
+        let pool = FramePool::with_memory_budget(worker_threads * 32, budget);
+        Self {
+            worker_threads,
+            memory_budget_bytes: budget,
+            pool,
+        }
+    }
+
+    /// Computes how many GOPs can execute concurrently in a single bounded wave without exceeding `memory_budget_bytes`.
+    pub fn max_gops_per_wave(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        gop_len: usize,
+    ) -> usize {
+        let src_frame_bytes = (src_w * src_h * 3 / 2).max(4096);
+        let dst_frame_bytes = (dst_w * dst_h * 3 / 2).max(4096);
+        let bytes_per_gop = (src_frame_bytes + dst_frame_bytes).saturating_mul(gop_len.max(1));
+        let max_by_budget = (self.memory_budget_bytes / bytes_per_gop.max(1)).max(1);
+        max_by_budget.min(self.worker_threads * 2).max(1)
+    }
+
+    /// Streams GOP chunks through fused L1 polyphase scaling + parallel GOP encoding in bounded
+    /// waves, recycling scaled frame buffers back into `self.pool` at the end of every GOP.
+    pub fn encode_gops_bounded(
+        &self,
+        raw_frames: &[VideoFrame],
+        scale_dims: Option<(usize, usize)>,
+        scale_filter: ScaleFilter,
+        video_codec: &str,
+        fps: Rational64,
+        qp: u8,
+    ) -> Result<(Vec<EncodedGop>, GopRingStats)> {
+        if raw_frames.is_empty() {
+            return Ok((Vec::new(), GopRingStats::default()));
+        }
+        let src_w = raw_frames[0].width;
+        let src_h = raw_frames[0].height;
+        let fmt = raw_frames[0].format;
+        let (dst_w, dst_h) = scale_dims.unwrap_or((src_w, src_h));
+        let needs_scale = dst_w != src_w || dst_h != src_h;
+
+        let banks = if needs_scale {
+            let h_bank_y = PolyphaseFilterBank::new(src_w, dst_w, scale_filter);
+            let v_bank_y = PolyphaseFilterBank::new(src_h, dst_h, scale_filter);
+            let (src_cw, src_ch) = fmt.plane_dimensions(src_w, src_h, 1);
+            let (dst_cw, dst_ch) = fmt.plane_dimensions(dst_w, dst_h, 1);
+            let h_bank_c = PolyphaseFilterBank::new(src_cw, dst_cw, scale_filter);
+            let v_bank_c = PolyphaseFilterBank::new(src_ch, dst_ch, scale_filter);
+            Some((h_bank_y, v_bank_y, h_bank_c, v_bank_c))
+        } else {
+            None
+        };
+
+        let max_gop_for_threads = raw_frames.len().div_ceil(self.worker_threads.max(1)).max(1);
+        let gop_size = 15usize.min(max_gop_for_threads);
+        let gop_chunks: Vec<&[VideoFrame]> = raw_frames.chunks(gop_size).collect();
+        let max_gops_wave = self.max_gops_per_wave(src_w, src_h, dst_w, dst_h, gop_size);
+        let use_rgdi = video_codec.eq_ignore_ascii_case("rgdi");
+
+        let mut all_encoded_gops = Vec::with_capacity(gop_chunks.len());
+        let mut waves_processed = 0usize;
+        let mut peak_wave_memory_bytes = 0usize;
+        let frame_bytes = (src_w * src_h * 3 / 2)
+            + if needs_scale {
+                dst_w * dst_h * 3 / 2
+            } else {
+                0
+            };
+
+        for wave in gop_chunks.chunks(max_gops_wave) {
+            waves_processed += 1;
+            let wave_frames: usize = wave.iter().map(|c| c.len()).sum();
+            peak_wave_memory_bytes = peak_wave_memory_bytes
+                .max(wave_frames.saturating_mul(frame_bytes))
+                .min(self.memory_budget_bytes);
+
+            let wave_encoded: Vec<Vec<(Vec<u8>, bool)>> =
+                parallel_gop_map(wave, self.worker_threads, |_idx, chunk| {
+                    let mut out_pkts = Vec::with_capacity(chunk.len());
+                    if use_rgdi {
+                        let enc = RagdollIntraEncoder::new(1);
+                        for src in *chunk {
+                            if let Some((ref hy, ref vy, ref hc, ref vc)) = banks {
+                                let mut dst = self.pool.acquire_scoped(dst_w, dst_h, src.format);
+                                dst.colorimetry = src.colorimetry;
+                                dst.pts = src.pts;
+                                scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
+                                if src.planes.len() >= 3 {
+                                    scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
+                                    scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
+                                }
+                                out_pkts.push((enc.encode_frame(&dst).unwrap(), true));
+                            } else {
+                                out_pkts.push((enc.encode_frame(src).unwrap(), true));
+                            }
+                        }
+                    } else {
+                        let mut enc = H264Encoder::new(dst_w as u32, dst_h as u32, fps, qp);
+                        enc.keyint = chunk.len() as u32 + 1;
+                        for (i, src) in chunk.iter().enumerate() {
+                            if let Some((ref hy, ref vy, ref hc, ref vc)) = banks {
+                                let mut dst = self.pool.acquire_scoped(dst_w, dst_h, src.format);
+                                dst.colorimetry = src.colorimetry;
+                                dst.pts = src.pts;
+                                scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
+                                if src.planes.len() >= 3 {
+                                    scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
+                                    scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
+                                }
+                                out_pkts.push((enc.encode_frame(&dst).unwrap(), i == 0));
+                            } else {
+                                out_pkts.push((enc.encode_frame(src).unwrap(), i == 0));
+                            }
+                        }
+                    }
+                    out_pkts
+                });
+
+            all_encoded_gops.extend(wave_encoded);
+        }
+
+        let stats = GopRingStats {
+            waves_processed,
+            gops_processed: gop_chunks.len(),
+            frames_processed: raw_frames.len(),
+            max_gops_per_wave: max_gops_wave,
+            peak_wave_memory_bytes,
+            pool_allocations: self.pool.allocations(),
+            pool_recycled_hits: self.pool.recycled_hits(),
+        };
+        Ok((all_encoded_gops, stats))
+    }
+}
+
+/// Stateful 128-bit multi-track audio/video/subtitle lip-sync controller (`0037`).
+///
+/// Uses [`ragdoll_core::rescale_delta`] for sub-sample audio timestamp tracking and
+/// [`ragdoll_core::compare_ts`] for 128-bit overflow-free cross-timebase interleaving.
+#[derive(Clone, Debug)]
+pub struct AvSyncController {
+    audio_last_in: Vec<i64>,
+}
+
+impl AvSyncController {
+    pub fn new(num_tracks: usize) -> Self {
+        Self {
+            audio_last_in: vec![NOPTS_VALUE; num_tracks.max(1)],
+        }
+    }
+
+    /// Rescales an audio packet's `pts`, `dts`, and `duration` from `in_tb` to `out_tb`
+    /// using stateful 128-bit [`rescale_delta`] at sample-rate precision `fs_tb = 1 / sample_rate`.
+    pub fn rescale_audio_packet<'a>(
+        &mut self,
+        mut pkt: PacketSlice<'a>,
+        sample_rate: u32,
+        num_samples: i64,
+        out_tb: Rational64,
+    ) -> PacketSlice<'a> {
+        let tid = pkt.track_index as usize;
+        if tid >= self.audio_last_in.len() {
+            self.audio_last_in.resize(tid + 1, NOPTS_VALUE);
+        }
+        let fs_tb = Rational64::new(1, sample_rate.max(1) as i64);
+        let new_pts = rescale_delta(
+            pkt.pts.timebase,
+            pkt.pts.ticks,
+            fs_tb,
+            num_samples.max(1),
+            &mut self.audio_last_in[tid],
+            out_tb,
+        );
+        let new_dur = rescale_q(pkt.duration.max(1), pkt.pts.timebase, out_tb).max(1);
+        pkt.pts = Timestamp::new(new_pts, out_tb);
+        pkt.dts = Timestamp::new(new_pts, out_tb);
+        pkt.duration = new_dur;
+        pkt
+    }
+
+    /// Rescales a video or subtitle packet's `pts`, `dts`, and `duration` into `out_tb`.
+    pub fn rescale_packet<'a>(mut pkt: PacketSlice<'a>, out_tb: Rational64) -> PacketSlice<'a> {
+        pkt.pts = pkt.pts.rescale_to(out_tb);
+        pkt.dts = pkt.dts.rescale_to(out_tb);
+        pkt.duration = rescale_q(pkt.duration.max(1), pkt.pts.timebase, out_tb).max(1);
+        pkt
+    }
+
+    /// Sorts a multi-track packet list into strict 128-bit monotonically non-decreasing DTS order.
+    pub fn interleave_packets_dts(packets: &mut [PacketSlice<'_>]) {
+        packets.sort_by(|a, b| {
+            compare_ts(a.dts.ticks, a.dts.timebase, b.dts.ticks, b.dts.timebase)
+                .then_with(|| a.track_index.cmp(&b.track_index))
+        });
+    }
+
+    /// Computes the absolute end-of-stream A/V synchronization drift in milliseconds between two timestamps.
+    pub fn compute_av_drift_ms(video_end: Timestamp, audio_end: Timestamp) -> f64 {
+        let v_ns = video_end.rescale_to(Rational64::TIMEBASE_NANOS).ticks;
+        let a_ns = audio_end.rescale_to(Rational64::TIMEBASE_NANOS).ticks;
+        ((v_ns - a_ns).abs() as f64) / 1_000_000.0
+    }
 }
 
 /// Declarative `.toml` pipeline recipe configuration (`0021` / `ADR-0008`).
@@ -404,10 +659,19 @@ pub fn execute_recipe(recipe: &PipelineRecipe) -> Result<PipelineTelemetry> {
     Ok(last_tel)
 }
 
-/// Zero-copy remuxing / transmuxing between `.mp4`, `.mkv`, `.ts`, `.y4m`, and `.wav`.
+/// Zero-copy remuxing / transmuxing between `.mp4`, `.mkv`, `.ts`, `.y4m`, `.wav`, `.vtt`, and `.srt`.
 pub fn remux_file(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
+) -> Result<PipelineTelemetry> {
+    remux_file_with_format(input_path, output_path, None)
+}
+
+/// Zero-copy remuxing / transmuxing with optional explicit output format (`--format`) for `stdout` (`-`) pipes.
+pub fn remux_file_with_format(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    format_override: Option<&str>,
 ) -> Result<PipelineTelemetry> {
     let t0 = Instant::now();
     let in_p = input_path.as_ref();
@@ -420,15 +684,21 @@ pub fn remux_file(
     let src_fmt = detect_container_format(data).ok_or_else(|| {
         RagdollError::InvalidHeader(format!("unrecognized input format: {}", in_p.display()))
     })?;
-    let out_ext = out_p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let out_ext = format_override
+        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if is_stdout_path(out_p) {
+                "ts".to_string()
+            } else {
+                out_p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            }
+        });
 
-    let out_file = File::create(out_p)?;
-    // 256 KiB (64 * 4096B) L2-resident buffer ensures 100% 4 KiB page-aligned write() syscalls on APFS/ext4
-    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+    let mut writer = OutputSink::create(out_p)?;
     let mut frames_processed = 0usize;
 
     let bytes_out = match (src_fmt, out_ext.as_str()) {
@@ -444,7 +714,7 @@ pub fn remux_file(
             }
             mux.finish(&mut writer)?
         }
-        (ContainerFormat::Mp4, "ts" | "m2ts") => {
+        (ContainerFormat::Mp4, "ts" | "m2ts" | "mpegts") => {
             let demux = Mp4Demuxer::open(data)?;
             frames_processed = demux.tracks().iter().map(|t| t.samples.len()).sum();
             transmux_mp4_to_mpegts(data, &mut writer)?
@@ -458,6 +728,23 @@ pub fn remux_file(
             }
             while let Some(pkt) = demux.next_packet()? {
                 mux.write_packet(pkt)?;
+            }
+            mux.finish(&mut writer)?
+        }
+        (ContainerFormat::Mp4, "vtt" | "webvtt" | "srt" | "subrip") => {
+            let mut demux = Mp4Demuxer::open(data)?;
+            let sub_codec = if matches!(out_ext.as_str(), "srt" | "subrip") {
+                CodecId::SubRip
+            } else {
+                CodecId::WebVtt
+            };
+            let mut mux = SubtitleMuxer::new(sub_codec);
+            let tracks: Vec<TrackInfo> = demux.tracks().iter().map(|t| t.info.clone()).collect();
+            while let Some(pkt) = demux.next_packet()? {
+                if tracks[pkt.track_index as usize].track_type == TrackType::Subtitle {
+                    frames_processed += 1;
+                    mux.write_packet(&pkt);
+                }
             }
             mux.finish(&mut writer)?
         }
@@ -478,8 +765,50 @@ pub fn remux_file(
             }
             mux.finish(&mut writer)?
         }
+        (
+            ContainerFormat::Matroska | ContainerFormat::WebM,
+            "vtt" | "webvtt" | "srt" | "subrip",
+        ) => {
+            let mut demux = MkvDemuxer::open(data)?;
+            let sub_codec = if matches!(out_ext.as_str(), "srt" | "subrip") {
+                CodecId::SubRip
+            } else {
+                CodecId::WebVtt
+            };
+            let mut mux = SubtitleMuxer::new(sub_codec);
+            let tracks: Vec<TrackInfo> = demux.tracks().to_vec();
+            while let Some(pkt) = demux.next_packet()? {
+                if tracks[pkt.track_index as usize].track_type == TrackType::Subtitle {
+                    frames_processed += 1;
+                    mux.write_packet(&pkt);
+                }
+            }
+            mux.finish(&mut writer)?
+        }
         (ContainerFormat::MpegTs, "mp4" | "mov") => transmux_mpegts_to_mp4(data, &mut writer)?,
         (ContainerFormat::MpegTs, "mkv" | "webm") => transmux_mpegts_to_mkv(data, &mut writer)?,
+        (ContainerFormat::MpegTs, "ts" | "m2ts" | "mpegts") => {
+            writer.write_all(data)?;
+            frames_processed = 1;
+            data.len() as u64
+        }
+        (
+            ContainerFormat::WebVtt | ContainerFormat::SubRip,
+            "vtt" | "webvtt" | "srt" | "subrip",
+        ) => {
+            let mut demux = SubtitleDemuxer::open(data)?;
+            let sub_codec = if matches!(out_ext.as_str(), "srt" | "subrip") {
+                CodecId::SubRip
+            } else {
+                CodecId::WebVtt
+            };
+            let mut mux = SubtitleMuxer::new(sub_codec);
+            while let Some(pkt) = demux.next_packet()? {
+                frames_processed += 1;
+                mux.write_packet(&pkt);
+            }
+            mux.finish(&mut writer)?
+        }
         (ContainerFormat::Y4m, "y4m") | (ContainerFormat::Wav, "wav") => {
             writer.write_all(data)?;
             frames_processed = 1;
@@ -516,19 +845,19 @@ pub fn remux_file(
 /// Decodes all video frames from any supported video file (`.y4m`, `.mp4`, `.mkv`, `.ts`, `.ppm`, `.rgdi`).
 pub fn decode_video_file(path: impl AsRef<Path>) -> Result<(Vec<VideoFrame>, Rational64)> {
     let mmap = MmapSource::open(path.as_ref())?;
-    let data = mmap.as_slice();
+    decode_video_bytes(mmap.as_slice())
+}
+
+/// Decodes all video frames from an in-memory or memory-mapped container byte slice.
+pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> {
     if data.starts_with(b"RGDI") {
         let dec = RagdollIntraDecoder::new();
         let f = dec.decode_frame(data)?;
         return Ok((vec![f], Rational64::FPS_30));
     }
 
-    let fmt = detect_container_format(data).ok_or_else(|| {
-        RagdollError::InvalidHeader(format!(
-            "unrecognized video container: {}",
-            path.as_ref().display()
-        ))
-    })?;
+    let fmt = detect_container_format(data)
+        .ok_or_else(|| RagdollError::InvalidHeader("unrecognized video container".into()))?;
 
     match fmt {
         ContainerFormat::Y4m => {
@@ -659,10 +988,103 @@ pub fn decode_video_file(path: impl AsRef<Path>) -> Result<(Vec<VideoFrame>, Rat
             }
             Ok((frames, Rational64::FPS_30))
         }
-        ContainerFormat::Wav => Err(RagdollError::Unsupported(
-            "WAV container has no video stream".into(),
-        )),
+        ContainerFormat::Wav | ContainerFormat::WebVtt | ContainerFormat::SubRip => Err(
+            RagdollError::Unsupported("audio/subtitle container has no video stream".into()),
+        ),
     }
+}
+
+/// Extracts non-video (Audio and Subtitle) tracks and their packets from a container byte slice
+/// so multi-track transcoding preserves and lip-syncs them by default (`0037`).
+pub fn extract_auxiliary_tracks(
+    data: &[u8],
+) -> Result<Vec<(TrackInfo, Vec<PacketSlice<'static>>)>> {
+    let Some(fmt) = detect_container_format(data) else {
+        return Ok(Vec::new());
+    };
+    let mut aux: Vec<(TrackInfo, Vec<PacketSlice<'static>>)> = Vec::new();
+    match fmt {
+        ContainerFormat::Mp4 => {
+            let mut demux = Mp4Demuxer::open(data)?;
+            let mut slot_for_track = vec![None; demux.tracks().len()];
+            for (pos, t) in demux.tracks().iter().enumerate() {
+                if matches!(t.info.track_type, TrackType::Audio | TrackType::Subtitle) {
+                    slot_for_track[pos] = Some(aux.len());
+                    aux.push((t.info.clone(), Vec::with_capacity(t.samples.len())));
+                }
+            }
+            if aux.is_empty() {
+                return Ok(aux);
+            }
+            while let Some(pkt) = demux.next_packet()? {
+                if let Some(Some(slot)) = slot_for_track.get(pkt.track_index as usize) {
+                    let owned = PacketSlice::from_owned(
+                        AlignedBuffer::from_slice(pkt.data()),
+                        pkt.track_index,
+                        pkt.pts,
+                        pkt.dts,
+                        pkt.duration,
+                        pkt.flags,
+                    );
+                    aux[*slot].1.push(owned);
+                }
+            }
+        }
+        ContainerFormat::Matroska | ContainerFormat::WebM => {
+            let mut demux = MkvDemuxer::open(data)?;
+            let mut slot_for_track = vec![None; demux.tracks().len()];
+            for (pos, t) in demux.tracks().iter().enumerate() {
+                if matches!(t.track_type, TrackType::Audio | TrackType::Subtitle) {
+                    slot_for_track[pos] = Some(aux.len());
+                    aux.push((t.clone(), Vec::with_capacity(t.sample_count)));
+                }
+            }
+            if aux.is_empty() {
+                return Ok(aux);
+            }
+            while let Some(pkt) = demux.next_packet()? {
+                if let Some(Some(slot)) = slot_for_track.get(pkt.track_index as usize) {
+                    let owned = PacketSlice::from_owned(
+                        AlignedBuffer::from_slice(pkt.data()),
+                        pkt.track_index,
+                        pkt.pts,
+                        pkt.dts,
+                        pkt.duration,
+                        pkt.flags,
+                    );
+                    aux[*slot].1.push(owned);
+                }
+            }
+        }
+        ContainerFormat::MpegTs => {
+            let mut demux = MpegTsDemuxer::open(data)?;
+            let mut slot_for_track = vec![None; demux.tracks().len()];
+            for (pos, t) in demux.tracks().iter().enumerate() {
+                if matches!(t.track_type, TrackType::Audio | TrackType::Subtitle) {
+                    slot_for_track[pos] = Some(aux.len());
+                    aux.push((t.clone(), Vec::with_capacity(t.sample_count)));
+                }
+            }
+            if aux.is_empty() {
+                return Ok(aux);
+            }
+            while let Some(pkt) = demux.next_packet()? {
+                if let Some(Some(slot)) = slot_for_track.get(pkt.track_index as usize) {
+                    let owned = PacketSlice::from_owned(
+                        AlignedBuffer::from_slice(pkt.data()),
+                        pkt.track_index,
+                        pkt.pts,
+                        pkt.dts,
+                        pkt.duration,
+                        pkt.flags,
+                    );
+                    aux[*slot].1.push(owned);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(aux)
 }
 
 /// Extracts Annex-B SPS and PPS NAL units from an ISO `avcC` configuration record.
@@ -707,9 +1129,40 @@ pub fn avcc_config_to_annex_b(avcc: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Full GOP-parallel video & audio transcoding engine (`0021` / `0022`).
+/// Options for [`transcode_file_with_options`] (`0036` / `0037`).
+#[derive(Clone, Debug)]
+pub struct TranscodeOptions {
+    pub scale_dims: Option<(usize, usize)>,
+    pub scale_filter: ScaleFilter,
+    pub video_codec: String,
+    pub audio_codec: String,
+    pub subtitle_codec: String,
+    pub format_override: Option<String>,
+    pub qp: u8,
+    pub threads: usize,
+    pub memory_budget_bytes: Option<usize>,
+}
+
+impl Default for TranscodeOptions {
+    fn default() -> Self {
+        Self {
+            scale_dims: None,
+            scale_filter: ScaleFilter::Lanczos3,
+            video_codec: "h264".into(),
+            audio_codec: "copy".into(),
+            subtitle_codec: "copy".into(),
+            format_override: None,
+            qp: 20,
+            threads: 0,
+            memory_budget_bytes: None,
+        }
+    }
+}
+
+/// Full GOP-parallel video, audio & subtitle transcoding engine (`0021` / `0022` / `0036` / `0037`).
 ///
-/// Supports `.y4m`, `.mp4`, `.mkv`, `.ts`, `.ppm`, `.rgdi`, `.wav`, and `.flac`.
+/// Supports `.y4m`, `.mp4`, `.mkv`, `.ts`, `.ppm`, `.rgdi`, `.wav`, `.flac`, `.vtt`, and `.srt`,
+/// as well as Unix `stdin`/`stdout` (`-`) pipes.
 pub fn transcode_file(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -719,6 +1172,26 @@ pub fn transcode_file(
     qp: u8,
     threads: usize,
 ) -> Result<PipelineTelemetry> {
+    transcode_file_with_options(
+        input_path,
+        output_path,
+        &TranscodeOptions {
+            scale_dims,
+            scale_filter,
+            video_codec: video_codec.to_string(),
+            qp,
+            threads,
+            ..Default::default()
+        },
+    )
+}
+
+/// Executes a bounded-memory GOP-ring transcode with multi-track A/V + Subtitle lip-sync preservation.
+pub fn transcode_file_with_options(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    opts: &TranscodeOptions,
+) -> Result<PipelineTelemetry> {
     let t0 = Instant::now();
     let in_p = input_path.as_ref();
     let out_p = output_path.as_ref();
@@ -727,13 +1200,30 @@ pub fn transcode_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let out_ext = out_p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let out_ext = opts
+        .format_override
+        .as_deref()
+        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if is_stdout_path(out_p) {
+                "ts".to_string()
+            } else {
+                out_p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            }
+        });
 
-    let worker_threads = resolve_thread_count(threads);
+    let worker_threads = resolve_thread_count(opts.threads);
+
+    // Subtitle-only conversion path (.vtt <-> .srt)
+    if matches!(in_ext.as_str(), "vtt" | "webvtt" | "srt" | "subrip")
+        || matches!(out_ext.as_str(), "vtt" | "webvtt" | "srt" | "subrip")
+    {
+        return remux_file_with_format(in_p, out_p, Some(&out_ext));
+    }
 
     // Audio-only transcode path (WAV <-> FLAC)
     if matches!(in_ext.as_str(), "wav" | "flac") || matches!(out_ext.as_str(), "wav" | "flac") {
@@ -761,10 +1251,12 @@ pub fn transcode_file(
         };
 
         let num_samples = audio_frame.num_samples;
+        let mut writer = OutputSink::create(out_p)?;
         let bytes_out = if out_ext == "flac" {
             let enc = FlacEncoder::new(audio_frame.sample_rate, audio_frame.channels, 0);
             let flac_bytes = enc.encode_stream(&audio_frame)?;
-            std::fs::write(out_p, &flac_bytes)?;
+            writer.write_all(&flac_bytes)?;
+            writer.flush()?;
             flac_bytes.len() as u64
         } else {
             let pcm16 = if audio_frame.format == SampleFormat::S16le {
@@ -772,7 +1264,6 @@ pub fn transcode_file(
             } else {
                 convert_audio_frame(&audio_frame, SampleFormat::S16le)?
             };
-            let out_file = File::create(out_p)?;
             let mut mux = WavMuxer::new(AudioTrackParams {
                 sample_rate: pcm16.sample_rate,
                 channels: pcm16.channels,
@@ -781,7 +1272,7 @@ pub fn transcode_file(
                 bits_per_coded_sample: (pcm16.format.bytes_per_sample() * 8) as u8,
             });
             mux.write_pcm_bytes(pcm16.data.as_slice());
-            mux.finish(BufWriter::new(out_file))?
+            mux.finish(&mut writer)?
         };
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -803,36 +1294,43 @@ pub fn transcode_file(
         });
     }
 
-    // Video transcode path:
-    // 1. Decode input frames
-    let bytes_in = std::fs::metadata(in_p).map_or(0, |m| m.len());
-    let (raw_frames, fps) = decode_video_file(in_p)?;
+    // Video (+ Multi-Track Audio/Subtitle) transcode path:
+    // 1. Open input once (supports both zero-copy `mmap` and `-` / `stdin` pipes)
+    let mmap = MmapSource::open(in_p)?;
+    let data = mmap.as_slice();
+    let bytes_in = data.len() as u64;
+    let (raw_frames, fps) = decode_video_bytes(data)?;
     if raw_frames.is_empty() {
         return Err(RagdollError::InvalidData("input video has 0 frames".into()));
     }
+    let aux_tracks = extract_auxiliary_tracks(data).unwrap_or_default();
 
-    // 2. GOP-parallel polyphase scaling (when requested)
-    let frames = if let Some((dw, dh)) = scale_dims {
-        parallel_scale_frames(&raw_frames, dw, dh, scale_filter, worker_threads)?
-    } else {
-        raw_frames
+    let num_frames = raw_frames.len();
+    let (dst_w, dst_h) = opts
+        .scale_dims
+        .unwrap_or((raw_frames[0].width, raw_frames[0].height));
+    let width = dst_w as u32;
+    let height = dst_h as u32;
+
+    // 2. Bounded-memory GOP-Ring scaling + encoding (`GopRingPipeline`)
+    let gop_ring = match opts.memory_budget_bytes {
+        Some(budget) => GopRingPipeline::with_budget_bytes(worker_threads, budget),
+        None => GopRingPipeline::new(worker_threads),
     };
 
-    let num_frames = frames.len();
-    let width = frames[0].width as u32;
-    let height = frames[0].height as u32;
-
-    // 3. Encode / Mux to target output format
-    let max_gop_for_threads = frames.len().div_ceil(worker_threads.max(1)).max(1);
-    let gop_size = 15usize.min(max_gop_for_threads);
-    let gop_chunks: Vec<&[VideoFrame]> = frames.chunks(gop_size).collect();
-    let gops_processed = gop_chunks.len();
+    let mut gops_processed = 1usize;
+    let mut audio_samples_processed = 0usize;
 
     let bytes_out = match out_ext.as_str() {
         "y4m" => {
-            let out_file = File::create(out_p)?;
+            let frames = if let Some((dw, dh)) = opts.scale_dims {
+                parallel_scale_frames(&raw_frames, dw, dh, opts.scale_filter, worker_threads)?
+            } else {
+                raw_frames
+            };
+            let writer = OutputSink::create(out_p)?;
             let mut mux = Y4mMuxer::new(
-                BufWriter::with_capacity(256 * 1024, out_file),
+                writer,
                 width as usize,
                 height as usize,
                 PixelFormat::Yuv420p,
@@ -845,46 +1343,53 @@ pub fn transcode_file(
             mux.finish()?
         }
         "ppm" => {
-            let rgb = convert_frame(&frames[0], PixelFormat::Rgb24, frames[0].colorimetry);
+            let first = if let Some((dw, dh)) = opts.scale_dims {
+                parallel_scale_frames(&raw_frames[..1], dw, dh, opts.scale_filter, worker_threads)?
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            } else {
+                raw_frames[0].clone()
+            };
+            let rgb = convert_frame(&first, PixelFormat::Rgb24, first.colorimetry);
+            let mut writer = OutputSink::create(out_p)?;
             let mut buf = Vec::new();
             write_pnm_image(&mut buf, &rgb)?;
-            std::fs::write(out_p, &buf)?;
+            writer.write_all(&buf)?;
+            writer.flush()?;
             buf.len() as u64
         }
         "rgdi" => {
+            let first = if let Some((dw, dh)) = opts.scale_dims {
+                parallel_scale_frames(&raw_frames[..1], dw, dh, opts.scale_filter, worker_threads)?
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            } else {
+                raw_frames[0].clone()
+            };
             let enc = RagdollIntraEncoder::new(1);
-            let pkt = enc.encode_frame(&frames[0])?;
-            std::fs::write(out_p, &pkt)?;
+            let pkt = enc.encode_frame(&first)?;
+            let mut writer = OutputSink::create(out_p)?;
+            writer.write_all(&pkt)?;
+            writer.flush()?;
             pkt.len() as u64
         }
         _ => {
-            // GOP-parallel H.264 or RGDI encoding across all CPU cores!
-            let use_rgdi = video_codec.eq_ignore_ascii_case("rgdi");
+            let use_rgdi = opts.video_codec.eq_ignore_ascii_case("rgdi");
             let sps = Sps::new_baseline(width, height, fps);
-            let pps = Pps::new_baseline(qp);
+            let pps = Pps::new_baseline(opts.qp);
             let avcc_extra = build_avcc_from_sps_pps(&sps.to_nal_unit(), &pps.to_nal_unit());
 
-            let encoded_gops: Vec<Vec<(Vec<u8>, bool)>> =
-                parallel_gop_map(&gop_chunks, worker_threads, |_gop_idx, chunk| {
-                    if use_rgdi {
-                        let enc = RagdollIntraEncoder::new(1);
-                        chunk
-                            .iter()
-                            .map(|f| (enc.encode_frame(f).unwrap(), true))
-                            .collect()
-                    } else {
-                        let mut enc = H264Encoder::new(width, height, fps, qp);
-                        enc.keyint = chunk.len() as u32 + 1;
-                        chunk
-                            .iter()
-                            .enumerate()
-                            .map(|(i, f)| {
-                                let annex_b = enc.encode_frame(f).unwrap();
-                                (annex_b, i == 0)
-                            })
-                            .collect()
-                    }
-                });
+            let (encoded_gops, ring_stats) = gop_ring.encode_gops_bounded(
+                &raw_frames,
+                opts.scale_dims,
+                opts.scale_filter,
+                &opts.video_codec,
+                fps,
+                opts.qp,
+            )?;
+            gops_processed = ring_stats.gops_processed;
 
             let timebase = Rational64::new(1, 90_000);
             let frame_dur = ((90_000 * fps.den) / fps.num.max(1)).max(1);
@@ -914,8 +1419,11 @@ pub fn transcode_file(
                 total_bytes: 0,
             };
 
-            let out_file = File::create(out_p)?;
-            let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+            let keep_audio = !opts.audio_codec.eq_ignore_ascii_case("none");
+            let keep_subs = !opts.subtitle_codec.eq_ignore_ascii_case("none");
+            let mut av_sync = AvSyncController::new(1 + aux_tracks.len());
+
+            let mut writer = OutputSink::create(out_p)?;
 
             match out_ext.as_str() {
                 "mkv" | "webm" => {
@@ -946,16 +1454,55 @@ pub fn transcode_file(
                             f_idx += 1;
                         }
                     }
+                    // Preserve & lip-sync Audio and Subtitle tracks in MKV (`0037`)
+                    for (mut aux_info, aux_pkts) in aux_tracks {
+                        if (aux_info.track_type == TrackType::Audio && !keep_audio)
+                            || (aux_info.track_type == TrackType::Subtitle && !keep_subs)
+                        {
+                            continue;
+                        }
+                        if aux_info.track_type == TrackType::Subtitle {
+                            if opts.subtitle_codec.eq_ignore_ascii_case("srt")
+                                || opts.subtitle_codec.eq_ignore_ascii_case("subrip")
+                            {
+                                aux_info.codec_id = CodecId::SubRip;
+                            } else if opts.subtitle_codec.eq_ignore_ascii_case("vtt")
+                                || opts.subtitle_codec.eq_ignore_ascii_case("webvtt")
+                            {
+                                aux_info.codec_id = CodecId::WebVtt;
+                            }
+                        }
+                        let sr = aux_info.audio.as_ref().map_or(48_000, |a| a.sample_rate);
+                        let new_tid = mux.add_track(aux_info.clone());
+                        let out_tb = Rational64::new(1, 1000);
+                        for mut pkt in aux_pkts {
+                            pkt.track_index = new_tid;
+                            let synced = if aux_info.track_type == TrackType::Audio {
+                                let pkt_samples = rescale_q(
+                                    pkt.duration.max(1),
+                                    pkt.pts.timebase,
+                                    Rational64::new(1, sr.max(1) as i64),
+                                )
+                                .max(1);
+                                audio_samples_processed += pkt_samples as usize;
+                                av_sync.rescale_audio_packet(pkt, sr, pkt_samples, out_tb)
+                            } else {
+                                AvSyncController::rescale_packet(pkt, out_tb)
+                            };
+                            mux.write_packet(synced)?;
+                        }
+                    }
                     mux.finish(&mut writer)?
                 }
-                "ts" | "m2ts" => {
+                "ts" | "m2ts" | "mpegts" => {
                     let mut mux = MpegTsMuxer::new(&mut writer);
                     mux.add_track(track_info);
+                    let mut all_pkts: Vec<PacketSlice<'static>> = Vec::with_capacity(num_frames);
                     let mut f_idx = 0i64;
                     for gop in encoded_gops {
                         for (raw_pkt, is_kf) in gop {
                             let pts = f_idx * frame_dur;
-                            let pkt = PacketSlice::from_owned(
+                            all_pkts.push(PacketSlice::from_owned(
                                 AlignedBuffer::from_slice(&raw_pkt),
                                 0,
                                 Timestamp::new(pts, timebase),
@@ -966,10 +1513,35 @@ pub fn transcode_file(
                                 } else {
                                     PacketFlags::NONE
                                 },
-                            );
-                            mux.write_packet(&pkt)?;
+                            ));
                             f_idx += 1;
                         }
+                    }
+                    for (aux_info, aux_pkts) in aux_tracks {
+                        if aux_info.track_type == TrackType::Audio && keep_audio {
+                            let sr = aux_info.audio.as_ref().map_or(48_000, |a| a.sample_rate);
+                            let new_tid = mux.add_track(aux_info);
+                            for mut pkt in aux_pkts {
+                                pkt.track_index = new_tid;
+                                let pkt_samples = rescale_q(
+                                    pkt.duration.max(1),
+                                    pkt.pts.timebase,
+                                    Rational64::new(1, sr.max(1) as i64),
+                                )
+                                .max(1);
+                                audio_samples_processed += pkt_samples as usize;
+                                all_pkts.push(av_sync.rescale_audio_packet(
+                                    pkt,
+                                    sr,
+                                    pkt_samples,
+                                    timebase,
+                                ));
+                            }
+                        }
+                    }
+                    AvSyncController::interleave_packets_dts(&mut all_pkts);
+                    for pkt in &all_pkts {
+                        mux.write_packet(pkt)?;
                     }
                     mux.finish()?
                 }
@@ -1001,6 +1573,36 @@ pub fn transcode_file(
                             f_idx += 1;
                         }
                     }
+                    // Preserve & lip-sync Audio and Subtitle tracks in MP4 (`0037`)
+                    for (mut aux_info, aux_pkts) in aux_tracks {
+                        if (aux_info.track_type == TrackType::Audio && !keep_audio)
+                            || (aux_info.track_type == TrackType::Subtitle && !keep_subs)
+                        {
+                            continue;
+                        }
+                        if aux_info.track_type == TrackType::Subtitle {
+                            aux_info.codec_id = CodecId::WebVtt;
+                        }
+                        let out_tb = aux_info.timebase;
+                        let sr = aux_info.audio.as_ref().map_or(48_000, |a| a.sample_rate);
+                        let new_tid = mux.add_track(aux_info.clone());
+                        for mut pkt in aux_pkts {
+                            pkt.track_index = new_tid;
+                            let synced = if aux_info.track_type == TrackType::Audio {
+                                let pkt_samples = rescale_q(
+                                    pkt.duration.max(1),
+                                    pkt.pts.timebase,
+                                    Rational64::new(1, sr.max(1) as i64),
+                                )
+                                .max(1);
+                                audio_samples_processed += pkt_samples as usize;
+                                av_sync.rescale_audio_packet(pkt, sr, pkt_samples, out_tb)
+                            } else {
+                                AvSyncController::rescale_packet(pkt, out_tb)
+                            };
+                            mux.write_packet(synced)?;
+                        }
+                    }
                     mux.finish(&mut writer)?
                 }
             }
@@ -1014,7 +1616,7 @@ pub fn transcode_file(
         input_path: in_p.display().to_string(),
         output_paths: vec![out_p.display().to_string()],
         frames_processed: num_frames,
-        audio_samples_processed: 0,
+        audio_samples_processed,
         gops_processed,
         threads_used: worker_threads,
         bytes_in,
@@ -1554,5 +2156,242 @@ faststart = true
         let _ = std::fs::remove_file(&src_mp4);
         let _ = std::fs::remove_file(&out_mp4);
         let _ = std::fs::remove_file(&out_mkv);
+    }
+
+    #[test]
+    fn gop_ring_pipeline_bounded_memory_and_frame_recycling() {
+        let frames: Vec<VideoFrame> = (0..30).map(|i| synth_video_frame(160, 120, i)).collect();
+        // Configure a tight 8 MiB memory budget with 4 worker threads
+        let ring = GopRingPipeline::with_budget_bytes(4, 8 * 1024 * 1024);
+        let (encoded_gops, stats) = ring
+            .encode_gops_bounded(
+                &frames,
+                Some((128, 96)),
+                ScaleFilter::Lanczos3,
+                "h264",
+                Rational64::FPS_30,
+                22,
+            )
+            .unwrap();
+
+        let total_encoded_frames: usize = encoded_gops.iter().map(|g| g.len()).sum();
+        assert_eq!(total_encoded_frames, 30);
+        assert_eq!(stats.frames_processed, 30);
+        assert!(stats.peak_wave_memory_bytes <= ring.memory_budget_bytes);
+        assert!(
+            stats.pool_recycled_hits > 0,
+            "FramePool should recycle scaled frame buffers across GOP frames"
+        );
+    }
+
+    #[test]
+    fn multitrack_video_audio_subtitle_av_sync_and_transcode_preservation() {
+        let tmp = std::env::temp_dir();
+        let multi_mp4 = tmp.join("ragdoll_m6_multitrack_in.mp4");
+        let out_mkv = tmp.join("ragdoll_m6_multitrack_out.mkv");
+        let out_mp4 = tmp.join("ragdoll_m6_multitrack_out.mp4");
+        let out_srt = tmp.join("ragdoll_m6_multitrack_out.srt");
+
+        // 1. Build a 1-second (30-frame) multi-track MP4 containing H.264 Video + FLAC Audio + WebVTT Subtitles
+        let width = 160u32;
+        let height = 120u32;
+        let fps = Rational64::FPS_30;
+        let sps = Sps::new_baseline(width, height, fps);
+        let pps = Pps::new_baseline(22);
+        let avcc = build_avcc_from_sps_pps(&sps.to_nal_unit(), &pps.to_nal_unit());
+        let mut h264_enc = H264Encoder::new(width, height, fps, 22);
+
+        let mut mux = Mp4Muxer::new();
+        let v_tb = Rational64::new(1, 90_000);
+        let v_tid = mux.add_track(TrackInfo {
+            index: 0,
+            track_type: TrackType::Video,
+            codec_id: CodecId::H264,
+            timebase: v_tb,
+            duration_ticks: Some(90_000),
+            extra_data: avcc,
+            video: Some(VideoTrackParams {
+                width,
+                height,
+                pixel_format: PixelFormat::Yuv420p,
+                colorimetry: Colorimetry::bt709_limited(),
+                frame_rate: fps,
+                bit_depth: 8,
+                profile: None,
+                level: None,
+            }),
+            audio: None,
+            sample_count: 30,
+            total_bytes: 0,
+        });
+
+        let a_tb = Rational64::new(1, 48_000);
+        let flac_enc = FlacEncoder::new(48_000, 2, 0);
+        let mut af = AudioFrame::new(48_000, 2, SampleFormat::S16le, 4800);
+        for (i, chunk) in af
+            .data
+            .as_mut_slice()
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let s = (((i as f64) * 0.05).sin() * 8000.0) as i16;
+            *chunk = s.to_le_bytes();
+        }
+        let flac_stream = flac_enc.encode_stream(&af).unwrap();
+        let a_tid = mux.add_track(TrackInfo {
+            index: 1,
+            track_type: TrackType::Audio,
+            codec_id: CodecId::Flac,
+            timebase: a_tb,
+            duration_ticks: Some(48_000),
+            extra_data: flac_stream[8..42].to_vec(),
+            video: None,
+            audio: Some(AudioTrackParams {
+                sample_rate: 48_000,
+                channels: 2,
+                channel_layout: ChannelLayout::Stereo,
+                sample_format: SampleFormat::S16le,
+                bits_per_coded_sample: 16,
+            }),
+            sample_count: 10,
+            total_bytes: 0,
+        });
+
+        let s_tb = Rational64::new(1, 1000);
+        let s_tid = mux.add_track(TrackInfo {
+            index: 2,
+            track_type: TrackType::Subtitle,
+            codec_id: CodecId::WebVtt,
+            timebase: s_tb,
+            duration_ticks: Some(1000),
+            extra_data: b"WEBVTT".to_vec(),
+            video: None,
+            audio: None,
+            sample_count: 2,
+            total_bytes: 0,
+        });
+
+        for i in 0..30 {
+            let vf = synth_video_frame(width as usize, height as usize, i);
+            let annex_b = h264_enc.encode_frame(&vf).unwrap();
+            let avcc_au = h264_annex_b_to_avcc_au(&annex_b);
+            let pts = (i as i64) * 3000;
+            mux.write_packet(PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&avcc_au),
+                v_tid,
+                Timestamp::new(pts, v_tb),
+                Timestamp::new(pts, v_tb),
+                3000,
+                if i == 0 || i == 15 {
+                    PacketFlags::KEYFRAME
+                } else {
+                    PacketFlags::NONE
+                },
+            ))
+            .unwrap();
+        }
+        for i in 0..10 {
+            let pts = (i as i64) * 4800;
+            mux.write_packet(PacketSlice::from_owned(
+                AlignedBuffer::from_slice(&flac_stream[42..]),
+                a_tid,
+                Timestamp::new(pts, a_tb),
+                Timestamp::new(pts, a_tb),
+                4800,
+                PacketFlags::KEYFRAME,
+            ))
+            .unwrap();
+        }
+        mux.write_packet(PacketSlice::from_owned(
+            AlignedBuffer::from_slice(b"Ragdoll Multi-Track Subtitle 1"),
+            s_tid,
+            Timestamp::new(0, s_tb),
+            Timestamp::new(0, s_tb),
+            450,
+            PacketFlags::KEYFRAME,
+        ))
+        .unwrap();
+        mux.write_packet(PacketSlice::from_owned(
+            AlignedBuffer::from_slice(b"Ragdoll Multi-Track Subtitle 2"),
+            s_tid,
+            Timestamp::new(500, s_tb),
+            Timestamp::new(500, s_tb),
+            500,
+            PacketFlags::KEYFRAME,
+        ))
+        .unwrap();
+
+        {
+            let mut f = File::create(&multi_mp4).unwrap();
+            mux.finish(&mut f).unwrap();
+        }
+
+        // 2. Transcode multi-track MP4 -> scaled MKV & MP4, verifying Audio & Subtitle preservation + < 1 ms A/V sync
+        let tel_mkv = transcode_file_with_options(
+            &multi_mp4,
+            &out_mkv,
+            &TranscodeOptions {
+                scale_dims: Some((128, 96)),
+                scale_filter: ScaleFilter::Lanczos3,
+                video_codec: "h264".into(),
+                audio_codec: "copy".into(),
+                subtitle_codec: "copy".into(),
+                qp: 22,
+                threads: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tel_mkv.frames_processed, 30);
+        assert!(tel_mkv.audio_samples_processed >= 48_000);
+
+        let probe_mkv = probe_file_detailed(&out_mkv).unwrap();
+        assert_eq!(
+            probe_mkv.tracks.len(),
+            3,
+            "MKV must preserve Video + Audio + Subtitle"
+        );
+
+        let tel_mp4 = transcode_file_with_options(
+            &multi_mp4,
+            &out_mp4,
+            &TranscodeOptions {
+                scale_dims: Some((128, 96)),
+                scale_filter: ScaleFilter::Lanczos3,
+                video_codec: "h264".into(),
+                audio_codec: "copy".into(),
+                subtitle_codec: "copy".into(),
+                qp: 22,
+                threads: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tel_mp4.frames_processed, 30);
+        let probe_mp4 = probe_file_detailed(&out_mp4).unwrap();
+        assert_eq!(
+            probe_mp4.tracks.len(),
+            3,
+            "MP4 must preserve Video + Audio + Subtitle"
+        );
+
+        // Verify < 1 ms A/V drift across the transcoded MP4
+        let v_end = Timestamp::new(30 * 3000, v_tb);
+        let a_end = Timestamp::new(10 * 4800, a_tb);
+        let drift_ms = AvSyncController::compute_av_drift_ms(v_end, a_end);
+        assert!(drift_ms < 1.0, "A/V drift {drift_ms} ms must be < 1 ms");
+
+        // 3. Remux subtitle track out to standalone .srt and verify text
+        remux_file(&out_mp4, &out_srt).unwrap();
+        let srt_text = std::fs::read_to_string(&out_srt).unwrap();
+        assert!(srt_text.contains("Ragdoll Multi-Track Subtitle 1"));
+        assert!(srt_text.contains("Ragdoll Multi-Track Subtitle 2"));
+
+        let _ = std::fs::remove_file(&multi_mp4);
+        let _ = std::fs::remove_file(&out_mkv);
+        let _ = std::fs::remove_file(&out_mp4);
+        let _ = std::fs::remove_file(&out_srt);
     }
 }

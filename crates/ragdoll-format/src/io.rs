@@ -1,8 +1,68 @@
 use ragdoll_core::{AlignedBuffer, RagdollError, Result};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Read, Write};
 use std::ops::Deref;
 use std::path::Path;
+
+/// Default streaming ring chunk size (4 MiB) when ingesting from `stdin` or a non-seekable pipe.
+pub const STREAM_READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Returns `true` if `path` denotes Unix standard input (`"-"` or `"/dev/stdin"`).
+#[inline]
+pub fn is_stdin_path<P: AsRef<Path>>(path: P) -> bool {
+    let s = path.as_ref().to_str().unwrap_or("");
+    s == "-" || s == "/dev/stdin"
+}
+
+/// Returns `true` if `path` denotes Unix standard output (`"-"` or `"/dev/stdout"`).
+#[inline]
+pub fn is_stdout_path<P: AsRef<Path>>(path: P) -> bool {
+    let s = path.as_ref().to_str().unwrap_or("");
+    s == "-" || s == "/dev/stdout"
+}
+
+/// Unified streaming or memory-mapped input source (`0036`).
+pub type StreamSource = MmapSource;
+
+/// Unified buffered output writer supporting both local files (256 KiB page-aligned buffer)
+/// and Unix `stdout` pipes (`-` / `/dev/stdout`).
+pub enum OutputSink {
+    File(BufWriter<File>),
+    Stdout(BufWriter<std::io::Stdout>),
+}
+
+impl OutputSink {
+    /// Opens `path` for buffered output, routing `"-"` or `"/dev/stdout"` to standard output.
+    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        if is_stdout_path(&path) {
+            Ok(Self::Stdout(BufWriter::with_capacity(
+                256 * 1024,
+                std::io::stdout(),
+            )))
+        } else {
+            let f = File::create(path.as_ref())?;
+            Ok(Self::File(BufWriter::with_capacity(256 * 1024, f)))
+        }
+    }
+}
+
+impl Write for OutputSink {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(w) => w.write(buf),
+            Self::Stdout(w) => w.write(buf),
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(w) => w.flush(),
+            Self::Stdout(w) => w.flush(),
+        }
+    }
+}
 
 /// Zero-copy read-only byte source backed by OS virtual memory mapping (`mmap`)
 /// or a 64-byte cache-line-aligned in-memory buffer.
@@ -52,10 +112,40 @@ mod sys {
 }
 
 impl MmapSource {
-    /// Memory-maps the file at `path` read-only (`PROT_READ | MAP_PRIVATE`).
+    /// Memory-maps the file at `path` read-only (`PROT_READ | MAP_PRIVATE`), or reads from
+    /// `stdin` / named pipes when `path` is `"-"` (`0036`).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        if is_stdin_path(&path) {
+            return Self::from_reader(std::io::stdin().lock());
+        }
         let file = File::open(path.as_ref())?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Self::from_reader(file);
+        }
         Self::from_file(&file)
+    }
+
+    /// Reads an arbitrary sequential stream (`Read`, such as `stdin` or a Unix FIFO pipe)
+    /// in 4 MiB chunks into a 64-byte-aligned buffer with 64-byte tail safety padding.
+    pub fn from_reader<R: Read>(mut reader: R) -> Result<Self> {
+        let mut raw = Vec::new();
+        let mut chunk = vec![0u8; STREAM_READ_CHUNK_BYTES];
+        loop {
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        if raw.is_empty() {
+            return Ok(Self {
+                inner: MmapInner::Empty,
+            });
+        }
+        Ok(Self {
+            inner: MmapInner::Buffer(AlignedBuffer::from_slice(&raw)),
+        })
     }
 
     /// Memory-maps an open [`File`] handle read-only.

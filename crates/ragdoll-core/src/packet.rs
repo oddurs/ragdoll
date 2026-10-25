@@ -231,6 +231,9 @@ pub enum CodecId {
     PcmS24Le,
     PcmS32Le,
     PcmF32Le,
+    // Subtitles
+    WebVtt,
+    SubRip,
 }
 
 impl CodecId {
@@ -244,7 +247,22 @@ impl CodecId {
 
     #[inline]
     pub const fn is_audio(self) -> bool {
-        !self.is_video()
+        matches!(
+            self,
+            Self::Flac
+                | Self::Aac
+                | Self::Opus
+                | Self::PcmU8
+                | Self::PcmS16Le
+                | Self::PcmS24Le
+                | Self::PcmS32Le
+                | Self::PcmF32Le
+        )
+    }
+
+    #[inline]
+    pub const fn is_subtitle(self) -> bool {
+        matches!(self, Self::WebVtt | Self::SubRip)
     }
 
     #[inline]
@@ -264,6 +282,8 @@ impl CodecId {
             Self::PcmS24Le => "pcm_s24le",
             Self::PcmS32Le => "pcm_s32le",
             Self::PcmF32Le => "pcm_f32le",
+            Self::WebVtt => "webvtt",
+            Self::SubRip => "subrip",
         }
     }
 }

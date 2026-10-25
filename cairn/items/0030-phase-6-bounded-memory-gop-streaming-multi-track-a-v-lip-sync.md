@@ -4,9 +4,10 @@ uid: afd0db62-a2b4-4de3-8bc6-f6fad4c63abf
 key: m6-streaming-av-sync
 title: Phase 6 — Bounded-Memory GOP Streaming & Multi-Track A/V Lip-Sync
 type: milestone
-status: planned
+status: done
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: pipeline
 ---
@@ -16,3 +17,7 @@ Replace full-file in-memory frame buffering with a bounded-memory GOP ring strea
 ## Release gate
 
 2-hour 4K multi-track media files and `stdin`/`stdout` pipe streams transcode and remux within a hard `< 256 MiB` memory ceiling (`< 64 MiB` in `--battery-saver` mode) while preserving all video, audio, and subtitle tracks with zero PTS/DTS drift.
+
+## 2026-10-25
+
+Delivered Milestone M6 (Streaming I/O, Multi-Track A/V Sync & Subtitles): ADR-0035, 0036, and 0037 verified.

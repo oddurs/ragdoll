@@ -3,12 +3,14 @@ id: 36
 uid: 070cf7c0-4620-46ee-947d-56194afc65f3
 title: Bounded-Memory GopRingPipeline & Streaming stdin/stdout Pipe I/O
 type: feature
-status: planned
+status: done
 milestone: m6-streaming-av-sync
+assignee: Oddur Sigurdsson
 depends_on:
 - 35
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: pipeline
 effort: l
@@ -26,6 +28,10 @@ In `v0.1.0`, `decode_video_file` and `transcode_file` materialize all decoded `V
 
 ## Acceptance criteria
 
-- [ ] `transcode_file` processes arbitrarily long video streams within a bounded `< 256 MiB` (`< 64 MiB` in `--battery-saver`) memory footprint.
-- [ ] `ragdoll transcode - - --format ts` and `ragdoll probe -` work over Unix `stdin`/`stdout` pipes.
-- [ ] Zero throughput regression on multi-core GOP-parallel transcoding compared to `v0.1.0`.
+- [x] `transcode_file` processes arbitrarily long video streams within a bounded `< 256 MiB` (`< 64 MiB` in `--battery-saver`) memory footprint.
+- [x] `ragdoll transcode - - --format ts` and `ragdoll probe -` work over Unix `stdin`/`stdout` pipes.
+- [x] Zero throughput regression on multi-core GOP-parallel transcoding compared to `v0.1.0`.
+
+## 2026-10-25
+
+Implemented GopRingPipeline with bounded GOP-wave execution (256 MiB default / 64 MiB efficiency budget), FramePool plane recycling, StreamSource / MmapSource::from_reader, and OutputSink stdin/stdout (-) pipe streaming.

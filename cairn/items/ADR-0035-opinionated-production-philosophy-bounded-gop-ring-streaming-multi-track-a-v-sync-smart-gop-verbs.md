@@ -3,10 +3,12 @@ id: 35
 uid: b8754572-6f08-4151-aee0-75daf74292bb
 title: 'Opinionated Production Philosophy: Bounded GOP Ring Streaming, Multi-Track A/V Sync & Smart-GOP Verbs'
 type: decision
-status: planned
+status: done
 milestone: m6-streaming-av-sync
+assignee: Oddur Sigurdsson
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: arch
 effort: s
@@ -31,5 +33,13 @@ Adopt Option 2 across Milestones `m6` through `m10`. Move full-file in-memory he
 
 ## Acceptance criteria
 
-- [ ] The architectural invariant, its rationale, and its consequences are recorded.
-- [ ] Milestones `m6-streaming-av-sync` through `m10-production-v1` are linked to this decision in Cairn.
+- [x] The architectural invariant, its rationale, and its consequences are recorded.
+- [x] Milestones `m6-streaming-av-sync` through `m10-production-v1` are linked to this decision in Cairn.
+
+## 2026-10-25
+
+Recorded Ragdoll v1.0 opinionated production architecture: bounded GopRingPipeline (<256 MiB / <64 MiB battery-saver), default multi-track A/V+Subtitle preservation with 128-bit rescale_delta lip-sync, Smart-GOP cut/concat, and single-decode CMAF ABR package.
+
+## Result
+
+Adopted Option 2 (Opinionated Ragdoll v1.0 Architecture) across Milestones m6 through m10.

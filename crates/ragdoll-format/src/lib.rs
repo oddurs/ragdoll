@@ -18,10 +18,14 @@ pub mod mkv;
 pub mod mp4;
 pub mod mpegts;
 pub mod ppm;
+pub mod subtitle;
 pub mod wav;
 pub mod y4m;
 
-pub use io::{MmapSource, VectoredWriter};
+pub use io::{
+    MmapSource, OutputSink, STREAM_READ_CHUNK_BYTES, StreamSource, VectoredWriter, is_stdin_path,
+    is_stdout_path,
+};
 pub use mkv::{MkvDemuxer, MkvMuxer};
 pub use mp4::{FourCC, Mp4Demuxer, Mp4Muxer, Mp4TrackIndex};
 pub use mpegts::{
@@ -31,6 +35,11 @@ pub use mpegts::{
     h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, parse_adts_header,
 };
 pub use ppm::{compose_contact_sheet_rgb24, read_pnm_image, write_pnm_image};
+pub use subtitle::{
+    SubtitleCue, SubtitleDemuxer, SubtitleMuxer, format_subtitle_timestamp_ms, is_srt_bytes,
+    is_webvtt_bytes, parse_subtitle_timestamp_ms, parse_subtitles, unwrap_mp4_wvtt_sample,
+    wrap_mp4_wvtt_sample,
+};
 pub use wav::{WavDemuxer, WavMuxer};
 pub use y4m::{Y4mDemuxer, Y4mMuxer};
 
@@ -48,6 +57,8 @@ pub enum ContainerFormat {
     Ppm,
     Pgm,
     Wav,
+    WebVtt,
+    SubRip,
 }
 
 impl std::fmt::Display for ContainerFormat {
@@ -61,6 +72,8 @@ impl std::fmt::Display for ContainerFormat {
             Self::Ppm => "ppm",
             Self::Pgm => "pgm",
             Self::Wav => "wav",
+            Self::WebVtt => "webvtt",
+            Self::SubRip => "subrip",
         };
         write!(f, "{s}")
     }
@@ -102,6 +115,12 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
     if data.len() >= 3 && &data[0..2] == b"P5" && data[2].is_ascii_whitespace() {
         return Some(ContainerFormat::Pgm);
     }
+    if is_webvtt_bytes(data) {
+        return Some(ContainerFormat::WebVtt);
+    }
+    if is_srt_bytes(data) {
+        return Some(ContainerFormat::SubRip);
+    }
     if detect_mpegts_stride_and_sync(data).is_some() {
         return Some(ContainerFormat::MpegTs);
     }
@@ -135,6 +154,10 @@ pub fn probe_container(data: &[u8]) -> Result<(ContainerFormat, Vec<TrackInfo>)>
         }
         ContainerFormat::Wav => {
             let demux = WavDemuxer::open(data)?;
+            Ok((fmt, vec![demux.track().clone()]))
+        }
+        ContainerFormat::WebVtt | ContainerFormat::SubRip => {
+            let demux = SubtitleDemuxer::open(data)?;
             Ok((fmt, vec![demux.track().clone()]))
         }
         ContainerFormat::Ppm | ContainerFormat::Pgm => {
@@ -1031,5 +1054,47 @@ mod tests {
         assert!(rf64_demux.is_rf64());
         assert_eq!(rf64_demux.track().codec_id, CodecId::PcmF32Le);
         assert_eq!(rf64_demux.pcm_data(), &f32_pcm[..]);
+    }
+
+    #[test]
+    fn webvtt_subrip_and_streaming_reader_roundtrip() {
+        let vtt_src = b"WEBVTT\n\n00:00:01.000 --> 00:00:03.500 line:80%\nHello Ragdoll WebVTT!\n\n00:00:04.250 --> 00:00:06.000\nSecond cue line 1\nSecond cue line 2\n";
+        let mmap = MmapSource::from_reader(std::io::Cursor::new(&vtt_src[..])).unwrap();
+        assert_eq!(
+            detect_container_format(mmap.as_slice()),
+            Some(ContainerFormat::WebVtt)
+        );
+
+        let mut demux = SubtitleDemuxer::open(mmap.as_slice()).unwrap();
+        assert_eq!(demux.cues().len(), 2);
+        assert_eq!(demux.cues()[0].start_ms, 1000);
+        assert_eq!(demux.cues()[0].end_ms, 3500);
+        assert_eq!(demux.cues()[0].payload, "Hello Ragdoll WebVTT!");
+
+        let mut srt_mux = SubtitleMuxer::new(CodecId::SubRip);
+        while let Some(pkt) = demux.next_packet().unwrap() {
+            srt_mux.write_packet(&pkt);
+        }
+        let mut srt_bytes = Vec::new();
+        srt_mux.finish(&mut srt_bytes).unwrap();
+        assert_eq!(
+            detect_container_format(&srt_bytes),
+            Some(ContainerFormat::SubRip)
+        );
+
+        let srt_demux = SubtitleDemuxer::open(&srt_bytes).unwrap();
+        assert_eq!(srt_demux.cues().len(), 2);
+        assert_eq!(srt_demux.cues()[1].start_ms, 4250);
+        assert_eq!(srt_demux.cues()[1].end_ms, 6000);
+        assert_eq!(
+            srt_demux.cues()[1].payload,
+            "Second cue line 1\nSecond cue line 2"
+        );
+
+        let wvtt = wrap_mp4_wvtt_sample(b"MP4 ISO 14496-30 cue", "line:90%");
+        assert_eq!(
+            unwrap_mp4_wvtt_sample(&wvtt),
+            ("MP4 ISO 14496-30 cue".into(), "line:90%".into())
+        );
     }
 }

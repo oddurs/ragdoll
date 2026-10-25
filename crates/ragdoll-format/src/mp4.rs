@@ -309,12 +309,20 @@ impl<'a> Mp4Demuxer<'a> {
     /// Emits the next interleaved packet as a zero-copy [`PacketSlice<'a>`] borrowing directly from `data`.
     #[inline]
     pub fn next_packet(&mut self) -> Result<Option<PacketSlice<'a>>> {
-        if self.cursor >= self.schedule.len() {
-            return Ok(None);
+        while self.cursor < self.schedule.len() {
+            let pref = self.schedule[self.cursor];
+            self.cursor += 1;
+            let pkt = self.packet_at(pref.track_pos, pref.sample_idx)?;
+            // Skip ISO/IEC 14496-30 `vtte` EmptyCueBox gap fillers on subtitle tracks
+            if self.tracks[pref.track_pos].info.track_type == TrackType::Subtitle
+                && pkt.data().len() >= 8
+                && &pkt.data()[4..8] == b"vtte"
+            {
+                continue;
+            }
+            return Ok(Some(pkt));
         }
-        let pref = self.schedule[self.cursor];
-        self.cursor += 1;
-        self.packet_at(pref.track_pos, pref.sample_idx).map(Some)
+        Ok(None)
     }
 
     /// Fetches a specific `(track_pos, sample_idx)` packet in $O(1)$ without moving the sequential cursor.
@@ -870,7 +878,7 @@ impl<'a> Mp4Demuxer<'a> {
             }
         }
 
-        if matches!(track_type, TrackType::Data | TrackType::Subtitle) {
+        if track_type == TrackType::Data {
             return Ok(None);
         }
 
@@ -1392,6 +1400,23 @@ impl<'a> Mp4Demuxer<'a> {
                         }
                     }
                 }
+                TrackType::Subtitle => {
+                    *codec_id = match &entry.fourcc.0 {
+                        b"wvtt" => Some(CodecId::WebVtt),
+                        b"tx3g" | b"text" | b"stpp" => Some(CodecId::SubRip),
+                        _ => None,
+                    };
+                    if entry.payload.len() >= 8 {
+                        for child_res in BoxIter::new(&entry.payload[8..]) {
+                            if let Ok(child) = child_res
+                                && &child.fourcc.0 == b"vttC"
+                            {
+                                extra_data.clear();
+                                extra_data.extend_from_slice(child.payload);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1659,6 +1684,46 @@ impl<'a> Mp4Muxer<'a> {
         let track = self.tracks.get_mut(packet.track_index as usize).ok_or(
             RagdollError::CorruptBitstream("Mp4Muxer::write_packet track_index out of bounds"),
         )?;
+        let packet = if track.info.track_type == TrackType::Subtitle {
+            let tb = track.info.timebase;
+            let cur_start = packet.pts.rescale_to(tb).ticks.max(0);
+            let cur_dur = rescale_q(packet.duration.max(1), packet.pts.timebase, tb).max(1);
+            let prev_end = if let Some(last) = track.packets.last() {
+                let last_start = last.payload.pts.rescale_to(tb).ticks.max(0);
+                let last_dur =
+                    rescale_q(last.payload.duration.max(1), last.payload.pts.timebase, tb).max(1);
+                last_start + last_dur
+            } else {
+                0
+            };
+            if cur_start > prev_end {
+                let vtte: [u8; 8] = [0, 0, 0, 8, b'v', b't', b't', b'e'];
+                let gap_ts = Timestamp::new(prev_end, tb);
+                let gap_pkt = PacketSlice::from_owned(
+                    ragdoll_core::AlignedBuffer::from_slice(&vtte),
+                    packet.track_index,
+                    gap_ts,
+                    gap_ts,
+                    cur_start - prev_end,
+                    PacketFlags::KEYFRAME,
+                );
+                track.packets.push(MuxTrackPacket { payload: gap_pkt });
+            }
+            let wrapped = crate::subtitle::wrap_mp4_wvtt_sample(packet.data(), "");
+            let ts = Timestamp::new(cur_start, tb);
+            let mut owned = PacketSlice::from_owned(
+                ragdoll_core::AlignedBuffer::from_slice(&wrapped),
+                packet.track_index,
+                ts,
+                ts,
+                cur_dur,
+                PacketFlags::KEYFRAME,
+            );
+            owned.file_offset = packet.file_offset;
+            owned
+        } else {
+            packet
+        };
         track.packets.push(MuxTrackPacket { payload: packet });
         Ok(())
     }
@@ -2127,6 +2192,7 @@ impl<'a> Mp4Muxer<'a> {
         let (handler_fourcc, handler_name) = match track.info.track_type {
             TrackType::Video => (b"vide", b"Ragdoll Video Handler\0" as &[u8]),
             TrackType::Audio => (b"soun", b"Ragdoll Audio Handler\0" as &[u8]),
+            TrackType::Subtitle => (b"text", b"Ragdoll Subtitle Handler\0" as &[u8]),
             _ => (b"data", b"Ragdoll Data Handler\0" as &[u8]),
         };
         let mut hdlr = Vec::with_capacity(24 + handler_name.len());
@@ -2137,7 +2203,7 @@ impl<'a> Mp4Muxer<'a> {
         hdlr.extend_from_slice(handler_name);
         let hdlr_box = Self::wrap_box(b"hdlr", &hdlr);
 
-        // `vmhd` or `smhd`
+        // `vmhd`, `smhd`, or `nmhd`
         let media_header_box = match track.info.track_type {
             TrackType::Video => {
                 let mut vmhd = Vec::with_capacity(12);
@@ -2145,6 +2211,7 @@ impl<'a> Mp4Muxer<'a> {
                 vmhd.extend_from_slice(&[0u8; 8]); // graphicsmode + opcolor
                 Self::wrap_box(b"vmhd", &vmhd)
             }
+            TrackType::Subtitle => Self::wrap_box(b"nmhd", &0u32.to_be_bytes()),
             _ => {
                 let mut smhd = Vec::with_capacity(8);
                 smhd.extend_from_slice(&0u32.to_be_bytes());
@@ -2383,6 +2450,20 @@ impl<'a> Mp4Muxer<'a> {
                 }
 
                 stsd.extend_from_slice(&Self::wrap_box(entry_fourcc, &ase));
+            }
+            TrackType::Subtitle => {
+                // ISO/IEC 14496-30 WebVTTSampleEntry (`wvtt`):
+                // 6 reserved bytes + 2-byte data_reference_index = 1 + `vttC` WebVTTConfigurationBox
+                let mut wvtt = Vec::with_capacity(32);
+                wvtt.extend_from_slice(&[0u8; 6]);
+                wvtt.extend_from_slice(&1u16.to_be_bytes());
+                let vttc_cfg = if info.extra_data.is_empty() {
+                    b"WEBVTT\n" as &[u8]
+                } else {
+                    info.extra_data.as_slice()
+                };
+                wvtt.extend_from_slice(&Self::wrap_box(b"vttC", vttc_cfg));
+                stsd.extend_from_slice(&Self::wrap_box(b"wvtt", &wvtt));
             }
             _ => {}
         }
