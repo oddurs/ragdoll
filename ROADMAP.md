@@ -87,3 +87,65 @@ Unify all engines under a work-stealing GOP-parallel pipeline scheduler, declara
 - [x] `BENCH-0023` Head-to-Head Benchmark Suite: Ragdoll vs. FFmpeg 9.0.2 on Apple M4 across 6 Flagship Workloads <sup>benchmark · p0 · bench</sup>
 - [x] `SIMD-0029` Reference-Hardened M4/M5 Codecs, E-Core Battery-Efficiency Mode & PMU Hardware Telemetry Benchmark Suite <sup>kernel · p0 · arch</sup>
 
+## m6-streaming-av-sync — Phase 6 — Bounded-Memory GOP Streaming & Multi-Track A/V Lip-Sync
+
+`··········` 0% · 0 of 3 done
+
+Replace full-file in-memory frame buffering with a bounded-memory GOP ring streaming engine (`GopRingPipeline`) supporting arbitrary-length feature films, Unix `stdin`/`stdout` pipes, and synchronized multi-track video + audio + subtitle (`WebVTT`/`SRT`) demuxing/muxing with 128-bit `rescale_delta` lip-sync alignment.
+
+### up next
+
+- [ ] `ADR-0035` Opinionated Production Philosophy: Bounded GOP Ring Streaming, Multi-Track A/V Sync & Smart-GOP Verbs <sup>decision · p0 · arch</sup>
+- [ ] `0036` Bounded-Memory GopRingPipeline & Streaming stdin/stdout Pipe I/O <sup>feature · p0 · pipeline</sup>
+- [ ] `0037` Multi-Track A/V + Subtitle (WebVTT/SRT) Demuxing, Muxing & 128-Bit Lip-Sync Engine <sup>feature · p0 · format</sup>
+
+## m7-video-production — Phase 7 — Production H.264 (Main/High CABAC, 4x4/8x8 Residuals, Qpel, Deblock & CRF Rate Control)
+
+`··········` 0% · 0 of 4 done
+
+Upgrade Ragdoll's pure-Rust H.264/AVC engine from Constrained Baseline skip/DC coding to full production Main and High Profile parity: quantized $4\times4$ and $8\times8$ AC/DC DCT residual coding (`I_4x4` all 9 spatial modes, `I_16x16`, `P_L0_16x16`, `P_8x8`), 6-tap FIR quarter-pel (`qpel`) motion interpolation, ITU-T H.264 8.7 adaptive in-loop deblocking filter, CABAC binary arithmetic coding, B-slice decoding, and perceptual CRF (`--crf`) + VBV bitrate control.
+
+### up next
+
+- [ ] `SIMD-0038` H.264 6-Tap Quarter-Pel Interpolation, In-Loop Deblocking Filter & Intra 4x4 9-Mode NEON/AVX2 Kernels <sup>kernel · p0 · simd</sup>
+- [ ] `0039` Full H.264 Residual Coding (I_4x4, I_16x16, P_L0_16x16, P_8x8 AC/DC CAVLC) & Sub-Pel Motion Refinement <sup>feature · p0 · codec-video</sup>
+- [ ] `0040` H.264 Main & High Profile CABAC Arithmetic Engine, 8x8 Transform & B-Frame Decoding <sup>feature · p0 · codec-video</sup>
+- [ ] `0041` Perceptual CRF (--crf), Variance-Adaptive Quantization (VAQ) & VBV Bitrate Control <sup>feature · p1 · codec-video</sup>
+
+## m8-audio-pro — Phase 8 — Lossy Audio (AAC-LC & Opus), Polyphase Resampler & EBU R128 Loudness
+
+`··········` 0% · 0 of 4 done
+
+Deliver a complete pure-Rust production audio engine: SIMD windowed-sinc Kaiser (`bessel_i0`) polyphase sample-rate conversion (`44.1/48/88.2/96 kHz`), channel matrix mixing (`5.1/7.1 <-> Stereo/Mono`), EBU R128 (`LUFS`) + True-Peak loudness measurement and normalization, pure-Rust AAC-LC and Opus MDCT/IMDCT lossy audio codecs, and standalone `.flac` / `.ogg` container support with `SEEKTABLE` and metadata tags.
+
+### up next
+
+- [ ] `SIMD-0042` SIMD Windowed-Sinc Kaiser (bessel_i0) Polyphase Audio Resampler & Channel Matrix Mixer <sup>kernel · p0 · codec-audio</sup>
+- [ ] `SIMD-0043` SIMD EBU R128 (LUFS) K-Weighting Filter, Gated Loudness & True-Peak Normalizer <sup>kernel · p1 · codec-audio</sup>
+- [ ] `0044` Pure-Rust AAC-LC & Opus MDCT/IMDCT Audio Decoder and Encoder <sup>feature · p0 · codec-audio</sup>
+- [ ] `0045` Native Standalone .flac and .ogg Container Demuxers/Muxers with SEEKTABLE & Metadata Tags <sup>feature · p1 · format</sup>
+
+## m9-edit-image-package — Phase 9 — Smart-GOP Editing (cut/concat), Spatial Filters, PNG/JPEG & ABR Packaging (package)
+
+`··········` 0% · 0 of 4 done
+
+Introduce Ragdoll's opinionated workflow upgrades over FFmpeg: frame-accurate Smart-GOP `ragdoll cut` and `ragdoll concat` (re-encoding only boundary GOPs while zero-copy `mmap` stream-copying interior GOPs), pure-Rust `.png` and `.jpg` image I/O, fused L1 compositional filters (`crop`, `--auto-crop`, `pad`, `rotate`, `fps`, `overlay`, Oklab HDR-to-SDR `tonemap`), and one-command multi-rendition CMAF HLS & DASH ABR packaging (`ragdoll package`).
+
+### up next
+
+- [ ] `0046` Smart-GOP Frame-Accurate ragdoll cut & ragdoll concat Non-Linear Editing Engine <sup>feature · p0 · pipeline</sup>
+- [ ] `0047` Pure-Rust PNG & Baseline JPEG Image Decoders/Encoders for Thumbnails, Overlays & Image Sequences <sup>feature · p0 · format</sup>
+- [ ] `SIMD-0048` Fused L1 Compositional Video Filters: crop (--auto-crop), pad, rotate, fps, overlay & Oklab HDR-to-SDR tonemap <sup>kernel · p1 · pix</sup>
+- [ ] `0049` One-Command CMAF HLS (m3u8) & DASH (mpd) Multi-Rendition ABR Packager (ragdoll package) <sup>feature · p1 · pipeline</sup>
+
+## m10-production-v1 — Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
+
+`··········` 0% · 0 of 2 done
+
+Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic, zero-unsafe-required Rust library SDK (`ragdoll` crate / builder API), enforce a Zero-Panic Malformed Bitstream Guarantee across all container demuxers and codec decoders via deterministic mutation/fuzz corpus tests, and validate speed, perceptual quality, and E-core battery efficiency across a 12-workload benchmark suite against FFmpeg 9.0.2.
+
+### up next
+
+- [ ] `0050` Ergonomic ragdoll Rust Library SDK & Zero-Panic Malformed Bitstream Fuzz Corpus <sup>feature · p0 · arch</sup>
+- [ ] `BENCH-0051` 12-Workload Production v1.0 Benchmark Suite: Ragdoll vs. FFmpeg 9.0.2 (Speed, Quality & Battery Efficiency) <sup>benchmark · p0 · bench</sup>
+
