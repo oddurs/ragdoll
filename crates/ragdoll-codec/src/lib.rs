@@ -9,6 +9,7 @@
 //! - [`rgdi`]: Ragdoll Fast-Intra (`RGDI`) SIMD studio video codec sustaining > 300 fps 4K encode/decode on Apple M4.
 
 pub mod av1;
+pub mod cabac;
 pub mod flac;
 pub mod h264;
 pub mod pcm;
@@ -18,15 +19,17 @@ pub use av1::{
     Av1SequenceHeader, IvfHeader, ObuHeader, ObuPacket, ObuType, encode_obu, parse_ivf_stream,
     parse_obu_header, split_obus,
 };
+pub use cabac::{CabacContext, CabacDecoder, CabacEncoder, init_cabac_contexts};
 pub use flac::{
     FLAC_STREAM_MARKER, FlacChannelMode, FlacDecoder, FlacEncoder, FlacFrameHeader, FlacStreamInfo,
     compute_flac_pcm_md5_planar, md5_digest, parse_flac_stream_header,
 };
 pub use h264::{
-    H264Decoder, H264Encoder, NalHeader, NalUnitType, Pps, SeiMessage, SliceHeader, Sps,
-    decode_cavlc_block, dequantize_block4x4, encode_annex_b_nal, encode_cavlc_block,
-    parse_nal_rbsp, predict_intra_16x16, predict_intra_16x16_scalar, predict_intra_chroma_8x8,
-    predict_intra_chroma_8x8_scalar, quantize_block4x4, roundtrip_block4x4_dct,
+    H264Decoder, H264Encoder, H264Profile, NalHeader, NalUnitType, Pps, RateControlMode,
+    SeiMessage, SliceHeader, Sps, decode_cavlc_block, dequantize_block4x4, dequantize_block8x8,
+    encode_annex_b_nal, encode_cavlc_block, parse_nal_rbsp, predict_intra_16x16,
+    predict_intra_16x16_scalar, predict_intra_chroma_8x8, predict_intra_chroma_8x8_scalar,
+    quantize_block4x4, quantize_block8x8, roundtrip_block4x4_dct,
 };
 pub use pcm::{
     audio_frame_to_planar_i32, convert_audio_frame, decorrelate_mid_side_i32,
@@ -622,5 +625,479 @@ mod tests {
         }
         let _ = std::fs::remove_file(&tmp_h264);
         let _ = std::fs::remove_file(&tmp_yuv);
+    }
+
+    #[test]
+    fn h264_0039_full_residual_coding_qpel_and_ffmpeg_baseline_bit_exact() {
+        let w = 160usize;
+        let h = 96usize;
+        let num_frames = 8usize;
+
+        // 1. Generate natural moving multi-frequency video sequence with sub-pel motion
+        let mut raw_frames = Vec::with_capacity(num_frames);
+        let mut raw_yuv_bytes = Vec::new();
+        for f_idx in 0..num_frames {
+            let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
+            for y in 0..h {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    let sx = x + f_idx * 2;
+                    let sy = y + f_idx;
+                    let grad = ((sx * 3 + sy * 5) & 0xFF) as u16;
+                    let detail = (((sx ^ (sy * 3)) * 17) & 0x3F) as u16;
+                    *p = ((grad * 3 + detail) / 4).min(255) as u8;
+                }
+                raw_yuv_bytes.extend_from_slice(f.plane(0).row(y));
+            }
+            for y in 0..h / 2 {
+                for x in 0..w / 2 {
+                    f.plane_mut(1).row_mut(y)[x] = (110 + ((x + y + f_idx) * 3) % 40) as u8;
+                    f.plane_mut(2).row_mut(y)[x] = (145 - ((x + y + f_idx) * 3) % 40) as u8;
+                }
+            }
+            for y in 0..h / 2 {
+                raw_yuv_bytes.extend_from_slice(f.plane(1).row(y));
+            }
+            for y in 0..h / 2 {
+                raw_yuv_bytes.extend_from_slice(f.plane(2).row(y));
+            }
+            raw_frames.push(f);
+        }
+
+        // 2. Encode with H264Encoder at QP=22 (0% I_PCM macroblocks, >3x smaller than v0.1.0 raw/I_PCM size)
+        let mut enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 22);
+        enc.keyint = 4; // Multi-GOP (2 GOPs across 8 frames)
+        let mut dec = H264Decoder::new();
+        let mut ragdoll_stream = Vec::new();
+        let mut ragdoll_dec_frames = Vec::new();
+        for f in &raw_frames {
+            let pkt = enc.encode_frame(f).unwrap();
+            let df = dec.decode_annex_b_packet(&pkt).unwrap().unwrap();
+            let q = evaluate_frame_quality(f, &df, None);
+            assert!(
+                q.psnr_y > 34.0,
+                "expected H264Encoder QP=22 luma PSNR > 34 dB, got {:.2} dB",
+                q.psnr_y
+            );
+            ragdoll_stream.extend_from_slice(&pkt);
+            ragdoll_dec_frames.push(df);
+        }
+        let v010_ipcm_bytes = w * h * 3 / 2 * num_frames;
+        assert!(
+            ragdoll_stream.len() * 3 < v010_ipcm_bytes,
+            "expected H264Encoder stream ({} B) to be >3x smaller than v0.1.0 I_PCM ({} B)",
+            ragdoll_stream.len(),
+            v010_ipcm_bytes
+        );
+
+        // 3. Verify Ragdoll -> FFmpeg decoding bit-exactness across multi-GOP moving video
+        let tmp_dir = std::env::temp_dir();
+        let rag_h264_path = tmp_dir.join("ragdoll_0039_out.h264");
+        let rag_ff_yuv_path = tmp_dir.join("ragdoll_0039_ff_dec.yuv");
+        std::fs::write(&rag_h264_path, &ragdoll_stream).unwrap();
+        let st_rag = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                rag_h264_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                rag_ff_yuv_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            st_rag.success(),
+            "ffmpeg failed to decode Ragdoll H.264 stream"
+        );
+        let ff_dec_bytes = std::fs::read(&rag_ff_yuv_path).unwrap();
+        let frame_bytes = w * h * 3 / 2;
+        assert_eq!(ff_dec_bytes.len(), frame_bytes * num_frames);
+        for (f_idx, df) in ragdoll_dec_frames.iter().enumerate() {
+            let ff_slice = &ff_dec_bytes[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
+            for y in 0..h {
+                assert_eq!(
+                    df.plane(0).row(y),
+                    &ff_slice[y * w..(y + 1) * w],
+                    "Ragdoll vs FFmpeg Y row {y} mismatch on frame {f_idx}"
+                );
+            }
+        }
+
+        // 4. Verify FFmpeg (`libx264 -profile:v baseline` with I_4x4, I_16x16, P_L0_16x16, P_8x8) -> Ragdoll bit-exact!
+        let raw_in_path = tmp_dir.join("ragdoll_0039_in.yuv");
+        let x264_h264_path = tmp_dir.join("ragdoll_0039_x264_base.h264");
+        let x264_ff_yuv_path = tmp_dir.join("ragdoll_0039_x264_ff.yuv");
+        std::fs::write(&raw_in_path, &raw_yuv_bytes).unwrap();
+        let st_x264 = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s:v",
+                &format!("{w}x{h}"),
+                "-r",
+                "30",
+                "-i",
+                raw_in_path.to_str().unwrap(),
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "baseline",
+                "-x264-params",
+                "qp=22:keyint=4:min-keyint=4:scenecut=0:ref=1:deblock=0,0",
+                "-f",
+                "h264",
+                x264_h264_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st_x264.success(), "ffmpeg libx264 baseline encode failed");
+
+        let st_x264_dec = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                x264_h264_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                x264_ff_yuv_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st_x264_dec.success());
+
+        let x264_stream = std::fs::read(&x264_h264_path).unwrap();
+        let x264_ff_yuv = std::fs::read(&x264_ff_yuv_path).unwrap();
+        let mut rag_dec = H264Decoder::new();
+        let rag_frames = rag_dec.decode_stream_pts_ordered(&x264_stream).unwrap();
+        assert_eq!(rag_frames.len(), num_frames);
+        for (f_idx, rf) in rag_frames.iter().enumerate() {
+            let ff_slice = &x264_ff_yuv[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
+            for y in 0..h {
+                assert_eq!(
+                    rf.plane(0).row(y),
+                    &ff_slice[y * w..(y + 1) * w],
+                    "libx264 Baseline Y mismatch at frame {f_idx} row {y}"
+                );
+            }
+            let u_off = w * h;
+            let v_off = u_off + (w / 2) * (h / 2);
+            for y in 0..h / 2 {
+                assert_eq!(
+                    rf.plane(1).row(y),
+                    &ff_slice[u_off + y * (w / 2)..u_off + (y + 1) * (w / 2)],
+                    "libx264 Baseline U mismatch at frame {f_idx} row {y}"
+                );
+                assert_eq!(
+                    rf.plane(2).row(y),
+                    &ff_slice[v_off + y * (w / 2)..v_off + (y + 1) * (w / 2)],
+                    "libx264 Baseline V mismatch at frame {f_idx} row {y}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&rag_h264_path);
+        let _ = std::fs::remove_file(&rag_ff_yuv_path);
+        let _ = std::fs::remove_file(&raw_in_path);
+        let _ = std::fs::remove_file(&x264_h264_path);
+        let _ = std::fs::remove_file(&x264_ff_yuv_path);
+    }
+
+    #[test]
+    fn h264_0040_main_and_high_cabac_8x8_transform_and_b_frame_pts_reordering() {
+        let w = 160usize;
+        let h = 96usize;
+        let num_frames = 6usize;
+
+        let mut frames = Vec::with_capacity(num_frames);
+        let mut raw_yuv_bytes = Vec::new();
+        for f_idx in 0..num_frames {
+            let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
+            for y in 0..h {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    let sx = x + f_idx * 2;
+                    let sy = y + f_idx;
+                    let v = (40 + ((sx * 2 + sy) % 140) + (((sx / 4) ^ (sy / 4)) & 7) * 3).min(235);
+                    *p = v as u8;
+                }
+                raw_yuv_bytes.extend_from_slice(f.plane(0).row(y));
+            }
+            for y in 0..h / 2 {
+                for x in 0..w / 2 {
+                    f.plane_mut(1).row_mut(y)[x] = (120 + ((x + y + f_idx) % 24)) as u8;
+                    f.plane_mut(2).row_mut(y)[x] = (135 - ((x + y + f_idx) % 24)) as u8;
+                }
+            }
+            for y in 0..h / 2 {
+                raw_yuv_bytes.extend_from_slice(f.plane(1).row(y));
+            }
+            for y in 0..h / 2 {
+                raw_yuv_bytes.extend_from_slice(f.plane(2).row(y));
+            }
+            frames.push(f);
+        }
+
+        // 1. Compare Baseline (CAVLC) vs Main (CABAC) vs High (CABAC + 8x8 transform)
+        let mut enc_base = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 24)
+            .with_profile(H264Profile::Baseline);
+        let mut enc_main = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 24)
+            .with_profile(H264Profile::Main);
+        let mut enc_high = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 24)
+            .with_profile(H264Profile::High);
+
+        let mut stream_base = Vec::new();
+        let mut stream_main = Vec::new();
+        let mut stream_high = Vec::new();
+        for f in &frames {
+            stream_base.extend_from_slice(&enc_base.encode_frame(f).unwrap());
+            stream_main.extend_from_slice(&enc_main.encode_frame(f).unwrap());
+            stream_high.extend_from_slice(&enc_high.encode_frame(f).unwrap());
+        }
+
+        // CABAC Main profile must reduce bitrate vs CAVLC Baseline at identical QP & reconstruction!
+        let savings_pct = (1.0 - (stream_main.len() as f64) / (stream_base.len() as f64)) * 100.0;
+        println!(
+            "H.264 Baseline={} B, Main (CABAC)={} B ({:.1}% smaller), High (CABAC+8x8)={} B",
+            stream_base.len(),
+            stream_main.len(),
+            savings_pct,
+            stream_high.len()
+        );
+        assert!(
+            savings_pct >= 10.0,
+            "expected CABAC Main ({} B) to achieve >= 10% savings vs CAVLC Baseline ({} B), got {:.1}%",
+            stream_main.len(),
+            stream_base.len(),
+            savings_pct
+        );
+
+        let mut dec_main = H264Decoder::new();
+        let recon_main = dec_main.decode_stream_pts_ordered(&stream_main).unwrap();
+        assert_eq!(recon_main.len(), num_frames);
+
+        let mut dec_high = H264Decoder::new();
+        let recon_high = dec_high.decode_stream_pts_ordered(&stream_high).unwrap();
+        assert_eq!(recon_high.len(), num_frames);
+
+        // Verify FFmpeg decodes our CABAC Main and High profile streams cleanly
+        let tmp_dir = std::env::temp_dir();
+        for (tag, bytes) in [("main", &stream_main), ("high", &stream_high)] {
+            let p_h264 = tmp_dir.join(format!("ragdoll_0040_{tag}.h264"));
+            let p_yuv = tmp_dir.join(format!("ragdoll_0040_{tag}.yuv"));
+            std::fs::write(&p_h264, bytes).unwrap();
+            let st = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    p_h264.to_str().unwrap(),
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    p_yuv.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(
+                st.success(),
+                "ffmpeg failed to decode Ragdoll {tag} CABAC stream"
+            );
+            let yuv = std::fs::read(&p_yuv).unwrap();
+            assert_eq!(yuv.len(), w * h * 3 / 2 * num_frames);
+            let _ = std::fs::remove_file(&p_h264);
+            let _ = std::fs::remove_file(&p_yuv);
+        }
+
+        // 2. Decode High Profile CABAC + 8x8 transform + B-frames produced by `ffmpeg -c:v libx264 -profile:v high`
+        let in_yuv = tmp_dir.join("ragdoll_0040_in.yuv");
+        let high_h264 = tmp_dir.join("ragdoll_0040_x264_high.h264");
+        std::fs::write(&in_yuv, &raw_yuv_bytes).unwrap();
+        let st_high = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s:v",
+                &format!("{w}x{h}"),
+                "-r",
+                "30",
+                "-i",
+                in_yuv.to_str().unwrap(),
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-x264-params",
+                "qp=22:bframes=2:b-adapt=0:ref=2:8x8dct=1:cabac=1",
+                "-f",
+                "h264",
+                high_h264.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st_high.success());
+        let high_bytes = std::fs::read(&high_h264).unwrap();
+        let mut x264_high_dec = H264Decoder::new();
+        let ordered_frames = x264_high_dec
+            .decode_stream_pts_ordered(&high_bytes)
+            .unwrap();
+        assert_eq!(ordered_frames.len(), num_frames);
+        for i in 1..ordered_frames.len() {
+            assert!(
+                ordered_frames[i].pts.ticks > ordered_frames[i - 1].pts.ticks,
+                "PTS must be strictly monotonic after DPB reordering"
+            );
+        }
+        let _ = std::fs::remove_file(&in_yuv);
+        let _ = std::fs::remove_file(&high_h264);
+    }
+
+    #[test]
+    fn h264_0041_crf_vaq_perceptual_gain_and_vbv_abr_1080p_rate_control() {
+        // 1. Compare CRF + VAQ vs Fixed QP on mixed flat/structural + high-energy scene
+        let w = 320usize;
+        let h = 192usize;
+        let mut frames = Vec::new();
+        for f_idx in 0..6usize {
+            let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
+            for y in 0..h {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    if y < h / 2 {
+                        // Subtle structural gradient region (sensitive to quantization banding)
+                        *p = (80 + ((x + y + f_idx * 2) / 3) % 48) as u8;
+                    } else {
+                        // High-variance complex texture region (strong visual masking)
+                        *p = ((((x * 37) ^ (y * 53) ^ (f_idx * 19)) + x * 7) & 0xFF) as u8;
+                    }
+                }
+            }
+            for y in 0..h / 2 {
+                f.plane_mut(1).row_mut(y).fill(128);
+                f.plane_mut(2).row_mut(y).fill(128);
+            }
+            frames.push(f);
+        }
+
+        let mut enc_crf = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 23)
+            .with_profile(H264Profile::Main)
+            .with_rate_control(RateControlMode::Crf {
+                crf: 23.0,
+                maxrate_kbps: None,
+                bufsize_kb: None,
+            });
+        let mut dec_crf = H264Decoder::new();
+        let mut crf_bytes = 0usize;
+        let mut crf_msssim_sum = 0.0f64;
+        for f in &frames {
+            let pkt = enc_crf.encode_frame(f).unwrap();
+            crf_bytes += pkt.len();
+            let rf = dec_crf.decode_annex_b_packet(&pkt).unwrap().unwrap();
+            let q = evaluate_frame_quality(f, &rf, None);
+            crf_msssim_sum += q.ms_ssim;
+        }
+        let crf_msssim = crf_msssim_sum / (frames.len() as f64);
+        let crf_db = -10.0 * (1.0 - crf_msssim.min(0.999999)).log10();
+
+        // Find the Fixed QP that uses the same (or slightly higher) average bitrate as CRF 23
+        let mut best_fixed_qp = 25u8;
+        let mut qp_bytes = 0usize;
+        let mut qp_msssim = 0.0f64;
+        for cand_qp in 18..=40u8 {
+            let mut enc_qp = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, cand_qp)
+                .with_profile(H264Profile::Main);
+            let mut dec_qp = H264Decoder::new();
+            let mut bytes = 0usize;
+            let mut msssim_sum = 0.0f64;
+            for f in &frames {
+                let pkt = enc_qp.encode_frame(f).unwrap();
+                bytes += pkt.len();
+                let rf = dec_qp.decode_annex_b_packet(&pkt).unwrap().unwrap();
+                let q = evaluate_frame_quality(f, &rf, None);
+                msssim_sum += q.ms_ssim;
+            }
+            best_fixed_qp = cand_qp;
+            qp_bytes = bytes;
+            qp_msssim = msssim_sum / (frames.len() as f64);
+            if bytes <= crf_bytes {
+                break;
+            }
+        }
+        let qp_db = -10.0 * (1.0 - qp_msssim.min(0.999999)).log10();
+        println!(
+            "CRF 23 ({} B): MS-SSIM={:.5} ({:.2} dB) vs Fixed QP {} ({} B): MS-SSIM={:.5} ({:.2} dB)",
+            crf_bytes, crf_msssim, crf_db, best_fixed_qp, qp_bytes, qp_msssim, qp_db
+        );
+        assert!(
+            crf_db >= qp_db + 1.0,
+            "expected CRF+VAQ MS-SSIM dB ({crf_db:.2}) >= Fixed QP ({qp_db:.2}) + 1.0 dB"
+        );
+
+        // 2. Verify 1080p ABR + VBV (`--bitrate 2M --maxrate 3M`) constrains output bitrate within +-5% of target
+        let w1080 = 1920usize;
+        let h1080 = 1080usize;
+        let fps = 30u32;
+        let n_1080 = 10usize;
+        let mut enc_abr = H264Encoder::new(
+            w1080 as u32,
+            h1080 as u32,
+            Rational64::new(fps as i64, 1),
+            26,
+        )
+        .with_profile(H264Profile::Main)
+        .with_rate_control(RateControlMode::Abr {
+            bitrate_kbps: 2000,
+            maxrate_kbps: Some(3000),
+            bufsize_kb: Some(4000),
+        });
+        let mut total_bytes = 0usize;
+        for f_idx in 0..n_1080 {
+            let mut f = VideoFrame::new(w1080, h1080, PixelFormat::Yuv420p);
+            for y in 0..h1080 {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    *p = (((x + y + f_idx * 4) * 3) & 0xFF) as u8;
+                }
+            }
+            for y in 0..h1080 / 2 {
+                f.plane_mut(1).row_mut(y).fill(128);
+                f.plane_mut(2).row_mut(y).fill(128);
+            }
+            let pkt = enc_abr.encode_frame(&f).unwrap();
+            total_bytes += pkt.len();
+        }
+        let duration_sec = (n_1080 as f64) / (fps as f64);
+        let actual_kbps = ((total_bytes * 8) as f64) / 1000.0 / duration_sec;
+        let rel_err = ((actual_kbps - 2000.0) / 2000.0).abs();
+        println!(
+            "1080p ABR target=2000 kbps, actual={:.1} kbps (err={:.2}%)",
+            actual_kbps,
+            rel_err * 100.0
+        );
+        assert!(
+            rel_err <= 0.05,
+            "expected 1080p ABR bitrate within +-5% of 2000 kbps, got {actual_kbps:.1} kbps ({:.2}%)",
+            rel_err * 100.0
+        );
     }
 }

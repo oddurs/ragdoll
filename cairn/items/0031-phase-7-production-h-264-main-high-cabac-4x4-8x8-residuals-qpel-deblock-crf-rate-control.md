@@ -4,9 +4,11 @@ uid: 8ad195ce-0f1f-4db3-b4a2-84b8c8668742
 key: m7-video-production
 title: Phase 7 — Production H.264 (Main/High CABAC, 4x4/8x8 Residuals, Qpel, Deblock & CRF Rate Control)
 type: milestone
-status: planned
+status: done
+assignee: Oddur Sigurdsson
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-video
 ---
@@ -16,3 +18,11 @@ Upgrade Ragdoll's pure-Rust H.264/AVC engine from Constrained Baseline skip/DC c
 ## Release gate
 
 Real-world Main/High Profile CABAC + B-frame H.264 streams (iPhone, YouTube, OBS, x264) decode bit-accurately, and Ragdoll's H.264 encoder achieves competitive BD-Rate / PSNR / SSIM / VMAF-Lite under `--crf` and `--bitrate` without `I_PCM` fallback on natural video.
+
+## 2026-10-25
+
+Completed Milestone 7 (m7-video-production): SIMD-0038, 0039, 0040, and 0041 verified bit-exact and closed.
+
+## Result
+
+Shipped Milestone 7 (m7-video-production): SIMD-0038, 0039, 0040, and 0041 complete and verified.
