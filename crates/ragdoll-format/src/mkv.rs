@@ -975,6 +975,8 @@ impl<'a> MkvMuxer<'a> {
         let mut cues_body = Vec::new();
         let mut cluster_rel_offset = tracks_rel_offset + (tracks_elem.len() as u64);
 
+        let mut tn_vint = Vec::with_capacity(8);
+        let mut sb_sz_vint = Vec::with_capacity(8);
         for c in &mut clusters {
             let mut ts_elem = Vec::with_capacity(12);
             Self::push_uint(&mut ts_elem, ID_TIMESTAMP, c.cluster_ts_ms as u64);
@@ -983,10 +985,10 @@ impl<'a> MkvMuxer<'a> {
             let mut logged_cue = false;
 
             for &(track_num, _rel_ts, _flags, data, is_video_kf) in &c.blocks {
-                let mut tn_vint = Vec::with_capacity(8);
+                tn_vint.clear();
                 write_ebml_vint(track_num, &mut tn_vint);
                 let sb_payload_len = tn_vint.len() + 3 + data.len();
-                let mut sb_sz_vint = Vec::with_capacity(8);
+                sb_sz_vint.clear();
                 write_ebml_vint(sb_payload_len as u64, &mut sb_sz_vint);
                 cluster_payload_len += 1 + sb_sz_vint.len() + sb_payload_len;
 
@@ -1042,26 +1044,37 @@ impl<'a> MkvMuxer<'a> {
             &tracks_elem,
         ])?;
 
-        // 7. Stream each Cluster and its SimpleBlock payloads zero-copy via vectored I/O
-        let mut sb_hdr = Vec::with_capacity(24);
+        // 7. Stream each Cluster and all of its SimpleBlock payloads in a single batched `writev` call per Cluster!
+        let mut sb_hdr_arena = Vec::new();
+        let mut hdr_ranges = Vec::new();
+
         for c in &clusters {
-            vw.write_all_counted(&c.header_bytes)?;
+            sb_hdr_arena.clear();
+            hdr_ranges.clear();
+            sb_hdr_arena.reserve(c.blocks.len() * 16);
+
             for &(track_num, rel_ts, flags, data, _) in &c.blocks {
-                sb_hdr.clear();
-                Self::push_id(&mut sb_hdr, ID_SIMPLE_BLOCK);
-                let mut tn_vint = [0u8; 8];
-                let mut tn_vec = Vec::with_capacity(8);
-                write_ebml_vint(track_num, &mut tn_vec);
-                tn_vint[..tn_vec.len()].copy_from_slice(&tn_vec);
+                let start = sb_hdr_arena.len();
+                Self::push_id(&mut sb_hdr_arena, ID_SIMPLE_BLOCK);
+                tn_vint.clear();
+                write_ebml_vint(track_num, &mut tn_vint);
 
-                let sb_payload_len = tn_vec.len() + 3 + data.len();
-                write_ebml_vint(sb_payload_len as u64, &mut sb_hdr);
-                sb_hdr.extend_from_slice(&tn_vint[..tn_vec.len()]);
-                sb_hdr.extend_from_slice(&rel_ts.to_be_bytes());
-                sb_hdr.push(flags);
-
-                vw.write_vectored_all(&[&sb_hdr, data])?;
+                let sb_payload_len = tn_vint.len() + 3 + data.len();
+                write_ebml_vint(sb_payload_len as u64, &mut sb_hdr_arena);
+                sb_hdr_arena.extend_from_slice(&tn_vint);
+                sb_hdr_arena.extend_from_slice(&rel_ts.to_be_bytes());
+                sb_hdr_arena.push(flags);
+                let end = sb_hdr_arena.len();
+                hdr_ranges.push(start..end);
             }
+
+            let mut cluster_slices = Vec::with_capacity(1 + c.blocks.len() * 2);
+            cluster_slices.push(c.header_bytes.as_slice());
+            for (i, &(_, _, _, data, _)) in c.blocks.iter().enumerate() {
+                cluster_slices.push(&sb_hdr_arena[hdr_ranges[i].clone()]);
+                cluster_slices.push(data);
+            }
+            vw.write_vectored_all(&cluster_slices)?;
         }
 
         if !cues_elem.is_empty() {
