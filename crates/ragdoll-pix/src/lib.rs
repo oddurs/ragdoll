@@ -10,17 +10,21 @@ pub mod metrics;
 pub mod scale;
 
 pub use color::{
-    OklabColor, YuvRgbMatrix, convert_frame, convert_frame_into, oklab_row_to_rgb24,
-    rgb24_row_to_oklab, rgb24_to_yuv420p, rgb24_to_yuv420p_scalar, upsample_chroma_420_to_444,
-    yuv420p_to_rgb24, yuv420p_to_rgb24_scalar, yuv420p_to_rgba8,
+    BAYER_TABLE_16X16, OklabColor, YuvRgbMatrix, convert_frame, convert_frame_into,
+    dither_plane_u16le_to_u8_bayer, dither_plane_u16le_to_u8_bayer_scalar, nv12_to_rgb24,
+    nv12_to_rgb24_scalar, oklab_row_to_rgb24, rgb24_row_to_oklab, rgb24_to_yuv420p,
+    rgb24_to_yuv420p_scalar, upsample_chroma_420_to_444, yuv420p_to_bgra8, yuv420p_to_bgra8_scalar,
+    yuv420p_to_rgb24, yuv420p_to_rgb24_scalar, yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
 };
 pub use metrics::{
-    QualityReport, evaluate_frame_quality, psnr_plane_u8, ssim_plane_u8, vmaf_lite_plane_u8,
+    MS_SSIM_WEIGHTS, QualityReport, decimate_2x2_u8, decimate_2x2_u8_scalar,
+    evaluate_frame_quality, ms_ssim_plane_u8, psnr_plane_u8, ssim_plane_u8, vmaf_lite_plane_u8,
 };
 pub use scale::{
-    PolyphaseFilterBank, ScaleFilter, hscale_row_8tap_q14, hscale_row_8tap_q14_scalar, scale_frame,
-    scale_frame_into, scale_plane, scale_plane_with_banks, vscale_row_8tap_q14,
-    vscale_row_8tap_q14_scalar,
+    PolyphaseFilterBank, ScaleFilter, hscale_row_8tap_q14, hscale_row_8tap_q14_scalar,
+    hscale_row_8tap_q14_to_q6, hscale_row_8tap_q14_to_q6_scalar, scale_frame, scale_frame_into,
+    scale_plane, scale_plane_with_banks, vscale_row_8tap_q6_to_u8, vscale_row_8tap_q6_to_u8_scalar,
+    vscale_row_8tap_q14, vscale_row_8tap_q14_scalar,
 };
 
 #[cfg(test)]
@@ -261,6 +265,205 @@ mod tests {
         let expected_psnr = 10.0 * (255.0f64 * 255.0).log10();
         assert!((rep.psnr_y - expected_psnr).abs() < 1e-6);
         assert!(rep.ssim_y > 0.99 && rep.ssim_y <= 1.0);
+        assert!(rep.ms_ssim > 0.99 && rep.ms_ssim <= 1.0);
         assert!(rep.vmaf_lite > 90.0 && rep.vmaf_lite < 100.0);
+    }
+
+    #[test]
+    fn rgba8_bgra8_nv12_and_bayer_10bit_dither_neon_vs_scalar() {
+        let mat = YuvRgbMatrix::from_colorimetry(MatrixCoefficients::BT709, ColorRange::Limited);
+        for &(w, h) in &[(16usize, 8usize), (33, 19), (50, 27)] {
+            let cw = w.div_ceil(2);
+            let ch = h.div_ceil(2);
+            let y_stride = (w + 63) & !63;
+            let c_stride = (cw + 63) & !63;
+            let uv_stride = (cw * 2 + 63) & !63;
+            let rgba_stride = (w * 4 + 63) & !63;
+            let rgb_stride = (w * 3 + 63) & !63;
+
+            let mut y_p = vec![0u8; y_stride * h];
+            let mut u_p = vec![128u8; c_stride * ch];
+            let mut v_p = vec![128u8; c_stride * ch];
+            let mut uv_p = vec![128u8; uv_stride * ch];
+
+            for y in 0..h {
+                for x in 0..w {
+                    y_p[y * y_stride + x] = ((x * 31 + y * 17 + 20) % 210 + 16) as u8;
+                }
+            }
+            for cy in 0..ch {
+                for cx in 0..cw {
+                    let u = ((cx * 23 + cy * 41 + 30) % 190 + 24) as u8;
+                    let v = ((cx * 47 + cy * 13 + 30) % 190 + 24) as u8;
+                    u_p[cy * c_stride + cx] = u;
+                    v_p[cy * c_stride + cx] = v;
+                    uv_p[cy * uv_stride + cx * 2] = u;
+                    uv_p[cy * uv_stride + cx * 2 + 1] = v;
+                }
+            }
+
+            let mut rgba_simd = vec![0u8; rgba_stride * h];
+            let mut rgba_ref = vec![0u8; rgba_stride * h];
+            yuv420p_to_rgba8(
+                &y_p,
+                y_stride,
+                &u_p,
+                c_stride,
+                &v_p,
+                c_stride,
+                &mut rgba_simd,
+                rgba_stride,
+                w,
+                h,
+                &mat,
+            );
+            yuv420p_to_rgba8_scalar(
+                &y_p,
+                y_stride,
+                &u_p,
+                c_stride,
+                &v_p,
+                c_stride,
+                &mut rgba_ref,
+                rgba_stride,
+                w,
+                h,
+                &mat,
+            );
+            assert_eq!(rgba_simd, rgba_ref, "RGBA8 NEON vs scalar mismatch {w}x{h}");
+
+            let mut bgra_simd = vec![0u8; rgba_stride * h];
+            let mut bgra_ref = vec![0u8; rgba_stride * h];
+            yuv420p_to_bgra8(
+                &y_p,
+                y_stride,
+                &u_p,
+                c_stride,
+                &v_p,
+                c_stride,
+                &mut bgra_simd,
+                rgba_stride,
+                w,
+                h,
+                &mat,
+            );
+            yuv420p_to_bgra8_scalar(
+                &y_p,
+                y_stride,
+                &u_p,
+                c_stride,
+                &v_p,
+                c_stride,
+                &mut bgra_ref,
+                rgba_stride,
+                w,
+                h,
+                &mat,
+            );
+            assert_eq!(bgra_simd, bgra_ref, "BGRA8 NEON vs scalar mismatch {w}x{h}");
+
+            let mut nv12_rgb_simd = vec![0u8; rgb_stride * h];
+            let mut nv12_rgb_ref = vec![0u8; rgb_stride * h];
+            nv12_to_rgb24(
+                &y_p,
+                y_stride,
+                &uv_p,
+                uv_stride,
+                &mut nv12_rgb_simd,
+                rgb_stride,
+                w,
+                h,
+                &mat,
+            );
+            nv12_to_rgb24_scalar(
+                &y_p,
+                y_stride,
+                &uv_p,
+                uv_stride,
+                &mut nv12_rgb_ref,
+                rgb_stride,
+                w,
+                h,
+                &mat,
+            );
+            assert_eq!(
+                nv12_rgb_simd, nv12_rgb_ref,
+                "NV12->RGB24 NEON vs scalar mismatch {w}x{h}"
+            );
+
+            // 10-bit Bayer dither NEON vs scalar differential check
+            let s16_stride = (w * 2 + 63) & !63;
+            let mut src_10bit = vec![0u8; s16_stride * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let v10 = ((x * 13 + y * 29 + 500) % 1024) as u16;
+                    let bytes = v10.to_le_bytes();
+                    src_10bit[y * s16_stride + x * 2] = bytes[0];
+                    src_10bit[y * s16_stride + x * 2 + 1] = bytes[1];
+                }
+            }
+            let mut dither_simd = vec![0u8; y_stride * h];
+            let mut dither_ref = vec![0u8; y_stride * h];
+            dither_plane_u16le_to_u8_bayer(
+                &src_10bit,
+                s16_stride,
+                &mut dither_simd,
+                y_stride,
+                w,
+                h,
+                10,
+            );
+            dither_plane_u16le_to_u8_bayer_scalar(
+                &src_10bit,
+                s16_stride,
+                &mut dither_ref,
+                y_stride,
+                w,
+                h,
+                10,
+            );
+            assert_eq!(
+                dither_simd, dither_ref,
+                "10-bit Bayer dither NEON vs scalar mismatch {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn spline36_and_q6_intermediate_vscale_neon_vs_scalar() {
+        for filter in [ScaleFilter::Spline36, ScaleFilter::Lanczos3] {
+            let bank = PolyphaseFilterBank::new(67, 43, filter);
+            let mut src_row = vec![0u8; 128];
+            for (i, b) in src_row.iter_mut().enumerate() {
+                *b = ((i * 53 + 17) & 0xFF) as u8;
+            }
+            let mut q6_simd = vec![0i16; 43];
+            let mut q6_ref = vec![0i16; 43];
+            hscale_row_8tap_q14_to_q6(&src_row, &mut q6_simd, &bank);
+            hscale_row_8tap_q14_to_q6_scalar(&src_row, &mut q6_ref, &bank);
+            assert_eq!(q6_simd, q6_ref, "Q6 hscale NEON vs scalar mismatch");
+
+            let v_rows = [&q6_simd[..]; 8];
+            let mut v_simd = vec![0u8; 43];
+            let mut v_ref = vec![0u8; 43];
+            vscale_row_8tap_q6_to_u8(v_rows, &bank.weights[0], &mut v_simd, 43);
+            vscale_row_8tap_q6_to_u8_scalar(v_rows, &bank.weights[0], &mut v_ref, 43);
+            assert_eq!(v_simd, v_ref, "Q6->u8 vscale NEON vs scalar mismatch");
+        }
+    }
+
+    #[test]
+    fn decimate_2x2_and_ms_ssim_neon_vs_scalar() {
+        let w = 70usize;
+        let h = 50usize;
+        let mut src = vec![0u8; w * h];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        let mut dec_simd = vec![0u8; (w / 2) * (h / 2)];
+        let mut dec_ref = vec![0u8; (w / 2) * (h / 2)];
+        decimate_2x2_u8(&src, w, &mut dec_simd, w / 2, w, h);
+        decimate_2x2_u8_scalar(&src, w, &mut dec_ref, w / 2, w, h);
+        assert_eq!(dec_simd, dec_ref, "decimate_2x2 NEON vs scalar mismatch");
     }
 }

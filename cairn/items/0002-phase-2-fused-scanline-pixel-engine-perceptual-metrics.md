@@ -20,4 +20,4 @@ Fused 4K-to-1080p YUV420p Lanczos-3 downscaling + RGB conversion and SIMD SSIM/P
 
 ## Result
 
-Completed Milestone 2 (M2 — Fused Scanline Pixel Engine & Perceptual Metrics): `SIMD-0012` (YUV<->RGB/Oklab at 5.17-5.96 Gpx/s), `SIMD-0013` (4K->1080p Lanczos-3 L1 ring-buffer resampler at 451.8 fps), and `SIMD-0014` (`PSNR`, `SSIM`, `VMAF-Lite`), passing 32 release tests.
+Completed m2-pix milestone including reference hardening against libswscale, zimg, libyuv, and libvmaf.

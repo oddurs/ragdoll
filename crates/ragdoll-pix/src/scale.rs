@@ -22,6 +22,8 @@ pub enum ScaleFilter {
     Bilinear,
     /// 4-tap Mitchell-Netravali bicubic spline ($B = 1/3, C = 1/3$).
     MitchellNetravali,
+    /// 6-tap piecewise cubic `Spline36` mastering filter (`zimg` / `zscale`).
+    Spline36,
     /// 6-tap / 8-tap windowed sinc Lanczos-3 ($a = 3$).
     #[default]
     Lanczos3,
@@ -33,6 +35,7 @@ impl ScaleFilter {
         match self {
             Self::Bilinear => 1.0,
             Self::MitchellNetravali => 2.0,
+            Self::Spline36 => 3.0,
             Self::Lanczos3 => 3.0,
         }
     }
@@ -54,6 +57,20 @@ impl ScaleFilter {
                     (7.0 * ax * ax * ax - 12.0 * ax * ax + 16.0 / 3.0) / 6.0
                 } else if ax < 2.0 {
                     (-7.0 / 3.0 * ax * ax * ax + 12.0 * ax * ax - 20.0 * ax + 32.0 / 3.0) / 6.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Spline36 => {
+                // Exact `zimg::resize::Spline36Filter` polynomials
+                if ax < 1.0 {
+                    1.0 + ax * (-3.0 / 209.0 + ax * (-453.0 / 209.0 + ax * (13.0 / 11.0)))
+                } else if ax < 2.0 {
+                    let t = ax - 1.0;
+                    t * (-156.0 / 209.0 + t * (270.0 / 209.0 + t * (-6.0 / 11.0)))
+                } else if ax < 3.0 {
+                    let t = ax - 2.0;
+                    t * (26.0 / 209.0 + t * (-45.0 / 209.0 + t * (1.0 / 11.0)))
                 } else {
                     0.0
                 }
@@ -127,9 +144,14 @@ impl PolyphaseFilterBank {
             let mut max_abs = -1.0f64;
 
             if sum_f64.abs() > 1e-12 {
+                // Error-diffusion coefficient quantization (`zimg::resize::matrix_to_filter`)
+                // preserves the sub-pixel phase center of mass across the 8 taps.
+                let mut i16_err = 0.0f64;
                 for (slot, &wf) in folded_f64.iter().enumerate() {
                     let norm = wf / sum_f64;
-                    let q = (norm * (Q14_ONE as f64)).round() as i16;
+                    let expected_i16 = norm * (Q14_ONE as f64) - i16_err;
+                    let q = expected_i16.round().clamp(-32768.0, 32767.0) as i16;
+                    i16_err = (q as f64) - expected_i16;
                     q14_taps[slot] = q;
                     q14_sum += q as i32;
                     if norm.abs() > max_abs {
@@ -137,7 +159,7 @@ impl PolyphaseFilterBank {
                         max_slot = slot;
                     }
                 }
-                // Fold exact integer rounding residual into the dominant center tap so sum == 16384
+                // Fold final <= 1 LSB residual into the dominant center tap so sum == 16384
                 let diff = Q14_ONE - q14_sum;
                 q14_taps[max_slot] = (q14_taps[max_slot] as i32 + diff) as i16;
             } else {
@@ -196,22 +218,26 @@ pub fn hscale_row_8tap_q14_scalar(src_row: &[u8], dst_row: &mut [u8], bank: &Pol
 unsafe fn hscale_row_8tap_q14_neon(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseFilterBank) {
     use std::arch::aarch64::*;
     let dst_len = bank.dst_len;
+    assert!(dst_row.len() >= dst_len);
+    assert!(bank.win_starts.len() >= dst_len && bank.weights.len() >= dst_len);
+
     let src_ptr = src_row.as_ptr();
-    let starts = &bank.win_starts;
-    let weights = &bank.weights;
+    let dst_ptr = dst_row.as_mut_ptr();
+    let starts_ptr = bank.win_starts.as_ptr();
+    let weights_ptr = bank.weights.as_ptr();
     let mut x = 0usize;
 
-    // Process 4 output pixels per iteration using libswscale hscale.S's 2-stage `vpaddq_s32` reduction
-    while x + 4 <= dst_len {
-        let s0 = unsafe { vld1_u8(src_ptr.add(starts[x])) };
-        let s1 = unsafe { vld1_u8(src_ptr.add(starts[x + 1])) };
-        let s2 = unsafe { vld1_u8(src_ptr.add(starts[x + 2])) };
-        let s3 = unsafe { vld1_u8(src_ptr.add(starts[x + 3])) };
+    // Helper for 4 output pixels -> int32x4_t sum
+    let eval4 = |base: usize| unsafe {
+        let s0 = vld1_u8(src_ptr.add(*starts_ptr.add(base)));
+        let s1 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 1)));
+        let s2 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 2)));
+        let s3 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 3)));
 
-        let w0 = unsafe { vld1q_s16(weights[x].as_ptr()) };
-        let w1 = unsafe { vld1q_s16(weights[x + 1].as_ptr()) };
-        let w2 = unsafe { vld1q_s16(weights[x + 2].as_ptr()) };
-        let w3 = unsafe { vld1q_s16(weights[x + 3].as_ptr()) };
+        let w0 = vld1q_s16((*weights_ptr.add(base)).as_ptr());
+        let w1 = vld1q_s16((*weights_ptr.add(base + 1)).as_ptr());
+        let w2 = vld1q_s16((*weights_ptr.add(base + 2)).as_ptr());
+        let w3 = vld1q_s16((*weights_ptr.add(base + 3)).as_ptr());
 
         let s0_16 = vreinterpretq_s16_u16(vmovl_u8(s0));
         let s1_16 = vreinterpretq_s16_u16(vmovl_u8(s1));
@@ -223,25 +249,37 @@ unsafe fn hscale_row_8tap_q14_neon(src_row: &[u8], dst_row: &mut [u8], bank: &Po
         let acc2 = vmlal_high_s16(vmull_s16(vget_low_s16(s2_16), vget_low_s16(w2)), s2_16, w2);
         let acc3 = vmlal_high_s16(vmull_s16(vget_low_s16(s3_16), vget_low_s16(w3)), s3_16, w3);
 
-        // Pairwise horizontal reduction across 4 registers -> [sum0, sum1, sum2, sum3]
         let p01 = vpaddq_s32(acc0, acc1);
         let p23 = vpaddq_s32(acc2, acc3);
-        let sum4 = vpaddq_s32(p01, p23);
+        vpaddq_s32(p01, p23)
+    };
 
-        // Rounded shift >> 14 and unsigned saturate to u8
+    // Process 8 output pixels per iteration with direct NEON `vst1_u8` store (zero NEON->GPR stall)
+    while x + 8 <= dst_len {
+        let sum_lo = eval4(x);
+        let sum_hi = eval4(x + 4);
+        let shifted16 = vrshrn_high_n_s32::<14>(vrshrn_n_s32::<14>(sum_lo), sum_hi);
+        let out8 = vqmovun_s16(shifted16);
+        unsafe {
+            vst1_u8(dst_ptr.add(x), out8);
+        }
+        x += 8;
+    }
+
+    while x + 4 <= dst_len {
+        let sum4 = eval4(x);
         let shifted16 = vrshrn_n_s32::<14>(sum4);
         let out8 = vqmovun_s16(vcombine_s16(shifted16, shifted16));
-        let packed4 = vget_lane_u32(vreinterpret_u32_u8(out8), 0);
         unsafe {
-            (dst_row.as_mut_ptr().add(x) as *mut u32).write_unaligned(packed4);
+            vst1_lane_u32::<0>(dst_ptr.add(x) as *mut u32, vreinterpret_u32_u8(out8));
         }
         x += 4;
     }
 
     while x < dst_len {
-        let ws = starts[x];
+        let ws = bank.win_starts[x];
         let samples: &[u8; 8] = src_row[ws..ws + 8].try_into().unwrap();
-        dst_row[x] = convolve_8tap_q14_u8_scalar(samples, &weights[x]);
+        dst_row[x] = convolve_8tap_q14_u8_scalar(samples, &bank.weights[x]);
         x += 1;
     }
 }
@@ -327,9 +365,223 @@ unsafe fn vscale_row_8tap_q14_neon(
     }
 }
 
-/// Scales a 2D `Plane` into `dst` using a **fused 8-row L1-cache-resident rolling scanline ring buffer**.
+/// Horizontally scales a `u8` scanline into a 14-bit signed `Q6` (`u8 << 6`) intermediate `i16` row.
 ///
-/// Each input row is horizontally filtered at most once into the 8-row ring buffer, and vertical
+/// Modeled after `libswscale` `ff_hscale8to15_X8_neon` and `zimg`: preserves 6 fractional bits
+/// (`1/64`th of an 8-bit LSB) and keeps negative / $>255$ Lanczos-3 ringing lobes unclipped
+/// between the horizontal and vertical passes.
+#[inline]
+pub fn hscale_row_8tap_q14_to_q6(src_row: &[u8], dst_row: &mut [i16], bank: &PolyphaseFilterBank) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if src_row.len() >= 8 {
+            unsafe { hscale_row_8tap_q14_to_q6_neon(src_row, dst_row, bank) };
+            return;
+        }
+    }
+    hscale_row_8tap_q14_to_q6_scalar(src_row, dst_row, bank);
+}
+
+#[allow(clippy::needless_range_loop)]
+pub fn hscale_row_8tap_q14_to_q6_scalar(
+    src_row: &[u8],
+    dst_row: &mut [i16],
+    bank: &PolyphaseFilterBank,
+) {
+    let dst_len = bank.dst_len;
+    if src_row.len() >= 8 {
+        for x in 0..dst_len {
+            let ws = bank.win_starts[x];
+            let w = &bank.weights[x];
+            let mut acc = 128i32; // rounding bias for >> 8 (Q14 -> Q6)
+            for k in 0..8 {
+                acc += (src_row[ws + k] as i32) * (w[k] as i32);
+            }
+            dst_row[x] = (acc >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+    } else {
+        let mut padded = [0u8; 8];
+        padded[..src_row.len()].copy_from_slice(src_row);
+        for x in 0..dst_len {
+            let w = &bank.weights[x];
+            let mut acc = 128i32;
+            for k in 0..8 {
+                acc += (padded[k] as i32) * (w[k] as i32);
+            }
+            dst_row[x] = (acc >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hscale_row_8tap_q14_to_q6_neon(
+    src_row: &[u8],
+    dst_row: &mut [i16],
+    bank: &PolyphaseFilterBank,
+) {
+    use std::arch::aarch64::*;
+    let dst_len = bank.dst_len;
+    assert!(dst_row.len() >= dst_len);
+    assert!(bank.win_starts.len() >= dst_len && bank.weights.len() >= dst_len);
+
+    let src_ptr = src_row.as_ptr();
+    let dst_ptr = dst_row.as_mut_ptr();
+    let starts_ptr = bank.win_starts.as_ptr();
+    let weights_ptr = bank.weights.as_ptr();
+    let mut x = 0usize;
+
+    let eval4 = |base: usize| unsafe {
+        let s0 = vld1_u8(src_ptr.add(*starts_ptr.add(base)));
+        let s1 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 1)));
+        let s2 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 2)));
+        let s3 = vld1_u8(src_ptr.add(*starts_ptr.add(base + 3)));
+
+        let w0 = vld1q_s16((*weights_ptr.add(base)).as_ptr());
+        let w1 = vld1q_s16((*weights_ptr.add(base + 1)).as_ptr());
+        let w2 = vld1q_s16((*weights_ptr.add(base + 2)).as_ptr());
+        let w3 = vld1q_s16((*weights_ptr.add(base + 3)).as_ptr());
+
+        let s0_16 = vreinterpretq_s16_u16(vmovl_u8(s0));
+        let s1_16 = vreinterpretq_s16_u16(vmovl_u8(s1));
+        let s2_16 = vreinterpretq_s16_u16(vmovl_u8(s2));
+        let s3_16 = vreinterpretq_s16_u16(vmovl_u8(s3));
+
+        let acc0 = vmlal_high_s16(vmull_s16(vget_low_s16(s0_16), vget_low_s16(w0)), s0_16, w0);
+        let acc1 = vmlal_high_s16(vmull_s16(vget_low_s16(s1_16), vget_low_s16(w1)), s1_16, w1);
+        let acc2 = vmlal_high_s16(vmull_s16(vget_low_s16(s2_16), vget_low_s16(w2)), s2_16, w2);
+        let acc3 = vmlal_high_s16(vmull_s16(vget_low_s16(s3_16), vget_low_s16(w3)), s3_16, w3);
+
+        let p01 = vpaddq_s32(acc0, acc1);
+        let p23 = vpaddq_s32(acc2, acc3);
+        vpaddq_s32(p01, p23)
+    };
+
+    while x + 8 <= dst_len {
+        let sum_lo = eval4(x);
+        let sum_hi = eval4(x + 4);
+        let q6_8 = vqrshrn_high_n_s32::<8>(vqrshrn_n_s32::<8>(sum_lo), sum_hi);
+        unsafe {
+            vst1q_s16(dst_ptr.add(x), q6_8);
+        }
+        x += 8;
+    }
+
+    while x + 4 <= dst_len {
+        let sum4 = eval4(x);
+        let q6_4 = vqrshrn_n_s32::<8>(sum4);
+        unsafe {
+            vst1_s16(dst_ptr.add(x), q6_4);
+        }
+        x += 4;
+    }
+
+    while x < dst_len {
+        let ws = bank.win_starts[x];
+        let w = &bank.weights[x];
+        let mut acc = 128i32;
+        for k in 0..8 {
+            acc += (src_row[ws + k] as i32) * (w[k] as i32);
+        }
+        dst_row[x] = (acc >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        x += 1;
+    }
+}
+
+/// Vertically convolves 8 `Q6` (`i16`) intermediate ring-buffer rows with `Q14` weights into `u8`.
+///
+/// Uses `libswscale/aarch64/output.S`'s two-stage narrowing shift (`vqshrun_n_s32::<16>` + `vqshrn_n_u16::<4>`)
+/// to shift right by `20` (`Q6 * Q14 = Q20`) and saturate to `0..=255` in two instructions.
+#[inline]
+pub fn vscale_row_8tap_q6_to_u8(
+    rows: [&[i16]; 8],
+    weights: &[i16; 8],
+    dst_row: &mut [u8],
+    width: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { vscale_row_8tap_q6_to_u8_neon(rows, weights, dst_row, width) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        vscale_row_8tap_q6_to_u8_scalar(rows, weights, dst_row, width)
+    }
+}
+
+pub fn vscale_row_8tap_q6_to_u8_scalar(
+    rows: [&[i16]; 8],
+    weights: &[i16; 8],
+    dst_row: &mut [u8],
+    width: usize,
+) {
+    const Q20_HALF: i32 = 1 << 19;
+    for x in 0..width {
+        let mut acc = Q20_HALF;
+        for t in 0..8 {
+            acc += (rows[t][x] as i32) * (weights[t] as i32);
+        }
+        dst_row[x] = clamp_u8(acc >> 20);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vscale_row_8tap_q6_to_u8_neon(
+    rows: [&[i16]; 8],
+    weights: &[i16; 8],
+    dst_row: &mut [u8],
+    width: usize,
+) {
+    use std::arch::aarch64::*;
+    const Q20_HALF: i32 = 1 << 19;
+    let v_bias = vdupq_n_s32(Q20_HALF);
+    let mut x = 0usize;
+
+    // Process 16 horizontal pixels per iteration directly from `i16` ring-buffer rows
+    while x + 16 <= width {
+        let mut acc0 = v_bias;
+        let mut acc1 = v_bias;
+        let mut acc2 = v_bias;
+        let mut acc3 = v_bias;
+
+        for t in 0..8 {
+            let w = weights[t];
+            if w == 0 {
+                continue;
+            }
+            let r_lo = unsafe { vld1q_s16(rows[t].as_ptr().add(x)) };
+            let r_hi = unsafe { vld1q_s16(rows[t].as_ptr().add(x + 8)) };
+
+            acc0 = vmlal_n_s16(acc0, vget_low_s16(r_lo), w);
+            acc1 = vmlal_high_n_s16(acc1, r_lo, w);
+            acc2 = vmlal_n_s16(acc2, vget_low_s16(r_hi), w);
+            acc3 = vmlal_high_n_s16(acc3, r_hi, w);
+        }
+
+        // Two-stage narrowing shift >> 20 (`>> 16` via `vqshrun_n_s32::<16>` + `>> 4` via `vqshrn_n_u16::<4>`)
+        let u01 = vcombine_u16(vqshrun_n_s32::<16>(acc0), vqshrun_n_s32::<16>(acc1));
+        let u23 = vcombine_u16(vqshrun_n_s32::<16>(acc2), vqshrun_n_s32::<16>(acc3));
+        let out8 = vcombine_u8(vqshrn_n_u16::<4>(u01), vqshrn_n_u16::<4>(u23));
+        unsafe {
+            vst1q_u8(dst_row.as_mut_ptr().add(x), out8);
+        }
+        x += 16;
+    }
+
+    while x < width {
+        let mut acc = Q20_HALF;
+        for t in 0..8 {
+            acc += (rows[t][x] as i32) * (weights[t] as i32);
+        }
+        dst_row[x] = clamp_u8(acc >> 20);
+        x += 1;
+    }
+}
+
+/// Scales a 2D `Plane` into `dst` using a **fused 8-row 14-bit (`Q6`) L1-cache-resident rolling scanline ring buffer**.
+///
+/// Each input row is horizontally filtered at most once into the 8-row `i16` (`Q6`) ring buffer, and vertical
 /// NEON dot products immediately emit finished output rows into `dst` with zero full-frame intermediate buffers.
 pub fn scale_plane_with_banks(
     src: &Plane,
@@ -346,9 +598,9 @@ pub fn scale_plane_with_banks(
     let dst_h = dst.height();
     let src_h = src.height();
 
-    // 8-slot rolling scanline ring buffer resident in L1 cache
-    let ring_stride = (dst_w + 63) & !63;
-    let mut ring_buf = vec![0u8; ring_stride * 8];
+    // 8-slot 14-bit (`Q6` `i16`) rolling scanline ring buffer resident in L1 cache (~30 KB for 1080p)
+    let ring_stride = (dst_w + 31) & !31;
+    let mut ring_buf = vec![0i16; ring_stride * 8];
     let mut cached_src_y = [usize::MAX; 8];
 
     for dy in 0..dst_h {
@@ -362,7 +614,7 @@ pub fn scale_plane_with_banks(
             if cached_src_y[slot] != sy {
                 let src_row = src.row_padded(sy);
                 let ring_row = &mut ring_buf[slot * ring_stride..slot * ring_stride + dst_w];
-                hscale_row_8tap_q14(src_row, ring_row, h_bank);
+                hscale_row_8tap_q14_to_q6(src_row, ring_row, h_bank);
                 cached_src_y[slot] = sy;
             }
         }
@@ -376,7 +628,7 @@ pub fn scale_plane_with_banks(
         let s6 = ((win_start + 6).min(src_h - 1)) & 7;
         let s7 = ((win_start + 7).min(src_h - 1)) & 7;
 
-        let rows: [&[u8]; 8] = [
+        let rows: [&[i16]; 8] = [
             &ring_buf[s0 * ring_stride..s0 * ring_stride + dst_w],
             &ring_buf[s1 * ring_stride..s1 * ring_stride + dst_w],
             &ring_buf[s2 * ring_stride..s2 * ring_stride + dst_w],
@@ -387,7 +639,7 @@ pub fn scale_plane_with_banks(
             &ring_buf[s7 * ring_stride..s7 * ring_stride + dst_w],
         ];
 
-        vscale_row_8tap_q14(rows, v_weights, dst.row_mut(dy), dst_w);
+        vscale_row_8tap_q6_to_u8(rows, v_weights, dst.row_mut(dy), dst_w);
     }
 }
 

@@ -293,34 +293,34 @@ unsafe fn yuv420p_to_rgb24_neon(
                 let y2 = vmull_n_s16(vget_low_s16(y_hi), mat.y_coeff as i16);
                 let y3 = vmull_high_n_s16(y_hi, mat.y_coeff as i16);
 
-                let r01 = vcombine_s16(
+                let r01 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y0, cr_0)),
-                    vshrn_n_s32::<14>(vaddq_s32(y1, cr_1)),
+                    vaddq_s32(y1, cr_1),
                 );
-                let r23 = vcombine_s16(
+                let r23 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y2, cr_2)),
-                    vshrn_n_s32::<14>(vaddq_s32(y3, cr_3)),
+                    vaddq_s32(y3, cr_3),
                 );
-                let g01 = vcombine_s16(
+                let g01 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y0, cg_0)),
-                    vshrn_n_s32::<14>(vaddq_s32(y1, cg_1)),
+                    vaddq_s32(y1, cg_1),
                 );
-                let g23 = vcombine_s16(
+                let g23 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y2, cg_2)),
-                    vshrn_n_s32::<14>(vaddq_s32(y3, cg_3)),
+                    vaddq_s32(y3, cg_3),
                 );
-                let b01 = vcombine_s16(
+                let b01 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y0, cb_0)),
-                    vshrn_n_s32::<14>(vaddq_s32(y1, cb_1)),
+                    vaddq_s32(y1, cb_1),
                 );
-                let b23 = vcombine_s16(
+                let b23 = vshrn_high_n_s32::<14>(
                     vshrn_n_s32::<14>(vaddq_s32(y2, cb_2)),
-                    vshrn_n_s32::<14>(vaddq_s32(y3, cb_3)),
+                    vaddq_s32(y3, cb_3),
                 );
 
-                let r8 = vcombine_u8(vqmovun_s16(r01), vqmovun_s16(r23));
-                let g8 = vcombine_u8(vqmovun_s16(g01), vqmovun_s16(g23));
-                let b8 = vcombine_u8(vqmovun_s16(b01), vqmovun_s16(b23));
+                let r8 = vqmovun_high_s16(vqmovun_s16(r01), r23);
+                let g8 = vqmovun_high_s16(vqmovun_s16(g01), g23);
+                let b8 = vqmovun_high_s16(vqmovun_s16(b01), b23);
 
                 vst3q_u8(dst_ptr, uint8x16x3_t(r8, g8, b8));
             };
@@ -368,8 +368,112 @@ unsafe fn yuv420p_to_rgb24_neon(
 }
 
 /// Converts a planar `YUV420p` image into packed `RGBA8` (`alpha = 255`).
+///
+/// Dispatches to a 2-row $\times$ 16-pixel `aarch64` NEON `vst4q_u8` kernel on Apple Silicon
+/// (matching `libswscale/aarch64/yuv2rgb_neon.S`).
 #[allow(clippy::too_many_arguments)]
 pub fn yuv420p_to_rgba8(
+    y_plane: &[u8],
+    y_stride: usize,
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    rgba_dst: &mut [u8],
+    rgba_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            yuv420p_to_rgba_or_bgra_neon::<false>(
+                y_plane,
+                y_stride,
+                u_plane,
+                u_stride,
+                v_plane,
+                v_stride,
+                rgba_dst,
+                rgba_stride,
+                width,
+                height,
+                mat,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        yuv420p_to_rgba8_scalar(
+            y_plane,
+            y_stride,
+            u_plane,
+            u_stride,
+            v_plane,
+            v_stride,
+            rgba_dst,
+            rgba_stride,
+            width,
+            height,
+            mat,
+        );
+    }
+}
+
+/// Converts a planar `YUV420p` image into packed `BGRA8` (`alpha = 255`).
+#[allow(clippy::too_many_arguments)]
+pub fn yuv420p_to_bgra8(
+    y_plane: &[u8],
+    y_stride: usize,
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    bgra_dst: &mut [u8],
+    bgra_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            yuv420p_to_rgba_or_bgra_neon::<true>(
+                y_plane,
+                y_stride,
+                u_plane,
+                u_stride,
+                v_plane,
+                v_stride,
+                bgra_dst,
+                bgra_stride,
+                width,
+                height,
+                mat,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        yuv420p_to_bgra8_scalar(
+            y_plane,
+            y_stride,
+            u_plane,
+            u_stride,
+            v_plane,
+            v_stride,
+            bgra_dst,
+            bgra_stride,
+            width,
+            height,
+            mat,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn yuv420p_to_rgba8_scalar(
     y_plane: &[u8],
     y_stride: usize,
     u_plane: &[u8],
@@ -396,6 +500,433 @@ pub fn yuv420p_to_rgba8(
             dst_row[d + 2] = b;
             dst_row[d + 3] = 255;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn yuv420p_to_bgra8_scalar(
+    y_plane: &[u8],
+    y_stride: usize,
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    bgra_dst: &mut [u8],
+    bgra_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    for y in 0..height {
+        let y_row = &y_plane[y * y_stride..y * y_stride + width];
+        let cy = y >> 1;
+        let u_row = &u_plane[cy * u_stride..];
+        let v_row = &v_plane[cy * v_stride..];
+        let dst_row = &mut bgra_dst[y * bgra_stride..y * bgra_stride + width * 4];
+        for x in 0..width {
+            let (r, g, b) = mat.yuv_to_rgb_pixel(y_row[x], u_row[x >> 1], v_row[x >> 1]);
+            let d = x * 4;
+            dst_row[d] = b;
+            dst_row[d + 1] = g;
+            dst_row[d + 2] = r;
+            dst_row[d + 3] = 255;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn yuv420p_to_rgba_or_bgra_neon<const BGRA: bool>(
+    y_plane: &[u8],
+    y_stride: usize,
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    use std::arch::aarch64::*;
+
+    let v_y_off = vdupq_n_s16(mat.y_offset as i16);
+    let v_128 = vdupq_n_s16(128);
+    let v_bias = vdupq_n_s32(Q14_HALF);
+    let v_alpha = vdupq_n_u8(255);
+
+    let mut y = 0usize;
+    while y + 2 <= height {
+        let cy = y >> 1;
+        let y_row0 = &y_plane[y * y_stride..y * y_stride + width];
+        let y_row1 = &y_plane[(y + 1) * y_stride..(y + 1) * y_stride + width];
+        let u_row = &u_plane[cy * u_stride..];
+        let v_row = &v_plane[cy * v_stride..];
+
+        let (top_half, bot_half) = dst.split_at_mut((y + 1) * dst_stride);
+        let dst0 = &mut top_half[y * dst_stride..y * dst_stride + width * 4];
+        let dst1 = &mut bot_half[..width * 4];
+
+        let mut x = 0usize;
+        while x + 16 <= width {
+            let cx = x >> 1;
+            let u8_vec = unsafe { vld1_u8(u_row.as_ptr().add(cx)) };
+            let v8_vec = unsafe { vld1_u8(v_row.as_ptr().add(cx)) };
+
+            let u16_adj = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8_vec)), v_128);
+            let v16_adj = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8_vec)), v_128);
+
+            let u_lo = vmovl_s16(vget_low_s16(u16_adj));
+            let u_hi = vmovl_high_s16(u16_adj);
+            let v_lo = vmovl_s16(vget_low_s16(v16_adj));
+            let v_hi = vmovl_high_s16(v16_adj);
+
+            let cr_lo = vmlaq_n_s32(v_bias, v_lo, mat.v_to_r);
+            let cr_hi = vmlaq_n_s32(v_bias, v_hi, mat.v_to_r);
+            let cg_lo = vmlaq_n_s32(vmlaq_n_s32(v_bias, u_lo, mat.u_to_g), v_lo, mat.v_to_g);
+            let cg_hi = vmlaq_n_s32(vmlaq_n_s32(v_bias, u_hi, mat.u_to_g), v_hi, mat.v_to_g);
+            let cb_lo = vmlaq_n_s32(v_bias, u_lo, mat.u_to_b);
+            let cb_hi = vmlaq_n_s32(v_bias, u_hi, mat.u_to_b);
+
+            let cr_0 = vzip1q_s32(cr_lo, cr_lo);
+            let cr_1 = vzip2q_s32(cr_lo, cr_lo);
+            let cr_2 = vzip1q_s32(cr_hi, cr_hi);
+            let cr_3 = vzip2q_s32(cr_hi, cr_hi);
+
+            let cg_0 = vzip1q_s32(cg_lo, cg_lo);
+            let cg_1 = vzip2q_s32(cg_lo, cg_lo);
+            let cg_2 = vzip1q_s32(cg_hi, cg_hi);
+            let cg_3 = vzip2q_s32(cg_hi, cg_hi);
+
+            let cb_0 = vzip1q_s32(cb_lo, cb_lo);
+            let cb_1 = vzip2q_s32(cb_lo, cb_lo);
+            let cb_2 = vzip1q_s32(cb_hi, cb_hi);
+            let cb_3 = vzip2q_s32(cb_hi, cb_hi);
+
+            let emit_row = |y_ptr: *const u8, dst_ptr: *mut u8| unsafe {
+                let y_raw = vld1q_u8(y_ptr);
+                let y_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y_raw))), v_y_off);
+                let y_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_high_u8(y_raw)), v_y_off);
+
+                let y0 = vmull_n_s16(vget_low_s16(y_lo), mat.y_coeff as i16);
+                let y1 = vmull_high_n_s16(y_lo, mat.y_coeff as i16);
+                let y2 = vmull_n_s16(vget_low_s16(y_hi), mat.y_coeff as i16);
+                let y3 = vmull_high_n_s16(y_hi, mat.y_coeff as i16);
+
+                let r01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cr_0)),
+                    vaddq_s32(y1, cr_1),
+                );
+                let r23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cr_2)),
+                    vaddq_s32(y3, cr_3),
+                );
+                let g01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cg_0)),
+                    vaddq_s32(y1, cg_1),
+                );
+                let g23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cg_2)),
+                    vaddq_s32(y3, cg_3),
+                );
+                let b01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cb_0)),
+                    vaddq_s32(y1, cb_1),
+                );
+                let b23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cb_2)),
+                    vaddq_s32(y3, cb_3),
+                );
+
+                let r8 = vqmovun_high_s16(vqmovun_s16(r01), r23);
+                let g8 = vqmovun_high_s16(vqmovun_s16(g01), g23);
+                let b8 = vqmovun_high_s16(vqmovun_s16(b01), b23);
+
+                if BGRA {
+                    vst4q_u8(dst_ptr, uint8x16x4_t(b8, g8, r8, v_alpha));
+                } else {
+                    vst4q_u8(dst_ptr, uint8x16x4_t(r8, g8, b8, v_alpha));
+                }
+            };
+
+            unsafe {
+                emit_row(y_row0.as_ptr().add(x), dst0.as_mut_ptr().add(x * 4));
+                emit_row(y_row1.as_ptr().add(x), dst1.as_mut_ptr().add(x * 4));
+            }
+            x += 16;
+        }
+
+        while x < width {
+            let u = u_row[x >> 1];
+            let v = v_row[x >> 1];
+            let (r0, g0, b0) = mat.yuv_to_rgb_pixel(y_row0[x], u, v);
+            let (r1, g1, b1) = mat.yuv_to_rgb_pixel(y_row1[x], u, v);
+            let d = x * 4;
+            if BGRA {
+                dst0[d] = b0;
+                dst0[d + 1] = g0;
+                dst0[d + 2] = r0;
+                dst0[d + 3] = 255;
+                dst1[d] = b1;
+                dst1[d + 1] = g1;
+                dst1[d + 2] = r1;
+                dst1[d + 3] = 255;
+            } else {
+                dst0[d] = r0;
+                dst0[d + 1] = g0;
+                dst0[d + 2] = b0;
+                dst0[d + 3] = 255;
+                dst1[d] = r1;
+                dst1[d + 1] = g1;
+                dst1[d + 2] = b1;
+                dst1[d + 3] = 255;
+            }
+            x += 1;
+        }
+
+        y += 2;
+    }
+
+    if y < height {
+        if BGRA {
+            yuv420p_to_bgra8_scalar(
+                &y_plane[y * y_stride..],
+                y_stride,
+                &u_plane[(y >> 1) * u_stride..],
+                u_stride,
+                &v_plane[(y >> 1) * v_stride..],
+                v_stride,
+                &mut dst[y * dst_stride..],
+                dst_stride,
+                width,
+                height - y,
+                mat,
+            );
+        } else {
+            yuv420p_to_rgba8_scalar(
+                &y_plane[y * y_stride..],
+                y_stride,
+                &u_plane[(y >> 1) * u_stride..],
+                u_stride,
+                &v_plane[(y >> 1) * v_stride..],
+                v_stride,
+                &mut dst[y * dst_stride..],
+                dst_stride,
+                width,
+                height - y,
+                mat,
+            );
+        }
+    }
+}
+
+/// Converts semi-planar `NV12` (`Y` plane + interleaved `UV` plane) into packed `RGB24`.
+///
+/// Uses `vld2_u8` on `aarch64` NEON to deinterleave 8 `U` and 8 `V` samples in a single instruction
+/// (matching `libswscale/aarch64/yuv2rgb_neon.S` `load_chroma_nv12`).
+#[allow(clippy::too_many_arguments)]
+pub fn nv12_to_rgb24(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    rgb_dst: &mut [u8],
+    rgb_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            nv12_to_rgb24_neon(
+                y_plane, y_stride, uv_plane, uv_stride, rgb_dst, rgb_stride, width, height, mat,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        nv12_to_rgb24_scalar(
+            y_plane, y_stride, uv_plane, uv_stride, rgb_dst, rgb_stride, width, height, mat,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nv12_to_rgb24_scalar(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    rgb_dst: &mut [u8],
+    rgb_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    for y in 0..height {
+        let y_row = &y_plane[y * y_stride..y * y_stride + width];
+        let cy = y >> 1;
+        let uv_row = &uv_plane[cy * uv_stride..];
+        let dst_row = &mut rgb_dst[y * rgb_stride..y * rgb_stride + width * 3];
+        for (x, &y_val) in y_row.iter().enumerate() {
+            let cx = (x >> 1) * 2;
+            let (r, g, b) = mat.yuv_to_rgb_pixel(y_val, uv_row[cx], uv_row[cx + 1]);
+            let d = x * 3;
+            dst_row[d] = r;
+            dst_row[d + 1] = g;
+            dst_row[d + 2] = b;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn nv12_to_rgb24_neon(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    rgb_dst: &mut [u8],
+    rgb_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    use std::arch::aarch64::*;
+
+    let v_y_off = vdupq_n_s16(mat.y_offset as i16);
+    let v_128 = vdupq_n_s16(128);
+    let v_bias = vdupq_n_s32(Q14_HALF);
+
+    let mut y = 0usize;
+    while y + 2 <= height {
+        let cy = y >> 1;
+        let y_row0 = &y_plane[y * y_stride..y * y_stride + width];
+        let y_row1 = &y_plane[(y + 1) * y_stride..(y + 1) * y_stride + width];
+        let uv_row = &uv_plane[cy * uv_stride..];
+
+        let (top_half, bot_half) = rgb_dst.split_at_mut((y + 1) * rgb_stride);
+        let dst0 = &mut top_half[y * rgb_stride..y * rgb_stride + width * 3];
+        let dst1 = &mut bot_half[..width * 3];
+
+        let mut x = 0usize;
+        while x + 16 <= width {
+            // Single-instruction deinterleave of 8 (U, V) pairs (`ld2 {v16.8b, v17.8b}`)
+            let uv8 = unsafe { vld2_u8(uv_row.as_ptr().add(x)) };
+            let u16_adj = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uv8.0)), v_128);
+            let v16_adj = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uv8.1)), v_128);
+
+            let u_lo = vmovl_s16(vget_low_s16(u16_adj));
+            let u_hi = vmovl_high_s16(u16_adj);
+            let v_lo = vmovl_s16(vget_low_s16(v16_adj));
+            let v_hi = vmovl_high_s16(v16_adj);
+
+            let cr_lo = vmlaq_n_s32(v_bias, v_lo, mat.v_to_r);
+            let cr_hi = vmlaq_n_s32(v_bias, v_hi, mat.v_to_r);
+            let cg_lo = vmlaq_n_s32(vmlaq_n_s32(v_bias, u_lo, mat.u_to_g), v_lo, mat.v_to_g);
+            let cg_hi = vmlaq_n_s32(vmlaq_n_s32(v_bias, u_hi, mat.u_to_g), v_hi, mat.v_to_g);
+            let cb_lo = vmlaq_n_s32(v_bias, u_lo, mat.u_to_b);
+            let cb_hi = vmlaq_n_s32(v_bias, u_hi, mat.u_to_b);
+
+            let cr_0 = vzip1q_s32(cr_lo, cr_lo);
+            let cr_1 = vzip2q_s32(cr_lo, cr_lo);
+            let cr_2 = vzip1q_s32(cr_hi, cr_hi);
+            let cr_3 = vzip2q_s32(cr_hi, cr_hi);
+
+            let cg_0 = vzip1q_s32(cg_lo, cg_lo);
+            let cg_1 = vzip2q_s32(cg_lo, cg_lo);
+            let cg_2 = vzip1q_s32(cg_hi, cg_hi);
+            let cg_3 = vzip2q_s32(cg_hi, cg_hi);
+
+            let cb_0 = vzip1q_s32(cb_lo, cb_lo);
+            let cb_1 = vzip2q_s32(cb_lo, cb_lo);
+            let cb_2 = vzip1q_s32(cb_hi, cb_hi);
+            let cb_3 = vzip2q_s32(cb_hi, cb_hi);
+
+            let emit_row = |y_ptr: *const u8, dst_ptr: *mut u8| unsafe {
+                let y_raw = vld1q_u8(y_ptr);
+                let y_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y_raw))), v_y_off);
+                let y_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_high_u8(y_raw)), v_y_off);
+
+                let y0 = vmull_n_s16(vget_low_s16(y_lo), mat.y_coeff as i16);
+                let y1 = vmull_high_n_s16(y_lo, mat.y_coeff as i16);
+                let y2 = vmull_n_s16(vget_low_s16(y_hi), mat.y_coeff as i16);
+                let y3 = vmull_high_n_s16(y_hi, mat.y_coeff as i16);
+
+                let r01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cr_0)),
+                    vaddq_s32(y1, cr_1),
+                );
+                let r23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cr_2)),
+                    vaddq_s32(y3, cr_3),
+                );
+                let g01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cg_0)),
+                    vaddq_s32(y1, cg_1),
+                );
+                let g23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cg_2)),
+                    vaddq_s32(y3, cg_3),
+                );
+                let b01 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y0, cb_0)),
+                    vaddq_s32(y1, cb_1),
+                );
+                let b23 = vshrn_high_n_s32::<14>(
+                    vshrn_n_s32::<14>(vaddq_s32(y2, cb_2)),
+                    vaddq_s32(y3, cb_3),
+                );
+
+                let r8 = vqmovun_high_s16(vqmovun_s16(r01), r23);
+                let g8 = vqmovun_high_s16(vqmovun_s16(g01), g23);
+                let b8 = vqmovun_high_s16(vqmovun_s16(b01), b23);
+
+                vst3q_u8(dst_ptr, uint8x16x3_t(r8, g8, b8));
+            };
+
+            unsafe {
+                emit_row(y_row0.as_ptr().add(x), dst0.as_mut_ptr().add(x * 3));
+                emit_row(y_row1.as_ptr().add(x), dst1.as_mut_ptr().add(x * 3));
+            }
+            x += 16;
+        }
+
+        while x < width {
+            let cx = (x >> 1) * 2;
+            let u = uv_row[cx];
+            let v = uv_row[cx + 1];
+            let (r0, g0, b0) = mat.yuv_to_rgb_pixel(y_row0[x], u, v);
+            let (r1, g1, b1) = mat.yuv_to_rgb_pixel(y_row1[x], u, v);
+            let d = x * 3;
+            dst0[d] = r0;
+            dst0[d + 1] = g0;
+            dst0[d + 2] = b0;
+            dst1[d] = r1;
+            dst1[d + 1] = g1;
+            dst1[d + 2] = b1;
+            x += 1;
+        }
+
+        y += 2;
+    }
+
+    if y < height {
+        nv12_to_rgb24_scalar(
+            &y_plane[y * y_stride..],
+            y_stride,
+            &uv_plane[(y >> 1) * uv_stride..],
+            uv_stride,
+            &mut rgb_dst[y * rgb_stride..],
+            rgb_stride,
+            width,
+            height - y,
+            mat,
+        );
     }
 }
 
@@ -845,6 +1376,177 @@ pub fn oklab_row_to_rgb24(oklab_row: &[OklabColor], dst_rgb: &mut [u8]) {
     }
 }
 
+/// $16\times16$ ordered Bayer dither matrix (`0..=255`) from `zimg/src/zimg/depth/dither.cpp`.
+pub const BAYER_TABLE_16X16: [[u8; 16]; 16] = [
+    [
+        0, 192, 48, 240, 12, 204, 60, 252, 3, 195, 51, 243, 15, 207, 63, 255,
+    ],
+    [
+        128, 64, 176, 112, 140, 76, 188, 124, 131, 67, 179, 115, 143, 79, 191, 127,
+    ],
+    [
+        32, 224, 16, 208, 44, 236, 28, 220, 35, 227, 19, 211, 47, 239, 31, 223,
+    ],
+    [
+        160, 96, 144, 80, 172, 108, 156, 92, 163, 99, 147, 83, 175, 111, 159, 95,
+    ],
+    [
+        8, 200, 56, 248, 4, 196, 52, 244, 11, 203, 59, 251, 7, 199, 55, 247,
+    ],
+    [
+        136, 72, 184, 120, 132, 68, 180, 116, 139, 75, 187, 123, 135, 71, 183, 119,
+    ],
+    [
+        40, 232, 24, 216, 36, 228, 20, 212, 43, 235, 27, 219, 39, 231, 23, 215,
+    ],
+    [
+        168, 104, 152, 88, 164, 100, 148, 84, 171, 107, 155, 91, 167, 103, 151, 87,
+    ],
+    [
+        2, 194, 50, 242, 14, 206, 62, 254, 1, 193, 49, 241, 13, 205, 61, 253,
+    ],
+    [
+        130, 66, 178, 114, 142, 78, 190, 126, 129, 65, 177, 113, 141, 77, 189, 125,
+    ],
+    [
+        34, 226, 18, 210, 46, 238, 30, 222, 33, 225, 17, 209, 45, 237, 29, 221,
+    ],
+    [
+        162, 98, 146, 82, 174, 110, 158, 94, 161, 97, 145, 81, 173, 109, 157, 93,
+    ],
+    [
+        10, 202, 58, 250, 6, 198, 54, 246, 9, 201, 57, 249, 5, 197, 53, 245,
+    ],
+    [
+        138, 74, 186, 122, 134, 70, 182, 118, 137, 73, 185, 121, 133, 69, 181, 117,
+    ],
+    [
+        42, 234, 26, 218, 38, 230, 22, 214, 41, 233, 25, 217, 37, 229, 21, 213,
+    ],
+    [
+        170, 106, 154, 90, 166, 102, 150, 86, 169, 105, 153, 89, 165, 101, 149, 85,
+    ],
+];
+
+/// Converts a 10-bit or 12-bit little-endian `u16` plane (`src_bits` in `9..=16`) to an 8-bit `u8`
+/// plane using $16\times16$ ordered Bayer dithering (`zimg` table) to prevent Mach-band contouring.
+pub fn dither_plane_u16le_to_u8_bayer(
+    src_u16le: &[u8],
+    src_stride_bytes: usize,
+    dst_u8: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+    src_bits: u32,
+) {
+    assert!((9..=16).contains(&src_bits));
+    #[cfg(target_arch = "aarch64")]
+    {
+        if src_bits == 10 {
+            unsafe {
+                dither_plane_u10le_to_u8_bayer_neon(
+                    src_u16le,
+                    src_stride_bytes,
+                    dst_u8,
+                    dst_stride,
+                    width,
+                    height,
+                );
+            }
+            return;
+        }
+    }
+    dither_plane_u16le_to_u8_bayer_scalar(
+        src_u16le,
+        src_stride_bytes,
+        dst_u8,
+        dst_stride,
+        width,
+        height,
+        src_bits,
+    );
+}
+
+#[allow(clippy::needless_range_loop)]
+pub fn dither_plane_u16le_to_u8_bayer_scalar(
+    src_u16le: &[u8],
+    src_stride_bytes: usize,
+    dst_u8: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+    src_bits: u32,
+) {
+    let shift = src_bits - 8;
+    let max_val = (1u32 << src_bits) - 1;
+    for y in 0..height {
+        let bayer_row = &BAYER_TABLE_16X16[y & 15];
+        let src_row = &src_u16le[y * src_stride_bytes..y * src_stride_bytes + width * 2];
+        let dst_row = &mut dst_u8[y * dst_stride..y * dst_stride + width];
+        for x in 0..width {
+            let s =
+                u16::from_le_bytes([src_row[x * 2], src_row[x * 2 + 1]]).min(max_val as u16) as u32;
+            let bayer = bayer_row[x & 15] as u32;
+            let dithered = ((s << 8) + (bayer << shift)) >> (shift + 8);
+            dst_row[x] = dithered.min(255) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dither_plane_u10le_to_u8_bayer_neon(
+    src_u16le: &[u8],
+    src_stride_bytes: usize,
+    dst_u8: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    use std::arch::aarch64::*;
+    let v_max10 = vdupq_n_u16(1023);
+
+    for y in 0..height {
+        let bayer_row = &BAYER_TABLE_16X16[y & 15];
+        let v_bayer = unsafe { vld1q_u8(bayer_row.as_ptr()) };
+        let bayer_lo = vmovl_u8(vget_low_u8(v_bayer));
+        let bayer_hi = vmovl_high_u8(v_bayer);
+
+        let src_row = &src_u16le[y * src_stride_bytes..y * src_stride_bytes + width * 2];
+        let dst_row = &mut dst_u8[y * dst_stride..y * dst_stride + width];
+
+        let mut x = 0usize;
+        while x + 16 <= width {
+            let s_lo = vminq_u16(
+                unsafe { vld1q_u16(src_row.as_ptr().add(x * 2) as *const u16) },
+                v_max10,
+            );
+            let s_hi = vminq_u16(
+                unsafe { vld1q_u16(src_row.as_ptr().add((x + 8) * 2) as *const u16) },
+                v_max10,
+            );
+
+            // (s << 6) + bayer -> >> 8 == ((s << 8) + (bayer << 2)) >> 10
+            let q_lo = vqaddq_u16(vshlq_n_u16::<6>(s_lo), bayer_lo);
+            let q_hi = vqaddq_u16(vshlq_n_u16::<6>(s_hi), bayer_hi);
+
+            let out8 = vcombine_u8(vshrn_n_u16::<8>(q_lo), vshrn_n_u16::<8>(q_hi));
+            unsafe {
+                vst1q_u8(dst_row.as_mut_ptr().add(x), out8);
+            }
+            x += 16;
+        }
+
+        while x < width {
+            let s = u16::from_le_bytes([src_row[x * 2], src_row[x * 2 + 1]]).min(1023) as u32;
+            let bayer = bayer_row[x & 15] as u32;
+            let dithered = ((s << 6) + bayer) >> 8;
+            dst_row[x] = dithered.min(255) as u8;
+            x += 1;
+        }
+    }
+}
+
 /// Converts a `VideoFrame` into `dst_format` and `dst_colorimetry`.
 pub fn convert_frame(
     src: &VideoFrame,
@@ -910,6 +1612,63 @@ pub fn convert_frame_into(src: &VideoFrame, dst: &mut VideoFrame) {
                 height,
                 &mat,
             );
+        }
+        (PixelFormat::Yuv420p, PixelFormat::Bgra8) => {
+            let mat = YuvRgbMatrix::from_colorimetry(src.colorimetry.matrix, src.colorimetry.range);
+            let y_p = src.plane(0);
+            let u_p = src.plane(1);
+            let v_p = src.plane(2);
+            let bgra_stride = dst.plane(0).stride();
+            let bgra_buf = dst.plane_mut(0).data_mut();
+            yuv420p_to_bgra8(
+                y_p.data(),
+                y_p.stride(),
+                u_p.data(),
+                u_p.stride(),
+                v_p.data(),
+                v_p.stride(),
+                bgra_buf,
+                bgra_stride,
+                width,
+                height,
+                &mat,
+            );
+        }
+        (PixelFormat::Nv12, PixelFormat::Rgb24) => {
+            let mat = YuvRgbMatrix::from_colorimetry(src.colorimetry.matrix, src.colorimetry.range);
+            let y_p = src.plane(0);
+            let uv_p = src.plane(1);
+            let rgb_stride = dst.plane(0).stride();
+            let rgb_buf = dst.plane_mut(0).data_mut();
+            nv12_to_rgb24(
+                y_p.data(),
+                y_p.stride(),
+                uv_p.data(),
+                uv_p.stride(),
+                rgb_buf,
+                rgb_stride,
+                width,
+                height,
+                &mat,
+            );
+        }
+        (PixelFormat::Yuv420p10le, PixelFormat::Yuv420p) => {
+            for p in 0..3 {
+                let sp = src.plane(p);
+                let pw = sp.width();
+                let ph = sp.height();
+                let s_stride = sp.stride();
+                let d_stride = dst.plane(p).stride();
+                dither_plane_u16le_to_u8_bayer(
+                    sp.data(),
+                    s_stride,
+                    dst.plane_mut(p).data_mut(),
+                    d_stride,
+                    pw,
+                    ph,
+                    10,
+                );
+            }
         }
         (PixelFormat::Rgb24, PixelFormat::Yuv420p) => {
             let mat = YuvRgbMatrix::from_colorimetry(dst.colorimetry.matrix, dst.colorimetry.range);
