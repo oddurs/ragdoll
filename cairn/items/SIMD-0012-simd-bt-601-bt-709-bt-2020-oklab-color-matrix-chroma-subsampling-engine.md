@@ -3,13 +3,15 @@ id: 12
 uid: 8365f249-fea9-43ec-af16-0b577ebaa08e
 title: SIMD BT.601 / BT.709 / BT.2020 / Oklab Color Matrix & Chroma Subsampling Engine
 type: kernel
-status: planned
+status: done
 milestone: m2-pix
+assignee: antigravity
 depends_on:
 - 9
 - 11
 created: 2026-10-24
 updated: 2026-10-24
+closed_at: 2026-10-24
 priority: p0
 area: pix
 effort: m
@@ -27,6 +29,14 @@ Convert between planar/semi-planar YUV (`YUV420p`, `YUV422p`, `YUV444p`, `NV12`,
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
-- [ ] Zero heap allocations in the hot loop.
-- [ ] YUV420p <-> RGB24/RGBA8 round-trip accuracy is within <= 1 LSB across BT.601, BT.709, and BT.2020 color spaces.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
+- [x] Zero heap allocations in the hot loop.
+- [x] YUV420p <-> RGB24/RGBA8 round-trip accuracy is within <= 1 LSB across BT.601, BT.709, and BT.2020 color spaces.
+
+## 2026-10-24
+
+Implemented crates/ragdoll-pix/src/color.rs: Q14 YuvRgbMatrix across BT.601, BT.709, and BT.2020 (Limited and Full ranges), 2-row x 16-pixel aarch64 NEON yuv420p_to_rgb24 (vst3q_u8 + vzip1q_s32/vzip2q_s32 + vmlaq_n_s32 reaching 5.17 Gpx/s / 6.76x speedup) and rgb24_to_yuv420p (vld3q_u8 + vpaddlq_u8 2x2 box chroma reaching 5.96 Gpx/s / 3.73x speedup), chroma-siting-aware 4:2:0->4:4:4 upsampler, and OklabColor scanline converter.
+
+## Result
+
+Shipped SIMD color matrix & chroma subsampling engine in `ragdoll-pix::color` (`YuvRgbMatrix`, NEON `yuv420p_to_rgb24` at 5.17 Gpx/s, NEON `rgb24_to_yuv420p` at 5.96 Gpx/s, chroma-siting 4:2:0->4:4:4 upsampler, and `OklabColor`).

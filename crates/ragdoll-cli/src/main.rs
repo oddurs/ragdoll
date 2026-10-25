@@ -2,8 +2,14 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ragdoll_core::{
-    BitReader, BitWriter, FramePool, PixelFormat, Rational64, Timestamp, crc16_flac, crc32_mpeg2,
-    escape_rbsp, optimal_plane_stride, unescape_rbsp, unescape_rbsp_scalar,
+    BitReader, BitWriter, ColorRange, FramePool, MatrixCoefficients, PixelFormat, Plane,
+    Rational64, Timestamp, crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride,
+    unescape_rbsp, unescape_rbsp_scalar,
+};
+use ragdoll_pix::{
+    PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, evaluate_frame_quality, hscale_row_8tap_q14,
+    hscale_row_8tap_q14_scalar, rgb24_to_yuv420p, rgb24_to_yuv420p_scalar, scale_plane,
+    yuv420p_to_rgb24, yuv420p_to_rgb24_scalar,
 };
 use ragdoll_simd::{
     SimdLevel, find_annex_b_start_code, find_annex_b_start_code_scalar, forward_dct4x4,
@@ -15,7 +21,7 @@ use ragdoll_simd::{
 fn main() {
     let simd = SimdLevel::detect();
     println!("================================================================================");
-    println!("  RAGDOLL v0.1.0 — M1 Foundation & SIMD Kernel Live Benchmark / Self-Test");
+    println!("  RAGDOLL v0.1.0 — M1 & M2 SIMD Kernel Live Benchmark / Self-Test");
     println!("  Detected Hardware SIMD : {}", simd.name());
     println!("================================================================================\n");
 
@@ -273,6 +279,149 @@ fn main() {
         dt_rbsp_scalar / dt_rbsp_simd
     );
 
+    // 8. M2 Pixel Engine: 1080p YUV420p <-> RGB24 (vst3q_u8 / vld3q_u8) & 4K->1080p Lanczos-3
+    let w1080 = 1920usize;
+    let h1080 = 1080usize;
+    let px1080 = (w1080 * h1080) as f64;
+    let mat709 = YuvRgbMatrix::from_colorimetry(MatrixCoefficients::BT709, ColorRange::Limited);
+    let mut rgb_ref = vec![0u8; w1080 * 3 * h1080];
+    let mut rgb_simd = vec![0u8; w1080 * 3 * h1080];
+    let u_slice = frame_a.plane(1).data();
+    let v_slice = frame_a.plane(2).data();
+    let c_stride = frame_a.plane(1).stride();
+
+    let pix_iters = 30usize;
+    let t0 = Instant::now();
+    for _ in 0..pix_iters {
+        yuv420p_to_rgb24_scalar(
+            black_box(ya_slice),
+            stride,
+            black_box(u_slice),
+            c_stride,
+            black_box(v_slice),
+            c_stride,
+            black_box(&mut rgb_ref),
+            w1080 * 3,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_y2r_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..pix_iters {
+        yuv420p_to_rgb24(
+            black_box(ya_slice),
+            stride,
+            black_box(u_slice),
+            c_stride,
+            black_box(v_slice),
+            c_stride,
+            black_box(&mut rgb_simd),
+            w1080 * 3,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_y2r_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(rgb_ref, rgb_simd);
+    println!(
+        "1080p YUV420p -> RGB24 (BT.709 vst3q_u8)    {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (px1080 * pix_iters as f64) / dt_y2r_scalar / 1e9,
+        (px1080 * pix_iters as f64) / dt_y2r_simd / 1e9,
+        dt_y2r_scalar / dt_y2r_simd
+    );
+
+    let mut y_out_ref = vec![0u8; w1080 * h1080];
+    let mut u_out_ref = vec![0u8; (w1080 / 2) * (h1080 / 2)];
+    let mut v_out_ref = vec![0u8; (w1080 / 2) * (h1080 / 2)];
+    let mut y_out_simd = vec![0u8; w1080 * h1080];
+    let mut u_out_simd = vec![0u8; (w1080 / 2) * (h1080 / 2)];
+    let mut v_out_simd = vec![0u8; (w1080 / 2) * (h1080 / 2)];
+
+    let t0 = Instant::now();
+    for _ in 0..pix_iters {
+        rgb24_to_yuv420p_scalar(
+            black_box(&rgb_simd),
+            w1080 * 3,
+            &mut y_out_ref,
+            w1080,
+            &mut u_out_ref,
+            w1080 / 2,
+            &mut v_out_ref,
+            w1080 / 2,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_r2y_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..pix_iters {
+        rgb24_to_yuv420p(
+            black_box(&rgb_simd),
+            w1080 * 3,
+            &mut y_out_simd,
+            w1080,
+            &mut u_out_simd,
+            w1080 / 2,
+            &mut v_out_simd,
+            w1080 / 2,
+            w1080,
+            h1080,
+            &mat709,
+        );
+    }
+    let dt_r2y_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(y_out_ref, y_out_simd);
+    assert_eq!(u_out_ref, u_out_simd);
+    assert_eq!(v_out_ref, v_out_simd);
+    println!(
+        "1080p RGB24 -> YUV420p (BT.709 vld3q_u8)    {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (px1080 * pix_iters as f64) / dt_r2y_scalar / 1e9,
+        (px1080 * pix_iters as f64) / dt_r2y_simd / 1e9,
+        dt_r2y_scalar / dt_r2y_simd
+    );
+
+    // 9. Horizontal 8-tap Lanczos-3 4K -> 1080p Scanline Resampler
+    let hbank = PolyphaseFilterBank::new(3840, 1920, ScaleFilter::Lanczos3);
+    let mut scaled_ref = vec![0u8; 1920];
+    let mut scaled_simd = vec![0u8; 1920];
+    let scale_rows = 4000usize;
+    let t0 = Instant::now();
+    for r in 0..scale_rows {
+        let row = frame_a.plane(0).row_padded(r % 2160);
+        hscale_row_8tap_q14_scalar(black_box(row), black_box(&mut scaled_ref), &hbank);
+    }
+    let dt_hsc_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for r in 0..scale_rows {
+        let row = frame_a.plane(0).row_padded(r % 2160);
+        hscale_row_8tap_q14(black_box(row), black_box(&mut scaled_simd), &hbank);
+    }
+    let dt_hsc_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(scaled_ref, scaled_simd);
+    println!(
+        "Lanczos-3 8-Tap H-Scale (4K->1080p vpaddq)  {:>8.2} Gpx/s   {:>8.2} Gpx/s   {:>5.2}x    EXACT",
+        (1920.0 * scale_rows as f64) / dt_hsc_scalar / 1e9,
+        (1920.0 * scale_rows as f64) / dt_hsc_simd / 1e9,
+        dt_hsc_scalar / dt_hsc_simd
+    );
+
+    let mut dst_1080p_plane = Plane::new(1920, 1080, 1);
+    let t_l1 = Instant::now();
+    scale_plane(
+        frame_a.plane(0),
+        &mut dst_1080p_plane,
+        ScaleFilter::Lanczos3,
+    );
+    let l1_fps = 1.0 / t_l1.elapsed().as_secs_f64();
+    let q_rep = evaluate_frame_quality(&frame_a, &frame_b, None);
+
     // 8. Slicing-by-8 CRC-16 (FLAC) & CRC-32 (MPEG-TS), plus CLZ Bitstream & 128-bit Timestamp check
     let t_crc16 = Instant::now();
     let mut c16 = 0u16;
@@ -322,5 +471,9 @@ fn main() {
         ts_ns.format_hms(),
         ts_ns.ticks,
         satd8
+    );
+    println!(
+        "[M2 Pix & Quality] 4K->1080p Lanczos-3 L1 Ring-Buffer: {:.1} fps | 4K Quality: PSNR={:.2} dB, SSIM={:.5}, VMAF-Lite={:.2}",
+        l1_fps, q_rep.psnr_y, q_rep.ssim_y, q_rep.vmaf_lite
     );
 }

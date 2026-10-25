@@ -37,15 +37,15 @@ Establish the Cargo workspace, 128-bit overflow-safe Rational64 timebases, first
 
 ## m2-pix — Phase 2 — Fused Scanline Pixel Engine & Perceptual Metrics
 
-`··········` 0% · 0 of 3 done
+`##########` 100% · 3 of 3 done
 
 Replace libswscale's multi-pass full-frame memory round-trips with a fused L1-cache-resident scanline pixel engine supporting BT.601/BT.709/BT.2020/Oklab color science, separable polyphase Lanczos-3 and Mitchell-Netravali scaling, and SIMD-accelerated PSNR, SSIM, and VMAF-lite perceptual quality analyzers.
 
-### up next
+### shipped
 
-- [ ] `SIMD-0012` SIMD BT.601 / BT.709 / BT.2020 / Oklab Color Matrix & Chroma Subsampling Engine <sup>kernel · p0 · pix</sup>
-- [ ] `SIMD-0013` Fused Scanline Separable Polyphase Lanczos-3 & Mitchell-Netravali Resampler <sup>kernel · p0 · pix</sup>
-- [ ] `SIMD-0014` SIMD Perceptual Quality Engine: PSNR, 8x8 Windowed SSIM & VMAF-Lite <sup>kernel · p1 · pix</sup>
+- [x] `SIMD-0012` SIMD BT.601 / BT.709 / BT.2020 / Oklab Color Matrix & Chroma Subsampling Engine <sup>kernel · p0 · pix</sup>
+- [x] `SIMD-0013` Fused Scanline Separable Polyphase Lanczos-3 & Mitchell-Netravali Resampler <sup>kernel · p0 · pix</sup>
+- [x] `SIMD-0014` SIMD Perceptual Quality Engine: PSNR, 8x8 Windowed SSIM & VMAF-Lite <sup>kernel · p1 · pix</sup>
 
 ## m3-format — Phase 3 — Zero-Copy Memory-Mapped Containers & Vectored Muxers
 

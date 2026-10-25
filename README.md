@@ -88,16 +88,20 @@ Example output on Apple M4:
 
 Kernel (4K 3840x2160 Luma / 16 MB Stream)      Scalar         NEON SIMD      Speedup   Check
 ----------------------------------------------------------------------------------------------
-4K Plane SAD (sum |a - b|)                     32.11 Gpx/s      47.87 Gpx/s    1.49x    EXACT (49183200)
-4K Plane SSE (sum (a - b)^2)                   14.27 Gpx/s      22.65 Gpx/s    1.59x    EXACT (6295449600)
-4K Plane SSIM 4x4-Reuse (vf_ssim)               7.06 Gpx/s      10.06 Gpx/s    1.43x    EXACT (0.93131 / 11.63 dB)
-H.264 4x4 DCT+IDCT (vtrn1/vtrn2 + vrshr)       96.76 Mblk/s    191.03 Mblk/s   1.97x    EXACT
-Annex-B Start-Code Scan (isolated 0x00s)        5.25 GB/s       32.61 GB/s     6.21x    EXACT
-H.264/HEVC RBSP Unescape (vextq_u8 pair)        2.02 GB/s       10.65 GB/s     5.26x    EXACT
+4K Plane SAD (sum |a - b|)                     19.68 Gpx/s      35.47 Gpx/s    1.80x    EXACT (49183200)
+4K Plane SSE (sum (a - b)^2)                   14.05 Gpx/s      22.28 Gpx/s    1.59x    EXACT (6295449600)
+4K Plane SSIM 4x4-Reuse (vf_ssim)               7.03 Gpx/s       9.83 Gpx/s    1.40x    EXACT (0.93131 / 11.63 dB)
+H.264 4x4 DCT+IDCT (vtrn1/vtrn2 + vrshr)       94.50 Mblk/s    186.92 Mblk/s   1.98x    EXACT
+Annex-B Start-Code Scan (isolated 0x00s)        5.23 GB/s       27.58 GB/s     5.27x    EXACT
+H.264/HEVC RBSP Unescape (vextq_u8 pair)        2.01 GB/s       12.95 GB/s     6.46x    EXACT
+1080p YUV420p -> RGB24 (BT.709 vst3q_u8)        0.77 Gpx/s       5.17 Gpx/s    6.76x    EXACT
+1080p RGB24 -> YUV420p (BT.709 vld3q_u8)        1.60 Gpx/s       5.96 Gpx/s    3.73x    EXACT
+Lanczos-3 8-Tap H-Scale (4K->1080p vpaddq)      1.40 Gpx/s       2.86 Gpx/s    2.04x    EXACT
 ----------------------------------------------------------------------------------------------
-[CRC Slicing-by-8] FLAC CRC-16: 3.09 GB/s | MPEG-TS CRC-32: 2.56 GB/s (crc16=0x0000, crc32=0x00000000)
+[CRC Slicing-by-8] FLAC CRC-16: 3.08 GB/s | MPEG-TS CRC-32: 2.56 GB/s (crc16=0x0000, crc32=0x00000000)
 [CLZ Bitstream]    512 Exp-Golomb ue(v) + Signed Rice(k=4) + RBSP stop-bit verified in 819 bytes
 [128-bit Time]     48h MPEG-TS 90kHz -> Nanoseconds exact: 48:00:00.000 (172800000000000 ns), 8x8 SATD = 4096
+[M2 Pix & Quality] 4K->1080p Lanczos-3 L1 Ring-Buffer: 451.8 fps | 4K Quality: PSNR=19.33 dB, SSIM=0.93131, VMAF-Lite=83.54
 ```
 
 ---
@@ -116,7 +120,7 @@ Ragdoll tracks its architecture decisions (`ADR-*`), SIMD kernels (`SIMD-*`), be
 | Milestone | Status | Focus |
 | :--- | :---: | :--- |
 | **`m1-foundation`** | **Done** | 128-bit `Rational64`/`Timestamp`, CICP/Oklab colorimetry, 64B cache-aligned `FramePool`, 64-bit `CLZ` bitstreams, Slicing-by-8 CRCs, and NEON/AVX2 core primitives (`SAD`, `SSE`, `SSIM`, `SATD`, `DCT`, `Annex-B`, `RBSP`). |
-| **`m2-pix`** | Planned | Fused L1 scanline YUV $\leftrightarrow$ RGB/Oklab color matrices, polyphase Lanczos-3/Bicubic 4K scaling, and perceptual quality metrics (`PSNR`, `SSIM`, `VMAF-Lite`). |
+| **`m2-pix`** | **Done** | Fused L1 scanline YUV $\leftrightarrow$ RGB/Oklab color matrices (`5.17–5.96 Gpx/s`), polyphase Lanczos-3/Bicubic 4K scaling (`451.8 fps`), and perceptual quality metrics (`PSNR`, `SSIM`, `VMAF-Lite`). |
 | **`m3-format`** | Planned | Zero-copy `mmap` MP4/ISOBMFF, Matroska (`.mkv`)/WebM, MPEG-TS (`.ts`), YUV4MPEG2 (`.y4m`), Netpbm, and WAV demuxers & muxers. |
 | **`m4-codec`** | Planned | Pure-Rust FLAC lossless audio, H.264/AVC frame codec, AV1 OBU engine, and Ragdoll Fast-Intra (`RGDI`) SIMD studio codec. |
 | **`m5-cli-bench`** | Planned | Lock-free GOP-parallel pipeline, `.toml` recipe runner, full `ragdoll` CLI, and automated `ragdoll bench` vs. FFmpeg 9.0.2. |

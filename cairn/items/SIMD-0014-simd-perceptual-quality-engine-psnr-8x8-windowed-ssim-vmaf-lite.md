@@ -3,13 +3,15 @@ id: 14
 uid: 0bd3db99-ca51-4051-b97a-58dd631db729
 title: 'SIMD Perceptual Quality Engine: PSNR, 8x8 Windowed SSIM & VMAF-Lite'
 type: kernel
-status: planned
+status: done
 milestone: m2-pix
+assignee: antigravity
 depends_on:
 - 11
 - 12
 created: 2026-10-24
 updated: 2026-10-24
+closed_at: 2026-10-24
 priority: p1
 area: pix
 effort: m
@@ -30,6 +32,14 @@ Compute objective and perceptual video quality metrics across luma and chroma pl
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
-- [ ] Zero heap allocations in the hot loop.
-- [ ] Identical frames report PSNR = inf and SSIM = 1.000000; synthetic degraded frames match analytical reference values.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
+- [x] Zero heap allocations in the hot loop.
+- [x] Identical frames report PSNR = inf and SSIM = 1.000000; synthetic degraded frames match analytical reference values.
+
+## 2026-10-24
+
+Implemented crates/ragdoll-pix/src/metrics.rs: psnr_plane_u8, ssim_plane_u8 (4x4 sub-block reuse with Bessel sample variance), vmaf_lite_plane_u8 (VIF mutual information + structural detail retention + optional temporal motion masking), and evaluate_frame_quality.
+
+## Result
+
+Shipped SIMD perceptual quality analyzer (`PSNR`, `SSIM`, `VMAF-Lite`, `QualityReport`) in `ragdoll-pix::metrics`, verified on identity (PSNR=inf, SSIM=1.0, VMAF-Lite=100.0) and analytical MSE test cases.
