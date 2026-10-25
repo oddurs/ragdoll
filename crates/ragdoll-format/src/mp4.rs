@@ -195,20 +195,15 @@ impl<'a> Mp4Demuxer<'a> {
             let b = box_res?;
             let box_start = iter.offset - b.total_len;
             match &b.fourcc.0 {
-                b"ftyp" => {
-                    if b.payload.len() >= 4 {
-                        major_brand =
-                            FourCC([b.payload[0], b.payload[1], b.payload[2], b.payload[3]]);
-                    }
+                b"ftyp" if b.payload.len() >= 4 => {
+                    major_brand = FourCC([b.payload[0], b.payload[1], b.payload[2], b.payload[3]]);
                 }
                 b"moov" => {
                     moov_offset = Some(box_start);
                     Self::parse_moov(b.payload, data.len(), &mut tracks)?;
                 }
-                b"mdat" => {
-                    if mdat_offset.is_none() {
-                        mdat_offset = Some(box_start);
-                    }
+                b"mdat" if mdat_offset.is_none() => {
+                    mdat_offset = Some(box_start);
                 }
                 _ => {}
             }
@@ -378,29 +373,27 @@ impl<'a> Mp4Demuxer<'a> {
         for box_res in BoxIter::new(moov_data) {
             let b = box_res?;
             match &b.fourcc.0 {
-                b"mvhd" => {
-                    if b.payload.len() >= 20 {
-                        let version = b.payload[0];
-                        if version == 0 && b.payload.len() >= 16 {
-                            let ts = u32::from_be_bytes([
-                                b.payload[12],
-                                b.payload[13],
-                                b.payload[14],
-                                b.payload[15],
-                            ]);
-                            if ts > 0 {
-                                movie_timescale = ts;
-                            }
-                        } else if version == 1 && b.payload.len() >= 24 {
-                            let ts = u32::from_be_bytes([
-                                b.payload[20],
-                                b.payload[21],
-                                b.payload[22],
-                                b.payload[23],
-                            ]);
-                            if ts > 0 {
-                                movie_timescale = ts;
-                            }
+                b"mvhd" if b.payload.len() >= 20 => {
+                    let version = b.payload[0];
+                    if version == 0 && b.payload.len() >= 16 {
+                        let ts = u32::from_be_bytes([
+                            b.payload[12],
+                            b.payload[13],
+                            b.payload[14],
+                            b.payload[15],
+                        ]);
+                        if ts > 0 {
+                            movie_timescale = ts;
+                        }
+                    } else if version == 1 && b.payload.len() >= 24 {
+                        let ts = u32::from_be_bytes([
+                            b.payload[20],
+                            b.payload[21],
+                            b.payload[22],
+                            b.payload[23],
+                        ]);
+                        if ts > 0 {
+                            movie_timescale = ts;
                         }
                     }
                 }
@@ -547,15 +540,13 @@ impl<'a> Mp4Demuxer<'a> {
                         }
                     }
                 }
-                b"hdlr" => {
-                    if b.payload.len() >= 12 {
-                        track_type = match &b.payload[8..12] {
-                            b"vide" => TrackType::Video,
-                            b"soun" => TrackType::Audio,
-                            b"subt" | b"sbtl" | b"text" => TrackType::Subtitle,
-                            _ => TrackType::Data,
-                        };
-                    }
+                b"hdlr" if b.payload.len() >= 12 => {
+                    track_type = match &b.payload[8..12] {
+                        b"vide" => TrackType::Video,
+                        b"soun" => TrackType::Audio,
+                        b"subt" | b"sbtl" | b"text" => TrackType::Subtitle,
+                        _ => TrackType::Data,
+                    };
                 }
                 b"minf" => {
                     minf_slice = Some(b.payload);
@@ -608,216 +599,201 @@ impl<'a> Mp4Demuxer<'a> {
                         &mut audio_params,
                     )?;
                 }
-                b"stts" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.stts.reserve(count.min(65536));
-                        for _ in 0..count {
-                            if pos + 8 > b.payload.len() {
-                                break;
-                            }
-                            let sc = u32::from_be_bytes([
-                                b.payload[pos],
-                                b.payload[pos + 1],
-                                b.payload[pos + 2],
-                                b.payload[pos + 3],
-                            ]);
-                            let sd = u32::from_be_bytes([
-                                b.payload[pos + 4],
-                                b.payload[pos + 5],
-                                b.payload[pos + 6],
-                                b.payload[pos + 7],
-                            ]);
-                            tables.stts.push((sc, sd));
-                            pos += 8;
+                b"stts" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.stts.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 8 > b.payload.len() {
+                            break;
                         }
-                    }
-                }
-                b"ctts" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.ctts.reserve(count.min(65536));
-                        for _ in 0..count {
-                            if pos + 8 > b.payload.len() {
-                                break;
-                            }
-                            let sc = u32::from_be_bytes([
-                                b.payload[pos],
-                                b.payload[pos + 1],
-                                b.payload[pos + 2],
-                                b.payload[pos + 3],
-                            ]);
-                            // Both v0 (unsigned -> signed in mov.c when negative occurs) and v1 (signed i32)
-                            let so = i32::from_be_bytes([
-                                b.payload[pos + 4],
-                                b.payload[pos + 5],
-                                b.payload[pos + 6],
-                                b.payload[pos + 7],
-                            ]);
-                            tables.ctts.push((sc, so));
-                            pos += 8;
-                        }
-                    }
-                }
-                b"stsc" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.stsc.reserve(count.min(65536));
-                        for _ in 0..count {
-                            if pos + 12 > b.payload.len() {
-                                break;
-                            }
-                            let first_chunk = u32::from_be_bytes([
-                                b.payload[pos],
-                                b.payload[pos + 1],
-                                b.payload[pos + 2],
-                                b.payload[pos + 3],
-                            ]);
-                            let spc = u32::from_be_bytes([
-                                b.payload[pos + 4],
-                                b.payload[pos + 5],
-                                b.payload[pos + 6],
-                                b.payload[pos + 7],
-                            ]);
-                            let sdi = u32::from_be_bytes([
-                                b.payload[pos + 8],
-                                b.payload[pos + 9],
-                                b.payload[pos + 10],
-                                b.payload[pos + 11],
-                            ]);
-                            tables.stsc.push((first_chunk, spc, sdi));
-                            pos += 12;
-                        }
-                    }
-                }
-                b"stsz" => {
-                    if b.payload.len() >= 12 {
-                        tables.stsz_default = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
+                        let sc = u32::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
                         ]);
-                        tables.stsz_count = u32::from_be_bytes([
-                            b.payload[8],
-                            b.payload[9],
-                            b.payload[10],
-                            b.payload[11],
-                        ]) as usize;
-                        if tables.stsz_default == 0 {
-                            let mut pos = 12usize;
-                            tables.stsz_entries.reserve(tables.stsz_count.min(262_144));
-                            for _ in 0..tables.stsz_count {
-                                if pos + 4 > b.payload.len() {
-                                    break;
-                                }
-                                let sz = u32::from_be_bytes([
-                                    b.payload[pos],
-                                    b.payload[pos + 1],
-                                    b.payload[pos + 2],
-                                    b.payload[pos + 3],
-                                ]);
-                                tables.stsz_entries.push(sz);
-                                pos += 4;
-                            }
-                        }
+                        let sd = u32::from_be_bytes([
+                            b.payload[pos + 4],
+                            b.payload[pos + 5],
+                            b.payload[pos + 6],
+                            b.payload[pos + 7],
+                        ]);
+                        tables.stts.push((sc, sd));
+                        pos += 8;
                     }
                 }
-                b"stco" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.chunk_offsets.reserve(count.min(65536));
-                        for _ in 0..count {
+                b"ctts" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.ctts.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 8 > b.payload.len() {
+                            break;
+                        }
+                        let sc = u32::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
+                        ]);
+                        let so = i32::from_be_bytes([
+                            b.payload[pos + 4],
+                            b.payload[pos + 5],
+                            b.payload[pos + 6],
+                            b.payload[pos + 7],
+                        ]);
+                        tables.ctts.push((sc, so));
+                        pos += 8;
+                    }
+                }
+                b"stsc" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.stsc.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 12 > b.payload.len() {
+                            break;
+                        }
+                        let first_chunk = u32::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
+                        ]);
+                        let spc = u32::from_be_bytes([
+                            b.payload[pos + 4],
+                            b.payload[pos + 5],
+                            b.payload[pos + 6],
+                            b.payload[pos + 7],
+                        ]);
+                        let sdi = u32::from_be_bytes([
+                            b.payload[pos + 8],
+                            b.payload[pos + 9],
+                            b.payload[pos + 10],
+                            b.payload[pos + 11],
+                        ]);
+                        tables.stsc.push((first_chunk, spc, sdi));
+                        pos += 12;
+                    }
+                }
+                b"stsz" if b.payload.len() >= 12 => {
+                    tables.stsz_default = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]);
+                    tables.stsz_count = u32::from_be_bytes([
+                        b.payload[8],
+                        b.payload[9],
+                        b.payload[10],
+                        b.payload[11],
+                    ]) as usize;
+                    if tables.stsz_default == 0 {
+                        let mut pos = 12usize;
+                        tables.stsz_entries.reserve(tables.stsz_count.min(262_144));
+                        for _ in 0..tables.stsz_count {
                             if pos + 4 > b.payload.len() {
                                 break;
                             }
-                            let off = u32::from_be_bytes([
+                            let sz = u32::from_be_bytes([
                                 b.payload[pos],
                                 b.payload[pos + 1],
                                 b.payload[pos + 2],
                                 b.payload[pos + 3],
-                            ]) as u64;
-                            tables.chunk_offsets.push(off);
+                            ]);
+                            tables.stsz_entries.push(sz);
                             pos += 4;
                         }
                     }
                 }
-                b"co64" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.chunk_offsets.reserve(count.min(65536));
-                        for _ in 0..count {
-                            if pos + 8 > b.payload.len() {
-                                break;
-                            }
-                            let off = u64::from_be_bytes([
-                                b.payload[pos],
-                                b.payload[pos + 1],
-                                b.payload[pos + 2],
-                                b.payload[pos + 3],
-                                b.payload[pos + 4],
-                                b.payload[pos + 5],
-                                b.payload[pos + 6],
-                                b.payload[pos + 7],
-                            ]);
-                            tables.chunk_offsets.push(off);
-                            pos += 8;
+                b"stco" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.chunk_offsets.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 4 > b.payload.len() {
+                            break;
                         }
+                        let off = u32::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
+                        ]) as u64;
+                        tables.chunk_offsets.push(off);
+                        pos += 4;
                     }
                 }
-                b"stss" => {
-                    if b.payload.len() >= 8 {
-                        let count = u32::from_be_bytes([
-                            b.payload[4],
-                            b.payload[5],
-                            b.payload[6],
-                            b.payload[7],
-                        ]) as usize;
-                        let mut pos = 8usize;
-                        tables.stss.reserve(count.min(65536));
-                        for _ in 0..count {
-                            if pos + 4 > b.payload.len() {
-                                break;
-                            }
-                            let sync_idx = u32::from_be_bytes([
-                                b.payload[pos],
-                                b.payload[pos + 1],
-                                b.payload[pos + 2],
-                                b.payload[pos + 3],
-                            ]);
-                            tables.stss.push(sync_idx);
-                            pos += 4;
+                b"co64" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.chunk_offsets.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 8 > b.payload.len() {
+                            break;
                         }
+                        let off = u64::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
+                            b.payload[pos + 4],
+                            b.payload[pos + 5],
+                            b.payload[pos + 6],
+                            b.payload[pos + 7],
+                        ]);
+                        tables.chunk_offsets.push(off);
+                        pos += 8;
+                    }
+                }
+                b"stss" if b.payload.len() >= 8 => {
+                    let count = u32::from_be_bytes([
+                        b.payload[4],
+                        b.payload[5],
+                        b.payload[6],
+                        b.payload[7],
+                    ]) as usize;
+                    let mut pos = 8usize;
+                    tables.stss.reserve(count.min(65536));
+                    for _ in 0..count {
+                        if pos + 4 > b.payload.len() {
+                            break;
+                        }
+                        let sync_idx = u32::from_be_bytes([
+                            b.payload[pos],
+                            b.payload[pos + 1],
+                            b.payload[pos + 2],
+                            b.payload[pos + 3],
+                        ]);
+                        tables.stss.push(sync_idx);
+                        pos += 4;
                     }
                 }
                 _ => {}
@@ -906,34 +882,31 @@ impl<'a> Mp4Demuxer<'a> {
                                     extra_data.clear();
                                     extra_data.extend_from_slice(child.payload);
                                 }
-                                b"colr" => {
-                                    if child.payload.len() >= 11 && &child.payload[0..4] == b"nclx"
-                                    {
-                                        let prim = u16::from_be_bytes([
-                                            child.payload[4],
-                                            child.payload[5],
-                                        ]) as u8;
-                                        let trc = u16::from_be_bytes([
-                                            child.payload[6],
-                                            child.payload[7],
-                                        ]) as u8;
-                                        let mat = u16::from_be_bytes([
-                                            child.payload[8],
-                                            child.payload[9],
-                                        ]) as u8;
-                                        let full_range = (child.payload[10] & 0x80) != 0;
-                                        video.colorimetry = Colorimetry {
-                                            primaries: ColorPrimaries::from_cicp(prim),
-                                            transfer: TransferCharacteristics::from_cicp(trc),
-                                            matrix: MatrixCoefficients::from_cicp(mat),
-                                            range: if full_range {
-                                                ColorRange::Full
-                                            } else {
-                                                ColorRange::Limited
-                                            },
-                                            ..Default::default()
-                                        };
-                                    }
+                                b"colr"
+                                    if child.payload.len() >= 11
+                                        && &child.payload[0..4] == b"nclx" =>
+                                {
+                                    let prim =
+                                        u16::from_be_bytes([child.payload[4], child.payload[5]])
+                                            as u8;
+                                    let trc =
+                                        u16::from_be_bytes([child.payload[6], child.payload[7]])
+                                            as u8;
+                                    let mat =
+                                        u16::from_be_bytes([child.payload[8], child.payload[9]])
+                                            as u8;
+                                    let full_range = (child.payload[10] & 0x80) != 0;
+                                    video.colorimetry = Colorimetry {
+                                        primaries: ColorPrimaries::from_cicp(prim),
+                                        transfer: TransferCharacteristics::from_cicp(trc),
+                                        matrix: MatrixCoefficients::from_cicp(mat),
+                                        range: if full_range {
+                                            ColorRange::Full
+                                        } else {
+                                            ColorRange::Limited
+                                        },
+                                        ..Default::default()
+                                    };
                                 }
                                 _ => {}
                             }
@@ -991,33 +964,31 @@ impl<'a> Mp4Demuxer<'a> {
                             for child_res in BoxIter::new(&entry.payload[child_start..]) {
                                 let child = child_res?;
                                 match &child.fourcc.0 {
-                                    b"dfLa" => {
+                                    b"dfLa" if child.payload.len() >= 8 => {
                                         // ISO/IEC 14496-12 FLACSpecificBox: 4-byte version/flags followed by FLAC metadata blocks
-                                        if child.payload.len() >= 8 {
-                                            let blocks = &child.payload[4..];
-                                            // First block is STREAMINFO (4-byte block header + 34-byte STREAMINFO)
-                                            if blocks.len() >= 38 && (blocks[0] & 0x7F) == 0 {
-                                                extra_data.clear();
-                                                extra_data.extend_from_slice(&blocks[4..38]);
-                                                // Parse exact 20-bit sample rate, 3-bit channels-1, 5-bit bps-1 from STREAMINFO
-                                                let s = &blocks[4..38];
-                                                let flac_sr = ((s[10] as u32) << 12)
-                                                    | ((s[11] as u32) << 4)
-                                                    | ((s[12] as u32) >> 4);
-                                                let flac_ch = ((s[12] >> 1) & 0x07) + 1;
-                                                let flac_bps =
-                                                    (((s[12] & 0x01) << 4) | (s[13] >> 4)) + 1;
-                                                if flac_sr > 0 {
-                                                    audio.sample_rate = flac_sr;
-                                                }
-                                                audio.channels = flac_ch;
-                                                audio.channel_layout =
-                                                    ChannelLayout::from_channels(flac_ch);
-                                                audio.bits_per_coded_sample = flac_bps;
-                                            } else {
-                                                extra_data.clear();
-                                                extra_data.extend_from_slice(blocks);
+                                        let blocks = &child.payload[4..];
+                                        // First block is STREAMINFO (4-byte block header + 34-byte STREAMINFO)
+                                        if blocks.len() >= 38 && (blocks[0] & 0x7F) == 0 {
+                                            extra_data.clear();
+                                            extra_data.extend_from_slice(&blocks[4..38]);
+                                            // Parse exact 20-bit sample rate, 3-bit channels-1, 5-bit bps-1 from STREAMINFO
+                                            let s = &blocks[4..38];
+                                            let flac_sr = ((s[10] as u32) << 12)
+                                                | ((s[11] as u32) << 4)
+                                                | ((s[12] as u32) >> 4);
+                                            let flac_ch = ((s[12] >> 1) & 0x07) + 1;
+                                            let flac_bps =
+                                                (((s[12] & 0x01) << 4) | (s[13] >> 4)) + 1;
+                                            if flac_sr > 0 {
+                                                audio.sample_rate = flac_sr;
                                             }
+                                            audio.channels = flac_ch;
+                                            audio.channel_layout =
+                                                ChannelLayout::from_channels(flac_ch);
+                                            audio.bits_per_coded_sample = flac_bps;
+                                        } else {
+                                            extra_data.clear();
+                                            extra_data.extend_from_slice(blocks);
                                         }
                                     }
                                     b"esds" => {
