@@ -626,6 +626,8 @@ impl<'a> MkvDemuxer<'a> {
                 32 => CodecId::PcmS32Le,
                 _ => CodecId::PcmS16Le,
             },
+            "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" => CodecId::WebVtt,
+            "S_TEXT/UTF8" | "S_TEXT/ASCII" => CodecId::SubRip,
             _ => return Ok(None),
         };
 
@@ -873,20 +875,42 @@ impl<'a> MkvMuxer<'a> {
     }
 
     pub fn write_packet(&mut self, packet: PacketSlice<'a>) -> Result<()> {
-        if (packet.track_index as usize) >= self.tracks.len() {
+        let Some(track) = self.tracks.get(packet.track_index as usize) else {
             return Err(RagdollError::CorruptBitstream(
                 "MkvMuxer::write_packet track_index out of bounds",
             ));
-        }
+        };
+        let packet = if track.track_type == TrackType::Subtitle {
+            let (text, _settings) = crate::subtitle::unwrap_mp4_wvtt_sample(packet.data());
+            if text.is_empty() {
+                return Ok(());
+            }
+            PacketSlice::from_owned(
+                ragdoll_core::AlignedBuffer::from_slice(text.as_bytes()),
+                packet.track_index,
+                packet.pts,
+                packet.dts,
+                packet.duration,
+                PacketFlags::KEYFRAME,
+            )
+        } else {
+            packet
+        };
         self.packets.push(packet);
         Ok(())
     }
 
     /// Writes a complete spec-compliant `.mkv` or `.webm` container with `Info`, `Tracks`,
     /// `Cluster` (`SimpleBlock`), and `Cues` keyframe seek table.
-    pub fn finish<W: Write>(self, writer: W) -> Result<u64> {
+    pub fn finish<W: Write>(mut self, writer: W) -> Result<u64> {
         let mut vw = VectoredWriter::new(writer);
         let ms_tb = Rational64::new(1, 1000); // TimestampScale = 1_000_000 ns (1 ms)
+        self.packets.sort_by(|a, b| {
+            let a_ns = a.pts.rescale_to(Rational64::TIMEBASE_NANOS).ticks;
+            let b_ns = b.pts.rescale_to(Rational64::TIMEBASE_NANOS).ticks;
+            a_ns.cmp(&b_ns)
+                .then_with(|| a.track_index.cmp(&b.track_index))
+        });
 
         // 1. Build `EBML` header
         let doc_type = if self.webm_mode {
@@ -922,9 +946,10 @@ impl<'a> MkvMuxer<'a> {
         let tracks_elem = self.build_tracks_element()?;
 
         // 5. Group packets into `Cluster`s (start a new cluster on video keyframes or every 15s)
+        type ClusterBlock<'p> = (u64, i16, u8, &'p [u8], bool, Option<u64>);
         struct ClusterPlan<'p> {
             cluster_ts_ms: i64,
-            blocks: Vec<(u64, i16, u8, &'p [u8], bool)>,
+            blocks: Vec<ClusterBlock<'p>>,
             header_bytes: Vec<u8>,
             total_cluster_bytes: usize,
         }
@@ -932,7 +957,10 @@ impl<'a> MkvMuxer<'a> {
         let mut clusters: Vec<ClusterPlan<'_>> = Vec::new();
         for pkt in &self.packets {
             let pts_ms = pkt.pts.rescale_to(ms_tb).ticks.max(0);
-            let is_video = self.tracks[pkt.track_index as usize].track_type == TrackType::Video;
+            let ttype = self.tracks[pkt.track_index as usize].track_type;
+            let is_video = ttype == TrackType::Video;
+            let explicit_dur_ms = (ttype == TrackType::Subtitle)
+                .then(|| rescale_q(pkt.duration.max(1), pkt.pts.timebase, ms_tb).max(1) as u64);
             let need_new_cluster = match clusters.last() {
                 None => true,
                 Some(c) => {
@@ -960,6 +988,7 @@ impl<'a> MkvMuxer<'a> {
                 flags,
                 pkt.data(),
                 is_video && pkt.is_keyframe(),
+                explicit_dur_ms,
             ));
         }
 
@@ -977,6 +1006,8 @@ impl<'a> MkvMuxer<'a> {
 
         let mut tn_vint = Vec::with_capacity(8);
         let mut sb_sz_vint = Vec::with_capacity(8);
+        let mut dur_elem_buf = Vec::with_capacity(12);
+        let mut bg_sz_vint = Vec::with_capacity(8);
         for c in &mut clusters {
             let mut ts_elem = Vec::with_capacity(12);
             Self::push_uint(&mut ts_elem, ID_TIMESTAMP, c.cluster_ts_ms as u64);
@@ -984,13 +1015,24 @@ impl<'a> MkvMuxer<'a> {
             let mut cluster_payload_len = ts_elem.len();
             let mut logged_cue = false;
 
-            for &(track_num, _rel_ts, _flags, data, is_video_kf) in &c.blocks {
+            for &(track_num, _rel_ts, _flags, data, is_video_kf, explicit_dur) in &c.blocks {
                 tn_vint.clear();
                 write_ebml_vint(track_num, &mut tn_vint);
                 let sb_payload_len = tn_vint.len() + 3 + data.len();
                 sb_sz_vint.clear();
                 write_ebml_vint(sb_payload_len as u64, &mut sb_sz_vint);
-                cluster_payload_len += 1 + sb_sz_vint.len() + sb_payload_len;
+                let block_elem_len = 1 + sb_sz_vint.len() + sb_payload_len;
+
+                if let Some(dur_ms) = explicit_dur {
+                    dur_elem_buf.clear();
+                    Self::push_uint(&mut dur_elem_buf, ID_BLOCK_DURATION, dur_ms);
+                    let bg_payload_len = block_elem_len + dur_elem_buf.len();
+                    bg_sz_vint.clear();
+                    write_ebml_vint(bg_payload_len as u64, &mut bg_sz_vint);
+                    cluster_payload_len += 1 + bg_sz_vint.len() + bg_payload_len;
+                } else {
+                    cluster_payload_len += block_elem_len;
+                }
 
                 if is_video_kf && !logged_cue {
                     logged_cue = true;
@@ -1044,35 +1086,64 @@ impl<'a> MkvMuxer<'a> {
             &tracks_elem,
         ])?;
 
-        // 7. Stream each Cluster and all of its SimpleBlock payloads in a single batched `writev` call per Cluster!
+        // 7. Stream each Cluster and all of its SimpleBlock/BlockGroup payloads in a single batched `writev` call per Cluster!
         let mut sb_hdr_arena = Vec::new();
+        let mut sb_trl_arena = Vec::new();
         let mut hdr_ranges = Vec::new();
+        let mut trl_ranges = Vec::new();
 
         for c in &clusters {
             sb_hdr_arena.clear();
+            sb_trl_arena.clear();
             hdr_ranges.clear();
-            sb_hdr_arena.reserve(c.blocks.len() * 16);
+            trl_ranges.clear();
+            sb_hdr_arena.reserve(c.blocks.len() * 20);
 
-            for &(track_num, rel_ts, flags, data, _) in &c.blocks {
+            for &(track_num, rel_ts, flags, data, _, explicit_dur) in &c.blocks {
                 let start = sb_hdr_arena.len();
-                Self::push_id(&mut sb_hdr_arena, ID_SIMPLE_BLOCK);
+                let trl_start = sb_trl_arena.len();
                 tn_vint.clear();
                 write_ebml_vint(track_num, &mut tn_vint);
-
                 let sb_payload_len = tn_vint.len() + 3 + data.len();
-                write_ebml_vint(sb_payload_len as u64, &mut sb_hdr_arena);
-                sb_hdr_arena.extend_from_slice(&tn_vint);
-                sb_hdr_arena.extend_from_slice(&rel_ts.to_be_bytes());
-                sb_hdr_arena.push(flags);
+
+                if let Some(dur_ms) = explicit_dur {
+                    dur_elem_buf.clear();
+                    Self::push_uint(&mut dur_elem_buf, ID_BLOCK_DURATION, dur_ms);
+                    sb_sz_vint.clear();
+                    write_ebml_vint(sb_payload_len as u64, &mut sb_sz_vint);
+                    let block_elem_len = 1 + sb_sz_vint.len() + sb_payload_len;
+                    let bg_payload_len = block_elem_len + dur_elem_buf.len();
+
+                    Self::push_id(&mut sb_hdr_arena, ID_BLOCK_GROUP);
+                    write_ebml_vint(bg_payload_len as u64, &mut sb_hdr_arena);
+                    Self::push_id(&mut sb_hdr_arena, ID_BLOCK);
+                    sb_hdr_arena.extend_from_slice(&sb_sz_vint);
+                    sb_hdr_arena.extend_from_slice(&tn_vint);
+                    sb_hdr_arena.extend_from_slice(&rel_ts.to_be_bytes());
+                    sb_hdr_arena.push(0x00); // Block flags in BlockGroup have no keyframe bit
+                    sb_trl_arena.extend_from_slice(&dur_elem_buf);
+                } else {
+                    Self::push_id(&mut sb_hdr_arena, ID_SIMPLE_BLOCK);
+                    write_ebml_vint(sb_payload_len as u64, &mut sb_hdr_arena);
+                    sb_hdr_arena.extend_from_slice(&tn_vint);
+                    sb_hdr_arena.extend_from_slice(&rel_ts.to_be_bytes());
+                    sb_hdr_arena.push(flags);
+                }
                 let end = sb_hdr_arena.len();
+                let trl_end = sb_trl_arena.len();
                 hdr_ranges.push(start..end);
+                trl_ranges.push(trl_start..trl_end);
             }
 
-            let mut cluster_slices = Vec::with_capacity(1 + c.blocks.len() * 2);
+            let mut cluster_slices = Vec::with_capacity(1 + c.blocks.len() * 3);
             cluster_slices.push(c.header_bytes.as_slice());
-            for (i, &(_, _, _, data, _)) in c.blocks.iter().enumerate() {
+            for (i, &(_, _, _, data, _, _)) in c.blocks.iter().enumerate() {
                 cluster_slices.push(&sb_hdr_arena[hdr_ranges[i].clone()]);
                 cluster_slices.push(data);
+                let trl = &sb_trl_arena[trl_ranges[i].clone()];
+                if !trl.is_empty() {
+                    cluster_slices.push(trl);
+                }
             }
             vw.write_vectored_all(&cluster_slices)?;
         }
@@ -1134,10 +1205,12 @@ impl<'a> MkvMuxer<'a> {
                 CodecId::PcmU8 | CodecId::PcmS16Le | CodecId::PcmS24Le | CodecId::PcmS32Le => {
                     "A_PCM/INT/LIT"
                 }
+                CodecId::WebVtt => "S_TEXT/WEBVTT",
+                CodecId::SubRip => "S_TEXT/UTF8",
             };
             Self::push_element(&mut te, ID_CODEC_ID, codec_str.as_bytes());
 
-            if !t.extra_data.is_empty() {
+            if !t.extra_data.is_empty() && t.track_type != TrackType::Subtitle {
                 if t.codec_id == CodecId::Flac && t.extra_data.len() == 34 {
                     // Matroska A_FLAC CodecPrivate requires "fLaC" + 4-byte metadata block header + 34-byte STREAMINFO
                     let mut flac_priv = Vec::with_capacity(42);

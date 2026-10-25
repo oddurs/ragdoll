@@ -27,13 +27,14 @@ use ragdoll_core::{
     set_global_power_mode, unescape_rbsp, unescape_rbsp_scalar, with_power_mode,
 };
 use ragdoll_format::{
-    MkvDemuxer, Mp4Demuxer, Mp4Muxer, Y4mMuxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv,
-    transmux_mp4_to_mpegts,
+    MkvDemuxer, Mp4Demuxer, Mp4Muxer, Y4mMuxer, build_avcc_from_sps_pps, is_stdout_path,
+    transmux_mp4_to_mkv, transmux_mp4_to_mpegts,
 };
 use ragdoll_pipeline::{
-    PipelineRecipe, PipelineTelemetry, ProbeReport, evaluate_media_metrics, execute_recipe,
-    extract_media, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
-    probe_file_detailed, remux_file, synth_media, synth_video_frame, transcode_file,
+    PipelineRecipe, PipelineTelemetry, ProbeReport, TranscodeOptions, evaluate_media_metrics,
+    execute_recipe, extract_media, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
+    probe_file_detailed, remux_file, remux_file_with_format, synth_media, synth_video_frame,
+    transcode_file, transcode_file_with_options,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
@@ -251,7 +252,9 @@ fn cmd_probe(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "--gop-map" | "-g" => show_gop = true,
             "--json" | "-j" => json = true,
-            s if !s.starts_with('-') && file_path.is_none() => file_path = Some(s.to_string()),
+            s if (s == "-" || !s.starts_with('-')) && file_path.is_none() => {
+                file_path = Some(s.to_string())
+            }
             _ => {}
         }
     }
@@ -321,6 +324,12 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                 t.sample_count, t.total_bytes
             );
         }
+        if t.track_type == TrackType::Subtitle {
+            println!(
+                "│ Track #{:<2} [Subtitle] codec={} cues={} ({} bytes)                            │",
+                t.index, t.codec_id, t.sample_count, t.total_bytes
+            );
+        }
     }
 
     if !rep.packet_sizes.is_empty() {
@@ -370,6 +379,11 @@ fn print_probe_json(rep: &ProbeReport) {
                 "    {{\"index\": {}, \"type\": \"audio\", \"codec\": \"{}\", \"sample_rate\": {}, \"channels\": {}, \"sample_format\": \"{}\", \"samples\": {}}}{comma}",
                 t.index, t.codec_id, a.sample_rate, a.channels, a.sample_format, t.sample_count
             );
+        } else if t.track_type == TrackType::Subtitle {
+            println!(
+                "    {{\"index\": {}, \"type\": \"subtitle\", \"codec\": \"{}\", \"samples\": {}}}{comma}",
+                t.index, t.codec_id, t.sample_count
+            );
         }
     }
     println!("  ]");
@@ -378,30 +392,35 @@ fn print_probe_json(rep: &ProbeReport) {
 
 fn cmd_remux(args: &[String]) -> Result<()> {
     let mut positional = Vec::new();
+    let mut format_override: Option<String> = None;
     let mut json = false;
-    for arg in args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--json" | "-j" => json = true,
             "--faststart" => {}
-            s if !s.starts_with('-') => positional.push(s.to_string()),
+            "--format" | "-f" if i + 1 < args.len() => {
+                i += 1;
+                format_override = Some(args[i].clone());
+            }
+            s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
             _ => {}
         }
+        i += 1;
     }
     if positional.len() < 2 {
         return Err(RagdollError::InvalidSyntax("remux requires <IN> <OUT>"));
     }
-    let tel = remux_file(&positional[0], &positional[1])?;
-    print_telemetry(&tel, json);
+    let tel = remux_file_with_format(&positional[0], &positional[1], format_override.as_deref())?;
+    if !is_stdout_path(&positional[1]) {
+        print_telemetry(&tel, json);
+    }
     Ok(())
 }
 
 fn cmd_transcode(args: &[String]) -> Result<()> {
     let mut positional = Vec::new();
-    let mut video_codec = "h264".to_string();
-    let mut scale_dims: Option<(usize, usize)> = None;
-    let mut filter = ScaleFilter::Lanczos3;
-    let mut qp = 20u8;
-    let mut threads = 0usize;
+    let mut opts = TranscodeOptions::default();
     let mut recipe_path: Option<String> = None;
     let mut json = false;
 
@@ -411,32 +430,50 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
             "--json" | "-j" => json = true,
             "--video" | "-c:v" if i + 1 < args.len() => {
                 i += 1;
-                video_codec = args[i].clone();
+                opts.video_codec = args[i].clone();
+            }
+            "--audio" | "-c:a" if i + 1 < args.len() => {
+                i += 1;
+                opts.audio_codec = args[i].clone();
+            }
+            "--subs" | "--subtitles" | "-c:s" if i + 1 < args.len() => {
+                i += 1;
+                opts.subtitle_codec = args[i].clone();
+            }
+            "--an" => {
+                opts.audio_codec = "none".into();
+            }
+            "--sn" => {
+                opts.subtitle_codec = "none".into();
+            }
+            "--format" | "-f" if i + 1 < args.len() => {
+                i += 1;
+                opts.format_override = Some(args[i].clone());
             }
             "--scale" | "-s" if i + 1 < args.len() => {
                 i += 1;
-                scale_dims = parse_dimensions(&args[i]);
+                opts.scale_dims = parse_dimensions(&args[i]);
             }
             "--filter" if i + 1 < args.len() => {
                 i += 1;
-                filter = parse_scale_filter(&args[i]);
+                opts.scale_filter = parse_scale_filter(&args[i]);
             }
             "--qp" if i + 1 < args.len() => {
                 i += 1;
-                qp = args[i].parse::<u8>().unwrap_or(20).min(51);
+                opts.qp = args[i].parse::<u8>().unwrap_or(20).min(51);
             }
             "--threads" | "-t" if i + 1 < args.len() => {
                 i += 1;
-                threads = args[i].parse::<usize>().unwrap_or(0);
+                opts.threads = args[i].parse::<usize>().unwrap_or(0);
             }
             "--recipe" | "-r" if i + 1 < args.len() => {
                 i += 1;
                 recipe_path = Some(args[i].clone());
             }
-            "--color" | "--audio" if i + 1 < args.len() => {
+            "--color" if i + 1 < args.len() => {
                 i += 1;
             }
-            s if !s.starts_with('-') => positional.push(s.to_string()),
+            s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
             _ => {}
         }
         i += 1;
@@ -452,18 +489,12 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
                 "transcode requires <IN> <OUT> or --recipe <FILE.toml>",
             ));
         }
-        transcode_file(
-            &positional[0],
-            &positional[1],
-            scale_dims,
-            filter,
-            &video_codec,
-            qp,
-            threads,
-        )?
+        transcode_file_with_options(&positional[0], &positional[1], &opts)?
     };
 
-    print_telemetry(&tel, json);
+    if positional.get(1).is_none_or(|p| !is_stdout_path(p)) {
+        print_telemetry(&tel, json);
+    }
     Ok(())
 }
 

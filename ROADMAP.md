@@ -89,15 +89,15 @@ Unify all engines under a work-stealing GOP-parallel pipeline scheduler, declara
 
 ## m6-streaming-av-sync — Phase 6 — Bounded-Memory GOP Streaming & Multi-Track A/V Lip-Sync
 
-`··········` 0% · 0 of 3 done
+`##########` 100% · 3 of 3 done
 
 Replace full-file in-memory frame buffering with a bounded-memory GOP ring streaming engine (`GopRingPipeline`) supporting arbitrary-length feature films, Unix `stdin`/`stdout` pipes, and synchronized multi-track video + audio + subtitle (`WebVTT`/`SRT`) demuxing/muxing with 128-bit `rescale_delta` lip-sync alignment.
 
-### up next
+### shipped
 
-- [ ] `ADR-0035` Opinionated Production Philosophy: Bounded GOP Ring Streaming, Multi-Track A/V Sync & Smart-GOP Verbs <sup>decision · p0 · arch</sup>
-- [ ] `0036` Bounded-Memory GopRingPipeline & Streaming stdin/stdout Pipe I/O <sup>feature · p0 · pipeline</sup>
-- [ ] `0037` Multi-Track A/V + Subtitle (WebVTT/SRT) Demuxing, Muxing & 128-Bit Lip-Sync Engine <sup>feature · p0 · format</sup>
+- [x] `ADR-0035` Opinionated Production Philosophy: Bounded GOP Ring Streaming, Multi-Track A/V Sync & Smart-GOP Verbs <sup>decision · p0 · arch</sup>
+- [x] `0036` Bounded-Memory GopRingPipeline & Streaming stdin/stdout Pipe I/O <sup>feature · p0 · pipeline</sup>
+- [x] `0037` Multi-Track A/V + Subtitle (WebVTT/SRT) Demuxing, Muxing & 128-Bit Lip-Sync Engine <sup>feature · p0 · format</sup>
 
 ## m7-video-production — Phase 7 — Production H.264 (Main/High CABAC, 4x4/8x8 Residuals, Qpel, Deblock & CRF Rate Control)
 

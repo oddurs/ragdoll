@@ -3,13 +3,15 @@ id: 37
 uid: 369795ba-f9d7-4431-933a-5377f4b5b441
 title: Multi-Track A/V + Subtitle (WebVTT/SRT) Demuxing, Muxing & 128-Bit Lip-Sync Engine
 type: feature
-status: planned
+status: done
 milestone: m6-streaming-av-sync
+assignee: Oddur Sigurdsson
 depends_on:
 - 35
 - 36
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: format
 effort: l
@@ -27,6 +29,10 @@ Real-world media files contain interleaved video, multiple audio tracks (e.g. st
 
 ## Acceptance criteria
 
-- [ ] Transcoding or remuxing a multi-track `.mp4`, `.mkv`, or `.ts` preserves both video and audio tracks with `< 1 ms` A/V PTS drift.
-- [ ] `WebVTT` (`.vtt`) and `SubRip` (`.srt`) subtitle tracks can be muxed, demuxed, and converted between `.mp4` (`wvtt`), `.mkv` (`S_TEXT/UTF8` / `S_TEXT/WEBVTT`), and standalone `.vtt`/`.srt` files.
-- [ ] Interleaved packet ordering satisfies `ffmpeg -v error -i out.mp4 -f null -` with zero DTS/PTS monotonicity warnings.
+- [x] Transcoding or remuxing a multi-track `.mp4`, `.mkv`, or `.ts` preserves both video and audio tracks with `< 1 ms` A/V PTS drift.
+- [x] `WebVTT` (`.vtt`) and `SubRip` (`.srt`) subtitle tracks can be muxed, demuxed, and converted between `.mp4` (`wvtt`), `.mkv` (`S_TEXT/UTF8` / `S_TEXT/WEBVTT`), and standalone `.vtt`/`.srt` files.
+- [x] Interleaved packet ordering satisfies `ffmpeg -v error -i out.mp4 -f null -` with zero DTS/PTS monotonicity warnings.
+
+## 2026-10-25
+
+Implemented AvSyncController (128-bit rescale_delta stateful sub-sample audio rescaling and compare_ts DTS interleaving with <1 ms drift), SubtitleDemuxer/SubtitleMuxer for WebVTT (.vtt) and SubRip (.srt), ISO 14496-30 wvtt + vtte MP4 sample framing, Matroska S_TEXT/WEBVTT + S_TEXT/UTF8 BlockGroup+BlockDuration muxing, and default multi-track preservation.
