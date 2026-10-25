@@ -690,130 +690,132 @@ mod tests {
             v010_ipcm_bytes
         );
 
-        // 3. Verify Ragdoll -> FFmpeg decoding bit-exactness across multi-GOP moving video
-        let tmp_dir = std::env::temp_dir();
-        let rag_h264_path = tmp_dir.join("ragdoll_0039_out.h264");
-        let rag_ff_yuv_path = tmp_dir.join("ragdoll_0039_ff_dec.yuv");
-        std::fs::write(&rag_h264_path, &ragdoll_stream).unwrap();
-        let st_rag = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-i",
-                rag_h264_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                rag_ff_yuv_path.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(
-            st_rag.success(),
-            "ffmpeg failed to decode Ragdoll H.264 stream"
-        );
-        let ff_dec_bytes = std::fs::read(&rag_ff_yuv_path).unwrap();
-        let frame_bytes = w * h * 3 / 2;
-        assert_eq!(ff_dec_bytes.len(), frame_bytes * num_frames);
-        for (f_idx, df) in ragdoll_dec_frames.iter().enumerate() {
-            let ff_slice = &ff_dec_bytes[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
-            for y in 0..h {
-                assert_eq!(
-                    df.plane(0).row(y),
-                    &ff_slice[y * w..(y + 1) * w],
-                    "Ragdoll vs FFmpeg Y row {y} mismatch on frame {f_idx}"
-                );
+        // 3. Verify Ragdoll -> FFmpeg decoding bit-exactness across multi-GOP moving video (when ffmpeg is installed)
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let tmp_dir = std::env::temp_dir();
+            let rag_h264_path = tmp_dir.join("ragdoll_0039_out.h264");
+            let rag_ff_yuv_path = tmp_dir.join("ragdoll_0039_ff_dec.yuv");
+            std::fs::write(&rag_h264_path, &ragdoll_stream).unwrap();
+            let st_rag = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    rag_h264_path.to_str().unwrap(),
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    rag_ff_yuv_path.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(
+                st_rag.success(),
+                "ffmpeg failed to decode Ragdoll H.264 stream"
+            );
+            let ff_dec_bytes = std::fs::read(&rag_ff_yuv_path).unwrap();
+            let frame_bytes = w * h * 3 / 2;
+            assert_eq!(ff_dec_bytes.len(), frame_bytes * num_frames);
+            for (f_idx, df) in ragdoll_dec_frames.iter().enumerate() {
+                let ff_slice = &ff_dec_bytes[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
+                for y in 0..h {
+                    assert_eq!(
+                        df.plane(0).row(y),
+                        &ff_slice[y * w..(y + 1) * w],
+                        "Ragdoll vs FFmpeg Y row {y} mismatch on frame {f_idx}"
+                    );
+                }
             }
+
+            // 4. Verify FFmpeg (`libx264 -profile:v baseline` with I_4x4, I_16x16, P_L0_16x16, P_8x8) -> Ragdoll bit-exact!
+            let raw_in_path = tmp_dir.join("ragdoll_0039_in.yuv");
+            let x264_h264_path = tmp_dir.join("ragdoll_0039_x264_base.h264");
+            let x264_ff_yuv_path = tmp_dir.join("ragdoll_0039_x264_ff.yuv");
+            std::fs::write(&raw_in_path, &raw_yuv_bytes).unwrap();
+            let st_x264 = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-s:v",
+                    &format!("{w}x{h}"),
+                    "-r",
+                    "30",
+                    "-i",
+                    raw_in_path.to_str().unwrap(),
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "baseline",
+                    "-x264-params",
+                    "qp=22:keyint=4:min-keyint=4:scenecut=0:ref=1:deblock=0,0",
+                    "-f",
+                    "h264",
+                    x264_h264_path.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st_x264.success(), "ffmpeg libx264 baseline encode failed");
+
+            let st_x264_dec = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    x264_h264_path.to_str().unwrap(),
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    x264_ff_yuv_path.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st_x264_dec.success());
+
+            let x264_stream = std::fs::read(&x264_h264_path).unwrap();
+            let x264_ff_yuv = std::fs::read(&x264_ff_yuv_path).unwrap();
+            let mut rag_dec = H264Decoder::new();
+            let rag_frames = rag_dec.decode_stream_pts_ordered(&x264_stream).unwrap();
+            assert_eq!(rag_frames.len(), num_frames);
+            for (f_idx, rf) in rag_frames.iter().enumerate() {
+                let ff_slice = &x264_ff_yuv[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
+                for y in 0..h {
+                    assert_eq!(
+                        rf.plane(0).row(y),
+                        &ff_slice[y * w..(y + 1) * w],
+                        "libx264 Baseline Y mismatch at frame {f_idx} row {y}"
+                    );
+                }
+                let u_off = w * h;
+                let v_off = u_off + (w / 2) * (h / 2);
+                for y in 0..h / 2 {
+                    assert_eq!(
+                        rf.plane(1).row(y),
+                        &ff_slice[u_off + y * (w / 2)..u_off + (y + 1) * (w / 2)],
+                        "libx264 Baseline U mismatch at frame {f_idx} row {y}"
+                    );
+                    assert_eq!(
+                        rf.plane(2).row(y),
+                        &ff_slice[v_off + y * (w / 2)..v_off + (y + 1) * (w / 2)],
+                        "libx264 Baseline V mismatch at frame {f_idx} row {y}"
+                    );
+                }
+            }
+
+            let _ = std::fs::remove_file(&rag_h264_path);
+            let _ = std::fs::remove_file(&rag_ff_yuv_path);
+            let _ = std::fs::remove_file(&raw_in_path);
+            let _ = std::fs::remove_file(&x264_h264_path);
+            let _ = std::fs::remove_file(&x264_ff_yuv_path);
         }
-
-        // 4. Verify FFmpeg (`libx264 -profile:v baseline` with I_4x4, I_16x16, P_L0_16x16, P_8x8) -> Ragdoll bit-exact!
-        let raw_in_path = tmp_dir.join("ragdoll_0039_in.yuv");
-        let x264_h264_path = tmp_dir.join("ragdoll_0039_x264_base.h264");
-        let x264_ff_yuv_path = tmp_dir.join("ragdoll_0039_x264_ff.yuv");
-        std::fs::write(&raw_in_path, &raw_yuv_bytes).unwrap();
-        let st_x264 = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "-s:v",
-                &format!("{w}x{h}"),
-                "-r",
-                "30",
-                "-i",
-                raw_in_path.to_str().unwrap(),
-                "-c:v",
-                "libx264",
-                "-profile:v",
-                "baseline",
-                "-x264-params",
-                "qp=22:keyint=4:min-keyint=4:scenecut=0:ref=1:deblock=0,0",
-                "-f",
-                "h264",
-                x264_h264_path.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(st_x264.success(), "ffmpeg libx264 baseline encode failed");
-
-        let st_x264_dec = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-i",
-                x264_h264_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                x264_ff_yuv_path.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(st_x264_dec.success());
-
-        let x264_stream = std::fs::read(&x264_h264_path).unwrap();
-        let x264_ff_yuv = std::fs::read(&x264_ff_yuv_path).unwrap();
-        let mut rag_dec = H264Decoder::new();
-        let rag_frames = rag_dec.decode_stream_pts_ordered(&x264_stream).unwrap();
-        assert_eq!(rag_frames.len(), num_frames);
-        for (f_idx, rf) in rag_frames.iter().enumerate() {
-            let ff_slice = &x264_ff_yuv[f_idx * frame_bytes..(f_idx + 1) * frame_bytes];
-            for y in 0..h {
-                assert_eq!(
-                    rf.plane(0).row(y),
-                    &ff_slice[y * w..(y + 1) * w],
-                    "libx264 Baseline Y mismatch at frame {f_idx} row {y}"
-                );
-            }
-            let u_off = w * h;
-            let v_off = u_off + (w / 2) * (h / 2);
-            for y in 0..h / 2 {
-                assert_eq!(
-                    rf.plane(1).row(y),
-                    &ff_slice[u_off + y * (w / 2)..u_off + (y + 1) * (w / 2)],
-                    "libx264 Baseline U mismatch at frame {f_idx} row {y}"
-                );
-                assert_eq!(
-                    rf.plane(2).row(y),
-                    &ff_slice[v_off + y * (w / 2)..v_off + (y + 1) * (w / 2)],
-                    "libx264 Baseline V mismatch at frame {f_idx} row {y}"
-                );
-            }
-        }
-
-        let _ = std::fs::remove_file(&rag_h264_path);
-        let _ = std::fs::remove_file(&rag_ff_yuv_path);
-        let _ = std::fs::remove_file(&raw_in_path);
-        let _ = std::fs::remove_file(&x264_h264_path);
-        let _ = std::fs::remove_file(&x264_ff_yuv_path);
     }
 
     #[test]
@@ -892,84 +894,92 @@ mod tests {
         let mut dec_high = H264Decoder::new();
         let recon_high = dec_high.decode_stream_pts_ordered(&stream_high).unwrap();
         assert_eq!(recon_high.len(), num_frames);
+        for i in 1..recon_high.len() {
+            assert!(
+                recon_high[i].pts.ticks > recon_high[i - 1].pts.ticks,
+                "PTS must be strictly monotonic after DPB reordering"
+            );
+        }
 
-        // Verify FFmpeg decodes our CABAC Main and High profile streams cleanly
-        let tmp_dir = std::env::temp_dir();
-        for (tag, bytes) in [("main", &stream_main), ("high", &stream_high)] {
-            let p_h264 = tmp_dir.join(format!("ragdoll_0040_{tag}.h264"));
-            let p_yuv = tmp_dir.join(format!("ragdoll_0040_{tag}.yuv"));
-            std::fs::write(&p_h264, bytes).unwrap();
-            let st = Command::new("ffmpeg")
+        // Verify FFmpeg decodes our CABAC Main and High profile streams cleanly and Ragdoll decodes x264 High + B-frames (when ffmpeg is installed)
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let tmp_dir = std::env::temp_dir();
+            for (tag, bytes) in [("main", &stream_main), ("high", &stream_high)] {
+                let p_h264 = tmp_dir.join(format!("ragdoll_0040_{tag}.h264"));
+                let p_yuv = tmp_dir.join(format!("ragdoll_0040_{tag}.yuv"));
+                std::fs::write(&p_h264, bytes).unwrap();
+                let st = Command::new("ffmpeg")
+                    .args([
+                        "-y",
+                        "-v",
+                        "error",
+                        "-i",
+                        p_h264.to_str().unwrap(),
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "yuv420p",
+                        p_yuv.to_str().unwrap(),
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(
+                    st.success(),
+                    "ffmpeg failed to decode Ragdoll {tag} CABAC stream"
+                );
+                let yuv = std::fs::read(&p_yuv).unwrap();
+                assert_eq!(yuv.len(), w * h * 3 / 2 * num_frames);
+                let _ = std::fs::remove_file(&p_h264);
+                let _ = std::fs::remove_file(&p_yuv);
+            }
+
+            // 2. Decode High Profile CABAC + 8x8 transform + B-frames produced by `ffmpeg -c:v libx264 -profile:v high`
+            let in_yuv = tmp_dir.join("ragdoll_0040_in.yuv");
+            let high_h264 = tmp_dir.join("ragdoll_0040_x264_high.h264");
+            std::fs::write(&in_yuv, &raw_yuv_bytes).unwrap();
+            let st_high = Command::new("ffmpeg")
                 .args([
                     "-y",
                     "-v",
                     "error",
-                    "-i",
-                    p_h264.to_str().unwrap(),
                     "-f",
                     "rawvideo",
                     "-pix_fmt",
                     "yuv420p",
-                    p_yuv.to_str().unwrap(),
+                    "-s:v",
+                    &format!("{w}x{h}"),
+                    "-r",
+                    "30",
+                    "-i",
+                    in_yuv.to_str().unwrap(),
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "high",
+                    "-x264-params",
+                    "qp=22:bframes=2:b-adapt=0:ref=2:8x8dct=1:cabac=1",
+                    "-f",
+                    "h264",
+                    high_h264.to_str().unwrap(),
                 ])
                 .status()
                 .unwrap();
-            assert!(
-                st.success(),
-                "ffmpeg failed to decode Ragdoll {tag} CABAC stream"
-            );
-            let yuv = std::fs::read(&p_yuv).unwrap();
-            assert_eq!(yuv.len(), w * h * 3 / 2 * num_frames);
-            let _ = std::fs::remove_file(&p_h264);
-            let _ = std::fs::remove_file(&p_yuv);
+            assert!(st_high.success());
+            let high_bytes = std::fs::read(&high_h264).unwrap();
+            let mut x264_high_dec = H264Decoder::new();
+            let ordered_frames = x264_high_dec
+                .decode_stream_pts_ordered(&high_bytes)
+                .unwrap();
+            assert_eq!(ordered_frames.len(), num_frames);
+            for i in 1..ordered_frames.len() {
+                assert!(
+                    ordered_frames[i].pts.ticks > ordered_frames[i - 1].pts.ticks,
+                    "PTS must be strictly monotonic after DPB reordering"
+                );
+            }
+            let _ = std::fs::remove_file(&in_yuv);
+            let _ = std::fs::remove_file(&high_h264);
         }
-
-        // 2. Decode High Profile CABAC + 8x8 transform + B-frames produced by `ffmpeg -c:v libx264 -profile:v high`
-        let in_yuv = tmp_dir.join("ragdoll_0040_in.yuv");
-        let high_h264 = tmp_dir.join("ragdoll_0040_x264_high.h264");
-        std::fs::write(&in_yuv, &raw_yuv_bytes).unwrap();
-        let st_high = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "-s:v",
-                &format!("{w}x{h}"),
-                "-r",
-                "30",
-                "-i",
-                in_yuv.to_str().unwrap(),
-                "-c:v",
-                "libx264",
-                "-profile:v",
-                "high",
-                "-x264-params",
-                "qp=22:bframes=2:b-adapt=0:ref=2:8x8dct=1:cabac=1",
-                "-f",
-                "h264",
-                high_h264.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(st_high.success());
-        let high_bytes = std::fs::read(&high_h264).unwrap();
-        let mut x264_high_dec = H264Decoder::new();
-        let ordered_frames = x264_high_dec
-            .decode_stream_pts_ordered(&high_bytes)
-            .unwrap();
-        assert_eq!(ordered_frames.len(), num_frames);
-        for i in 1..ordered_frames.len() {
-            assert!(
-                ordered_frames[i].pts.ticks > ordered_frames[i - 1].pts.ticks,
-                "PTS must be strictly monotonic after DPB reordering"
-            );
-        }
-        let _ = std::fs::remove_file(&in_yuv);
-        let _ = std::fs::remove_file(&high_h264);
     }
 
     #[test]
