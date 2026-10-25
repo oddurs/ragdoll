@@ -17,6 +17,11 @@ use ragdoll_core::{
     PacketFlags, PacketSlice, PixelFormat, RagdollError, Rational64, Result, SampleEntry,
     SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
 };
+pub use ragdoll_core::{
+    CpuTopology, HardwareMetrics, PowerMode, ProcessRusageSnapshot,
+    apply_current_power_mode_to_thread, apply_power_mode_to_current_thread, global_power_mode,
+    measure_hardware_metrics, parse_macos_time_l_stderr, set_global_power_mode, with_power_mode,
+};
 use ragdoll_format::{
     ContainerFormat, MkvDemuxer, MkvMuxer, MmapSource, Mp4Demuxer, Mp4Muxer, MpegTsDemuxer,
     MpegTsMuxer, WavDemuxer, WavMuxer, Y4mDemuxer, Y4mMuxer, build_avcc_from_sps_pps,
@@ -73,16 +78,10 @@ pub fn partition_into_gops(samples: &[SampleEntry]) -> Vec<Range<usize>> {
     gops
 }
 
-/// Returns the number of hardware threads to use (`threads == 0` queries `available_parallelism`).
+/// Returns the number of hardware threads to use (`threads == 0` queries [`CpuTopology`] for the active [`PowerMode`]).
 #[inline]
 pub fn resolve_thread_count(threads: usize) -> usize {
-    if threads > 0 {
-        threads
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    }
+    CpuTopology::detect().optimal_threads(global_power_mode(), threads)
 }
 
 /// Executes `worker_fn(index, &item)` across all items in `items` using a lock-free `AtomicUsize`
@@ -99,6 +98,7 @@ where
     }
     let workers = resolve_thread_count(num_threads).min(n);
     if workers <= 1 {
+        apply_current_power_mode_to_thread();
         return items
             .iter()
             .enumerate()
@@ -112,6 +112,7 @@ where
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
+                apply_current_power_mode_to_thread();
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                     if idx >= n {
@@ -532,16 +533,41 @@ pub fn decode_video_file(path: impl AsRef<Path>) -> Result<(Vec<VideoFrame>, Rat
     match fmt {
         ContainerFormat::Y4m => {
             let mut demux = Y4mDemuxer::open(data)?;
-            let fps = demux
+            let vp = demux
                 .track()
                 .video
-                .as_ref()
-                .map_or(Rational64::FPS_30, |v| v.frame_rate);
-            let mut frames = Vec::new();
-            let mut scratch = VideoFrame::new(1, 1, PixelFormat::Yuv420p);
-            while demux.read_frame_into(&mut scratch)? {
-                frames.push(scratch.clone());
+                .clone()
+                .ok_or_else(|| RagdollError::InvalidData("Y4M missing video params".into()))?;
+            let fps = vp.frame_rate;
+            let mut packets = Vec::with_capacity(demux.frame_count());
+            while let Some(pkt) = demux.next_packet()? {
+                packets.push(pkt);
             }
+            let frames = parallel_gop_map(&packets, 0, |_, pkt| {
+                let mut dst =
+                    VideoFrame::new(vp.width as usize, vp.height as usize, vp.pixel_format);
+                dst.pts = pkt.pts;
+                dst.colorimetry = vp.colorimetry;
+                let raw = pkt.data();
+                let mut src_off = 0usize;
+                for plane in &mut dst.planes {
+                    let row_bytes = plane.row_bytes();
+                    let h = plane.height();
+                    if plane.stride() == row_bytes {
+                        let total = row_bytes * h;
+                        plane.data_mut()[..total].copy_from_slice(&raw[src_off..src_off + total]);
+                        src_off += total;
+                    } else {
+                        for y in 0..h {
+                            plane
+                                .row_mut(y)
+                                .copy_from_slice(&raw[src_off..src_off + row_bytes]);
+                            src_off += row_bytes;
+                        }
+                    }
+                }
+                dst
+            });
             Ok((frames, fps))
         }
         ContainerFormat::Ppm | ContainerFormat::Pgm => {
@@ -797,7 +823,8 @@ pub fn transcode_file(
     let height = frames[0].height as u32;
 
     // 3. Encode / Mux to target output format
-    let gop_size = 15usize;
+    let max_gop_for_threads = frames.len().div_ceil(worker_threads.max(1)).max(1);
+    let gop_size = 15usize.min(max_gop_for_threads);
     let gop_chunks: Vec<&[VideoFrame]> = frames.chunks(gop_size).collect();
     let gops_processed = gop_chunks.len();
 

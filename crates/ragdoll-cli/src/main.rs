@@ -17,13 +17,14 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use ragdoll_codec::{FlacDecoder, FlacEncoder};
+use ragdoll_codec::{FlacDecoder, FlacEncoder, H264Decoder, H264Encoder};
 use ragdoll_core::{
-    AudioFrame, BitReader, BitWriter, CodecId, ColorRange, Colorimetry, FramePool,
-    MatrixCoefficients, PacketFlags, PacketSlice, PixelFormat, Plane, RagdollError, Rational64,
-    Result, SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
-    crc16_flac, crc32_mpeg2, escape_rbsp, optimal_plane_stride, unescape_rbsp,
-    unescape_rbsp_scalar,
+    AudioFrame, BitReader, BitWriter, CodecId, ColorRange, Colorimetry, CpuTopology, FramePool,
+    HardwareMetrics, MatrixCoefficients, PacketFlags, PacketSlice, PixelFormat, Plane, PowerMode,
+    ProcessRusageSnapshot, RagdollError, Rational64, Result, SampleFormat, Timestamp, TrackInfo,
+    TrackType, VideoFrame, VideoTrackParams, crc16_flac, crc32_mpeg2, escape_rbsp,
+    measure_hardware_metrics, optimal_plane_stride, parse_macos_time_l_stderr,
+    set_global_power_mode, unescape_rbsp, unescape_rbsp_scalar, with_power_mode,
 };
 use ragdoll_format::{
     MkvDemuxer, Mp4Demuxer, Mp4Muxer, Y4mMuxer, build_avcc_from_sps_pps, transmux_mp4_to_mkv,
@@ -42,10 +43,11 @@ use ragdoll_pix::{
     yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
 };
 use ragdoll_simd::{
-    SimdLevel, find_annex_b_start_code, find_annex_b_start_code_scalar, forward_dct4x4,
-    forward_dct4x4_scalar, inverse_idct4x4, inverse_idct4x4_scalar, sad_plane_u8,
-    sad_plane_u8_scalar, satd_8x8_u8, sse_plane_u8, sse_plane_u8_scalar, ssim_4x4xn_u8,
-    ssim_4x4xn_u8_scalar, ssim_plane_8bit, ssim_to_db,
+    SimdLevel, find_annex_b_start_code, find_annex_b_start_code_scalar, flac_eval_fixed_orders_l1,
+    flac_eval_fixed_orders_l1_scalar, forward_dct4x4, forward_dct4x4_scalar, inverse_idct4x4,
+    inverse_idct4x4_scalar, sad_16x16_u8, sad_16x16_u8_scalar, sad_plane_u8, sad_plane_u8_scalar,
+    satd_8x8_u8, sse_plane_u8, sse_plane_u8_scalar, ssim_4x4xn_u8, ssim_4x4xn_u8_scalar,
+    ssim_plane_8bit, ssim_to_db,
 };
 
 fn main() {
@@ -57,17 +59,41 @@ fn main() {
 }
 
 pub fn run_cli(args: &[String]) -> Result<()> {
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut power_mode = PowerMode::Performance;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--power-mode" | "-P" if i + 1 < args.len() => {
+                i += 1;
+                power_mode = PowerMode::parse(&args[i]);
+            }
+            "--battery-saver" | "--efficiency" => {
+                power_mode = PowerMode::Efficiency;
+            }
+            _ => filtered.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    set_global_power_mode(power_mode);
+
+    if filtered.is_empty() || matches!(filtered[0].as_str(), "-h" | "--help" | "help") {
         print_help();
         return Ok(());
     }
-    if matches!(args[0].as_str(), "-V" | "--version" | "version") {
-        println!("ragdoll 0.1.0 ({})", SimdLevel::detect().name());
+    if matches!(filtered[0].as_str(), "-V" | "--version" | "version") {
+        let topo = CpuTopology::detect();
+        println!(
+            "ragdoll 0.1.0 ({} | {} P-cores + {} E-cores)",
+            SimdLevel::detect().name(),
+            topo.p_cores,
+            topo.e_cores
+        );
         return Ok(());
     }
 
-    let sub = args[0].as_str();
-    let rest = &args[1..];
+    let sub = filtered[0].as_str();
+    let rest = &filtered[1..];
     match sub {
         "probe" => cmd_probe(rest),
         "remux" => cmd_remux(rest),
@@ -96,12 +122,19 @@ impl ErrorContext for RagdollError {
 
 fn print_help() {
     let simd = SimdLevel::detect();
+    let topo = CpuTopology::detect();
     println!("================================================================================");
     println!("  RAGDOLL v0.1.0 — 100% Safe Rust, Explicit SIMD, Zero-Copy Media Engine");
     println!("  Hardware SIMD : {}", simd.name());
+    println!(
+        "  CPU Topology  : {} logical ({} P-Cores + {} E-Cores)",
+        topo.total_cores, topo.p_cores, topo.e_cores
+    );
     println!("================================================================================\n");
     println!("USAGE:");
-    println!("  ragdoll <SUBCOMMAND> [OPTIONS]\n");
+    println!(
+        "  ragdoll <SUBCOMMAND> [OPTIONS] [--power-mode performance|efficiency|balanced | --battery-saver]\n"
+    );
     println!("SUBCOMMANDS:");
     println!("  probe <FILE> [--gop-map] [--json]");
     println!("      Sub-millisecond container/codec inspection, CICP colorimetry,");
@@ -111,7 +144,7 @@ fn print_help() {
     println!("      Zero-copy mmap -> writev remuxing across .mp4, .mkv, .ts, .y4m, and .wav.");
     println!();
     println!(
-        "  transcode <IN> <OUT> [--video h264|rgdi] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--recipe file.toml] [--json]"
+        "  transcode <IN> <OUT> [--video h264|rgdi] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]"
     );
     println!(
         "      Work-stealing GOP-parallel video & audio transcoding or TOML recipe execution."
@@ -132,11 +165,11 @@ fn print_help() {
     println!();
     println!("  bench [--compare-ffmpeg] [--json]");
     println!(
-        "      Automated head-to-head benchmark suite across 6 flagship multimedia workloads."
+        "      Automated speed + hardware PMU instruction/cycle/energy benchmark suite across 7 workloads."
     );
     println!();
     println!("  self-test");
-    println!("      Run M1-M4 SIMD vs. scalar bit-exact differential kernel verification.");
+    println!("      Run M1-M5 SIMD vs. scalar bit-exact differential kernel verification.");
 }
 
 /// Renders an 8-level Unicode block sparkline (`▁▂▃▄▅▆▇█`) over packet byte sizes.
@@ -588,11 +621,93 @@ fn cmd_synth(args: &[String]) -> Result<()> {
 struct BenchRow {
     workload: &'static str,
     unit: &'static str,
-    ragdoll_ms: f64,
-    ragdoll_rate: f64,
-    ffmpeg_ms: Option<f64>,
+    ragdoll_perf_hw: HardwareMetrics,
+    ragdoll_perf_rate: f64,
+    ragdoll_eff_hw: HardwareMetrics,
+    ragdoll_eff_rate: f64,
+    ffmpeg_hw: Option<HardwareMetrics>,
     ffmpeg_rate: Option<f64>,
-    speedup: Option<f64>,
+    speedup_perf: Option<f64>,
+    speedup_eff: Option<f64>,
+}
+
+fn scale_hardware_metrics(mut hw: HardwareMetrics, iters: usize) -> HardwareMetrics {
+    let div = (iters.max(1)) as f64;
+    if iters > 1 {
+        hw.wall_ms /= div;
+        hw.user_ms /= div;
+        hw.sys_ms /= div;
+        hw.cpu_ms /= div;
+        hw.instructions = ((hw.instructions as f64) / div).round() as u64;
+        hw.cycles = ((hw.cycles as f64) / div).round() as u64;
+        hw.energy_mj /= div;
+    }
+    hw
+}
+
+fn run_external_batch_with_telemetry(
+    cmds: &[(&str, Vec<String>)],
+    iters: usize,
+) -> Result<HardwareMetrics> {
+    let use_macos_time = cfg!(target_os = "macos") && Path::new("/usr/bin/time").exists();
+    let mut total = HardwareMetrics::default();
+    let total_iters = iters.max(1);
+
+    for _ in 0..total_iters {
+        for (prog, cmd_args) in cmds {
+            let t0 = Instant::now();
+            if use_macos_time {
+                let out = Command::new("/usr/bin/time")
+                    .arg("-l")
+                    .arg(prog)
+                    .args(cmd_args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output()?;
+                assert!(
+                    out.status.success(),
+                    "{prog} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let stderr_text = String::from_utf8_lossy(&out.stderr);
+                let hw = parse_macos_time_l_stderr(&stderr_text, wall_ms);
+                total.wall_ms += hw.wall_ms;
+                total.user_ms += hw.user_ms;
+                total.sys_ms += hw.sys_ms;
+                total.cpu_ms += hw.cpu_ms;
+                total.instructions += hw.instructions;
+                total.cycles += hw.cycles;
+                total.energy_mj += hw.energy_mj;
+                if hw.peak_rss_mib > total.peak_rss_mib {
+                    total.peak_rss_mib = hw.peak_rss_mib;
+                }
+                total.pageins += hw.pageins;
+                total.idle_wakeups += hw.idle_wakeups;
+            } else {
+                let status = Command::new(prog)
+                    .args(cmd_args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()?;
+                assert!(status.success());
+                let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                total.wall_ms += wall_ms;
+            }
+        }
+    }
+
+    let mut scaled = scale_hardware_metrics(total, total_iters);
+    if scaled.cycles > 0 {
+        scaled.ipc = (scaled.instructions as f64) / (scaled.cycles as f64);
+    }
+    if scaled.cpu_ms > 0.01 && scaled.cycles > 0 {
+        scaled.effective_ghz = (scaled.cycles as f64) / ((scaled.cpu_ms / 1000.0) * 1e9);
+    }
+    if scaled.wall_ms > 0.001 {
+        scaled.avg_power_watts = scaled.energy_mj / scaled.wall_ms;
+    }
+    Ok(scaled)
 }
 
 fn cmd_bench(args: &[String]) -> Result<()> {
@@ -611,96 +726,413 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     create_benchmark_mp4(&probe_mp4, 3840, 2160, 300, 32_768)?;
 
     let probe_iters = 50usize;
-    let t0 = Instant::now();
-    for _ in 0..probe_iters {
-        let rep = black_box(probe_file_detailed(&probe_mp4)?);
-        assert_eq!(rep.tracks[0].sample_count, 300);
-    }
-    let ragdoll_probe_ms = (t0.elapsed().as_secs_f64() * 1000.0) / (probe_iters as f64);
-    let ragdoll_probe_rate = 1000.0 / ragdoll_probe_ms; // files/s
+    let (_, probe_perf_raw) = with_power_mode(PowerMode::Performance, || {
+        measure_hardware_metrics(|| {
+            for _ in 0..probe_iters {
+                let rep = black_box(probe_file_detailed(&probe_mp4).unwrap());
+                assert_eq!(rep.tracks[0].sample_count, 300);
+            }
+        })
+    });
+    let probe_perf_hw = scale_hardware_metrics(probe_perf_raw, probe_iters);
+    let ragdoll_probe_rate = 1000.0 / probe_perf_hw.wall_ms;
 
-    let (ff_probe_ms, ff_probe_rate, probe_speedup) = if compare_ffmpeg {
-        let ff_iters = 5usize;
-        let t_ff = Instant::now();
-        for _ in 0..ff_iters {
-            let status = Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "error",
-                    "-show_streams",
-                    "-show_packets",
-                    "-of",
-                    "json",
-                ])
-                .arg(&probe_mp4)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            assert!(status.success());
-        }
-        let ms = (t_ff.elapsed().as_secs_f64() * 1000.0) / (ff_iters as f64);
-        (Some(ms), Some(1000.0 / ms), Some(ms / ragdoll_probe_ms))
+    let (_, probe_eff_raw) = with_power_mode(PowerMode::Efficiency, || {
+        measure_hardware_metrics(|| {
+            for _ in 0..probe_iters {
+                let rep = black_box(probe_file_detailed(&probe_mp4).unwrap());
+                assert_eq!(rep.tracks[0].sample_count, 300);
+            }
+        })
+    });
+    let probe_eff_hw = scale_hardware_metrics(probe_eff_raw, probe_iters);
+    let ragdoll_probe_eff_rate = 1000.0 / probe_eff_hw.wall_ms;
+
+    let (ff_probe_hw, ff_probe_rate, probe_speedup_perf, probe_speedup_eff) = if compare_ffmpeg {
+        let hw = run_external_batch_with_telemetry(
+            &[(
+                "ffprobe",
+                vec![
+                    "-v".into(),
+                    "error".into(),
+                    "-show_streams".into(),
+                    "-show_packets".into(),
+                    "-of".into(),
+                    "json".into(),
+                    probe_mp4.to_string_lossy().into_owned(),
+                ],
+            )],
+            5,
+        )?;
+        let rate = 1000.0 / hw.wall_ms;
+        (
+            Some(hw),
+            Some(rate),
+            Some(hw.wall_ms / probe_perf_hw.wall_ms),
+            Some(hw.wall_ms / probe_eff_hw.wall_ms),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     rows.push(BenchRow {
         workload: "1. Container Probe & GOP Index (300f 4K MP4)",
         unit: "files/s",
-        ragdoll_ms: ragdoll_probe_ms,
-        ragdoll_rate: ragdoll_probe_rate,
-        ffmpeg_ms: ff_probe_ms,
+        ragdoll_perf_hw: probe_perf_hw,
+        ragdoll_perf_rate: ragdoll_probe_rate,
+        ragdoll_eff_hw: probe_eff_hw,
+        ragdoll_eff_rate: ragdoll_probe_eff_rate,
+        ffmpeg_hw: ff_probe_hw,
         ffmpeg_rate: ff_probe_rate,
-        speedup: probe_speedup,
+        speedup_perf: probe_speedup_perf,
+        speedup_eff: probe_speedup_eff,
     });
     let _ = std::fs::remove_file(&probe_mp4);
 
     // -------------------------------------------------------------------------
-    // Workload 2: Zero-Copy Remuxing (MP4 -> MKV, ~15 MB 4K stream)
+    // Workload 2: Zero-Copy Remuxing (MP4 -> MKV, ~16 MB 4K stream)
     // -------------------------------------------------------------------------
     let remux_in = tmp_dir.join("remux_in.mp4");
     create_benchmark_mp4(&remux_in, 3840, 2160, 240, 65_536)?;
     let remux_bytes = std::fs::metadata(&remux_in)?.len() as f64;
 
     let remux_iters = 5usize;
-    let t0 = Instant::now();
-    for it in 0..remux_iters {
-        let out_p = tmp_dir.join(format!("remux_rag_{it}.mkv"));
-        let _ = black_box(remux_file(&remux_in, &out_p)?);
-        let _ = std::fs::remove_file(&out_p);
-    }
-    let rag_remux_ms = (t0.elapsed().as_secs_f64() * 1000.0) / (remux_iters as f64);
-    let rag_remux_gbps = (remux_bytes / 1e9) / (rag_remux_ms / 1000.0);
+    let (_, remux_perf_raw) = with_power_mode(PowerMode::Performance, || {
+        measure_hardware_metrics(|| {
+            for it in 0..remux_iters {
+                let out_p = tmp_dir.join(format!("remux_rag_{it}.mkv"));
+                let _ = black_box(remux_file(&remux_in, &out_p).unwrap());
+                let _ = std::fs::remove_file(&out_p);
+            }
+        })
+    });
+    let remux_perf_hw = scale_hardware_metrics(remux_perf_raw, remux_iters);
+    let rag_remux_gbps = (remux_bytes / 1e9) / (remux_perf_hw.wall_ms / 1000.0);
 
-    let (ff_remux_ms, ff_remux_gbps, remux_speedup) = if compare_ffmpeg {
-        let ff_iters = 5usize;
-        let t_ff = Instant::now();
-        for it in 0..ff_iters {
-            let out_p = tmp_dir.join(format!("remux_ff_{it}.mkv"));
-            let status = Command::new("ffmpeg")
-                .args(["-y", "-v", "error", "-i"])
-                .arg(&remux_in)
-                .args(["-c", "copy"])
-                .arg(&out_p)
-                .status()?;
-            assert!(status.success());
-            let _ = std::fs::remove_file(&out_p);
-        }
-        let ms = (t_ff.elapsed().as_secs_f64() * 1000.0) / (ff_iters as f64);
-        let gbps = (remux_bytes / 1e9) / (ms / 1000.0);
-        (Some(ms), Some(gbps), Some(ms / rag_remux_ms))
+    let (_, remux_eff_raw) = with_power_mode(PowerMode::Efficiency, || {
+        measure_hardware_metrics(|| {
+            for it in 0..remux_iters {
+                let out_p = tmp_dir.join(format!("remux_rag_eff_{it}.mkv"));
+                let _ = black_box(remux_file(&remux_in, &out_p).unwrap());
+                let _ = std::fs::remove_file(&out_p);
+            }
+        })
+    });
+    let remux_eff_hw = scale_hardware_metrics(remux_eff_raw, remux_iters);
+    let rag_remux_eff_gbps = (remux_bytes / 1e9) / (remux_eff_hw.wall_ms / 1000.0);
+
+    let (ff_remux_hw, ff_remux_gbps, remux_speedup_perf, remux_speedup_eff) = if compare_ffmpeg {
+        let out_p = tmp_dir.join("remux_ff.mkv");
+        let hw = run_external_batch_with_telemetry(
+            &[(
+                "ffmpeg",
+                vec![
+                    "-y".into(),
+                    "-v".into(),
+                    "error".into(),
+                    "-i".into(),
+                    remux_in.to_string_lossy().into_owned(),
+                    "-c".into(),
+                    "copy".into(),
+                    out_p.to_string_lossy().into_owned(),
+                ],
+            )],
+            5,
+        )?;
+        let _ = std::fs::remove_file(&out_p);
+        let gbps = (remux_bytes / 1e9) / (hw.wall_ms / 1000.0);
+        (
+            Some(hw),
+            Some(gbps),
+            Some(hw.wall_ms / remux_perf_hw.wall_ms),
+            Some(hw.wall_ms / remux_eff_hw.wall_ms),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     let _ = std::fs::remove_file(&remux_in);
-    rows.push(BenchRow {
+    let row2 = BenchRow {
         workload: "2. Zero-Copy Remux (MP4 -> MKV 16 MB 4K)",
         unit: "GB/s",
-        ragdoll_ms: rag_remux_ms,
-        ragdoll_rate: rag_remux_gbps,
-        ffmpeg_ms: ff_remux_ms,
+        ragdoll_perf_hw: remux_perf_hw,
+        ragdoll_perf_rate: rag_remux_gbps,
+        ragdoll_eff_hw: remux_eff_hw,
+        ragdoll_eff_rate: rag_remux_eff_gbps,
+        ffmpeg_hw: ff_remux_hw,
         ffmpeg_rate: ff_remux_gbps,
-        speedup: remux_speedup,
-    });
+        speedup_perf: remux_speedup_perf,
+        speedup_eff: remux_speedup_eff,
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 4: Lossless Audio Coding (WAV -> FLAC + FLAC -> WAV, 30s 48kHz Stereo)
+    // -------------------------------------------------------------------------
+    let row4 = {
+        let wav_in = tmp_dir.join("audio_30s.wav");
+        let flac_rag = tmp_dir.join("audio_rag.flac");
+        let flac_ff = tmp_dir.join("audio_ff.flac");
+        synth_media(&wav_in, 0, 0, 30, 30.0)?;
+        let audio_samples = 48_000 * 30;
+        let mmap_wav = ragdoll_format::MmapSource::open(&wav_in)?;
+        let wav_demux = ragdoll_format::WavDemuxer::open(mmap_wav.as_slice())?;
+        let mut pcm_frame = AudioFrame::new(48_000, 2, SampleFormat::S16le, audio_samples);
+        pcm_frame
+            .data
+            .as_mut_slice()
+            .copy_from_slice(wav_demux.pcm_data());
+        drop(mmap_wav);
+
+        let (flac_bytes, audio_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| {
+                let flac_enc = FlacEncoder::new(48_000, 2, 16);
+                let encoded = flac_enc.encode_stream(&pcm_frame).unwrap();
+                let (_info, decoded_pcm) = FlacDecoder::decode_stream(&encoded).unwrap();
+                assert_eq!(decoded_pcm.num_samples, audio_samples);
+                encoded
+            })
+        });
+        std::fs::write(&flac_rag, &flac_bytes)?;
+        drop(flac_bytes);
+        let rag_audio_xrt = 30.0 / (audio_perf_hw.wall_ms / 1000.0);
+
+        let (_, audio_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let flac_enc = FlacEncoder::new(48_000, 2, 16);
+                let encoded = flac_enc.encode_stream(&pcm_frame).unwrap();
+                let (_info, decoded_pcm) = FlacDecoder::decode_stream(&encoded).unwrap();
+                assert_eq!(decoded_pcm.num_samples, audio_samples);
+            })
+        });
+        drop(pcm_frame);
+        let rag_audio_eff_xrt = 30.0 / (audio_eff_hw.wall_ms / 1000.0);
+
+        let (ff_audio_hw, ff_audio_xrt, audio_speedup_perf, audio_speedup_eff) = if compare_ffmpeg {
+            let wav_ff_dec = tmp_dir.join("audio_ff_dec.wav");
+            let hw = run_external_batch_with_telemetry(
+                &[
+                    (
+                        "ffmpeg",
+                        vec![
+                            "-y".into(),
+                            "-v".into(),
+                            "error".into(),
+                            "-i".into(),
+                            wav_in.to_string_lossy().into_owned(),
+                            "-c:a".into(),
+                            "flac".into(),
+                            flac_ff.to_string_lossy().into_owned(),
+                        ],
+                    ),
+                    (
+                        "ffmpeg",
+                        vec![
+                            "-y".into(),
+                            "-v".into(),
+                            "error".into(),
+                            "-i".into(),
+                            flac_ff.to_string_lossy().into_owned(),
+                            wav_ff_dec.to_string_lossy().into_owned(),
+                        ],
+                    ),
+                ],
+                1,
+            )?;
+            let xrt = 30.0 / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(xrt),
+                Some(hw.wall_ms / audio_perf_hw.wall_ms),
+                Some(hw.wall_ms / audio_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        BenchRow {
+            workload: "4. Lossless FLAC Encode+Decode (30s 48kHz 2ch)",
+            unit: "x RT",
+            ragdoll_perf_hw: audio_perf_hw,
+            ragdoll_perf_rate: rag_audio_xrt,
+            ragdoll_eff_hw: audio_eff_hw,
+            ragdoll_eff_rate: rag_audio_eff_xrt,
+            ffmpeg_hw: ff_audio_hw,
+            ffmpeg_rate: ff_audio_xrt,
+            speedup_perf: audio_speedup_perf,
+            speedup_eff: audio_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 5: Fast Frame Seek & 4x4 Contact Sheet Extraction
+    // -------------------------------------------------------------------------
+    let row5 = {
+        let sheet_mp4 = tmp_dir.join("sheet_src.mp4");
+        let sheet_rag_ppm = tmp_dir.join("sheet_rag.ppm");
+        let sheet_ff_ppm = tmp_dir.join("sheet_ff.ppm");
+        synth_media(&sheet_mp4, 640, 360, 30, 1.0)?;
+
+        let (_, sheet_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| {
+                let _ = extract_media(&sheet_mp4, &sheet_rag_ppm, None, Some((16, 4, 4))).unwrap();
+            })
+        });
+        let rag_sheet_rate = 16.0 / (sheet_perf_hw.wall_ms / 1000.0);
+
+        let (_, sheet_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let _ = extract_media(&sheet_mp4, &sheet_rag_ppm, None, Some((16, 4, 4))).unwrap();
+            })
+        });
+        let rag_sheet_eff_rate = 16.0 / (sheet_eff_hw.wall_ms / 1000.0);
+
+        let (ff_sheet_hw, ff_sheet_rate, sheet_speedup_perf, sheet_speedup_eff) = if compare_ffmpeg
+        {
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        sheet_mp4.to_string_lossy().into_owned(),
+                        "-vf".into(),
+                        "scale=160:90:flags=lanczos,tile=4x4".into(),
+                        "-frames:v".into(),
+                        "1".into(),
+                        sheet_ff_ppm.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let rate = 16.0 / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(rate),
+                Some(hw.wall_ms / sheet_perf_hw.wall_ms),
+                Some(hw.wall_ms / sheet_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        BenchRow {
+            workload: "5. 4x4 Contact Sheet Extraction (16 Thumbs)",
+            unit: "thumbs/s",
+            ragdoll_perf_hw: sheet_perf_hw,
+            ragdoll_perf_rate: rag_sheet_rate,
+            ragdoll_eff_hw: sheet_eff_hw,
+            ragdoll_eff_rate: rag_sheet_eff_rate,
+            ffmpeg_hw: ff_sheet_hw,
+            ffmpeg_rate: ff_sheet_rate,
+            speedup_perf: sheet_speedup_perf,
+            speedup_eff: sheet_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 7: 1080p H.264 Inter-Frame Video Transcode (60f Y4M -> MP4)
+    // -------------------------------------------------------------------------
+    let row7 = {
+        let h264_frames_count = 60usize;
+        let h264_in_y4m = tmp_dir.join("h264_1080p_60f.y4m");
+        let h264_rag_mp4 = tmp_dir.join("h264_rag.mp4");
+        let h264_ff_mp4 = tmp_dir.join("h264_ff.mp4");
+        {
+            let seed_indices: Vec<usize> = (0..15).collect();
+            let seed_1080p: Vec<VideoFrame> =
+                parallel_gop_map(&seed_indices, 0, |_, &i| synth_video_frame(1920, 1080, i));
+            let f = std::fs::File::create(&h264_in_y4m)?;
+            let mut mux = Y4mMuxer::new(
+                BufWriter::with_capacity(2 * 1024 * 1024, f),
+                1920,
+                1080,
+                PixelFormat::Yuv420p,
+                Rational64::FPS_30,
+                Colorimetry::bt709_limited(),
+            )?;
+            for i in 0..h264_frames_count {
+                mux.write_frame(&seed_1080p[i % seed_1080p.len()])?;
+            }
+            mux.finish()?;
+        }
+
+        let (_, h264_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| {
+                let _ = transcode_file(
+                    &h264_in_y4m,
+                    &h264_rag_mp4,
+                    None,
+                    ScaleFilter::Lanczos3,
+                    "h264",
+                    24,
+                    0,
+                )
+                .unwrap();
+            })
+        });
+        let rag_h264_fps = (h264_frames_count as f64) / (h264_perf_hw.wall_ms / 1000.0);
+
+        let (_, h264_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let _ = transcode_file(
+                    &h264_in_y4m,
+                    &h264_rag_mp4,
+                    None,
+                    ScaleFilter::Lanczos3,
+                    "h264",
+                    24,
+                    0,
+                )
+                .unwrap();
+            })
+        });
+        let rag_h264_eff_fps = (h264_frames_count as f64) / (h264_eff_hw.wall_ms / 1000.0);
+
+        let (ff_h264_hw, ff_h264_fps, h264_speedup_perf, h264_speedup_eff) = if compare_ffmpeg {
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        h264_in_y4m.to_string_lossy().into_owned(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-qp".into(),
+                        "24".into(),
+                        h264_ff_mp4.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let fps = (h264_frames_count as f64) / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(fps),
+                Some(hw.wall_ms / h264_perf_hw.wall_ms),
+                Some(hw.wall_ms / h264_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let _ = std::fs::remove_file(&h264_in_y4m);
+        let _ = std::fs::remove_file(&h264_rag_mp4);
+        let _ = std::fs::remove_file(&h264_ff_mp4);
+        BenchRow {
+            workload: "7. 1080p H.264 Inter Transcode (60f Y4M->MP4)",
+            unit: "fps",
+            ragdoll_perf_hw: h264_perf_hw,
+            ragdoll_perf_rate: rag_h264_fps,
+            ragdoll_eff_hw: h264_eff_hw,
+            ragdoll_eff_rate: rag_h264_eff_fps,
+            ffmpeg_hw: ff_h264_hw,
+            ffmpeg_rate: ff_h264_fps,
+            speedup_perf: h264_speedup_perf,
+            speedup_eff: h264_speedup_eff,
+        }
+    };
 
     // -------------------------------------------------------------------------
     // Workload 3: 4K -> 1080p Fused Lanczos-3 Polyphase Scaling (30 frames)
@@ -710,13 +1142,25 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     let frames_4k: Vec<VideoFrame> =
         parallel_gop_map(&indices, 0, |_, &i| synth_video_frame(3840, 2160, i));
 
-    let t0 = Instant::now();
-    let scaled_1080p = parallel_scale_frames(&frames_4k, 1920, 1080, ScaleFilter::Lanczos3, 0)?;
+    let (scaled_1080p, scale_perf_hw) = with_power_mode(PowerMode::Performance, || {
+        measure_hardware_metrics(|| {
+            parallel_scale_frames(&frames_4k, 1920, 1080, ScaleFilter::Lanczos3, 0).unwrap()
+        })
+    });
     assert_eq!(scaled_1080p.len(), scale_frames_count);
-    let rag_scale_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let rag_scale_fps = (scale_frames_count as f64) / (rag_scale_ms / 1000.0);
+    drop(scaled_1080p);
+    let rag_scale_fps = (scale_frames_count as f64) / (scale_perf_hw.wall_ms / 1000.0);
 
-    let (ff_scale_ms, ff_scale_fps, scale_speedup) = if compare_ffmpeg {
+    let (scaled_1080p_eff, scale_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+        measure_hardware_metrics(|| {
+            parallel_scale_frames(&frames_4k, 1920, 1080, ScaleFilter::Lanczos3, 0).unwrap()
+        })
+    });
+    assert_eq!(scaled_1080p_eff.len(), scale_frames_count);
+    drop(scaled_1080p_eff);
+    let rag_scale_eff_fps = (scale_frames_count as f64) / (scale_eff_hw.wall_ms / 1000.0);
+
+    let (ff_scale_hw, ff_scale_fps, scale_speedup_perf, scale_speedup_eff) = if compare_ffmpeg {
         let y4m_4k = tmp_dir.join("scale_4k.y4m");
         {
             let f = std::fs::File::create(&y4m_4k)?;
@@ -733,128 +1177,47 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             }
             mux.finish()?;
         }
-        let t_ff = Instant::now();
-        let status = Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i"])
-            .arg(&y4m_4k)
-            .args(["-vf", "scale=1920:1080:flags=lanczos", "-f", "null", "-"])
-            .status()?;
-        assert!(status.success());
-        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
-        let fps = (scale_frames_count as f64) / (ms / 1000.0);
+        let hw = run_external_batch_with_telemetry(
+            &[(
+                "ffmpeg",
+                vec![
+                    "-y".into(),
+                    "-v".into(),
+                    "error".into(),
+                    "-i".into(),
+                    y4m_4k.to_string_lossy().into_owned(),
+                    "-vf".into(),
+                    "scale=1920:1080:flags=lanczos".into(),
+                    "-f".into(),
+                    "null".into(),
+                    "-".into(),
+                ],
+            )],
+            1,
+        )?;
+        let fps = (scale_frames_count as f64) / (hw.wall_ms / 1000.0);
         let _ = std::fs::remove_file(&y4m_4k);
-        (Some(ms), Some(fps), Some(ms / rag_scale_ms))
+        (
+            Some(hw),
+            Some(fps),
+            Some(hw.wall_ms / scale_perf_hw.wall_ms),
+            Some(hw.wall_ms / scale_eff_hw.wall_ms),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
-    rows.push(BenchRow {
+    let row3 = BenchRow {
         workload: "3. 4K -> 1080p Lanczos-3 Scaling (30 frames)",
         unit: "fps",
-        ragdoll_ms: rag_scale_ms,
-        ragdoll_rate: rag_scale_fps,
-        ffmpeg_ms: ff_scale_ms,
+        ragdoll_perf_hw: scale_perf_hw,
+        ragdoll_perf_rate: rag_scale_fps,
+        ragdoll_eff_hw: scale_eff_hw,
+        ragdoll_eff_rate: rag_scale_eff_fps,
+        ffmpeg_hw: ff_scale_hw,
         ffmpeg_rate: ff_scale_fps,
-        speedup: scale_speedup,
-    });
-
-    // -------------------------------------------------------------------------
-    // Workload 4: Lossless Audio Coding (WAV -> FLAC + FLAC -> WAV, 30s 48kHz Stereo)
-    // -------------------------------------------------------------------------
-    let wav_in = tmp_dir.join("audio_30s.wav");
-    let flac_rag = tmp_dir.join("audio_rag.flac");
-    let flac_ff = tmp_dir.join("audio_ff.flac");
-    synth_media(&wav_in, 0, 0, 30, 30.0)?;
-    let audio_samples = 48_000 * 30;
-    let mmap_wav = ragdoll_format::MmapSource::open(&wav_in)?;
-    let wav_demux = ragdoll_format::WavDemuxer::open(mmap_wav.as_slice())?;
-    let mut pcm_frame = AudioFrame::new(48_000, 2, SampleFormat::S16le, audio_samples);
-    pcm_frame
-        .data
-        .as_mut_slice()
-        .copy_from_slice(wav_demux.pcm_data());
-
-    let t0 = Instant::now();
-    let flac_enc = FlacEncoder::new(48_000, 2, 16);
-    let flac_bytes = flac_enc.encode_stream(&pcm_frame)?;
-    let (_info, decoded_pcm) = FlacDecoder::decode_stream(&flac_bytes)?;
-    assert_eq!(decoded_pcm.num_samples, audio_samples);
-    std::fs::write(&flac_rag, &flac_bytes)?;
-    let rag_audio_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let rag_audio_xrt = 30.0 / (rag_audio_ms / 1000.0); // x realtime
-
-    let (ff_audio_ms, ff_audio_xrt, audio_speedup) = if compare_ffmpeg {
-        let wav_ff_dec = tmp_dir.join("audio_ff_dec.wav");
-        let t_ff = Instant::now();
-        let st1 = Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i"])
-            .arg(&wav_in)
-            .args(["-c:a", "flac"])
-            .arg(&flac_ff)
-            .status()?;
-        let st2 = Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i"])
-            .arg(&flac_ff)
-            .arg(&wav_ff_dec)
-            .status()?;
-        assert!(st1.success() && st2.success());
-        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
-        let xrt = 30.0 / (ms / 1000.0);
-        (Some(ms), Some(xrt), Some(ms / rag_audio_ms))
-    } else {
-        (None, None, None)
+        speedup_perf: scale_speedup_perf,
+        speedup_eff: scale_speedup_eff,
     };
-    rows.push(BenchRow {
-        workload: "4. Lossless FLAC Encode+Decode (30s 48kHz 2ch)",
-        unit: "x RT",
-        ragdoll_ms: rag_audio_ms,
-        ragdoll_rate: rag_audio_xrt,
-        ffmpeg_ms: ff_audio_ms,
-        ffmpeg_rate: ff_audio_xrt,
-        speedup: audio_speedup,
-    });
-
-    // -------------------------------------------------------------------------
-    // Workload 5: Fast Frame Seek & 4x4 Contact Sheet Extraction
-    // -------------------------------------------------------------------------
-    let sheet_mp4 = tmp_dir.join("sheet_src.mp4");
-    let sheet_rag_ppm = tmp_dir.join("sheet_rag.ppm");
-    let sheet_ff_ppm = tmp_dir.join("sheet_ff.ppm");
-    synth_media(&sheet_mp4, 640, 360, 30, 1.0)?;
-
-    let t0 = Instant::now();
-    let _ = extract_media(&sheet_mp4, &sheet_rag_ppm, None, Some((16, 4, 4)))?;
-    let rag_sheet_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let rag_sheet_rate = 16.0 / (rag_sheet_ms / 1000.0);
-
-    let (ff_sheet_ms, ff_sheet_rate, sheet_speedup) = if compare_ffmpeg {
-        let t_ff = Instant::now();
-        let status = Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i"])
-            .arg(&sheet_mp4)
-            .args([
-                "-vf",
-                "scale=160:90:flags=lanczos,tile=4x4",
-                "-frames:v",
-                "1",
-            ])
-            .arg(&sheet_ff_ppm)
-            .status()?;
-        assert!(status.success());
-        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
-        let rate = 16.0 / (ms / 1000.0);
-        (Some(ms), Some(rate), Some(ms / rag_sheet_ms))
-    } else {
-        (None, None, None)
-    };
-    rows.push(BenchRow {
-        workload: "5. 4x4 Contact Sheet Extraction (16 Thumbs)",
-        unit: "thumbs/s",
-        ragdoll_ms: rag_sheet_ms,
-        ragdoll_rate: rag_sheet_rate,
-        ffmpeg_ms: ff_sheet_ms,
-        ffmpeg_rate: ff_sheet_rate,
-        speedup: sheet_speedup,
-    });
 
     // -------------------------------------------------------------------------
     // Workload 6: 4K Perceptual Quality Metrics (PSNR + 8x8 Windowed SSIM, 20 frames)
@@ -864,128 +1227,314 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     let dist_4k = &frames_4k[1..=metric_frames];
 
     let metric_indices: Vec<usize> = (0..metric_frames).collect();
-    let t0 = Instant::now();
-    let _metric_results: Vec<_> = parallel_gop_map(&metric_indices, 0, |_, &i| {
-        let r = &ref_4k[i];
-        let d = &dist_4k[i];
-        let psnr = ragdoll_pix::psnr_plane_u8(
-            r.plane(0).data(),
-            r.plane(0).stride(),
-            d.plane(0).data(),
-            d.plane(0).stride(),
-            r.width,
-            r.height,
-        );
-        let ssim = ssim_plane_8bit(
-            r.plane(0).data(),
-            r.plane(0).stride(),
-            d.plane(0).data(),
-            d.plane(0).stride(),
-            r.width,
-            r.height,
-        );
-        (psnr, ssim)
+    let (_, metrics_perf_hw) = with_power_mode(PowerMode::Performance, || {
+        measure_hardware_metrics(|| {
+            let _metric_results: Vec<_> = parallel_gop_map(&metric_indices, 0, |_, &i| {
+                let r = &ref_4k[i];
+                let d = &dist_4k[i];
+                let psnr = ragdoll_pix::psnr_plane_u8(
+                    r.plane(0).data(),
+                    r.plane(0).stride(),
+                    d.plane(0).data(),
+                    d.plane(0).stride(),
+                    r.width,
+                    r.height,
+                );
+                let ssim = ssim_plane_8bit(
+                    r.plane(0).data(),
+                    r.plane(0).stride(),
+                    d.plane(0).data(),
+                    d.plane(0).stride(),
+                    r.width,
+                    r.height,
+                );
+                (psnr, ssim)
+            });
+        })
     });
-    let rag_metrics_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let rag_metrics_fps = (metric_frames as f64) / (rag_metrics_ms / 1000.0);
+    let rag_metrics_fps = (metric_frames as f64) / (metrics_perf_hw.wall_ms / 1000.0);
 
-    let (ff_metrics_ms, ff_metrics_fps, metrics_speedup) = if compare_ffmpeg {
-        let ref_y4m = tmp_dir.join("ref_4k.y4m");
-        let dist_y4m = tmp_dir.join("dist_4k.y4m");
-        for (p, slice) in [(&ref_y4m, ref_4k), (&dist_y4m, dist_4k)] {
-            let f = std::fs::File::create(p)?;
-            let mut mux = Y4mMuxer::new(
-                BufWriter::with_capacity(1024 * 1024, f),
-                3840,
-                2160,
-                PixelFormat::Yuv420p,
-                Rational64::FPS_30,
-                Colorimetry::bt709_limited(),
-            )?;
-            for fr in slice {
-                mux.write_frame(fr)?;
+    let (_, metrics_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+        measure_hardware_metrics(|| {
+            let _metric_results: Vec<_> = parallel_gop_map(&metric_indices, 0, |_, &i| {
+                let r = &ref_4k[i];
+                let d = &dist_4k[i];
+                let psnr = ragdoll_pix::psnr_plane_u8(
+                    r.plane(0).data(),
+                    r.plane(0).stride(),
+                    d.plane(0).data(),
+                    d.plane(0).stride(),
+                    r.width,
+                    r.height,
+                );
+                let ssim = ssim_plane_8bit(
+                    r.plane(0).data(),
+                    r.plane(0).stride(),
+                    d.plane(0).data(),
+                    d.plane(0).stride(),
+                    r.width,
+                    r.height,
+                );
+                (psnr, ssim)
+            });
+        })
+    });
+    let rag_metrics_eff_fps = (metric_frames as f64) / (metrics_eff_hw.wall_ms / 1000.0);
+
+    let (ff_metrics_hw, ff_metrics_fps, metrics_speedup_perf, metrics_speedup_eff) =
+        if compare_ffmpeg {
+            let ref_y4m = tmp_dir.join("ref_4k.y4m");
+            let dist_y4m = tmp_dir.join("dist_4k.y4m");
+            for (p, slice) in [(&ref_y4m, ref_4k), (&dist_y4m, dist_4k)] {
+                let f = std::fs::File::create(p)?;
+                let mut mux = Y4mMuxer::new(
+                    BufWriter::with_capacity(1024 * 1024, f),
+                    3840,
+                    2160,
+                    PixelFormat::Yuv420p,
+                    Rational64::FPS_30,
+                    Colorimetry::bt709_limited(),
+                )?;
+                for fr in slice {
+                    mux.write_frame(fr)?;
+                }
+                mux.finish()?;
             }
-            mux.finish()?;
-        }
-        let t_ff = Instant::now();
-        let status = Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
-            .arg(&ref_y4m)
-            .arg("-i")
-            .arg(&dist_y4m)
-            .args(["-lavfi", "[0:v][1:v]psnr;[0:v][1:v]ssim", "-f", "null", "-"])
-            .status()?;
-        assert!(status.success());
-        let ms = t_ff.elapsed().as_secs_f64() * 1000.0;
-        let fps = (metric_frames as f64) / (ms / 1000.0);
-        (Some(ms), Some(fps), Some(ms / rag_metrics_ms))
-    } else {
-        (None, None, None)
-    };
-    rows.push(BenchRow {
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        ref_y4m.to_string_lossy().into_owned(),
+                        "-i".into(),
+                        dist_y4m.to_string_lossy().into_owned(),
+                        "-lavfi".into(),
+                        "[0:v][1:v]psnr;[0:v][1:v]ssim".into(),
+                        "-f".into(),
+                        "null".into(),
+                        "-".into(),
+                    ],
+                )],
+                1,
+            )?;
+            let fps = (metric_frames as f64) / (hw.wall_ms / 1000.0);
+            let _ = std::fs::remove_file(&ref_y4m);
+            let _ = std::fs::remove_file(&dist_y4m);
+            (
+                Some(hw),
+                Some(fps),
+                Some(hw.wall_ms / metrics_perf_hw.wall_ms),
+                Some(hw.wall_ms / metrics_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+    drop(frames_4k);
+    let row6 = BenchRow {
         workload: "6. 4K Perceptual Metrics (PSNR + 8x8 SSIM 20f)",
         unit: "fps",
-        ragdoll_ms: rag_metrics_ms,
-        ragdoll_rate: rag_metrics_fps,
-        ffmpeg_ms: ff_metrics_ms,
+        ragdoll_perf_hw: metrics_perf_hw,
+        ragdoll_perf_rate: rag_metrics_fps,
+        ragdoll_eff_hw: metrics_eff_hw,
+        ragdoll_eff_rate: rag_metrics_eff_fps,
+        ffmpeg_hw: ff_metrics_hw,
         ffmpeg_rate: ff_metrics_fps,
-        speedup: metrics_speedup,
-    });
+        speedup_perf: metrics_speedup_perf,
+        speedup_eff: metrics_speedup_eff,
+    };
+
+    rows.extend([row2, row3, row4, row5, row6, row7]);
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
+    let topo = CpuTopology::detect();
     if json {
         println!("{{");
         println!("  \"simd\": \"{}\",", SimdLevel::detect().name());
+        println!(
+            "  \"cpu_topology\": {{\"logical_cores\": {}, \"p_cores\": {}, \"e_cores\": {}}},",
+            topo.total_cores, topo.p_cores, topo.e_cores
+        );
         println!("  \"benchmarks\": [");
         for (i, r) in rows.iter().enumerate() {
             let comma = if i + 1 < rows.len() { "," } else { "" };
             println!(
-                "    {{\"workload\": \"{}\", \"unit\": \"{}\", \"ragdoll_ms\": {:.3}, \"ragdoll_rate\": {:.2}, \"ffmpeg_ms\": {}, \"ffmpeg_rate\": {}, \"speedup\": {}}}{comma}",
+                "    {{\"workload\": \"{}\", \"unit\": \"{}\", \"ragdoll_perf_ms\": {:.3}, \"ragdoll_perf_rate\": {:.2}, \"ragdoll_perf_instructions\": {}, \"ragdoll_perf_cycles\": {}, \"ragdoll_perf_energy_mj\": {:.3}, \"ragdoll_eff_ms\": {:.3}, \"ragdoll_eff_rate\": {:.2}, \"ragdoll_eff_instructions\": {}, \"ragdoll_eff_cycles\": {}, \"ragdoll_eff_ecore_pct\": {:.1}, \"ragdoll_eff_energy_mj\": {:.3}, \"ffmpeg_ms\": {}, \"ffmpeg_rate\": {}, \"ffmpeg_instructions\": {}, \"ffmpeg_cycles\": {}, \"ffmpeg_energy_mj\": {}, \"speedup_perf\": {}, \"speedup_eff\": {}}}{comma}",
                 r.workload,
                 r.unit,
-                r.ragdoll_ms,
-                r.ragdoll_rate,
-                r.ffmpeg_ms.map_or("null".into(), |v| format!("{v:.3}")),
+                r.ragdoll_perf_hw.wall_ms,
+                r.ragdoll_perf_rate,
+                r.ragdoll_perf_hw.instructions,
+                r.ragdoll_perf_hw.cycles,
+                r.ragdoll_perf_hw.energy_mj,
+                r.ragdoll_eff_hw.wall_ms,
+                r.ragdoll_eff_rate,
+                r.ragdoll_eff_hw.instructions,
+                r.ragdoll_eff_hw.cycles,
+                r.ragdoll_eff_hw.ecore_residency_pct,
+                r.ragdoll_eff_hw.energy_mj,
+                r.ffmpeg_hw
+                    .map_or("null".into(), |h| format!("{:.3}", h.wall_ms)),
                 r.ffmpeg_rate.map_or("null".into(), |v| format!("{v:.2}")),
-                r.speedup.map_or("null".into(), |v| format!("{v:.2}"))
+                r.ffmpeg_hw
+                    .map_or("null".into(), |h| format!("{}", h.instructions)),
+                r.ffmpeg_hw
+                    .map_or("null".into(), |h| format!("{}", h.cycles)),
+                r.ffmpeg_hw
+                    .map_or("null".into(), |h| format!("{:.3}", h.energy_mj)),
+                r.speedup_perf.map_or("null".into(), |v| format!("{v:.2}")),
+                r.speedup_eff.map_or("null".into(), |v| format!("{v:.2}"))
             );
         }
         println!("  ]");
         println!("}}");
     } else {
         println!(
-            "=========================================================================================================="
+            "=================================================================================================================================="
         );
         println!(
-            "  RAGDOLL v0.1.0 BENCHMARK SUITE — Hardware SIMD: {}",
-            SimdLevel::detect().name()
+            "  RAGDOLL v0.1.0 SPEED & BATTERY EFFICIENCY BENCHMARK SUITE — SIMD: {} | CPU: {} P-Cores + {} E-Cores",
+            SimdLevel::detect().name(),
+            topo.p_cores,
+            topo.e_cores
         );
         println!(
-            "=========================================================================================================="
+            "=================================================================================================================================="
         );
         println!(
-            "{:<48} {:>12} {:>14} {:>12} {:>10}",
-            "Workload", "Ragdoll (ms)", "Ragdoll Rate", "FFmpeg (ms)", "Speedup"
+            "{:<47} {:>11} {:>14} {:>11} {:>11} {:>10} {:>10}",
+            "Workload",
+            "P-Core (ms)",
+            "P-Core Rate",
+            "E-Core (ms)",
+            "FFmpeg (ms)",
+            "Speedup(P)",
+            "Speedup(E)"
         );
         println!(
-            "----------------------------------------------------------------------------------------------------------"
+            "----------------------------------------------------------------------------------------------------------------------------------"
         );
         for r in &rows {
             let ff_ms_str = r
-                .ffmpeg_ms
-                .map_or_else(|| "N/A".into(), |v| format!("{v:.2} ms"));
-            let sp_str = r
-                .speedup
+                .ffmpeg_hw
+                .map_or_else(|| "N/A".into(), |h| format!("{:.2} ms", h.wall_ms));
+            let sp_p_str = r
+                .speedup_perf
+                .map_or_else(|| "N/A".into(), |v| format!("{v:.2}x"));
+            let sp_e_str = r
+                .speedup_eff
                 .map_or_else(|| "N/A".into(), |v| format!("{v:.2}x"));
             println!(
-                "{:<48} {:>9.2} ms {:>9.2} {:<4} {:>12} {:>10}",
-                r.workload, r.ragdoll_ms, r.ragdoll_rate, r.unit, ff_ms_str, sp_str
+                "{:<47} {:>8.2} ms {:>8.2} {:<5} {:>8.2} ms {:>11} {:>10} {:>10}",
+                r.workload,
+                r.ragdoll_perf_hw.wall_ms,
+                r.ragdoll_perf_rate,
+                r.unit,
+                r.ragdoll_eff_hw.wall_ms,
+                ff_ms_str,
+                sp_p_str,
+                sp_e_str
             );
         }
         println!(
-            "=========================================================================================================="
+            "=================================================================================================================================="
         );
+        println!(
+            "\nHARDWARE PMU TELEMETRY & BATTERY EFFICIENCY (proc_pid_rusage RUSAGE_INFO_V4 / /usr/bin/time -l):"
+        );
+        println!(
+            "----------------------------------------------------------------------------------------------------------------------------------"
+        );
+        println!(
+            "{:<35} {:<16} {:>10} {:>10} {:>6} {:>8} {:>8} {:>10} {:>8} {:>9} {:>10}",
+            "Workload",
+            "Engine / Mode",
+            "Instr(M)",
+            "Cycles(M)",
+            "IPC",
+            "GHz",
+            "E-Core%",
+            "Energy",
+            "Power",
+            "Mem(MiB)",
+            "EnergySav"
+        );
+        println!(
+            "----------------------------------------------------------------------------------------------------------------------------------"
+        );
+        for r in &rows {
+            let short_wl = if r.workload.len() > 34 {
+                &r.workload[..34]
+            } else {
+                r.workload
+            };
+            let ff_energy = r.ffmpeg_hw.map(|h| h.energy_mj).unwrap_or(0.0);
+            let p_sav = if ff_energy > 0.0 && r.ragdoll_perf_hw.energy_mj > 0.0 {
+                format!("{:.1}x", ff_energy / r.ragdoll_perf_hw.energy_mj)
+            } else {
+                "N/A".into()
+            };
+            let e_sav = if ff_energy > 0.0 && r.ragdoll_eff_hw.energy_mj > 0.0 {
+                format!("{:.1}x", ff_energy / r.ragdoll_eff_hw.energy_mj)
+            } else if r.ragdoll_perf_hw.energy_mj > 0.0 && r.ragdoll_eff_hw.energy_mj > 0.0 {
+                format!(
+                    "{:.1}x vs P",
+                    r.ragdoll_perf_hw.energy_mj / r.ragdoll_eff_hw.energy_mj
+                )
+            } else {
+                "N/A".into()
+            };
+
+            println!(
+                "{:<35} {:<16} {:>10.2} {:>10.2} {:>6.2} {:>8.2} {:>7.1}% {:>7.2} mJ {:>6.2} W {:>9.1} {:>10}",
+                short_wl,
+                "Ragdoll P-Core",
+                (r.ragdoll_perf_hw.instructions as f64) / 1e6,
+                (r.ragdoll_perf_hw.cycles as f64) / 1e6,
+                r.ragdoll_perf_hw.ipc,
+                r.ragdoll_perf_hw.effective_ghz,
+                r.ragdoll_perf_hw.ecore_residency_pct,
+                r.ragdoll_perf_hw.energy_mj,
+                r.ragdoll_perf_hw.avg_power_watts,
+                r.ragdoll_perf_hw.peak_rss_mib,
+                p_sav
+            );
+            println!(
+                "{:<35} {:<16} {:>10.2} {:>10.2} {:>6.2} {:>8.2} {:>7.1}% {:>7.2} mJ {:>6.2} W {:>9.1} {:>10}",
+                "",
+                "Ragdoll E-Core",
+                (r.ragdoll_eff_hw.instructions as f64) / 1e6,
+                (r.ragdoll_eff_hw.cycles as f64) / 1e6,
+                r.ragdoll_eff_hw.ipc,
+                r.ragdoll_eff_hw.effective_ghz,
+                r.ragdoll_eff_hw.ecore_residency_pct,
+                r.ragdoll_eff_hw.energy_mj,
+                r.ragdoll_eff_hw.avg_power_watts,
+                r.ragdoll_eff_hw.peak_rss_mib,
+                e_sav
+            );
+            if let Some(ff) = r.ffmpeg_hw {
+                println!(
+                    "{:<35} {:<16} {:>10.2} {:>10.2} {:>6.2} {:>8.2} {:>7.1}% {:>7.2} mJ {:>6.2} W {:>9.1} {:>10}",
+                    "",
+                    "FFmpeg 9.0.2",
+                    (ff.instructions as f64) / 1e6,
+                    (ff.cycles as f64) / 1e6,
+                    ff.ipc,
+                    ff.effective_ghz,
+                    ff.ecore_residency_pct,
+                    ff.energy_mj,
+                    ff.avg_power_watts,
+                    ff.peak_rss_mib,
+                    "1.0x (ref)"
+                );
+            }
+            println!(
+                "----------------------------------------------------------------------------------------------------------------------------------"
+            );
+        }
     }
     Ok(())
 }
@@ -1641,6 +2190,68 @@ pub fn run_self_test() {
         dt_hsc_scalar / dt_hsc_simd
     );
 
+    // 16x16 Macroblock SAD (Motion Estimation inner kernel)
+    let sad16_iters = 500_000usize;
+    let t0 = Instant::now();
+    let mut sad16_ref = 0u32;
+    for it in 0..sad16_iters {
+        let off = (it & 63) * 16;
+        sad16_ref ^= black_box(sad_16x16_u8_scalar(
+            black_box(&ya_slice[off..]),
+            stride,
+            black_box(&yb_slice[off..]),
+            stride,
+        ));
+    }
+    let dt_sad16_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let mut sad16_simd = 0u32;
+    for it in 0..sad16_iters {
+        let off = (it & 63) * 16;
+        sad16_simd ^= black_box(sad_16x16_u8(
+            black_box(&ya_slice[off..]),
+            stride,
+            black_box(&yb_slice[off..]),
+            stride,
+        ));
+    }
+    let dt_sad16_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(sad16_ref, sad16_simd);
+    println!(
+        "H.264 16x16 Macroblock SAD (vabal_u8 x16)   {:>8.2} Mmb/s   {:>8.2} Mmb/s   {:>5.2}x    EXACT",
+        (sad16_iters as f64) / dt_sad16_scalar / 1e6,
+        (sad16_iters as f64) / dt_sad16_simd / 1e6,
+        dt_sad16_scalar / dt_sad16_simd
+    );
+
+    // Single-Pass 5-Order FLAC Fixed Predictor L1 Evaluator
+    let flac_block_len = 4096usize;
+    let flac_samples: Vec<i32> = (0..flac_block_len)
+        .map(|i| (((i * 37) as f64 * 0.05).sin() * 18000.0) as i32)
+        .collect();
+    let flac_iters = 10_000usize;
+    let t0 = Instant::now();
+    let mut flac_l1_ref = [0u64; 5];
+    for _ in 0..flac_iters {
+        flac_l1_ref = black_box(flac_eval_fixed_orders_l1_scalar(black_box(&flac_samples)));
+    }
+    let dt_flac_scalar = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let mut flac_l1_simd = [0u64; 5];
+    for _ in 0..flac_iters {
+        flac_l1_simd = black_box(flac_eval_fixed_orders_l1(black_box(&flac_samples)));
+    }
+    let dt_flac_simd = t1.elapsed().as_secs_f64();
+    assert_eq!(flac_l1_ref, flac_l1_simd);
+    println!(
+        "FLAC 5-Order Fixed L1 Eval (1-pass NEON)    {:>8.2} Gsmp/s  {:>8.2} Gsmp/s  {:>5.2}x    EXACT",
+        (flac_block_len * flac_iters) as f64 / dt_flac_scalar / 1e9,
+        (flac_block_len * flac_iters) as f64 / dt_flac_simd / 1e9,
+        dt_flac_scalar / dt_flac_simd
+    );
+
     let mut dst_1080p_plane = Plane::new(1920, 1080, 1);
     let t_l1 = Instant::now();
     scale_plane(
@@ -1774,6 +2385,18 @@ pub fn run_self_test() {
     let mkv_check = MkvDemuxer::open(&mkv_sink).unwrap();
     assert!(mkv_check.has_seek_head());
 
+    // M4/M5 H.264 P_L0_16x16 Motion Estimation + Hardware PMU check
+    let mut h264_enc = H264Encoder::new(128, 96, Rational64::FPS_30, 22);
+    let mut h264_dec = H264Decoder::new();
+    let f0 = synth_video_frame(128, 96, 0);
+    let f1 = synth_video_frame(128, 96, 2);
+    let au0 = h264_enc.encode_frame(&f0).unwrap();
+    let au1 = h264_enc.encode_frame(&f1).unwrap();
+    let _ = h264_dec.decode_annex_b_packet(&au0).unwrap();
+    let d1 = h264_dec.decode_annex_b_packet(&au1).unwrap().unwrap();
+    assert_eq!((d1.width, d1.height), (128, 96));
+    let snap = ProcessRusageSnapshot::capture();
+
     println!(
         "----------------------------------------------------------------------------------------------"
     );
@@ -1801,6 +2424,15 @@ pub fn run_self_test() {
         mkv_remux_gbps,
         ts_remux_gbps,
         mkv_check.has_seek_head()
+    );
+    println!(
+        "[M4/M5 Codecs+PMU] H.264 P_L0_16x16 ME: IDR={} B -> P={} B ({:.1}x) | PMU instr={:.1}M, cyc={:.1}M, footprint={:.1} MiB",
+        au0.len(),
+        au1.len(),
+        (au0.len() as f64) / (au1.len().max(1) as f64),
+        (snap.instructions as f64) / 1e6,
+        (snap.cycles as f64) / 1e6,
+        (snap.phys_footprint_bytes as f64) / (1024.0 * 1024.0)
     );
 }
 

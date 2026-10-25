@@ -20,13 +20,13 @@ pub use av1::{
 };
 pub use flac::{
     FLAC_STREAM_MARKER, FlacChannelMode, FlacDecoder, FlacEncoder, FlacFrameHeader, FlacStreamInfo,
-    parse_flac_stream_header,
+    compute_flac_pcm_md5_planar, md5_digest, parse_flac_stream_header,
 };
 pub use h264::{
     H264Decoder, H264Encoder, NalHeader, NalUnitType, Pps, SeiMessage, SliceHeader, Sps,
     decode_cavlc_block, dequantize_block4x4, encode_annex_b_nal, encode_cavlc_block,
-    parse_nal_rbsp, predict_intra_16x16, predict_intra_chroma_8x8, quantize_block4x4,
-    roundtrip_block4x4_dct,
+    parse_nal_rbsp, predict_intra_16x16, predict_intra_16x16_scalar, predict_intra_chroma_8x8,
+    predict_intra_chroma_8x8_scalar, quantize_block4x4, roundtrip_block4x4_dct,
 };
 pub use pcm::{
     audio_frame_to_planar_i32, convert_audio_frame, decorrelate_mid_side_i32,
@@ -504,5 +504,123 @@ mod tests {
             psnr_avg,
             (width * height * 3 / 2) as f64 / (pkt.len() as f64)
         );
+    }
+
+    #[test]
+    fn h264_neon_intra_pred_and_p_l0_16x16_motion_estimation_interop_and_flac_md5() {
+        // 1. Exhaustive NEON vs Scalar differential test for H.264 16x16 and 8x8 spatial predictors
+        let top16: [u8; 16] = [
+            12, 25, 44, 61, 80, 99, 118, 137, 150, 168, 182, 199, 211, 224, 238, 251,
+        ];
+        let left16: [u8; 16] = [
+            240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15,
+        ];
+        for mode in 0..=3u8 {
+            for t_opt in [None, Some(&top16)] {
+                for l_opt in [None, Some(&left16)] {
+                    for tl in [0u8, 64, 128, 255] {
+                        let mut simd_out = [0u8; 256];
+                        let mut scalar_out = [0u8; 256];
+                        predict_intra_16x16(mode, t_opt, l_opt, tl, &mut simd_out, 16);
+                        predict_intra_16x16_scalar(mode, t_opt, l_opt, tl, &mut scalar_out, 16);
+                        assert_eq!(
+                            simd_out, scalar_out,
+                            "Intra 16x16 mismatch at mode={mode}, tl={tl}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let top8: [u8; 8] = [18, 45, 79, 112, 146, 179, 213, 244];
+        let left8: [u8; 8] = [230, 200, 170, 140, 110, 80, 50, 20];
+        for mode in 0..=3u8 {
+            let mut simd_c = [0u8; 64];
+            let mut scalar_c = [0u8; 64];
+            predict_intra_chroma_8x8(mode, Some(&top8), Some(&left8), 100, &mut simd_c, 8);
+            predict_intra_chroma_8x8_scalar(mode, Some(&top8), Some(&left8), 100, &mut scalar_c, 8);
+            assert_eq!(simd_c, scalar_c, "Intra Chroma 8x8 mismatch at mode={mode}");
+        }
+
+        // 2. FLAC RFC 9639 STREAMINFO MD5 computation and corruption detection
+        let mut audio = AudioFrame::new(48_000, 2, SampleFormat::S16le, 4096);
+        for (i, s) in audio.as_i16_mut_slice().iter_mut().enumerate() {
+            *s = ((i as i32 * 313 - 20000) & 0x7FFF) as i16;
+        }
+        let enc_md5 = FlacEncoder::new(48_000, 2, 16).with_md5(true);
+        let flac_md5_bytes = enc_md5.encode_stream(&audio).unwrap();
+        let (info_md5, dec_md5) = FlacDecoder::decode_stream(&flac_md5_bytes).unwrap();
+        assert_ne!(info_md5.md5_signature, [0u8; 16]);
+        assert_eq!(dec_md5.as_i16_slice(), audio.as_i16_slice());
+
+        // Tampering with STREAMINFO MD5 must trigger ChecksumMismatch on decode_stream
+        let mut corrupted = flac_md5_bytes.clone();
+        corrupted[8 + 33] ^= 0xFF; // flip last byte of 34-byte STREAMINFO (inside md5_signature)
+        assert!(FlacDecoder::decode_stream(&corrupted).is_err());
+
+        // 3. H.264 P_L0_16x16 motion-compensated inter coding on a translating pattern
+        let w = 256usize;
+        let h = 128usize;
+        let mut h264_enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, 22);
+        let mut h264_dec = H264Decoder::new();
+        let mut stream = Vec::new();
+        let mut idr_size = 0usize;
+        let mut p_size = 0usize;
+
+        for f_idx in 0..5usize {
+            let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
+            let shift = f_idx * 4; // translates by 4 pixels per frame -> exact P_L0_16x16 / P_Skip match!
+            for y in 0..h {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    *p = (((x + y + shift) * 7) & 0xFF) as u8;
+                }
+            }
+            for y in 0..h / 2 {
+                f.plane_mut(1).row_mut(y).fill(128);
+                f.plane_mut(2).row_mut(y).fill(128);
+            }
+            let pkt = h264_enc.encode_frame(&f).unwrap();
+            if f_idx == 0 {
+                idr_size = pkt.len();
+            } else if f_idx == 1 {
+                p_size = pkt.len();
+            }
+            let dec_f = h264_dec.decode_annex_b_packet(&pkt).unwrap().unwrap();
+            assert_eq!(dec_f.width, w);
+            assert_eq!(dec_f.height, h);
+            stream.extend_from_slice(&pkt);
+        }
+        // P-frame using P_L0_16x16 + P_Skip motion compensation must be >10x smaller than IDR frame!
+        assert!(
+            p_size * 10 < idr_size,
+            "expected P-frame ({p_size} B) to be >10x smaller than IDR ({idr_size} B)"
+        );
+
+        let tmp_h264 = std::env::temp_dir().join("ragdoll_p_l0_16x16.h264");
+        let tmp_yuv = std::env::temp_dir().join("ragdoll_p_l0_16x16.yuv");
+        std::fs::write(&tmp_h264, &stream).unwrap();
+        let st = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                tmp_h264.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                tmp_yuv.to_str().unwrap(),
+            ])
+            .status();
+        if let Ok(s) = st
+            && s.success()
+        {
+            let yuv = std::fs::read(&tmp_yuv).unwrap();
+            assert_eq!(yuv.len(), w * h * 3 / 2 * 5);
+        }
+        let _ = std::fs::remove_file(&tmp_h264);
+        let _ = std::fs::remove_file(&tmp_yuv);
     }
 }
