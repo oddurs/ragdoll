@@ -1,0 +1,18 @@
+[package]
+name = "ragdoll-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Ragdoll CLI: probe, remux, transcode, extract, metrics, synth, and head-to-head FFmpeg benchmarks."
+
+[[bin]]
+name = "ragdoll"
+path = "src/main.rs"
+
+[dependencies]
+ragdoll-core = { path = "../ragdoll-core" }
+ragdoll-simd = { path = "../ragdoll-simd" }
+ragdoll-pix = { path = "../ragdoll-pix" }
+ragdoll-format = { path = "../ragdoll-format" }
+ragdoll-codec = { path = "../ragdoll-codec" }
+ragdoll-pipeline = { path = "../ragdoll-pipeline" }

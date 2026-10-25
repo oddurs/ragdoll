@@ -1,0 +1,11 @@
+[package]
+name = "ragdoll-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "100% pure-Rust video and audio codecs: H.264/AVC, AV1 OBU, Ragdoll Fast-Intra, FLAC, and vectorized PCM."
+
+[dependencies]
+ragdoll-core = { path = "../ragdoll-core" }
+ragdoll-simd = { path = "../ragdoll-simd" }
+ragdoll-pix = { path = "../ragdoll-pix" }

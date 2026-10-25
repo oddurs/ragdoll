@@ -1,0 +1,8 @@
+[package]
+name = "ragdoll-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Foundational media primitives: Rational64 timebases, CICP/Oklab colorimetry, 64B-aligned FramePool arenas, and branchless 64-bit CLZ bitstreams."
+
+[dependencies]

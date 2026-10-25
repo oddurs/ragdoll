@@ -1,0 +1,10 @@
+[package]
+name = "ragdoll-pix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fused L1-cache-resident scanline pixel engine, separable polyphase Lanczos-3/Mitchell scalers, and SIMD PSNR/SSIM/VMAF-lite analyzers."
+
+[dependencies]
+ragdoll-core = { path = "../ragdoll-core" }
+ragdoll-simd = { path = "../ragdoll-simd" }

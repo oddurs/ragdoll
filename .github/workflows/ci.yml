@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon (aarch64 NEON)
+            os: macos-14
+          - name: Linux (x86_64 AVX2 / Scalar)
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy strict lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run release test suite (SIMD + differential)
+        run: cargo test --workspace --release
+      - name: Run live M1 benchmark self-test
+        run: cargo run --release

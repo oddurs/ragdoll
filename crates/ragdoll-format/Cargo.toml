@@ -1,0 +1,10 @@
+[package]
+name = "ragdoll-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy memory-mapped demuxers and vectored I/O muxers for MP4/ISOBMFF, MKV/WebM, MPEG-TS, Y4M, PPM, and WAV."
+
+[dependencies]
+ragdoll-core = { path = "../ragdoll-core" }
+ragdoll-simd = { path = "../ragdoll-simd" }

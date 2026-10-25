@@ -1,0 +1,304 @@
+# cairn.toml — the schema for Ragdoll's roadmap, architecture decisions, and benchmarks.
+#
+#   cairn config                   show the resolved schema
+#   cairn check --render --strict  validate every item and ROADMAP.md
+#   cairn check --prompts          verify every open item is a complete prompt
+#   cairn next --view next         show ready-to-start engineering work
+
+format = 5
+
+[project]
+name = "ragdoll"
+description = "100% pure-Rust, SIMD-first, zero-copy reimagining of FFmpeg engineered for benchmark dominance and multimedia craftsmanship."
+dir = "cairn/items"
+id_width = 4
+default_type = "feature"
+default_status = "backlog"
+require_criteria = true
+claim_stale_after = 7
+
+# ─── Item types ──────────────────────────────────────────────────────────────
+
+[[type]]
+name = "feature"
+icon = "+"
+color = "cyan"
+description = "A core engine capability, container format, codec, or CLI subcommand"
+template = """
+## Problem
+
+## Architecture & SIMD Design
+
+## Acceptance criteria
+
+- [ ]
+"""
+
+[[type]]
+name = "kernel"
+icon = "#"
+color = "yellow"
+id_format = "SIMD-{n:04}"
+description = "A cache-aligned NEON/AVX2 SIMD kernel with bit-exact scalar fallback"
+template = """
+## Mathematical Specification
+
+## Register & Cache Layout (NEON / AVX2)
+
+## Acceptance criteria
+
+- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
+- [ ] Zero heap allocations in the hot loop.
+"""
+
+[[type]]
+name = "benchmark"
+icon = "%"
+color = "green"
+id_format = "BENCH-{n:04}"
+description = "A reproducible head-to-head benchmark against FFmpeg with latency, memory, and throughput targets"
+template = """
+## Workload & Fair Comparison Protocol
+
+## Target Metrics vs FFmpeg
+
+## Acceptance criteria
+
+- [ ] Deterministic test media synthesis and head-to-head execution in `ragdoll bench --compare-ffmpeg`.
+- [ ] Measured wall-clock time, throughput (GB/s or fps), and peak RSS recorded in `## Result`.
+"""
+
+[[type]]
+name = "decision"
+icon = "?"
+color = "magenta"
+id_format = "ADR-{n:04}"
+description = "An architectural decision record (ADR) capturing multimedia trade-offs and invariants"
+template = """
+## Context
+
+## Options & Trade-offs
+
+## Decision
+
+## Acceptance criteria
+
+- [ ] The architectural invariant, its rationale, and its consequences are recorded.
+"""
+
+[[type]]
+name = "bug"
+icon = "!"
+color = "red"
+id_format = "BUG-{n:04}"
+description = "A bit-exactness violation, container spec non-conformance, or performance regression"
+template = """
+## What happens
+
+## What should happen
+
+## Reproduction
+
+1.
+
+## Acceptance criteria
+
+- [ ] A regression test reproduces the failure and passes with the fix.
+"""
+
+[[type]]
+name = "chore"
+icon = "~"
+color = "gray"
+description = "Workspace scaffolding, CI, or tooling maintenance"
+template = """
+## Purpose
+
+## Approach
+
+## Acceptance criteria
+
+- [ ]
+"""
+
+[[type]]
+name = "docs"
+icon = "*"
+color = "blue"
+description = "Architecture guides, CLI manuals, and benchmark reports"
+template = """
+## Reader & Question
+
+## Content
+
+## Acceptance criteria
+
+- [ ] The documentation accurately reflects the current CLI and benchmark numbers.
+"""
+
+[[type]]
+name = "milestone"
+groups = "one"
+inverse = "scheduled"
+description = "A cohesive architectural phase and release gate"
+template = """
+Describe the architectural outcome in one paragraph; this appears in the rendered roadmap.
+
+## Release gate
+
+State what must be true and verified before this milestone closes.
+"""
+
+# ─── Statuses ────────────────────────────────────────────────────────────────
+
+[[status]]
+name = "backlog"
+category = "open"
+color = "gray"
+label = "backlog"
+
+[[status]]
+name = "planned"
+category = "open"
+color = "blue"
+label = "up next"
+
+[[status]]
+name = "doing"
+category = "active"
+color = "yellow"
+label = "in progress"
+
+[[status]]
+name = "blocked"
+category = "open"
+color = "red"
+label = "waiting"
+
+[[status]]
+name = "done"
+category = "done"
+color = "green"
+label = "shipped"
+
+[[status]]
+name = "dropped"
+category = "dropped"
+color = "gray"
+board = false
+
+# ─── Custom fields ───────────────────────────────────────────────────────────
+
+[[field]]
+name = "priority"
+kind = "enum"
+values = ["p0", "p1", "p2", "p3"]
+default = "p1"
+column = true
+description = "p0: foundational blocker; p1: core milestone deliverable; p2: optimization/polish; p3: future exploration"
+
+[[field]]
+name = "effort"
+kind = "enum"
+values = ["s", "m", "l", "xl"]
+description = "Engineering complexity (s, m, l, xl)"
+
+[[field]]
+name = "area"
+kind = "enum"
+values = ["core", "simd", "pix", "format", "codec-video", "codec-audio", "pipeline", "cli", "bench", "arch"]
+column = true
+description = "Crate or subsystem boundary in the Ragdoll workspace"
+
+[[field]]
+name = "due"
+kind = "date"
+description = "Optional target date (YYYY-MM-DD); releases are gated by verification evidence"
+
+[[field]]
+name = "part_of"
+kind = "ref"
+target = "*"
+cardinality = "many"
+acyclic = true
+rollup = true
+inverse = "contains"
+description = "Parent epic or subsystem item this work rolls up into"
+
+# ─── Saved views ─────────────────────────────────────────────────────────────
+
+[[view]]
+name = "now"
+description = "Work actively in progress right now"
+filter = "category=active,type!=milestone"
+sort = "priority,id"
+columns = ["id", "type", "assignee", "priority", "area", "title"]
+
+[[view]]
+name = "next"
+description = "Approved work with all dependencies satisfied, ranked for execution"
+filter = "status=planned|doing,blocked=false,type!=milestone"
+sort = "priority,milestone,id"
+columns = ["id", "type", "priority", "area", "milestone", "title"]
+
+[[view]]
+name = "dependencies"
+description = "Planned work waiting on an upstream architectural item"
+filter = "blocked=true,category=open|active,type!=milestone"
+sort = "milestone,priority,id"
+columns = ["id", "type", "priority", "area", "milestone", "title"]
+
+[[view]]
+name = "kernels"
+description = "All SIMD (NEON/AVX2) mathematical kernels and pixel engines"
+filter = "type=kernel"
+sort = "id"
+columns = ["id", "status", "priority", "area", "title"]
+
+[[view]]
+name = "benchmarks"
+description = "Head-to-head Ragdoll vs. FFmpeg marketing benchmarks"
+filter = "type=benchmark"
+sort = "id"
+columns = ["id", "status", "priority", "area", "title"]
+
+[[view]]
+name = "decisions"
+description = "Architectural Decision Records (ADRs)"
+filter = "type=decision,category=open|active|done|dropped"
+sort = "id"
+columns = ["id", "status", "area", "title"]
+
+[[view]]
+name = "triage"
+description = "Unscheduled backlog ideas"
+filter = "status=backlog,milestone=,type!=milestone"
+columns = ["id", "type", "area", "title", "created"]
+
+[[view]]
+name = "history"
+description = "Completed items and their recorded engineering results"
+filter = "category=done,type!=milestone"
+sort = "-updated,id"
+columns = ["id", "type", "area", "milestone", "title"]
+
+# ─── Hooks ───────────────────────────────────────────────────────────────────
+
+[hooks]
+after-create = ["cairn", "render", "-q"]
+after-change = ["cairn", "render", "-q"]
+after-remove = ["cairn", "render", "-q"]
+
+# ─── Rendered roadmap ────────────────────────────────────────────────────────
+
+[render]
+target = "ROADMAP.md"
+title = "Ragdoll Roadmap"
+group_by = "milestone"
+include = "category!=dropped"
+checkbox = true
+show_ids = true
+progress = true
+group_by_status = true
+link_items = false
+header = "doc/roadmap-intro.md"

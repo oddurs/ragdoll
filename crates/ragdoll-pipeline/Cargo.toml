@@ -1,0 +1,13 @@
+[package]
+name = "ragdoll-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Work-stealing GOP-parallel media pipeline scheduler and declarative TOML recipe engine."
+
+[dependencies]
+ragdoll-core = { path = "../ragdoll-core" }
+ragdoll-simd = { path = "../ragdoll-simd" }
+ragdoll-pix = { path = "../ragdoll-pix" }
+ragdoll-format = { path = "../ragdoll-format" }
+ragdoll-codec = { path = "../ragdoll-codec" }
