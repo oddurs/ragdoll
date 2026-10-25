@@ -3,14 +3,16 @@ id: 49
 uid: 40de7a77-ff91-4098-a25c-00480f4927cb
 title: One-Command CMAF HLS (m3u8) & DASH (mpd) Multi-Rendition ABR Packager (ragdoll package)
 type: feature
-status: planned
+status: done
 milestone: m9-edit-image-package
+assignee: Oddur Sigurdsson
 depends_on:
 - 37
 - 39
 - 44
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p1
 area: pipeline
 effort: l
@@ -29,5 +31,9 @@ Generating an Adaptive Bitrate (ABR) streaming package in `ffmpeg` requires comp
 
 ## Acceptance criteria
 
-- [ ] `ragdoll package input.mp4 -o ./abr_out/` generates `master.m3u8`, `manifest.mpd`, CMAF `init.mp4` + `.m4s` segments, and `thumbnails.vtt` in a single pass.
-- [ ] Generated HLS (`master.m3u8`) and DASH (`manifest.mpd`) streams demux and decode cleanly in `ffmpeg -v error -i master.m3u8 -f null -`.
+- [x] `ragdoll package input.mp4 -o ./abr_out/` generates `master.m3u8`, `manifest.mpd`, CMAF `init.mp4` + `.m4s` segments, and `thumbnails.vtt` in a single pass.
+- [x] Generated HLS (`master.m3u8`) and DASH (`manifest.mpd`) streams demux and decode cleanly in `ffmpeg -v error -i master.m3u8 -f null -`.
+
+## 2026-10-25
+
+Implemented one-command CMAF fMP4 HLS (master.m3u8) + DASH (manifest.mpd) + WebVTT trick-play sprite sheet ABR packager (ragdoll package / package_abr).

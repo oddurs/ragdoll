@@ -33,8 +33,9 @@ use ragdoll_format::{
     transmux_mp4_to_mkv, transmux_mp4_to_mpegts,
 };
 use ragdoll_pipeline::{
-    PipelineRecipe, PipelineTelemetry, ProbeReport, TranscodeOptions, evaluate_media_metrics,
-    execute_recipe, extract_media, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
+    CutOptions, PackageOptions, PipelineRecipe, PipelineTelemetry, ProbeReport, RotationMode,
+    TranscodeOptions, concat_media, cut_media, evaluate_media_metrics, execute_recipe,
+    extract_media, package_abr, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
     probe_file_detailed, remux_file, remux_file_with_format, synth_media, synth_video_frame,
     transcode_file, transcode_file_with_options,
 };
@@ -101,6 +102,9 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         "probe" => cmd_probe(rest),
         "remux" => cmd_remux(rest),
         "transcode" => cmd_transcode(rest),
+        "cut" => cmd_cut(rest),
+        "concat" => cmd_concat(rest),
+        "package" => cmd_package(rest),
         "extract" => cmd_extract(rest),
         "metrics" => cmd_metrics(rest),
         "synth" => cmd_synth(rest),
@@ -149,14 +153,31 @@ fn print_help() {
     );
     println!();
     println!(
-        "  transcode <IN> <OUT> [--video h264|rgdi] [--audio aac|opus|flac|copy|none] [--sample-rate HZ] [--channels N] [--loudness LUFS] [--true-peak DBTP] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]"
+        "  transcode <IN> <OUT> [--video h264|rgdi] [--audio aac|opus|flac|copy|none] [--sample-rate HZ] [--channels N] [--loudness LUFS] [--true-peak DBTP] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--crop W:H:X:Y] [--auto-crop] [--pad W:H:X:Y] [--rotate 90|180|270|hflip|vflip] [--fps NUM[/DEN]] [--overlay FILE] [--tonemap] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]"
     );
     println!(
-        "      Work-stealing GOP-parallel video & audio transcoding, Kaiser polyphase resampling, EBU R128 loudness normalization, or TOML recipe execution."
+        "      Work-stealing GOP-parallel video & audio transcoding, spatial/HDR filters, Kaiser polyphase resampling, EBU R128 loudness normalization, or TOML recipe execution."
+    );
+    println!();
+    println!("  cut <IN> <OUT> [--from <TIME>] [--to <TIME>] [--keyframes-only] [--qp N] [--json]");
+    println!(
+        "      Smart-GOP frame-accurate non-linear editing: re-encodes only boundary GOPs and zero-copy copies interior GOPs."
+    );
+    println!();
+    println!("  concat <IN1> <IN2> ... -o <OUT> [--json]");
+    println!(
+        "      Zero-copy multi-segment splicing with monotonic 128-bit PTS/DTS offset normalization."
+    );
+    println!();
+    println!("  package <IN> -o <OUT_DIR> [--ladder SPEC] [--segment-duration SEC] [--json]");
+    println!(
+        "      One-command CMAF fMP4 HLS (master.m3u8) + DASH (manifest.mpd) + WebVTT trick-play ABR packager."
     );
     println!();
     println!("  extract <IN> [-o <OUT>] [--at <SEC>] [--thumbnails <N> --grid <CxR>] [--json]");
-    println!("      Fast keyframe seek and single-frame or contact-sheet (.ppm/.y4m) extraction.");
+    println!(
+        "      Fast keyframe seek and single-frame or contact-sheet (.png/.jpg/.ppm/.y4m) extraction."
+    );
     println!();
     println!("  metrics <REF> <DIST> [--json]");
     println!(
@@ -502,6 +523,46 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
                 i += 1;
                 opts.scale_filter = parse_scale_filter(&args[i]);
             }
+            "--crop" if i + 1 < args.len() => {
+                i += 1;
+                opts.crop_spec = Some(args[i].clone());
+            }
+            "--auto-crop" => {
+                opts.auto_crop = true;
+            }
+            "--pad" if i + 1 < args.len() => {
+                i += 1;
+                opts.pad_spec = Some(args[i].clone());
+            }
+            "--rotate" if i + 1 < args.len() => {
+                i += 1;
+                opts.rotate_mode = Some(RotationMode::parse_spec(&args[i])?);
+            }
+            "--fps" | "-r:v" if i + 1 < args.len() => {
+                i += 1;
+                if let Some((n, d)) = args[i].split_once('/') {
+                    if let (Ok(num), Ok(den)) = (n.parse::<i64>(), d.parse::<i64>()) {
+                        opts.target_fps = Some(Rational64::new(num, den.max(1)));
+                    }
+                } else if let Ok(num) = args[i].parse::<i64>() {
+                    opts.target_fps = Some(Rational64::new(num.max(1), 1));
+                }
+            }
+            "--overlay" if i + 1 < args.len() => {
+                i += 1;
+                opts.overlay_path = Some(std::path::PathBuf::from(&args[i]));
+            }
+            "--overlay-xy" if i + 1 < args.len() => {
+                i += 1;
+                if let Some((xs, ys)) = args[i].split_once(':').or_else(|| args[i].split_once(','))
+                    && let (Ok(x), Ok(y)) = (xs.parse::<usize>(), ys.parse::<usize>())
+                {
+                    opts.overlay_xy = (x, y);
+                }
+            }
+            "--tonemap" => {
+                opts.tonemap = true;
+            }
             "--qp" if i + 1 < args.len() => {
                 i += 1;
                 opts.qp = args[i].parse::<u8>().unwrap_or(20).min(51);
@@ -552,6 +613,185 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
 
     if positional.get(1).is_none_or(|p| !is_stdout_path(p)) {
         print_telemetry(&tel, json);
+    }
+    Ok(())
+}
+
+fn cmd_cut(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut opts = CutOptions {
+        qp: 20,
+        ..Default::default()
+    };
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "--from" | "-ss" if i + 1 < args.len() => {
+                i += 1;
+                opts.from_sec = parse_time_seconds(&args[i]);
+            }
+            "--to" | "-to" if i + 1 < args.len() => {
+                i += 1;
+                opts.to_sec = parse_time_seconds(&args[i]);
+            }
+            "--keyframes-only" => {
+                opts.keyframes_only = true;
+            }
+            "--qp" if i + 1 < args.len() => {
+                i += 1;
+                opts.qp = args[i].parse::<u8>().unwrap_or(20).min(51);
+            }
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    if positional.len() < 2 {
+        return Err(RagdollError::InvalidSyntax(
+            "cut requires <IN> <OUT> [--from <TIME>] [--to <TIME>]",
+        ));
+    }
+    let rep = cut_media(&positional[0], &positional[1], &opts)?;
+    if json {
+        println!(
+            "{{\"operation\":\"cut\",\"output_bytes\":{},\"total_video_packets\":{},\"copied_video_packets\":{},\"reencoded_video_frames\":{},\"audio_packets\":{},\"elapsed_ms\":{:.3}}}",
+            rep.output_bytes,
+            rep.total_video_packets,
+            rep.copied_video_packets,
+            rep.reencoded_video_frames,
+            rep.audio_packets,
+            rep.elapsed_ms
+        );
+    } else {
+        println!(
+            "RAGDOLL CUT: {} -> {} | {} video pkts ({} zero-copy copied, {} boundary frames re-encoded), {} audio pkts ({} B in {:.2} ms)",
+            positional[0],
+            positional[1],
+            rep.total_video_packets,
+            rep.copied_video_packets,
+            rep.reencoded_video_frames,
+            rep.audio_packets,
+            rep.output_bytes,
+            rep.elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+fn cmd_concat(args: &[String]) -> Result<()> {
+    let mut inputs = Vec::new();
+    let mut out_opt: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "-o" | "--output" if i + 1 < args.len() => {
+                i += 1;
+                out_opt = Some(args[i].clone());
+            }
+            s if !s.starts_with('-') => inputs.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let out_path = if let Some(o) = out_opt {
+        o
+    } else if inputs.len() >= 2 {
+        inputs.pop().unwrap()
+    } else {
+        return Err(RagdollError::InvalidSyntax(
+            "concat requires <IN1> <IN2> ... -o <OUT>",
+        ));
+    };
+    let rep = concat_media(&inputs, &out_path)?;
+    if json {
+        println!(
+            "{{\"operation\":\"concat\",\"segments_merged\":{},\"video_packets\":{},\"audio_packets\":{},\"reencoded\":{},\"output_bytes\":{},\"elapsed_ms\":{:.3}}}",
+            rep.segments_merged,
+            rep.video_packets,
+            rep.audio_packets,
+            rep.reencoded,
+            rep.output_bytes,
+            rep.elapsed_ms
+        );
+    } else {
+        println!(
+            "RAGDOLL CONCAT: {} segments -> {} | {} video pkts, {} audio pkts (reencoded={}, {} B in {:.2} ms)",
+            rep.segments_merged,
+            out_path,
+            rep.video_packets,
+            rep.audio_packets,
+            rep.reencoded,
+            rep.output_bytes,
+            rep.elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+fn cmd_package(args: &[String]) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut out_dir_opt: Option<String> = None;
+    let mut opts = PackageOptions::default();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "-j" => json = true,
+            "-o" | "--output" if i + 1 < args.len() => {
+                i += 1;
+                out_dir_opt = Some(args[i].clone());
+            }
+            "--ladder" if i + 1 < args.len() => {
+                i += 1;
+                opts.ladder_spec = Some(args[i].clone());
+            }
+            "--segment-duration" | "--seg-dur" if i + 1 < args.len() => {
+                i += 1;
+                if let Ok(sec) = args[i].parse::<f64>() {
+                    opts.segment_duration_sec = sec.max(0.2);
+                }
+            }
+            "--no-thumbnails" => {
+                opts.generate_thumbnails = false;
+            }
+            s if !s.starts_with('-') => positional.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let in_path = positional.first().ok_or(RagdollError::InvalidSyntax(
+        "package requires <IN> -o <OUT_DIR>",
+    ))?;
+    let out_dir = out_dir_opt
+        .or_else(|| positional.get(1).cloned())
+        .ok_or(RagdollError::InvalidSyntax("package requires -o <OUT_DIR>"))?;
+    let rep = package_abr(in_path, &out_dir, &opts)?;
+    if json {
+        println!(
+            "{{\"operation\":\"package\",\"renditions\":{},\"segments_per_rendition\":{},\"master_m3u8\":\"{}\",\"mpd\":\"{}\",\"total_bytes\":{},\"elapsed_ms\":{:.3}}}",
+            rep.renditions,
+            rep.segments_per_rendition,
+            rep.master_m3u8_path.display(),
+            rep.mpd_path.display(),
+            rep.total_bytes,
+            rep.elapsed_ms
+        );
+    } else {
+        println!(
+            "RAGDOLL PACKAGE: {} -> {} | {} CMAF renditions x {} segments | HLS={} | DASH={} ({} B in {:.2} ms)",
+            in_path,
+            out_dir,
+            rep.renditions,
+            rep.segments_per_rendition,
+            rep.master_m3u8_path.display(),
+            rep.mpd_path.display(),
+            rep.total_bytes,
+            rep.elapsed_ms
+        );
     }
     Ok(())
 }

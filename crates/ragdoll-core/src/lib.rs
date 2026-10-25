@@ -26,8 +26,8 @@ pub use color::{
     TransferCharacteristics,
 };
 pub use crc::{
-    crc8_flac, crc8_flac_update, crc16_flac, crc16_flac_update, crc32_mpeg2, crc32_msb_update,
-    crc32_ogg,
+    adler32, crc8_flac, crc8_flac_update, crc16_flac, crc16_flac_update, crc32_lsb_update,
+    crc32_mpeg2, crc32_msb_update, crc32_ogg, crc32_png,
 };
 pub use error::{RagdollError, Result};
 pub use format::{ChannelLayout, PixelFormat, SampleFormat};

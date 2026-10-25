@@ -222,6 +222,8 @@ pub enum CodecId {
     Vp9,
     RagdollIntra,
     RawVideo,
+    Png,
+    Jpeg,
     // Audio
     Flac,
     Aac,
@@ -241,7 +243,14 @@ impl CodecId {
     pub const fn is_video(self) -> bool {
         matches!(
             self,
-            Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9 | Self::RagdollIntra | Self::RawVideo
+            Self::H264
+                | Self::Hevc
+                | Self::Av1
+                | Self::Vp9
+                | Self::RagdollIntra
+                | Self::RawVideo
+                | Self::Png
+                | Self::Jpeg
         )
     }
 
@@ -274,6 +283,8 @@ impl CodecId {
             Self::Vp9 => "vp9",
             Self::RagdollIntra => "rgdi",
             Self::RawVideo => "rawvideo",
+            Self::Png => "png",
+            Self::Jpeg => "mjpeg",
             Self::Flac => "flac",
             Self::Aac => "aac",
             Self::Opus => "opus",

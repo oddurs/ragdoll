@@ -1801,6 +1801,116 @@ impl<'a> Mp4Muxer<'a> {
         Ok(vw.bytes_written())
     }
 
+    /// Writes a standalone CMAF (`init.mp4`) initialization segment (`ftyp` + `moov`/`mvex`/`trex`).
+    pub fn write_cmaf_init_segment<W: Write>(&self, writer: W) -> Result<u64> {
+        let mut vw = VectoredWriter::new(writer);
+        let mut ftyp_payload = Vec::with_capacity(28);
+        ftyp_payload.extend_from_slice(b"iso5");
+        ftyp_payload.extend_from_slice(&512u32.to_be_bytes());
+        ftyp_payload.extend_from_slice(b"iso5");
+        ftyp_payload.extend_from_slice(b"iso6");
+        ftyp_payload.extend_from_slice(b"cmfc");
+        ftyp_payload.extend_from_slice(b"avc1");
+        ftyp_payload.extend_from_slice(b"mp41");
+        let ftyp_box = Self::wrap_box(b"ftyp", &ftyp_payload);
+        let init_moov = self.build_fragmented_init_moov()?;
+        vw.write_vectored_all(&[&ftyp_box, &init_moov])?;
+        vw.flush()?;
+        Ok(vw.bytes_written())
+    }
+
+    /// Writes a standalone CMAF (`.m4s`) media segment (`styp` + `sidx` + `moof`/`tfdt`/`trun` + `mdat`).
+    pub fn write_cmaf_media_segment<W: Write>(
+        &self,
+        writer: W,
+        seq_num: u32,
+        track_id: u32,
+        packets: &[PacketSlice<'_>],
+    ) -> Result<u64> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let mut vw = VectoredWriter::new(writer);
+        let t_idx = (track_id.saturating_sub(1) as usize).min(self.tracks.len().saturating_sub(1));
+        let tb = self
+            .tracks
+            .get(t_idx)
+            .map_or(Rational64::new(1, 90_000), |t| t.info.timebase);
+        let track_timescale = if tb.den > 0 { tb.den as u32 } else { 90_000 };
+        let target_tb = Rational64::new(1, track_timescale as i64);
+
+        let base_dts = packets[0].dts.rescale_to(target_tb).ticks.max(0) as u64;
+        let earliest_pts = packets[0].pts.rescale_to(target_tb).ticks.max(0) as u64;
+
+        let mut trun_entries = Vec::with_capacity(packets.len());
+        let mut frag_payload_len = 0u64;
+        let mut subsegment_duration = 0u32;
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let pts_ticks = pkt.pts.rescale_to(target_tb).ticks;
+            let dts_ticks = pkt.dts.rescale_to(target_tb).ticks;
+            let cts_offset = (pts_ticks - dts_ticks) as i32;
+            let dur = if i + 1 < packets.len() {
+                let next_dts = packets[i + 1].dts.rescale_to(target_tb).ticks;
+                (next_dts - dts_ticks).max(1) as u32
+            } else {
+                rescale_q(pkt.duration.max(1), pkt.dts.timebase, target_tb).max(1) as u32
+            };
+            let size = pkt.len() as u32;
+            let flags = if pkt.is_keyframe() {
+                0x0200_0000u32
+            } else {
+                0x0101_0000u32
+            };
+            trun_entries.push((dur, size, flags, cts_offset));
+            frag_payload_len += size as u64;
+            subsegment_duration = subsegment_duration.saturating_add(dur);
+        }
+
+        let dummy_moof = Self::build_moof_box(seq_num, track_id, base_dts, 0, &trun_entries);
+        let data_offset = (dummy_moof.len() as i32) + 8;
+        let moof_box =
+            Self::build_moof_box(seq_num, track_id, base_dts, data_offset, &trun_entries);
+
+        let mdat_total_len = (frag_payload_len + 8) as u32;
+        let mut mdat_header = Vec::with_capacity(8);
+        mdat_header.extend_from_slice(&mdat_total_len.to_be_bytes());
+        mdat_header.extend_from_slice(b"mdat");
+
+        // `styp` box
+        let mut styp_payload = Vec::with_capacity(24);
+        styp_payload.extend_from_slice(b"msdh");
+        styp_payload.extend_from_slice(&0u32.to_be_bytes());
+        styp_payload.extend_from_slice(b"msdh");
+        styp_payload.extend_from_slice(b"msix");
+        styp_payload.extend_from_slice(b"cmfs");
+        styp_payload.extend_from_slice(b"iso6");
+        let styp_box = Self::wrap_box(b"styp", &styp_payload);
+
+        // `sidx` (SegmentIndexBox, version 1 for 64-bit earliest_presentation_time)
+        let ref_size = (moof_box.len() as u32) + mdat_total_len;
+        let mut sidx_payload = Vec::with_capacity(44);
+        sidx_payload.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // version 1, flags 0
+        sidx_payload.extend_from_slice(&track_id.to_be_bytes());
+        sidx_payload.extend_from_slice(&track_timescale.to_be_bytes());
+        sidx_payload.extend_from_slice(&earliest_pts.to_be_bytes());
+        sidx_payload.extend_from_slice(&0u64.to_be_bytes()); // first_offset = 0
+        sidx_payload.extend_from_slice(&0u16.to_be_bytes()); // reserved = 0
+        sidx_payload.extend_from_slice(&1u16.to_be_bytes()); // reference_count = 1
+        sidx_payload.extend_from_slice(&(ref_size & 0x7FFF_FFFF).to_be_bytes()); // reference_type=0, size
+        sidx_payload.extend_from_slice(&subsegment_duration.to_be_bytes());
+        // starts_with_SAP = 1 (bit 31), SAP_type = 1 (bits 28..30), SAP_delta_time = 0
+        sidx_payload.extend_from_slice(&0x9000_0000u32.to_be_bytes());
+        let sidx_box = Self::wrap_box(b"sidx", &sidx_payload);
+
+        vw.write_vectored_all(&[&styp_box, &sidx_box, &moof_box, &mdat_header])?;
+        for pkt in packets {
+            vw.write_all_counted(pkt.data())?;
+        }
+        vw.flush()?;
+        Ok(vw.bytes_written())
+    }
+
     /// Finalizes and writes an ISO/IEC 14496-12 / CMAF / DASH / MSE Fragmented MP4 (`fMP4`):
     /// - `ftyp` (`iso5` / `iso6` / `mp41`)
     /// - Initialization `moov` (empty `stbl` tables + `mvex`/`trex` track extenders)

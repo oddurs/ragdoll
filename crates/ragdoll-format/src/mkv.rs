@@ -1207,6 +1207,8 @@ impl<'a> MkvMuxer<'a> {
                 }
                 CodecId::WebVtt => "S_TEXT/WEBVTT",
                 CodecId::SubRip => "S_TEXT/UTF8",
+                CodecId::Png => "V_MS/VFW/FOURCC",
+                CodecId::Jpeg => "V_MJPEG",
             };
             Self::push_element(&mut te, ID_CODEC_ID, codec_str.as_bytes());
 

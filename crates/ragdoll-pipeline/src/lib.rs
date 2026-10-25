@@ -33,13 +33,17 @@ use ragdoll_format::{
     Mp4Demuxer, Mp4Muxer, MpegTsDemuxer, MpegTsMuxer, OggDemuxer, OggMuxer, OutputSink,
     SubtitleDemuxer, SubtitleMuxer, VorbisComments, WavDemuxer, WavMuxer, Y4mDemuxer, Y4mMuxer,
     build_avcc_from_sps_pps, compose_contact_sheet_rgb24, detect_container_format,
-    h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, is_stdout_path, read_pnm_image,
-    transmux_mkv_to_mp4, transmux_mp4_to_mpegts, transmux_mpegts_to_mkv, transmux_mpegts_to_mp4,
+    expand_image_sequence_inputs, format_image_sequence_path, h264_annex_b_to_avcc_au,
+    h264_avcc_to_annex_b_au, is_image_sequence_pattern, is_stdout_path, read_jpeg_image,
+    read_png_image, read_pnm_image, transmux_mkv_to_mp4, transmux_mp4_to_mpegts,
+    transmux_mpegts_to_mkv, transmux_mpegts_to_mp4, write_jpeg_image, write_png_image,
     write_pnm_image,
 };
+pub use ragdoll_pix::{CropRect, PadSpec, RotationMode};
 use ragdoll_pix::{
-    PolyphaseFilterBank, QualityReport, ScaleFilter, convert_frame, evaluate_frame_quality,
-    scale_plane_with_banks,
+    PolyphaseFilterBank, QualityReport, ScaleFilter, convert_frame, crop_frame, detect_auto_crop,
+    evaluate_frame_quality, overlay_rgba_onto_frame, pad_frame, rotate_frame,
+    scale_plane_with_banks, tonemap_hdr_to_sdr_oklab,
 };
 use ragdoll_simd::split_annex_b_nals;
 use std::fs::File;
@@ -956,8 +960,39 @@ pub fn remux_file_with_format(
     })
 }
 
-/// Decodes all video frames from any supported video file (`.y4m`, `.mp4`, `.mkv`, `.ts`, `.ppm`, `.rgdi`).
+/// Decodes a single raw image file (`.png`, `.jpg`/`.jpeg`, `.ppm`, `.pgm`) preserving its native pixel format (`Rgba8`/`Rgb24`/`Gray8`).
+pub fn decode_image_file(path: impl AsRef<Path>) -> Result<VideoFrame> {
+    let mmap = MmapSource::open(path.as_ref())?;
+    let data = mmap.as_slice();
+    match detect_container_format(data) {
+        Some(ContainerFormat::Png) => read_png_image(data),
+        Some(ContainerFormat::Jpeg) => read_jpeg_image(data),
+        Some(ContainerFormat::Ppm | ContainerFormat::Pgm) => read_pnm_image(data),
+        _ => Err(RagdollError::InvalidHeader(format!(
+            "unsupported image format for '{}'",
+            path.as_ref().display()
+        ))),
+    }
+}
+
+/// Decodes all video frames from any supported video file (`.y4m`, `.mp4`, `.mkv`, `.ts`, `.ppm`, `.png`, `.jpg`, `.rgdi`, or numbered image sequence `frame_%04d.png`).
 pub fn decode_video_file(path: impl AsRef<Path>) -> Result<(Vec<VideoFrame>, Rational64)> {
+    let p_str = path.as_ref().to_string_lossy();
+    if is_image_sequence_pattern(&p_str) {
+        let files = expand_image_sequence_inputs(&p_str)?;
+        let fps = Rational64::FPS_30;
+        let frames = parallel_gop_map(&files, 0, |idx, fpath| {
+            let img = decode_image_file(fpath).expect("valid image sequence frame");
+            let mut yuv = if img.format == PixelFormat::Yuv420p {
+                img
+            } else {
+                convert_frame(&img, PixelFormat::Yuv420p, img.colorimetry)
+            };
+            yuv.pts = Timestamp::new(idx as i64, fps.recip());
+            yuv
+        });
+        return Ok((frames, fps));
+    }
     let mmap = MmapSource::open(path.as_ref())?;
     decode_video_bytes(mmap.as_slice())
 }
@@ -1015,6 +1050,24 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
         }
         ContainerFormat::Ppm | ContainerFormat::Pgm => {
             let f = read_pnm_image(data)?;
+            let yuv = if f.format == PixelFormat::Yuv420p {
+                f
+            } else {
+                convert_frame(&f, PixelFormat::Yuv420p, f.colorimetry)
+            };
+            Ok((vec![yuv], Rational64::FPS_30))
+        }
+        ContainerFormat::Png => {
+            let f = read_png_image(data)?;
+            let yuv = if f.format == PixelFormat::Yuv420p {
+                f
+            } else {
+                convert_frame(&f, PixelFormat::Yuv420p, f.colorimetry)
+            };
+            Ok((vec![yuv], Rational64::FPS_30))
+        }
+        ContainerFormat::Jpeg => {
+            let f = read_jpeg_image(data)?;
             let yuv = if f.format == PixelFormat::Yuv420p {
                 f
             } else {
@@ -1256,7 +1309,7 @@ pub fn avcc_config_to_annex_b(avcc: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Options for [`transcode_file_with_options`] (`0036` / `0037` / `0040` / `0041` / `SIMD-0042` / `SIMD-0043` / `0044` / `0045`).
+/// Options for [`transcode_file_with_options`] (`0036` / `0037` / `0040` / `0041` / `SIMD-0042` / `SIMD-0043` / `0044` / `0045` / `0047` / `SIMD-0048`).
 #[derive(Clone, Debug)]
 pub struct TranscodeOptions {
     pub scale_dims: Option<(usize, usize)>,
@@ -1274,6 +1327,14 @@ pub struct TranscodeOptions {
     pub channels: Option<u8>,
     pub loudness_lufs: Option<f64>,
     pub true_peak_dbtp: Option<f64>,
+    pub crop_spec: Option<String>,
+    pub auto_crop: bool,
+    pub pad_spec: Option<String>,
+    pub rotate_mode: Option<RotationMode>,
+    pub target_fps: Option<Rational64>,
+    pub overlay_path: Option<std::path::PathBuf>,
+    pub overlay_xy: (usize, usize),
+    pub tonemap: bool,
 }
 
 impl Default for TranscodeOptions {
@@ -1294,8 +1355,109 @@ impl Default for TranscodeOptions {
             channels: None,
             loudness_lufs: None,
             true_peak_dbtp: None,
+            crop_spec: None,
+            auto_crop: false,
+            pad_spec: None,
+            rotate_mode: None,
+            target_fps: None,
+            overlay_path: None,
+            overlay_xy: (0, 0),
+            tonemap: false,
         }
     }
+}
+
+/// Applies the `SIMD-0048` compositional video filter chain (`tonemap`, `--auto-crop` / `--crop`,
+/// `--pad`, `--rotate`, `--overlay`, and `--fps` temporal resampling) to a batch of frames.
+pub fn apply_video_filters(
+    mut frames: Vec<VideoFrame>,
+    mut fps: Rational64,
+    opts: &TranscodeOptions,
+    worker_threads: usize,
+) -> Result<(Vec<VideoFrame>, Rational64)> {
+    if frames.is_empty() {
+        return Ok((frames, fps));
+    }
+
+    let auto_rect = if opts.auto_crop {
+        Some(detect_auto_crop(&frames[0], 20))
+    } else {
+        None
+    };
+
+    let overlay_img = if let Some(ref ov_p) = opts.overlay_path {
+        Some(decode_image_file(ov_p)?)
+    } else {
+        None
+    };
+
+    let has_spatial = opts.tonemap
+        || auto_rect.is_some()
+        || opts.crop_spec.is_some()
+        || opts.pad_spec.is_some()
+        || opts.rotate_mode.is_some()
+        || overlay_img.is_some();
+
+    if has_spatial {
+        let crop_rect = if let Some(ref spec) = opts.crop_spec {
+            Some(CropRect::parse_spec(
+                spec,
+                frames[0].width,
+                frames[0].height,
+            )?)
+        } else {
+            auto_rect
+        };
+        frames = parallel_gop_map(&frames, worker_threads, |_, f| {
+            let mut cur = if opts.tonemap {
+                tonemap_hdr_to_sdr_oklab(f, PixelFormat::Yuv420p)
+            } else {
+                f.clone()
+            };
+            if let Some(r) = crop_rect
+                && let Ok(c) = crop_frame(&cur, r)
+            {
+                cur = c;
+            }
+            if let Some(ref p_spec) = opts.pad_spec
+                && let Ok(ps) = PadSpec::parse_spec(p_spec, cur.width, cur.height)
+                && let Ok(p) = pad_frame(&cur, ps)
+            {
+                cur = p;
+            }
+            if let Some(rm) = opts.rotate_mode {
+                cur = rotate_frame(&cur, rm);
+            }
+            if let Some(ref ov) = overlay_img {
+                overlay_rgba_onto_frame(&mut cur, ov, opts.overlay_xy.0, opts.overlay_xy.1);
+            }
+            cur
+        });
+    }
+
+    if let Some(dst_fps) = opts.target_fps
+        && dst_fps.num > 0
+        && dst_fps.den > 0
+        && (dst_fps.num * fps.den != fps.num * dst_fps.den)
+    {
+        let src_fps_f = fps.as_f64().max(1.0);
+        let dst_fps_f = dst_fps.as_f64().max(1.0);
+        let out_count = ((frames.len() as f64) * dst_fps_f / src_fps_f)
+            .round()
+            .max(1.0) as usize;
+        let mut resampled = Vec::with_capacity(out_count);
+        for out_i in 0..out_count {
+            let src_i =
+                (((out_i as f64) * src_fps_f / dst_fps_f).floor() as usize).min(frames.len() - 1);
+            let mut f = frames[src_i].clone();
+            f.pts = Timestamp::new(out_i as i64, dst_fps.recip());
+            resampled.push(f);
+        }
+        frames = resampled;
+        fps = dst_fps;
+    }
+
+    Ok((frames, fps))
 }
 
 /// Decodes an audio stream from `.flac`, `.wav`, `.ogg`, `.aac` (ADTS), or `.mp4`/`.mkv`/`.ts` into
@@ -1870,15 +2032,30 @@ pub fn transcode_file_with_options(
     }
 
     // Video (+ Multi-Track Audio/Subtitle) transcode path:
-    // 1. Open input once (supports both zero-copy `mmap` and `-` / `stdin` pipes)
-    let mmap = MmapSource::open(in_p)?;
-    let data = mmap.as_slice();
-    let bytes_in = data.len() as u64;
-    let (raw_frames, fps) = decode_video_bytes(data)?;
-    if raw_frames.is_empty() {
+    // 1. Open input once (supports both zero-copy `mmap`, `-` / `stdin` pipes, and image sequences)
+    let in_str = in_p.to_string_lossy();
+    let (decoded_frames, decoded_fps, bytes_in, aux_tracks) = if is_image_sequence_pattern(&in_str)
+    {
+        let files = expand_image_sequence_inputs(&in_str)?;
+        let total_b: u64 = files
+            .iter()
+            .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+            .sum();
+        let (frames, fps) = decode_video_file(in_p)?;
+        (frames, fps, total_b, Vec::new())
+    } else {
+        let mmap = MmapSource::open(in_p)?;
+        let data = mmap.as_slice();
+        let bytes_in = data.len() as u64;
+        let (frames, fps) = decode_video_bytes(data)?;
+        let aux = extract_auxiliary_tracks(data).unwrap_or_default();
+        (frames, fps, bytes_in, aux)
+    };
+    if decoded_frames.is_empty() {
         return Err(RagdollError::InvalidData("input video has 0 frames".into()));
     }
-    let aux_tracks = extract_auxiliary_tracks(data).unwrap_or_default();
+
+    let (raw_frames, fps) = apply_video_filters(decoded_frames, decoded_fps, opts, worker_threads)?;
 
     let num_frames = raw_frames.len();
     let (dst_w, dst_h) = opts
@@ -1895,6 +2072,51 @@ pub fn transcode_file_with_options(
 
     let mut gops_processed = 1usize;
     let mut audio_samples_processed = 0usize;
+
+    let out_str = out_p.to_string_lossy();
+    if is_image_sequence_pattern(&out_str) {
+        let frames = if let Some((dw, dh)) = opts.scale_dims {
+            parallel_scale_frames(&raw_frames, dw, dh, opts.scale_filter, worker_threads)?
+        } else {
+            raw_frames
+        };
+        let mut total_bytes_out = 0u64;
+        for (idx, frame) in frames.iter().enumerate() {
+            let fpath = format_image_sequence_path(&out_str, idx + 1);
+            let rgb = convert_frame(frame, PixelFormat::Rgb24, frame.colorimetry);
+            let mut buf = Vec::new();
+            match out_ext.as_str() {
+                "png" => {
+                    write_png_image(&mut buf, &rgb)?;
+                }
+                "jpg" | "jpeg" => {
+                    write_jpeg_image(&mut buf, &rgb, 90)?;
+                }
+                _ => {
+                    write_pnm_image(&mut buf, &rgb)?;
+                }
+            }
+            std::fs::write(&fpath, &buf)?;
+            total_bytes_out += buf.len() as u64;
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_s = (elapsed_ms / 1000.0).max(1e-9);
+        return Ok(PipelineTelemetry {
+            operation: "transcode-image-seq".into(),
+            input_path: in_p.display().to_string(),
+            output_paths: vec![out_p.display().to_string()],
+            frames_processed: num_frames,
+            audio_samples_processed: 0,
+            gops_processed: 1,
+            threads_used: worker_threads,
+            bytes_in,
+            bytes_out: total_bytes_out,
+            elapsed_ms,
+            fps: (num_frames as f64) / elapsed_s,
+            bandwidth_gbps: ((bytes_in + total_bytes_out) as f64 / 1e9) / elapsed_s,
+            compression_ratio: (bytes_in as f64) / (total_bytes_out.max(1) as f64),
+        });
+    }
 
     let bytes_out = match out_ext.as_str() {
         "y4m" => {
@@ -1917,7 +2139,7 @@ pub fn transcode_file_with_options(
             }
             mux.finish()?
         }
-        "ppm" => {
+        "ppm" | "png" | "jpg" | "jpeg" => {
             let first = if let Some((dw, dh)) = opts.scale_dims {
                 parallel_scale_frames(&raw_frames[..1], dw, dh, opts.scale_filter, worker_threads)?
                     .into_iter()
@@ -1929,7 +2151,17 @@ pub fn transcode_file_with_options(
             let rgb = convert_frame(&first, PixelFormat::Rgb24, first.colorimetry);
             let mut writer = OutputSink::create(out_p)?;
             let mut buf = Vec::new();
-            write_pnm_image(&mut buf, &rgb)?;
+            match out_ext.as_str() {
+                "png" => {
+                    write_png_image(&mut buf, &rgb)?;
+                }
+                "jpg" | "jpeg" => {
+                    write_jpeg_image(&mut buf, &rgb, 90)?;
+                }
+                _ => {
+                    write_pnm_image(&mut buf, &rgb)?;
+                }
+            }
             writer.write_all(&buf)?;
             writer.flush()?;
             buf.len() as u64
@@ -2324,7 +2556,17 @@ pub fn extract_media(
             )
         };
         let mut buf = Vec::new();
-        write_pnm_image(&mut buf, &rgb)?;
+        match out_ext.as_str() {
+            "png" => {
+                write_png_image(&mut buf, &rgb)?;
+            }
+            "jpg" | "jpeg" => {
+                write_jpeg_image(&mut buf, &rgb, 90)?;
+            }
+            _ => {
+                write_pnm_image(&mut buf, &rgb)?;
+            }
+        }
         std::fs::write(out_p, &buf)?;
         buf.len() as u64
     };
@@ -2523,10 +2765,20 @@ pub fn synth_media(
             mux.write_frame(frame)?;
         }
         mux.finish()?;
-    } else if ext == "ppm" {
+    } else if matches!(ext.as_str(), "ppm" | "png" | "jpg" | "jpeg") {
         let rgb = convert_frame(&frames[0], PixelFormat::Rgb24, frames[0].colorimetry);
         let mut buf = Vec::new();
-        write_pnm_image(&mut buf, &rgb)?;
+        match ext.as_str() {
+            "png" => {
+                write_png_image(&mut buf, &rgb)?;
+            }
+            "jpg" | "jpeg" => {
+                write_jpeg_image(&mut buf, &rgb, 90)?;
+            }
+            _ => {
+                write_pnm_image(&mut buf, &rgb)?;
+            }
+        }
         std::fs::write(out_p, &buf)?;
     } else {
         let f = File::create(&tmp_y4m)?;
@@ -2684,6 +2936,881 @@ pub fn probe_file_detailed(path: impl AsRef<Path>) -> Result<ProbeReport> {
         gop_count,
         packet_sizes,
         probe_time_us: t0.elapsed().as_secs_f64() * 1e6,
+    })
+}
+
+/// Parses a flexible timestamp string (`"HH:MM:SS.mmm"`, `"MM:SS.mmm"`, or `"12.345"`) into seconds.
+pub fn parse_time_seconds(s: &str) -> Result<f64> {
+    let trimmed = s.trim().trim_end_matches('s');
+    if let Ok(sec) = trimmed.parse::<f64>() {
+        return Ok(sec.max(0.0));
+    }
+    if let Ok(ts) = Timestamp::parse_hms(trimmed) {
+        return Ok(ts.to_seconds_f64().unwrap_or(0.0).max(0.0));
+    }
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    if parts.len() == 2
+        && let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+    {
+        return Ok((m * 60.0 + sec).max(0.0));
+    }
+    Err(RagdollError::InvalidHeader(format!(
+        "invalid timestamp '{s}' (expected seconds or HH:MM:SS.mmm)"
+    )))
+}
+
+/// Options for [`cut_media`] (`0046`).
+#[derive(Clone, Debug, Default)]
+pub struct CutOptions {
+    pub from_sec: Option<f64>,
+    pub to_sec: Option<f64>,
+    pub keyframes_only: bool,
+    pub qp: u8,
+}
+
+/// Telemetry report from [`cut_media`] (`0046`).
+#[derive(Clone, Debug, Default)]
+pub struct CutReport {
+    pub output_bytes: u64,
+    pub total_video_packets: usize,
+    pub copied_video_packets: usize,
+    pub reencoded_video_frames: usize,
+    pub audio_packets: usize,
+    pub elapsed_ms: f64,
+}
+
+/// Extracts all tracks and packets from an MP4, MKV, or MPEG-TS byte slice in presentation/demux order.
+fn demux_all_tracks_and_packets(
+    data: &[u8],
+) -> Result<(ContainerFormat, Vec<TrackInfo>, Vec<PacketSlice<'static>>)> {
+    let fmt = detect_container_format(data).ok_or_else(|| {
+        RagdollError::InvalidHeader("unrecognized container for cut/concat".into())
+    })?;
+    match fmt {
+        ContainerFormat::Mp4 => {
+            let mut demux = Mp4Demuxer::open(data)?;
+            let tracks: Vec<TrackInfo> = demux.tracks().iter().map(|t| t.info.clone()).collect();
+            let mut pkts = Vec::new();
+            while let Some(p) = demux.next_packet()? {
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(p.data()),
+                    p.track_index,
+                    p.pts,
+                    p.dts,
+                    p.duration,
+                    p.flags,
+                ));
+            }
+            Ok((fmt, tracks, pkts))
+        }
+        ContainerFormat::Matroska | ContainerFormat::WebM => {
+            let mut demux = MkvDemuxer::open(data)?;
+            let tracks = demux.tracks().to_vec();
+            let mut pkts = Vec::new();
+            while let Some(p) = demux.next_packet()? {
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(p.data()),
+                    p.track_index,
+                    p.pts,
+                    p.dts,
+                    p.duration,
+                    p.flags,
+                ));
+            }
+            Ok((fmt, tracks, pkts))
+        }
+        ContainerFormat::MpegTs => {
+            let mut demux = MpegTsDemuxer::open(data)?;
+            let tracks = demux.tracks().to_vec();
+            let mut pkts = Vec::new();
+            while let Some(p) = demux.next_packet()? {
+                pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(p.data()),
+                    p.track_index,
+                    p.pts,
+                    p.dts,
+                    p.duration,
+                    p.flags,
+                ));
+            }
+            Ok((fmt, tracks, pkts))
+        }
+        _ => Err(RagdollError::Unsupported(format!(
+            "cut/concat requires MP4, MKV, or MPEG-TS container, got {fmt}"
+        ))),
+    }
+}
+
+fn mux_tracks_and_packets(
+    out_path: &Path,
+    tracks: &[TrackInfo],
+    packets: Vec<PacketSlice<'static>>,
+) -> Result<u64> {
+    let ext = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_ascii_lowercase();
+    let mut writer = OutputSink::create(out_path)?;
+    match ext.as_str() {
+        "mkv" | "webm" => {
+            let mut mux = MkvMuxer::new_matroska();
+            for t in tracks {
+                mux.add_track(t.clone());
+            }
+            for p in packets {
+                mux.write_packet(p)?;
+            }
+            mux.finish(&mut writer)
+        }
+        "ts" | "m2ts" | "mpegts" => {
+            let mut mux = MpegTsMuxer::new(&mut writer);
+            for t in tracks {
+                mux.add_track(t.clone());
+            }
+            for p in &packets {
+                mux.write_packet(p)?;
+            }
+            mux.finish()
+        }
+        _ => {
+            let mut mux = Mp4Muxer::new();
+            for t in tracks {
+                mux.add_track(t.clone());
+            }
+            for p in packets {
+                mux.write_packet(p)?;
+            }
+            mux.finish(&mut writer)
+        }
+    }
+}
+
+/// **`0046`**: Smart-GOP frame-accurate non-linear editing (`ragdoll cut <IN> <OUT> --from <T> --to <T>`).
+///
+/// When `--keyframes-only` is set or `--from` lands on an IDR keyframe, performs 100% zero-copy stream copy.
+/// When `--from` lands mid-GOP, decodes only the boundary GOP, drops frames before `--from`, re-encodes
+/// that partial GOP starting with a fresh IDR keyframe, and zero-copy copies all subsequent interior GOPs!
+pub fn cut_media(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    opts: &CutOptions,
+) -> Result<CutReport> {
+    let t0 = Instant::now();
+    let in_p = input_path.as_ref();
+    let out_p = output_path.as_ref();
+    let mmap = MmapSource::open(in_p)?;
+    let data = mmap.as_slice();
+    let (_fmt, tracks, all_pkts) = demux_all_tracks_and_packets(data)?;
+
+    let from_s = opts.from_sec.unwrap_or(0.0).max(0.0);
+    let to_s = opts.to_sec.unwrap_or(f64::INFINITY);
+    let qp = if opts.qp == 0 { 20 } else { opts.qp };
+
+    let Some(v_track) = tracks
+        .iter()
+        .find(|t| t.track_type == TrackType::Video)
+        .cloned()
+    else {
+        return Err(RagdollError::InvalidData(
+            "cut_media requires a video track".into(),
+        ));
+    };
+
+    let v_pkts: Vec<PacketSlice<'static>> = all_pkts
+        .iter()
+        .filter(|p| p.track_index == v_track.index)
+        .cloned()
+        .collect();
+    if v_pkts.is_empty() {
+        return Err(RagdollError::InvalidData(
+            "video track has 0 packets".into(),
+        ));
+    }
+
+    // Partition video packets into GOPs at keyframe boundaries
+    let mut gops: Vec<Vec<PacketSlice<'static>>> = Vec::new();
+    for p in v_pkts {
+        if p.is_keyframe() || gops.is_empty() {
+            gops.push(Vec::new());
+        }
+        gops.last_mut().unwrap().push(p);
+    }
+
+    // Find the GOP containing `from_s`
+    let mut start_gop_idx = 0usize;
+    for (gi, gop) in gops.iter().enumerate() {
+        let gop_start_s = gop[0].pts.to_seconds_f64().unwrap_or(0.0);
+        if gop_start_s <= from_s + 1e-6 {
+            start_gop_idx = gi;
+        } else {
+            break;
+        }
+    }
+
+    let first_gop = &gops[start_gop_idx];
+    let first_gop_start_s = first_gop[0].pts.to_seconds_f64().unwrap_or(0.0);
+    let lands_on_keyframe = (from_s - first_gop_start_s).abs() <= 1e-3;
+
+    let actual_cut_start_s = if opts.keyframes_only || lands_on_keyframe {
+        first_gop_start_s
+    } else {
+        from_s
+    };
+
+    let mut out_video_pkts: Vec<PacketSlice<'static>> = Vec::new();
+    let mut copied_video_packets = 0usize;
+    let mut reencoded_video_frames = 0usize;
+
+    let v_tb = v_track.timebase;
+    let cut_origin_ticks =
+        (actual_cut_start_s * (v_tb.den as f64) / (v_tb.num.max(1) as f64)).round() as i64;
+
+    for (gi, gop) in gops.iter().enumerate().skip(start_gop_idx) {
+        let gop_first_s = gop[0].pts.to_seconds_f64().unwrap_or(0.0);
+        if gop_first_s >= to_s - 1e-6 {
+            break;
+        }
+
+        let is_boundary_mid_gop = gi == start_gop_idx && !opts.keyframes_only && !lands_on_keyframe;
+
+        if is_boundary_mid_gop && v_track.codec_id == CodecId::H264 {
+            // Decode this single boundary GOP, keep frames in [from_s, to_s), and re-encode starting with an IDR keyframe
+            let mut dec = H264Decoder::new();
+            if v_track.extra_data.len() >= 8 {
+                let annex_b_hdr = avcc_config_to_annex_b(&v_track.extra_data);
+                let _ = dec.set_extradata(&annex_b_hdr);
+            }
+            let mut kept_frames = Vec::new();
+            for pkt in gop {
+                let pkt_s = pkt.pts.to_seconds_f64().unwrap_or(0.0);
+                let annex_b =
+                    h264_avcc_to_annex_b_au(&v_track.extra_data, pkt.data(), pkt.is_keyframe());
+                if let Some(mut f) = dec.decode_annex_b_packet(&annex_b)? {
+                    f.pts = pkt.pts;
+                    f.duration = pkt.duration;
+                    if pkt_s >= from_s - 1e-4 && pkt_s < to_s - 1e-6 {
+                        kept_frames.push(f);
+                    }
+                }
+            }
+            if !kept_frames.is_empty() {
+                let vp = v_track.video.clone().unwrap_or_default();
+                let mut enc = H264Encoder::new(vp.width, vp.height, vp.frame_rate, qp);
+                for (fi, frame) in kept_frames.iter().enumerate() {
+                    let annex_b = enc.encode_frame(frame)?;
+                    let avcc_au = h264_annex_b_to_avcc_au(&annex_b);
+                    let adj_pts = (frame.pts.rescale_to(v_tb).ticks - cut_origin_ticks).max(0);
+                    let dur = frame.duration.max(1);
+                    out_video_pkts.push(PacketSlice::from_owned(
+                        AlignedBuffer::from_slice(&avcc_au),
+                        v_track.index,
+                        Timestamp::new(adj_pts, v_tb),
+                        Timestamp::new(adj_pts, v_tb),
+                        dur,
+                        if fi == 0 {
+                            PacketFlags::KEYFRAME
+                        } else {
+                            PacketFlags::NONE
+                        },
+                    ));
+                    reencoded_video_frames += 1;
+                }
+            }
+        } else {
+            // Zero-copy stream copy of interior GOP packets up to `to_s`
+            for pkt in gop {
+                let pkt_s = pkt.pts.to_seconds_f64().unwrap_or(0.0);
+                if pkt_s < actual_cut_start_s - 1e-4 || pkt_s >= to_s - 1e-6 {
+                    continue;
+                }
+                let adj_pts = (pkt.pts.rescale_to(v_tb).ticks - cut_origin_ticks).max(0);
+                let adj_dts = (pkt.dts.rescale_to(v_tb).ticks - cut_origin_ticks).max(0);
+                out_video_pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(pkt.data()),
+                    v_track.index,
+                    Timestamp::new(adj_pts, v_tb),
+                    Timestamp::new(adj_dts, v_tb),
+                    pkt.duration,
+                    pkt.flags,
+                ));
+                copied_video_packets += 1;
+            }
+        }
+    }
+
+    let total_video_packets = out_video_pkts.len();
+    let mut final_pkts = out_video_pkts;
+    let mut audio_packets = 0usize;
+
+    // Trim & shift auxiliary Audio / Subtitle packets to `[actual_cut_start_s, to_s)`
+    for pkt in all_pkts {
+        if pkt.track_index == v_track.index {
+            continue;
+        }
+        let pkt_s = pkt.pts.to_seconds_f64().unwrap_or(0.0);
+        if pkt_s >= actual_cut_start_s - 1e-4 && pkt_s < to_s - 1e-6 {
+            let tb = pkt.pts.timebase;
+            let origin =
+                (actual_cut_start_s * (tb.den as f64) / (tb.num.max(1) as f64)).round() as i64;
+            let adj_pts = (pkt.pts.ticks - origin).max(0);
+            let adj_dts = (pkt.dts.ticks - origin).max(0);
+            final_pkts.push(PacketSlice::from_owned(
+                AlignedBuffer::from_slice(pkt.data()),
+                pkt.track_index,
+                Timestamp::new(adj_pts, tb),
+                Timestamp::new(adj_dts, tb),
+                pkt.duration,
+                pkt.flags,
+            ));
+            audio_packets += 1;
+        }
+    }
+
+    let output_bytes = mux_tracks_and_packets(out_p, &tracks, final_pkts)?;
+    Ok(CutReport {
+        output_bytes,
+        total_video_packets,
+        copied_video_packets,
+        reencoded_video_frames,
+        audio_packets,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Telemetry report from [`concat_media`] (`0046`).
+#[derive(Clone, Debug, Default)]
+pub struct ConcatReport {
+    pub output_bytes: u64,
+    pub segments_merged: usize,
+    pub video_packets: usize,
+    pub audio_packets: usize,
+    pub reencoded: bool,
+    pub elapsed_ms: f64,
+}
+
+/// **`0046`**: Concatenates multiple media files (`ragdoll concat <IN1> <IN2> ... -o <OUT>`).
+///
+/// Performs zero-copy packet splicing with monotonic 128-bit PTS/DTS offset accumulation when all
+/// inputs share compatible codec parameters, or automatically normalizes mismatched inputs.
+pub fn concat_media<P: AsRef<Path>>(
+    inputs: &[P],
+    output_path: impl AsRef<Path>,
+) -> Result<ConcatReport> {
+    let t0 = Instant::now();
+    if inputs.is_empty() {
+        return Err(RagdollError::InvalidHeader(
+            "concat_media requires at least 1 input file".into(),
+        ));
+    }
+    let out_p = output_path.as_ref();
+
+    let mut opened = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        let mmap = MmapSource::open(inp.as_ref())?;
+        let (_, tracks, pkts) = demux_all_tracks_and_packets(mmap.as_slice())?;
+        opened.push((inp.as_ref().to_path_buf(), tracks, pkts));
+    }
+
+    let ref_tracks = &opened[0].1;
+    let ref_v = ref_tracks
+        .iter()
+        .find(|t| t.track_type == TrackType::Video)
+        .cloned();
+
+    // Check if all inputs have identical video codec, dimensions, and extradata
+    let compatible = if let Some(ref rv) = ref_v {
+        let rvp = rv.video.clone().unwrap_or_default();
+        opened.iter().skip(1).all(|(_, trks, _)| {
+            trks.iter()
+                .find(|t| t.track_type == TrackType::Video)
+                .is_some_and(|tv| {
+                    let tvp = tv.video.clone().unwrap_or_default();
+                    tv.codec_id == rv.codec_id
+                        && tvp.width == rvp.width
+                        && tvp.height == rvp.height
+                        && tv.extra_data == rv.extra_data
+                })
+        })
+    } else {
+        false
+    };
+
+    if compatible {
+        let mut merged_pkts: Vec<PacketSlice<'static>> = Vec::new();
+        let mut track_end_ticks = vec![0i64; ref_tracks.len()];
+        let mut video_packets = 0usize;
+        let mut audio_packets = 0usize;
+
+        for (_, seg_tracks, seg_pkts) in &opened {
+            let mut next_track_end = track_end_ticks.clone();
+            for pkt in seg_pkts {
+                let tid = pkt.track_index as usize;
+                if tid >= ref_tracks.len() {
+                    continue;
+                }
+                let target_tb = ref_tracks[tid].timebase;
+                let offset_ticks = track_end_ticks[tid];
+                let pts_t = pkt.pts.rescale_to(target_tb).ticks + offset_ticks;
+                let dts_t = pkt.dts.rescale_to(target_tb).ticks + offset_ticks;
+                let dur_t = rescale_q(
+                    pkt.duration.max(1),
+                    seg_tracks.get(tid).map_or(pkt.pts.timebase, |t| t.timebase),
+                    target_tb,
+                )
+                .max(1);
+                next_track_end[tid] = next_track_end[tid].max(pts_t + dur_t);
+
+                if ref_tracks[tid].track_type == TrackType::Video {
+                    video_packets += 1;
+                } else {
+                    audio_packets += 1;
+                }
+
+                merged_pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(pkt.data()),
+                    pkt.track_index,
+                    Timestamp::new(pts_t, target_tb),
+                    Timestamp::new(dts_t, target_tb),
+                    dur_t,
+                    pkt.flags,
+                ));
+            }
+            track_end_ticks = next_track_end;
+        }
+
+        let output_bytes = mux_tracks_and_packets(out_p, ref_tracks, merged_pkts)?;
+        return Ok(ConcatReport {
+            output_bytes,
+            segments_merged: inputs.len(),
+            video_packets,
+            audio_packets,
+            reencoded: false,
+            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    // Fallback when resolution/codec differs across inputs: decode & normalize all frames to first input's dimensions
+    let mut all_frames = Vec::new();
+    let mut target_w = 0usize;
+    let mut target_h = 0usize;
+    let mut target_fps = Rational64::FPS_30;
+    for (idx, (path, _, _)) in opened.iter().enumerate() {
+        let (frames, fps) = decode_video_file(path)?;
+        if frames.is_empty() {
+            continue;
+        }
+        if idx == 0 {
+            target_w = frames[0].width;
+            target_h = frames[0].height;
+            target_fps = fps;
+        }
+        let scaled = if frames[0].width != target_w || frames[0].height != target_h {
+            parallel_scale_frames(&frames, target_w, target_h, ScaleFilter::Lanczos3, 0)?
+        } else {
+            frames
+        };
+        all_frames.extend(scaled);
+    }
+
+    let tmp_y4m = std::env::temp_dir().join(format!("ragdoll_concat_{}.y4m", std::process::id()));
+    {
+        let f = File::create(&tmp_y4m)?;
+        let mut mux = Y4mMuxer::new(
+            BufWriter::new(f),
+            target_w,
+            target_h,
+            PixelFormat::Yuv420p,
+            target_fps,
+            Colorimetry::bt709_limited(),
+        )?;
+        for frame in &all_frames {
+            mux.write_frame(frame)?;
+        }
+        mux.finish()?;
+    }
+    let tel = transcode_file(&tmp_y4m, out_p, None, ScaleFilter::Lanczos3, "h264", 20, 0)?;
+    let _ = std::fs::remove_file(&tmp_y4m);
+
+    Ok(ConcatReport {
+        output_bytes: tel.bytes_out,
+        segments_merged: inputs.len(),
+        video_packets: all_frames.len(),
+        audio_packets: 0,
+        reencoded: true,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Single rendition target in an ABR encoding ladder (`0049`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbrRenditionSpec {
+    pub width: usize,
+    pub height: usize,
+    pub bitrate_kbps: u32,
+}
+
+impl AbrRenditionSpec {
+    /// Parses a comma-separated ABR ladder specification such as:
+    /// `"1080p:4500k,720p:2500k,480p:1200k,360p:600k"` or `"320x180:400k,160x90:200k"`.
+    pub fn parse_ladder(spec: &str, src_w: usize, src_h: usize) -> Result<Vec<Self>> {
+        let mut out = Vec::new();
+        for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (res_s, br_s) = item.split_once(':').ok_or_else(|| {
+                RagdollError::InvalidHeader(format!(
+                    "expected '<RES>:<BITRATE>' in ABR ladder, got '{item}'"
+                ))
+            })?;
+            let br_clean = br_s
+                .trim()
+                .trim_end_matches("kbps")
+                .trim_end_matches("k")
+                .trim_end_matches('K');
+            let bitrate_kbps: u32 = br_clean.parse().map_err(|_| {
+                RagdollError::InvalidHeader(format!("invalid ABR bitrate '{br_s}'"))
+            })?;
+
+            let (w, h) = if let Some((ws, hs)) = res_s.split_once('x') {
+                let w: usize = ws.parse().map_err(|_| {
+                    RagdollError::InvalidHeader(format!("invalid width in '{res_s}'"))
+                })?;
+                let h: usize = hs.parse().map_err(|_| {
+                    RagdollError::InvalidHeader(format!("invalid height in '{res_s}'"))
+                })?;
+                (w & !1, h & !1)
+            } else if let Some(h_str) = res_s.strip_suffix('p') {
+                let h: usize = h_str.parse().map_err(|_| {
+                    RagdollError::InvalidHeader(format!("invalid height in '{res_s}'"))
+                })?;
+                let h_even = (h & !1).max(2);
+                let w_even = (((h_even * src_w.max(16)) / src_h.max(9) + 1) & !1).max(2);
+                (w_even, h_even)
+            } else {
+                return Err(RagdollError::InvalidHeader(format!(
+                    "unsupported ABR resolution '{res_s}' (expected WxH or NNNp)"
+                )));
+            };
+            out.push(Self {
+                width: w.max(2),
+                height: h.max(2),
+                bitrate_kbps: bitrate_kbps.max(32),
+            });
+        }
+        if out.is_empty() {
+            return Err(RagdollError::InvalidHeader(
+                "ABR ladder cannot be empty".into(),
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// Options for [`package_abr`] (`0049`).
+#[derive(Clone, Debug)]
+pub struct PackageOptions {
+    pub ladder_spec: Option<String>,
+    pub segment_duration_sec: f64,
+    pub generate_thumbnails: bool,
+}
+
+impl Default for PackageOptions {
+    fn default() -> Self {
+        Self {
+            ladder_spec: None,
+            segment_duration_sec: 2.0,
+            generate_thumbnails: true,
+        }
+    }
+}
+
+/// Telemetry report emitted by [`package_abr`] (`0049`).
+#[derive(Clone, Debug)]
+pub struct PackageReport {
+    pub renditions: usize,
+    pub segments_per_rendition: usize,
+    pub master_m3u8_path: std::path::PathBuf,
+    pub mpd_path: std::path::PathBuf,
+    pub thumbnails_vtt_path: Option<std::path::PathBuf>,
+    pub total_bytes: u64,
+    pub elapsed_ms: f64,
+}
+
+/// **`0049`**: One-command CMAF `fMP4` HLS (`master.m3u8`) & DASH (`manifest.mpd`) multi-rendition
+/// ABR packager (`ragdoll package <IN> -o <OUT_DIR>`).
+///
+/// Decodes the input once, scales across all ABR renditions in parallel, enforces GOP-aligned IDR
+/// keyframes at exact segment boundaries, writes shared CMAF `init.mp4` + `seg_NNNN.m4s` fragments,
+/// generates HLS (`master.m3u8` + `stream_N/index.m3u8`) and DASH (`manifest.mpd`) manifests, and
+/// emits a `thumbnails.vtt` + `sprites.jpg` trick-play sprite sheet!
+pub fn package_abr(
+    input_path: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    opts: &PackageOptions,
+) -> Result<PackageReport> {
+    let t0 = Instant::now();
+    let in_p = input_path.as_ref();
+    let out_dir = output_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let (raw_frames, fps) = decode_video_file(in_p)?;
+    if raw_frames.is_empty() {
+        return Err(RagdollError::InvalidData(
+            "package_abr input has 0 video frames".into(),
+        ));
+    }
+
+    let src_w = raw_frames[0].width;
+    let src_h = raw_frames[0].height;
+    let ladder = if let Some(ref spec) = opts.ladder_spec {
+        AbrRenditionSpec::parse_ladder(spec, src_w, src_h)?
+    } else {
+        let half_w = ((src_w / 2) & !1).max(32);
+        let half_h = ((src_h / 2) & !1).max(32);
+        vec![
+            AbrRenditionSpec {
+                width: src_w & !1,
+                height: src_h & !1,
+                bitrate_kbps: 2400,
+            },
+            AbrRenditionSpec {
+                width: half_w,
+                height: half_h,
+                bitrate_kbps: 800,
+            },
+        ]
+    };
+
+    let seg_dur_s = opts.segment_duration_sec.max(0.2);
+    let fps_f = fps.as_f64().max(1.0);
+    let frames_per_seg = ((seg_dur_s * fps_f).round() as usize).max(1);
+    let num_segments = raw_frames.len().div_ceil(frames_per_seg);
+    let total_duration_s = (raw_frames.len() as f64) / fps_f;
+
+    let timebase = Rational64::new(1, 90_000);
+    let frame_dur_ticks = ((90_000 * fps.den) / fps.num.max(1)).max(1);
+
+    let mut total_bytes = 0u64;
+    let mut rendition_codecs = Vec::with_capacity(ladder.len());
+
+    for (r_idx, rend) in ladder.iter().enumerate() {
+        let r_dir = out_dir.join(format!("stream_{r_idx}"));
+        std::fs::create_dir_all(&r_dir)?;
+
+        let scaled = if rend.width == src_w && rend.height == src_h {
+            raw_frames.clone()
+        } else {
+            parallel_scale_frames(
+                &raw_frames,
+                rend.width,
+                rend.height,
+                ScaleFilter::Lanczos3,
+                0,
+            )?
+        };
+
+        let rc = RateControlMode::Abr {
+            bitrate_kbps: rend.bitrate_kbps,
+            maxrate_kbps: Some(rend.bitrate_kbps * 2),
+            bufsize_kb: Some(rend.bitrate_kbps * 2),
+        };
+        let hdr_enc = H264Encoder::new(rend.width as u32, rend.height as u32, fps, 22)
+            .with_profile(H264Profile::Main)
+            .with_rate_control(rc);
+        let sps_nal = hdr_enc.sps.to_nal_unit();
+        let pps_nal = hdr_enc.pps.to_nal_unit();
+        let avcc_extra = build_avcc_from_sps_pps(&sps_nal, &pps_nal);
+        let codecs_tag = format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            hdr_enc.sps.profile_idc, hdr_enc.sps.constraint_set_flags, hdr_enc.sps.level_idc
+        );
+        rendition_codecs.push(codecs_tag);
+
+        let track_info = TrackInfo {
+            index: 0,
+            track_type: TrackType::Video,
+            codec_id: CodecId::H264,
+            timebase,
+            duration_ticks: Some((scaled.len() as i64) * frame_dur_ticks),
+            extra_data: avcc_extra,
+            video: Some(VideoTrackParams {
+                width: rend.width as u32,
+                height: rend.height as u32,
+                pixel_format: PixelFormat::Yuv420p,
+                colorimetry: Colorimetry::bt709_limited(),
+                frame_rate: fps,
+                bit_depth: 8,
+                profile: None,
+                level: None,
+            }),
+            audio: None,
+            sample_count: scaled.len(),
+            total_bytes: 0,
+        };
+
+        let mut mux = Mp4Muxer::new();
+        mux.add_track(track_info);
+
+        // 1. Write `stream_N/init.mp4`
+        let init_path = r_dir.join("init.mp4");
+        let init_file = File::create(&init_path)?;
+        total_bytes += mux.write_cmaf_init_segment(BufWriter::new(init_file))?;
+
+        // 2. Encode each GOP-aligned segment and write `stream_N/seg_NNNN.m4s` + `stream_N/index.m3u8`
+        let mut m3u8 = String::new();
+        let target_dur_ceil = seg_dur_s.ceil().max(1.0) as u32;
+        m3u8.push_str("#EXTM3U\n");
+        m3u8.push_str("#EXT-X-VERSION:7\n");
+        m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur_ceil}\n"));
+        m3u8.push_str("#EXT-X-MEDIA-SEQUENCE:1\n");
+        m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+        m3u8.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+
+        for seg_idx in 0..num_segments {
+            let f_start = seg_idx * frames_per_seg;
+            let f_end = ((seg_idx + 1) * frames_per_seg).min(scaled.len());
+            let seg_frames = &scaled[f_start..f_end];
+
+            // Fresh encoder per segment guarantees every segment starts with an IDR keyframe (`SAP=1`)
+            let mut seg_enc = H264Encoder::new(rend.width as u32, rend.height as u32, fps, 22)
+                .with_profile(H264Profile::Main)
+                .with_rate_control(rc);
+
+            let mut seg_pkts = Vec::with_capacity(seg_frames.len());
+            for (local_i, frame) in seg_frames.iter().enumerate() {
+                let global_i = (f_start + local_i) as i64;
+                let annex_b = seg_enc.encode_frame(frame)?;
+                let avcc_au = h264_annex_b_to_avcc_au(&annex_b);
+                let pts = global_i * frame_dur_ticks;
+                seg_pkts.push(PacketSlice::from_owned(
+                    AlignedBuffer::from_slice(&avcc_au),
+                    0,
+                    Timestamp::new(pts, timebase),
+                    Timestamp::new(pts, timebase),
+                    frame_dur_ticks,
+                    if local_i == 0 {
+                        PacketFlags::KEYFRAME
+                    } else {
+                        PacketFlags::NONE
+                    },
+                ));
+            }
+
+            let seg_num = (seg_idx + 1) as u32;
+            let seg_name = format!("seg_{seg_num:04}.m4s");
+            let seg_path = r_dir.join(&seg_name);
+            let seg_file = File::create(&seg_path)?;
+            total_bytes +=
+                mux.write_cmaf_media_segment(BufWriter::new(seg_file), seg_num, 1, &seg_pkts)?;
+
+            let actual_seg_dur = (seg_frames.len() as f64) / fps_f;
+            m3u8.push_str(&format!("#EXTINF:{actual_seg_dur:.6},\n{seg_name}\n"));
+        }
+        m3u8.push_str("#EXT-X-ENDLIST\n");
+        let playlist_path = r_dir.join("index.m3u8");
+        std::fs::write(&playlist_path, m3u8.as_bytes())?;
+        total_bytes += m3u8.len() as u64;
+    }
+
+    // 3. Write RFC 8216 HLS `master.m3u8`
+    let mut master_m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    for (r_idx, rend) in ladder.iter().enumerate() {
+        let bw = rend.bitrate_kbps * 1000;
+        let avg_bw = (bw * 9) / 10;
+        let codecs = &rendition_codecs[r_idx];
+        master_m3u8.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},AVERAGE-BANDWIDTH={avg_bw},RESOLUTION={}x{},FRAME-RATE={fps_f:.3},CODECS=\"{codecs}\"\nstream_{r_idx}/index.m3u8\n",
+            rend.width, rend.height
+        ));
+    }
+    let master_m3u8_path = out_dir.join("master.m3u8");
+    std::fs::write(&master_m3u8_path, master_m3u8.as_bytes())?;
+    total_bytes += master_m3u8.len() as u64;
+
+    // 4. Write ISO/IEC 23009-1 DASH `manifest.mpd` referencing the exact same CMAF segments
+    let seg_dur_ticks = (frames_per_seg as i64) * frame_dur_ticks;
+    let mut mpd = String::new();
+    mpd.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    mpd.push_str(&format!(
+        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" profiles=\"urn:mpeg:dash:profile:isoff-live:2011,http://dashif.org/guidelines/dash264\" type=\"static\" mediaPresentationDuration=\"PT{total_duration_s:.3}S\" minBufferTime=\"PT{seg_dur_s:.3}S\">\n"
+    ));
+    mpd.push_str(&format!(
+        "  <Period id=\"0\" duration=\"PT{total_duration_s:.3}S\">\n"
+    ));
+    mpd.push_str("    <AdaptationSet id=\"0\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\">\n");
+    for (r_idx, rend) in ladder.iter().enumerate() {
+        let bw = rend.bitrate_kbps * 1000;
+        let codecs = &rendition_codecs[r_idx];
+        mpd.push_str(&format!(
+            "      <Representation id=\"{r_idx}\" bandwidth=\"{bw}\" width=\"{}\" height=\"{}\" codecs=\"{codecs}\">\n",
+            rend.width, rend.height
+        ));
+        mpd.push_str(&format!(
+            "        <SegmentTemplate timescale=\"90000\" duration=\"{seg_dur_ticks}\" initialization=\"stream_{r_idx}/init.mp4\" media=\"stream_{r_idx}/seg_$Number%04d$.m4s\" startNumber=\"1\"/>\n"
+        ));
+        mpd.push_str("      </Representation>\n");
+    }
+    mpd.push_str("    </AdaptationSet>\n  </Period>\n</MPD>\n");
+    let mpd_path = out_dir.join("manifest.mpd");
+    std::fs::write(&mpd_path, mpd.as_bytes())?;
+    total_bytes += mpd.len() as u64;
+
+    // 5. Generate WebVTT trick-play thumbnail track (`thumbnails.vtt` + `sprites.jpg`)
+    let thumbnails_vtt_path = if opts.generate_thumbnails {
+        let thumb_w = 160usize;
+        let thumb_h = 90usize;
+        let cols = 5usize;
+        let mut selected = Vec::with_capacity(num_segments);
+        for seg_idx in 0..num_segments {
+            let f_idx = (seg_idx * frames_per_seg).min(raw_frames.len() - 1);
+            selected.push(raw_frames[f_idx].clone());
+        }
+        let scaled_thumbs =
+            parallel_scale_frames(&selected, thumb_w, thumb_h, ScaleFilter::Lanczos3, 0)?;
+        let rgb_thumbs: Vec<VideoFrame> = scaled_thumbs
+            .iter()
+            .map(|f| convert_frame(f, PixelFormat::Rgb24, f.colorimetry))
+            .collect();
+        let refs: Vec<&VideoFrame> = rgb_thumbs.iter().collect();
+        let sheet = compose_contact_sheet_rgb24(&refs, cols, 0, [0, 0, 0])?;
+        let sprite_path = out_dir.join("sprites.jpg");
+        let mut jpg_buf = Vec::new();
+        write_jpeg_image(&mut jpg_buf, &sheet, 85)?;
+        std::fs::write(&sprite_path, &jpg_buf)?;
+        total_bytes += jpg_buf.len() as u64;
+
+        let mut vtt = String::from("WEBVTT\n\n");
+        for seg_idx in 0..num_segments {
+            let start_ms = ((seg_idx * frames_per_seg) as f64 * 1000.0 / fps_f).round() as u64;
+            let end_ms = ((((seg_idx + 1) * frames_per_seg).min(raw_frames.len())) as f64 * 1000.0
+                / fps_f)
+                .round() as u64;
+            let r = seg_idx / cols;
+            let c = seg_idx % cols;
+            let x = c * thumb_w;
+            let y = r * thumb_h;
+            let t0_str = ragdoll_format::format_subtitle_timestamp_ms(start_ms as i64, '.');
+            let t1_str = ragdoll_format::format_subtitle_timestamp_ms(end_ms as i64, '.');
+            vtt.push_str(&format!(
+                "{t0_str} --> {t1_str}\nsprites.jpg#xywh={x},{y},{thumb_w},{thumb_h}\n\n"
+            ));
+        }
+        let vtt_path = out_dir.join("thumbnails.vtt");
+        std::fs::write(&vtt_path, vtt.as_bytes())?;
+        total_bytes += vtt.len() as u64;
+        Some(vtt_path)
+    } else {
+        None
+    };
+
+    Ok(PackageReport {
+        renditions: ladder.len(),
+        segments_per_rendition: num_segments,
+        master_m3u8_path,
+        mpd_path,
+        thumbnails_vtt_path,
+        total_bytes,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
@@ -3083,5 +4210,140 @@ faststart = true
         let _ = std::fs::remove_file(&out_ogg);
         let _ = std::fs::remove_file(&out_m4a);
         let _ = std::fs::remove_file(&out_norm_wav);
+    }
+
+    #[test]
+    fn m9_edit_image_package_png_jpeg_filters_smart_gop_cut_concat_and_abr_package() {
+        let tmp = std::env::temp_dir().join("ragdoll_m9_suite");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let src_mp4 = tmp.join("src.mp4");
+        let thumb_png = tmp.join("thumb.png");
+        let thumb_jpg = tmp.join("thumb.jpg");
+        let filtered_mp4 = tmp.join("filtered.mp4");
+        let cut_mp4 = tmp.join("cut.mp4");
+        let concat_mp4 = tmp.join("concat.mp4");
+        let abr_dir = tmp.join("abr_out");
+
+        // 1. Synthesize 1.0s (30 frames @ 30fps, 2 GOPs of 15 frames) 160x120 MP4
+        synth_media(&src_mp4, 160, 120, 30, 1.0).unwrap();
+
+        // 2. Extract PNG and JPEG thumbnails (`0047`)
+        extract_media(&src_mp4, &thumb_png, Some(0.2), None).unwrap();
+        extract_media(&src_mp4, &thumb_jpg, Some(0.4), None).unwrap();
+        assert!(thumb_png.exists());
+        assert!(thumb_jpg.exists());
+
+        // 3. Transcode with crop + pad + rotate + PNG overlay + fps filter (`SIMD-0048`)
+        let tel_f = transcode_file_with_options(
+            &src_mp4,
+            &filtered_mp4,
+            &TranscodeOptions {
+                crop_spec: Some("128:96:16:12".into()),
+                pad_spec: Some("160:120:16:12:#102030".into()),
+                rotate_mode: Some(RotationMode::Rotate180),
+                overlay_path: Some(thumb_png.clone()),
+                overlay_xy: (8, 8),
+                target_fps: Some(Rational64::new(15, 1)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tel_f.frames_processed, 15);
+
+        // 4. Smart-GOP frame-accurate `cut_media` (`0046`)
+        //    Cut from 0.2s (frame 6, mid-GOP 0) to 0.9s (frame 27, inside GOP 1):
+        //    GOP 0 tail (9 frames: 6..15) is re-encoded starting with an IDR keyframe,
+        //    while GOP 1 (12 frames: 15..27) is zero-copy stream-copied!
+        let cut_rep = cut_media(
+            &src_mp4,
+            &cut_mp4,
+            &CutOptions {
+                from_sec: Some(0.033),
+                to_sec: Some(0.9),
+                keyframes_only: false,
+                qp: 22,
+            },
+        )
+        .unwrap();
+        assert!(
+            cut_rep.reencoded_video_frames > 0,
+            "mid-GOP cut should re-encode boundary GOP frames"
+        );
+        assert!(
+            cut_rep.copied_video_packets > 0,
+            "mid-GOP cut should zero-copy interior GOP packets"
+        );
+
+        // 5. Zero-copy `concat_media` (`0046`)
+        let concat_rep = concat_media(&[&src_mp4, &cut_mp4], &concat_mp4).unwrap();
+        assert_eq!(concat_rep.segments_merged, 2);
+        assert!(!concat_rep.reencoded);
+        assert_eq!(concat_rep.video_packets, 30 + cut_rep.total_video_packets);
+
+        // 6. One-command CMAF HLS & DASH ABR packager (`0049`)
+        let pkg_rep = package_abr(
+            &src_mp4,
+            &abr_dir,
+            &PackageOptions {
+                ladder_spec: Some("160x120:400k,96x72:180k".into()),
+                segment_duration_sec: 0.5,
+                generate_thumbnails: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(pkg_rep.renditions, 2);
+        assert_eq!(pkg_rep.segments_per_rendition, 2);
+        assert!(pkg_rep.master_m3u8_path.exists());
+        assert!(pkg_rep.mpd_path.exists());
+        assert!(pkg_rep.thumbnails_vtt_path.as_ref().unwrap().exists());
+        assert!(abr_dir.join("sprites.jpg").exists());
+        assert!(abr_dir.join("stream_0/init.mp4").exists());
+        assert!(abr_dir.join("stream_0/seg_0001.m4s").exists());
+
+        let m3u8_text = std::fs::read_to_string(&pkg_rep.master_m3u8_path).unwrap();
+        assert!(m3u8_text.contains("#EXT-X-STREAM-INF:BANDWIDTH=400000"));
+        assert!(m3u8_text.contains("RESOLUTION=160x120"));
+
+        let mpd_text = std::fs::read_to_string(&pkg_rep.mpd_path).unwrap();
+        assert!(mpd_text.contains("<SegmentTemplate"));
+        assert!(mpd_text.contains("stream_0/init.mp4"));
+
+        // Optional ffprobe verification of cut.mp4, concat.mp4, and CMAF init+seg
+        if std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            for p in [&cut_mp4, &concat_mp4] {
+                let st = std::process::Command::new("ffprobe")
+                    .args(["-v", "error", "-show_entries", "format=duration"])
+                    .arg(p)
+                    .status()
+                    .unwrap();
+                assert!(st.success());
+            }
+
+            // Concatenate init.mp4 + seg_0001.m4s and verify with ffprobe
+            let mut cmaf_combined = std::fs::read(abr_dir.join("stream_0/init.mp4")).unwrap();
+            let seg1 = std::fs::read(abr_dir.join("stream_0/seg_0001.m4s")).unwrap();
+            cmaf_combined.extend_from_slice(&seg1);
+            let cmaf_test_mp4 = tmp.join("cmaf_combined.mp4");
+            std::fs::write(&cmaf_test_mp4, &cmaf_combined).unwrap();
+            let st_cmaf = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                ])
+                .arg(&cmaf_test_mp4)
+                .status()
+                .unwrap();
+            assert!(st_cmaf.success());
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

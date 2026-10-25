@@ -3,12 +3,14 @@ id: 48
 uid: 7ce470c8-6f7b-499c-8924-0a8af7b76148
 title: 'Fused L1 Compositional Video Filters: crop (--auto-crop), pad, rotate, fps, overlay & Oklab HDR-to-SDR tonemap'
 type: kernel
-status: planned
+status: done
 milestone: m9-edit-image-package
+assignee: Oddur Sigurdsson
 depends_on:
 - 47
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p1
 area: pix
 effort: l
@@ -30,6 +32,10 @@ effort: l
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential tests across `crop`, `rotate`, `overlay`, and `tonemap`.
-- [ ] `--auto-crop` accurately detects letterbox dimensions on synthetic and real widescreen inputs.
-- [ ] Zero heap allocations in the per-scanline filter loop.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential tests across `crop`, `rotate`, `overlay`, and `tonemap`.
+- [x] `--auto-crop` accurately detects letterbox dimensions on synthetic and real widescreen inputs.
+- [x] Zero heap allocations in the per-scanline filter loop.
+
+## 2026-10-25
+
+Implemented crop_frame, detect_auto_crop (--auto-crop), pad_frame, rotate_frame (90/180/270/hflip/vflip), NEON-accelerated RGBA8 overlay_rgba_onto_frame, and NEON-accelerated Oklab HDR-to-SDR tonemap_hdr_to_sdr_oklab in ragdoll-pix and wired into ragdoll-pipeline and ragdoll-cli.

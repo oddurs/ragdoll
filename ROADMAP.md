@@ -127,16 +127,16 @@ Deliver a complete pure-Rust production audio engine: SIMD windowed-sinc Kaiser 
 
 ## m9-edit-image-package — Phase 9 — Smart-GOP Editing (cut/concat), Spatial Filters, PNG/JPEG & ABR Packaging (package)
 
-`··········` 0% · 0 of 4 done
+`##########` 100% · 4 of 4 done
 
 Introduce Ragdoll's opinionated workflow upgrades over FFmpeg: frame-accurate Smart-GOP `ragdoll cut` and `ragdoll concat` (re-encoding only boundary GOPs while zero-copy `mmap` stream-copying interior GOPs), pure-Rust `.png` and `.jpg` image I/O, fused L1 compositional filters (`crop`, `--auto-crop`, `pad`, `rotate`, `fps`, `overlay`, Oklab HDR-to-SDR `tonemap`), and one-command multi-rendition CMAF HLS & DASH ABR packaging (`ragdoll package`).
 
-### up next
+### shipped
 
-- [ ] `0046` Smart-GOP Frame-Accurate ragdoll cut & ragdoll concat Non-Linear Editing Engine <sup>feature · p0 · pipeline</sup>
-- [ ] `0047` Pure-Rust PNG & Baseline JPEG Image Decoders/Encoders for Thumbnails, Overlays & Image Sequences <sup>feature · p0 · format</sup>
-- [ ] `SIMD-0048` Fused L1 Compositional Video Filters: crop (--auto-crop), pad, rotate, fps, overlay & Oklab HDR-to-SDR tonemap <sup>kernel · p1 · pix</sup>
-- [ ] `0049` One-Command CMAF HLS (m3u8) & DASH (mpd) Multi-Rendition ABR Packager (ragdoll package) <sup>feature · p1 · pipeline</sup>
+- [x] `0046` Smart-GOP Frame-Accurate ragdoll cut & ragdoll concat Non-Linear Editing Engine <sup>feature · p0 · pipeline</sup>
+- [x] `0047` Pure-Rust PNG & Baseline JPEG Image Decoders/Encoders for Thumbnails, Overlays & Image Sequences <sup>feature · p0 · format</sup>
+- [x] `SIMD-0048` Fused L1 Compositional Video Filters: crop (--auto-crop), pad, rotate, fps, overlay & Oklab HDR-to-SDR tonemap <sup>kernel · p1 · pix</sup>
+- [x] `0049` One-Command CMAF HLS (m3u8) & DASH (mpd) Multi-Rendition ABR Packager (ragdoll package) <sup>feature · p1 · pipeline</sup>
 
 ## m10-production-v1 — Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
 
