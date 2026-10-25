@@ -58,11 +58,7 @@ Every plane lives in an `AlignedBuffer`:
 
 ## Working sets are bounded
 
-`GopRingPipeline` decides how many GOPs to process at once from the source and destination frame sizes and a memory budget: 256 MiB by default, 64 MiB in [efficiency mode](/docs/power/). Each wave scales and encodes its GOPs in parallel, returns its frames to the pool, and hands encoded packets to the muxer before the next wave starts.
-
-<Callout kind="warning" title="Current limitation">
-Decoding is not yet part of the bounded wave. `transcode`, `extract` and `metrics` decode the full input before processing it, so their peak memory still grows with input length. Moving decode into the ring is the remaining step toward constant-memory transcoding of arbitrarily long inputs.
-</Callout>
+`GopRingPipeline` decides how many GOPs to process at once from the source and destination frame sizes and a memory budget: 256 MiB by default, 64 MiB in [efficiency mode](/docs/power/). Each wave decodes, scales, and encodes its GOPs in parallel, returns its frames to `FramePool`, and hands encoded packets to the muxer before the next wave starts. Single-frame extraction (`extract --at`) seeks directly to the target GOP and decodes only that GOP.
 
 ## Pixel stages stay in L1
 

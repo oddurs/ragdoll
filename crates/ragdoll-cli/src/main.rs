@@ -282,6 +282,9 @@ fn cmd_probe(args: &[String]) -> Result<()> {
             s if (s == "-" || !s.starts_with('-')) && file_path.is_none() => {
                 file_path = Some(s.to_string())
             }
+            other if other != "-" && other.starts_with('-') => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
             _ => {}
         }
     }
@@ -425,13 +428,14 @@ fn cmd_remux(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--json" | "-j" => json = true,
-            "--faststart" => {}
             "--format" | "-f" if i + 1 < args.len() => {
                 i += 1;
                 format_override = Some(args[i].clone());
             }
             s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -577,11 +581,10 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
                 i += 1;
                 recipe_path = Some(args[i].clone());
             }
-            "--color" if i + 1 < args.len() => {
-                i += 1;
-            }
             s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -646,7 +649,9 @@ fn cmd_cut(args: &[String]) -> Result<()> {
                 opts.qp = args[i].parse::<u8>().unwrap_or(20).min(51);
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -695,7 +700,9 @@ fn cmd_concat(args: &[String]) -> Result<()> {
                 out_opt = Some(args[i].clone());
             }
             s if !s.starts_with('-') => inputs.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -761,7 +768,9 @@ fn cmd_package(args: &[String]) -> Result<()> {
                 opts.generate_thumbnails = false;
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -829,7 +838,9 @@ fn cmd_extract(args: &[String]) -> Result<()> {
                 }
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
         i += 1;
     }
@@ -857,7 +868,9 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "--json" | "-j" => json = true,
             s if !s.starts_with('-') => positional.push(s.to_string()),
-            _ => {}
+            other => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
         }
     }
     if positional.len() < 2 {
@@ -937,6 +950,9 @@ fn cmd_synth(args: &[String]) -> Result<()> {
                 duration = args[i].parse::<f64>().unwrap_or(2.0).max(0.05);
             }
             s if !s.starts_with('-') && out_path.is_none() => out_path = Some(s.to_string()),
+            other if other.starts_with('-') => {
+                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+            }
             _ => {}
         }
         i += 1;
@@ -3390,12 +3406,20 @@ mod tests {
         .unwrap();
         run_cli(&vec_args(&["probe", mp4_path.to_str().unwrap(), "--json"])).unwrap();
 
-        // 3. remux MP4 -> MKV and MP4 -> MPEG-TS
+        // 3. remux MP4 -> MKV and MP4 -> MPEG-TS (and verify unknown options are rejected)
+        assert!(
+            run_cli(&vec_args(&[
+                "remux",
+                mp4_path.to_str().unwrap(),
+                mkv_path.to_str().unwrap(),
+                "--faststart",
+            ]))
+            .is_err()
+        );
         run_cli(&vec_args(&[
             "remux",
             mp4_path.to_str().unwrap(),
             mkv_path.to_str().unwrap(),
-            "--faststart",
         ]))
         .unwrap();
         assert!(mkv_path.exists());

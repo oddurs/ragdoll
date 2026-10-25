@@ -12,10 +12,55 @@ pub fn sad_plane_u8(
     {
         unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { sad_plane_u8_avx2(a, a_stride, b, b_stride, width, height) }
+        } else {
+            sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_plane_u8_avx2(
+    a: &[u8],
+    a_stride: usize,
+    b: &[u8],
+    b_stride: usize,
+    width: usize,
+    height: usize,
+) -> u64 {
+    use std::arch::x86_64::*;
+    let mut total = 0u64;
+    for y in 0..height {
+        let row_a = &a[y * a_stride..y * a_stride + width];
+        let row_b = &b[y * b_stride..y * b_stride + width];
+        let pa = row_a.as_ptr();
+        let pb = row_b.as_ptr();
+        let mut x = 0usize;
+        let mut acc = _mm256_setzero_si256();
+        while x + 32 <= width {
+            let va = unsafe { _mm256_loadu_si256(pa.add(x) as *const __m256i) };
+            let vb = unsafe { _mm256_loadu_si256(pb.add(x) as *const __m256i) };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(va, vb));
+            x += 32;
+        }
+        let mut lanes = [0u64; 4];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc) };
+        let mut row_sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+        while x < width {
+            row_sum += row_a[x].abs_diff(row_b[x]) as u64;
+            x += 1;
+        }
+        total += row_sum;
+    }
+    total
 }
 
 pub fn sad_plane_u8_scalar(
@@ -128,10 +173,61 @@ pub fn sse_plane_u8(
     {
         unsafe { sse_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { sse_plane_u8_avx2(a, a_stride, b, b_stride, width, height) }
+        } else {
+            sse_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         sse_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sse_plane_u8_avx2(
+    a: &[u8],
+    a_stride: usize,
+    b: &[u8],
+    b_stride: usize,
+    width: usize,
+    height: usize,
+) -> u64 {
+    use std::arch::x86_64::*;
+    let mut total = 0u64;
+    let v_zero = _mm256_setzero_si256();
+    for y in 0..height {
+        let row_a = &a[y * a_stride..y * a_stride + width];
+        let row_b = &b[y * b_stride..y * b_stride + width];
+        let pa = row_a.as_ptr();
+        let pb = row_b.as_ptr();
+        let mut x = 0usize;
+        let mut acc = _mm256_setzero_si256();
+        while x + 32 <= width {
+            let va = unsafe { _mm256_loadu_si256(pa.add(x) as *const __m256i) };
+            let vb = unsafe { _mm256_loadu_si256(pb.add(x) as *const __m256i) };
+            let ad = _mm256_or_si256(_mm256_subs_epu8(va, vb), _mm256_subs_epu8(vb, va));
+            let lo = _mm256_unpacklo_epi8(ad, v_zero);
+            let hi = _mm256_unpackhi_epi8(ad, v_zero);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(lo, lo));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(hi, hi));
+            x += 32;
+        }
+        let mut lanes = [0u32; 8];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc) };
+        let mut row_sse: u64 = lanes.iter().map(|&v| v as u64).sum();
+        while x < width {
+            let d = row_a[x].abs_diff(row_b[x]) as u64;
+            row_sse += d * d;
+            x += 1;
+        }
+        total += row_sse;
+    }
+    total
 }
 
 pub fn sse_plane_u8_scalar(
@@ -348,9 +444,82 @@ pub fn ssim_4x4xn_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, sums:
     {
         unsafe { ssim_4x4xn_u8_neon(a, a_stride, b, b_stride, sums) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { ssim_4x4xn_u8_avx2(a, a_stride, b, b_stride, sums) }
+        } else {
+            ssim_4x4xn_u8_scalar(a, a_stride, b, b_stride, sums)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         ssim_4x4xn_u8_scalar(a, a_stride, b, b_stride, sums)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn ssim_4x4xn_u8_avx2(
+    a: &[u8],
+    a_stride: usize,
+    b: &[u8],
+    b_stride: usize,
+    sums: &mut [[i32; 4]],
+) {
+    use std::arch::x86_64::*;
+    let n = sums.len();
+    let mut blk = 0usize;
+    let v_ones = _mm256_set1_epi16(1);
+    while blk + 4 <= n {
+        let x0 = blk * 4;
+        let mut sa = _mm256_setzero_si256();
+        let mut sb = _mm256_setzero_si256();
+        let mut ss = _mm256_setzero_si256();
+        let mut sab = _mm256_setzero_si256();
+        for y in 0..4 {
+            let va128 =
+                unsafe { _mm_loadu_si128(a.as_ptr().add(y * a_stride + x0) as *const __m128i) };
+            let vb128 =
+                unsafe { _mm_loadu_si128(b.as_ptr().add(y * b_stride + x0) as *const __m128i) };
+            let va = _mm256_cvtepu8_epi16(va128);
+            let vb = _mm256_cvtepu8_epi16(vb128);
+            sa = _mm256_add_epi32(sa, _mm256_madd_epi16(va, v_ones));
+            sb = _mm256_add_epi32(sb, _mm256_madd_epi16(vb, v_ones));
+            ss = _mm256_add_epi32(
+                ss,
+                _mm256_add_epi32(_mm256_madd_epi16(va, va), _mm256_madd_epi16(vb, vb)),
+            );
+            sab = _mm256_add_epi32(sab, _mm256_madd_epi16(va, vb));
+        }
+        let mut la = [0i32; 8];
+        let mut lb = [0i32; 8];
+        let mut lss = [0i32; 8];
+        let mut lsab = [0i32; 8];
+        unsafe {
+            _mm256_storeu_si256(la.as_mut_ptr() as *mut __m256i, sa);
+            _mm256_storeu_si256(lb.as_mut_ptr() as *mut __m256i, sb);
+            _mm256_storeu_si256(lss.as_mut_ptr() as *mut __m256i, ss);
+            _mm256_storeu_si256(lsab.as_mut_ptr() as *mut __m256i, sab);
+        }
+        for k in 0..4 {
+            sums[blk + k] = [
+                la[k * 2] + la[k * 2 + 1],
+                lb[k * 2] + lb[k * 2 + 1],
+                lss[k * 2] + lss[k * 2 + 1],
+                lsab[k * 2] + lsab[k * 2 + 1],
+            ];
+        }
+        blk += 4;
+    }
+    if blk < n {
+        ssim_4x4xn_u8_scalar(
+            &a[blk * 4..],
+            a_stride,
+            &b[blk * 4..],
+            b_stride,
+            &mut sums[blk..],
+        );
     }
 }
 

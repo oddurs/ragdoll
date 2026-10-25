@@ -679,22 +679,73 @@ pub fn execute_recipe(recipe: &PipelineRecipe) -> Result<PipelineTelemetry> {
     let mut total_bytes_out = 0u64;
     let mut last_tel = PipelineTelemetry::default();
 
+    let trimmed_tmp = if recipe.start_time.is_some() || recipe.duration.is_some() {
+        let from_s = recipe
+            .start_time
+            .as_deref()
+            .and_then(|s| parse_time_seconds(s).ok());
+        let dur_s = recipe
+            .duration
+            .as_deref()
+            .and_then(|s| parse_time_seconds(s).ok());
+        let to_s = match (from_s, dur_s) {
+            (Some(f), Some(d)) => Some(f + d),
+            (None, Some(d)) => Some(d),
+            _ => None,
+        };
+        let tmp_p = std::env::temp_dir().join(format!(
+            "ragdoll_recipe_cut_{}_{}.mp4",
+            std::process::id(),
+            t0.elapsed().as_nanos()
+        ));
+        let _ = cut_media(
+            &recipe.input_path,
+            &tmp_p,
+            &CutOptions {
+                from_sec: from_s,
+                to_sec: to_s,
+                keyframes_only: false,
+                qp: recipe.qp,
+            },
+        )?;
+        Some(tmp_p)
+    } else {
+        None
+    };
+    let effective_input = trimmed_tmp
+        .as_ref()
+        .map_or(recipe.input_path.as_str(), |p| {
+            p.to_str().unwrap_or(&recipe.input_path)
+        });
+
     for out in &recipe.outputs {
-        let tel = if recipe.video_codec == "copy" && recipe.width.is_none() {
-            remux_file(&recipe.input_path, &out.path)?
+        let tel = if recipe.video_codec == "copy"
+            && recipe.width.is_none()
+            && recipe.sample_rate.is_none()
+        {
+            remux_file(effective_input, &out.path)?
         } else {
-            transcode_file(
-                &recipe.input_path,
-                &out.path,
-                recipe.width.zip(recipe.height),
-                recipe.scale_filter,
-                &recipe.video_codec,
-                recipe.qp,
-                recipe.threads,
-            )?
+            let mut opts = TranscodeOptions {
+                scale_dims: recipe.width.zip(recipe.height),
+                scale_filter: recipe.scale_filter,
+                video_codec: recipe.video_codec.clone(),
+                qp: recipe.qp,
+                threads: recipe.threads,
+                ..TranscodeOptions::default()
+            };
+            if !recipe.audio_codec.is_empty() && recipe.audio_codec != "flac" {
+                opts.audio_codec = recipe.audio_codec.clone();
+            }
+            if let Some(sr) = recipe.sample_rate {
+                opts.sample_rate = Some(sr);
+            }
+            transcode_file_with_options(effective_input, &out.path, &opts)?
         };
         total_bytes_out += tel.bytes_out;
         last_tel = tel;
+    }
+    if let Some(ref tmp_p) = trimmed_tmp {
+        let _ = std::fs::remove_file(tmp_p);
     }
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2525,6 +2576,64 @@ pub fn transcode_file_with_options(
     })
 }
 
+/// Decodes only the single GOP containing `target_sec` when the input is an MP4 container (`0054`).
+fn decode_single_frame_at_mp4(in_p: &Path, target_sec: f64) -> Option<(VideoFrame, Rational64)> {
+    let mmap = MmapSource::open(in_p).ok()?;
+    let data = mmap.as_slice();
+    if detect_container_format(data)? != ContainerFormat::Mp4 {
+        return None;
+    }
+    let demux = Mp4Demuxer::open(data).ok()?;
+    let v_track = demux
+        .tracks()
+        .iter()
+        .find(|t| t.info.track_type == TrackType::Video)?;
+    if v_track.info.codec_id != CodecId::H264 || v_track.samples.is_empty() {
+        return None;
+    }
+    let fps = v_track
+        .info
+        .video
+        .as_ref()
+        .map_or(Rational64::FPS_30, |v| v.frame_rate);
+    let target_idx = ((target_sec.max(0.0) * fps.as_f64()).round() as usize)
+        .min(v_track.samples.len().saturating_sub(1));
+    let gops = partition_into_gops(&v_track.samples);
+    let gop = gops
+        .iter()
+        .find(|g| target_idx >= g.start && target_idx < g.end)?;
+
+    let mut dec = H264Decoder::new();
+    if v_track.info.extra_data.len() >= 8 {
+        let hdr = avcc_config_to_annex_b(&v_track.info.extra_data);
+        let _ = dec.set_extradata(&hdr);
+    }
+    let mut gop_frames = Vec::with_capacity(gop.len());
+    for s_idx in gop.clone() {
+        let s = &v_track.samples[s_idx];
+        let end = (s.offset as usize).saturating_add(s.size as usize);
+        if end > data.len() {
+            return None;
+        }
+        let payload = &data[s.offset as usize..end];
+        let annex_b = h264_avcc_to_annex_b_au(&v_track.info.extra_data, payload, s.is_keyframe());
+        if let Ok(Some(f)) = dec.decode_annex_b_packet(&annex_b) {
+            gop_frames.push(f);
+        }
+    }
+    if gop_frames.is_empty() {
+        return None;
+    }
+    if !gop_frames
+        .windows(2)
+        .all(|w| w[0].pts.ticks <= w[1].pts.ticks)
+    {
+        gop_frames.sort_by_key(|f| f.pts.ticks);
+    }
+    let local_idx = (target_idx - gop.start).min(gop_frames.len() - 1);
+    Some((gop_frames.swap_remove(local_idx), fps))
+}
+
 /// Extracts either a single frame at `at_sec` or an `N`-thumbnail contact sheet (`cols x rows`) to `.ppm` or `.y4m`.
 pub fn extract_media(
     input_path: impl AsRef<Path>,
@@ -2536,12 +2645,6 @@ pub fn extract_media(
     let in_p = input_path.as_ref();
     let out_p = output_path.as_ref();
     let bytes_in = std::fs::metadata(in_p).map_or(0, |m| m.len());
-    let (frames, fps) = decode_video_file(in_p)?;
-    if frames.is_empty() {
-        return Err(RagdollError::InvalidData(
-            "no video frames to extract".into(),
-        ));
-    }
 
     let out_ext = out_p
         .extension()
@@ -2549,35 +2652,54 @@ pub fn extract_media(
         .unwrap_or("ppm")
         .to_ascii_lowercase();
 
-    let (out_rgb_or_yuv, extracted_count) = if let Some((count, cols, rows)) = thumbnails {
-        let count = count.max(1);
-        let thumb_w = (frames[0].width / cols.max(1)).max(64) & !1;
-        let thumb_h = (frames[0].height / rows.max(1)).max(36) & !1;
-        let mut selected = Vec::with_capacity(count);
-        for i in 0..count {
-            let idx = (i * frames.len() / count).min(frames.len() - 1);
-            selected.push(frames[idx].clone());
-        }
-        let scaled = parallel_scale_frames(&selected, thumb_w, thumb_h, ScaleFilter::Lanczos3, 0)?;
-        let rgb_thumbs: Vec<VideoFrame> = scaled
-            .iter()
-            .map(|f| convert_frame(f, PixelFormat::Rgb24, f.colorimetry))
-            .collect();
-        let thumb_refs: Vec<&VideoFrame> = rgb_thumbs.iter().collect();
-        let sheet = compose_contact_sheet_rgb24(&thumb_refs, cols.max(1), 4, [18, 18, 22])?;
-        (sheet, count)
-    } else {
-        let fps_val = fps.as_f64();
-        let target_idx = at_sec
-            .map(|s| ((s * fps_val).round() as usize).min(frames.len() - 1))
-            .unwrap_or(0);
-        let chosen = &frames[target_idx];
+    let (out_rgb_or_yuv, extracted_count, fps) = if thumbnails.is_none()
+        && let Some((single_frame, mp4_fps)) =
+            decode_single_frame_at_mp4(in_p, at_sec.unwrap_or(0.0))
+    {
         let out_frame = if out_ext == "y4m" {
-            chosen.clone()
+            single_frame
         } else {
-            convert_frame(chosen, PixelFormat::Rgb24, chosen.colorimetry)
+            convert_frame(&single_frame, PixelFormat::Rgb24, single_frame.colorimetry)
         };
-        (out_frame, 1)
+        (out_frame, 1, mp4_fps)
+    } else {
+        let (frames, fps) = decode_video_file(in_p)?;
+        if frames.is_empty() {
+            return Err(RagdollError::InvalidData(
+                "no video frames to extract".into(),
+            ));
+        }
+        if let Some((count, cols, rows)) = thumbnails {
+            let count = count.max(1);
+            let thumb_w = (frames[0].width / cols.max(1)).max(64) & !1;
+            let thumb_h = (frames[0].height / rows.max(1)).max(36) & !1;
+            let mut selected = Vec::with_capacity(count);
+            for i in 0..count {
+                let idx = (i * frames.len() / count).min(frames.len() - 1);
+                selected.push(frames[idx].clone());
+            }
+            let scaled =
+                parallel_scale_frames(&selected, thumb_w, thumb_h, ScaleFilter::Lanczos3, 0)?;
+            let rgb_thumbs: Vec<VideoFrame> = scaled
+                .iter()
+                .map(|f| convert_frame(f, PixelFormat::Rgb24, f.colorimetry))
+                .collect();
+            let thumb_refs: Vec<&VideoFrame> = rgb_thumbs.iter().collect();
+            let sheet = compose_contact_sheet_rgb24(&thumb_refs, cols.max(1), 4, [18, 18, 22])?;
+            (sheet, count, fps)
+        } else {
+            let fps_val = fps.as_f64();
+            let target_idx = at_sec
+                .map(|s| ((s * fps_val).round() as usize).min(frames.len() - 1))
+                .unwrap_or(0);
+            let chosen = &frames[target_idx];
+            let out_frame = if out_ext == "y4m" {
+                chosen.clone()
+            } else {
+                convert_frame(chosen, PixelFormat::Rgb24, chosen.colorimetry)
+            };
+            (out_frame, 1, fps)
+        }
     };
 
     let bytes_out = if out_ext == "y4m" {
@@ -2661,15 +2783,23 @@ pub fn evaluate_media_metrics(
         ));
     }
 
-    let indices: Vec<usize> = (0..count).collect();
-    let reports: Vec<QualityReport> = parallel_gop_map(&indices, 0, |_, &i| {
-        let prev = if i > 0 {
-            Some(&ref_frames[i - 1])
-        } else {
-            None
-        };
-        evaluate_frame_quality(&ref_frames[i], &dist_frames[i], prev)
-    });
+    const METRICS_WAVE: usize = 30;
+    let mut reports = Vec::with_capacity(count);
+    let mut wave_start = 0usize;
+    while wave_start < count {
+        let wave_end = (wave_start + METRICS_WAVE).min(count);
+        let indices: Vec<usize> = (wave_start..wave_end).collect();
+        let wave_reports: Vec<QualityReport> = parallel_gop_map(&indices, 0, |_, &i| {
+            let prev = if i > 0 {
+                Some(&ref_frames[i - 1])
+            } else {
+                None
+            };
+            evaluate_frame_quality(&ref_frames[i], &dist_frames[i], prev)
+        });
+        reports.extend(wave_reports);
+        wave_start = wave_end;
+    }
 
     let inv = 1.0 / (count as f64);
     let avg = QualityReport {

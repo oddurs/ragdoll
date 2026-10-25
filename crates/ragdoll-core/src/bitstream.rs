@@ -658,6 +658,56 @@ pub fn unescape_rbsp_into(src: &[u8], dst: &mut Vec<u8>) {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            #[target_feature(enable = "avx2")]
+            unsafe fn unescape_rbsp_avx2(
+                src: &[u8],
+                dst: &mut Vec<u8>,
+                i: &mut usize,
+                zeros: &mut usize,
+            ) {
+                use std::arch::x86_64::*;
+                let len = src.len();
+                let v_zero = _mm256_setzero_si256();
+                while *i + 32 <= len {
+                    if *zeros == 0 || (*zeros == 1 && src[*i] != 0) {
+                        let chunk =
+                            unsafe { _mm256_loadu_si256(src.as_ptr().add(*i) as *const __m256i) };
+                        let eq_zero = _mm256_cmpeq_epi8(chunk, v_zero);
+                        let zmask = _mm256_movemask_epi8(eq_zero) as u32;
+                        if (zmask & (zmask >> 1)) == 0 {
+                            dst.extend_from_slice(&src[*i..*i + 32]);
+                            *zeros = usize::from(src[*i + 31] == 0);
+                            *i += 32;
+                            continue;
+                        }
+                    }
+                    let block_end = *i + 32;
+                    while *i < block_end {
+                        let b = src[*i];
+                        if *zeros >= 2 && b == 0x03 {
+                            *zeros = 0;
+                            *i += 1;
+                            continue;
+                        }
+                        dst.push(b);
+                        if b == 0x00 {
+                            *zeros += 1;
+                        } else {
+                            *zeros = 0;
+                        }
+                        *i += 1;
+                    }
+                }
+            }
+            unsafe {
+                unescape_rbsp_avx2(src, dst, &mut i, &mut zeros);
+            }
+        }
+    }
+
     while i < len {
         let b = src[i];
         if zeros >= 2 && b == 0x03 {

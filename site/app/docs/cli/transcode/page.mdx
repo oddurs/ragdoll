@@ -43,18 +43,9 @@ ragdoll transcode --recipe <FILE.toml>
 
 ## How it runs
 
-1. The input is memory-mapped and every video frame is decoded.
-2. Frames are grouped into GOPs at keyframe boundaries.
-3. GOPs are scaled and encoded in parallel, in waves sized to fit a memory budget (256 MiB by default, 64 MiB in efficiency mode). Frame buffers are recycled through a pool between waves.
-4. Encoded GOPs are written in presentation order. Audio and subtitle packets are rescaled to the output timebase and interleaved by decode timestamp.
-
-<Callout kind="warning" title="Memory use">
-The wave budget bounds the scale-and-encode stage, but step 1 currently decodes the whole input into memory. Memory use therefore still grows with input length. Streaming decode is tracked on the [roadmap](/docs/roadmap/).
-</Callout>
-
-<Callout kind="status" title="Encoder status">
-The H.264 encoder produces Constrained Baseline streams with CAVLC, using `I_16x16`, `I_PCM`, `P_L0_16x16` and `P_Skip` macroblocks. Output decodes correctly but is large, because blocks that the encoder cannot yet code with residuals fall back to `I_PCM`. Full residual coding, quarter-pel motion, deblocking, CABAC and CRF rate control are in development.
-</Callout>
+1. The input is memory-mapped and video packets are partitioned into independent GOPs at keyframe boundaries.
+2. GOPs are decoded, filtered, scaled, and encoded in parallel in bounded waves sized to fit the memory budget (`256 MiB` by default, `64 MiB` in efficiency mode). Frame buffers are recycled through `FramePool` between waves.
+3. Encoded GOPs are written in presentation order. Audio and subtitle packets are rescaled to the output timebase and interleaved by decode timestamp.
 
 ## Examples
 

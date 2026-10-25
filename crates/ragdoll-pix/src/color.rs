@@ -168,12 +168,83 @@ pub fn yuv420p_to_rgb24(
             );
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                yuv420p_to_rgb24_avx2(
+                    y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride,
+                    width, height, mat,
+                );
+            }
+        } else {
+            yuv420p_to_rgb24_scalar(
+                y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride,
+                width, height, mat,
+            );
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         yuv420p_to_rgb24_scalar(
             y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride, width,
             height, mat,
         );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn yuv420p_to_rgb24_avx2(
+    y_plane: &[u8],
+    y_stride: usize,
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    rgb_dst: &mut [u8],
+    rgb_stride: usize,
+    width: usize,
+    height: usize,
+    mat: &YuvRgbMatrix,
+) {
+    use std::arch::x86_64::*;
+    let v_y_off = _mm256_set1_epi32(mat.y_offset);
+    let v_y_c = _mm256_set1_epi32(mat.y_coeff);
+    let v_bias = _mm256_set1_epi32(Q14_HALF);
+    for y in 0..height {
+        let y_row = &y_plane[y * y_stride..y * y_stride + width];
+        let cy = y >> 1;
+        let u_row = &u_plane[cy * u_stride..];
+        let v_row = &v_plane[cy * v_stride..];
+        let dst_row = &mut rgb_dst[y * rgb_stride..y * rgb_stride + width * 3];
+        let mut x = 0usize;
+        while x + 8 <= width {
+            let y8 = unsafe { _mm_loadl_epi64(y_row.as_ptr().add(x) as *const __m128i) };
+            let y32 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(y8), v_y_off);
+            let y_base = _mm256_add_epi32(_mm256_mullo_epi32(y32, v_y_c), v_bias);
+            let mut yb = [0i32; 8];
+            unsafe { _mm256_storeu_si256(yb.as_mut_ptr() as *mut __m256i, y_base) };
+            for k in 0..8 {
+                let px = x + k;
+                let u_adj = (u_row[px >> 1] as i32) - 128;
+                let v_adj = (v_row[px >> 1] as i32) - 128;
+                let d = px * 3;
+                dst_row[d] = clamp_u8((yb[k] + v_adj * mat.v_to_r) >> 14);
+                dst_row[d + 1] = clamp_u8((yb[k] + u_adj * mat.u_to_g + v_adj * mat.v_to_g) >> 14);
+                dst_row[d + 2] = clamp_u8((yb[k] + u_adj * mat.u_to_b) >> 14);
+            }
+            x += 8;
+        }
+        while x < width {
+            let (r, g, b) = mat.yuv_to_rgb_pixel(y_row[x], u_row[x >> 1], v_row[x >> 1]);
+            let d = x * 3;
+            dst_row[d] = r;
+            dst_row[d + 1] = g;
+            dst_row[d + 2] = b;
+            x += 1;
+        }
     }
 }
 

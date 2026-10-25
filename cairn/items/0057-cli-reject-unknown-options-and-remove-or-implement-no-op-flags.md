@@ -3,10 +3,12 @@ id: 57
 uid: 5bc84baf-5622-42dd-9749-86cf818f6634
 title: 'CLI: reject unknown options and remove or implement no-op flags'
 type: chore
-status: backlog
+status: done
 milestone: m10-production-v1
+assignee: Oddur Sigurdsson
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p2
 effort: s
 area: cli
@@ -18,6 +20,6 @@ The hand-rolled argument parser in `ragdoll-cli` silently ignores unknown option
 
 ## Acceptance criteria
 
-- [ ] Unknown options produce `error: unknown option` and exit status 1.
-- [ ] Every documented flag and recipe key either has an effect or is removed.
-- [ ] Docs pages for remux, transcode and recipes updated to match.
+- [x] Unknown options produce `error: unknown option` and exit status 1.
+- [x] Every documented flag and recipe key either has an effect or is removed.
+- [x] Docs pages for remux, transcode and recipes updated to match.
