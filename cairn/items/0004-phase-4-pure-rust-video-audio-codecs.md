@@ -4,9 +4,10 @@ uid: b887f676-9c47-47df-8f40-f5d3d825fc90
 key: m4-codec
 title: Phase 4 — Pure-Rust Video & Audio Codecs
 type: milestone
-status: planned
+status: done
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-video
 ---
@@ -16,3 +17,7 @@ Build 100% pure-Rust, zero-FFI video and audio codecs from scratch: H.264/AVC (N
 ## Release gate
 
 Video and audio codecs encode and decode bitstreams in pure Rust with zero unsafe memory bugs, full FLAC CRC verification, and clean FFmpeg cross-compatibility.
+
+## Result
+
+Delivered 100% pure-Rust FLAC lossless audio codec, vectorized NEON PCM engine, H.264/AVC SPS/PPS/Slice/SEI/CAVLC/4x4-DCT Baseline codec, AV1 OBU inspector, and Ragdoll Fast-Intra (RGDI) 1000+ fps 4K studio codec.

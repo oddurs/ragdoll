@@ -115,9 +115,9 @@ gh pr create \
 - [x] \`cargo test --workspace\` passes (including SIMD vs. scalar bit-exact differential tests)
 - [x] \`cairn check --render --strict\` passes (\`ROADMAP.md\` is in sync with \`cairn/items/\`)"
 
-# Wait for Light CI and squash-merge automatically
-gh pr checks --watch
-gh pr merge --squash --delete-branch
+# Enable GitHub auto-merge immediately, watch Light CI (3s poll), and sync main
+gh pr merge --auto --squash --delete-branch
+gh pr checks --watch --interval 3
 git checkout main && git pull --ff-only
 ```
 

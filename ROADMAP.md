@@ -64,15 +64,15 @@ Implement zero-copy demuxing over memory-mapped files (`PacketSlice<'mmap>`) and
 
 ## m4-codec — Phase 4 — Pure-Rust Video & Audio Codecs
 
-`··········` 0% · 0 of 3 done
+`##########` 100% · 3 of 3 done
 
 Build 100% pure-Rust, zero-FFI video and audio codecs from scratch: H.264/AVC (NAL Annex-B/AVCC SIMD framing, SPS/PPS/Slice headers, CAVLC entropy coding, 4x4 integer DCT/Hadamard transforms, intra/inter prediction), AV1 OBU parser/packetizer, Ragdoll Fast-Intra studio codec, pure-Rust FLAC encoder/decoder (LPC + Levinson-Durbin + SIMD Rice coding), and vectorized PCM.
 
-### up next
+### shipped
 
-- [ ] `0018` Pure-Rust FLAC Lossless Audio Decoder, LPC / Rice Encoder & Vectorized PCM Engine <sup>feature · p0 · codec-audio</sup>
-- [ ] `0019` Pure-Rust H.264 / AVC NAL Engine, SPS/PPS/Slice Parser, 4x4 Integer DCT/Hadamard & Frame Codec <sup>feature · p0 · codec-video</sup>
-- [ ] `0020` AV1 OBU Bitstream Inspector/Packetizer & Ragdoll Fast-Intra (RGDI) SIMD Studio Codec <sup>feature · p1 · codec-video</sup>
+- [x] `0018` Pure-Rust FLAC Lossless Audio Decoder, LPC / Rice Encoder & Vectorized PCM Engine <sup>feature · p0 · codec-audio</sup>
+- [x] `0019` Pure-Rust H.264 / AVC NAL Engine, SPS/PPS/Slice Parser, 4x4 Integer DCT/Hadamard & Frame Codec <sup>feature · p0 · codec-video</sup>
+- [x] `0020` AV1 OBU Bitstream Inspector/Packetizer & Ragdoll Fast-Intra (RGDI) SIMD Studio Codec <sup>feature · p1 · codec-video</sup>
 
 ## m5-cli-bench — Phase 5 — GOP-Parallel Pipeline, Modern CLI & Marketing Benchmark Suite
 
