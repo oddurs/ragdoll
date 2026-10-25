@@ -3,13 +3,15 @@ id: 18
 uid: 08461f63-4769-46c7-b707-d7a2f7c82a7b
 title: Pure-Rust FLAC Lossless Audio Decoder, LPC / Rice Encoder & Vectorized PCM Engine
 type: feature
-status: planned
+status: done
 milestone: m4-codec
+assignee: Oddur Sigurdsson
 depends_on:
 - 10
 - 11
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-audio
 effort: l
@@ -33,5 +35,9 @@ Audio transcoding between uncompressed PCM (`WAV`) and lossless `FLAC` requires 
 
 ## Acceptance criteria
 
-- [ ] Pure-Rust FLAC encoder and decoder round-trip 16-bit and 24-bit audio bit-identically (0 LSB error) with valid CRC-8 and CRC-16 checksums.
-- [ ] `.flac` files encoded by Ragdoll decode bit-identically in `ffmpeg`, and `.flac` files encoded by `ffmpeg` decode bit-identically in Ragdoll.
+- [x] Pure-Rust FLAC encoder and decoder round-trip 16-bit and 24-bit audio bit-identically (0 LSB error) with valid CRC-8 and CRC-16 checksums.
+- [x] `.flac` files encoded by Ragdoll decode bit-identically in `ffmpeg`, and `.flac` files encoded by `ffmpeg` decode bit-identically in Ragdoll.
+
+## 2026-10-25
+
+Implemented pure-Rust FLAC decoder & encoder (STREAMINFO, Constant/Verbatim/Fixed 0..=4/FIR LPC 1..=32 subframes, wasted_bits, Rice/Rice2 partitions, Left-Side/Right-Side/Mid-Side stereo decorrelation, CRC-8 + CRC-16) and NEON vectorized PCM conversion/interleaving. Verified 16-bit & 24-bit 0-LSB roundtrip and bidirectional ffmpeg interop.

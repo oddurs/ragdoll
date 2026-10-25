@@ -3,14 +3,16 @@ id: 19
 uid: 9c8e910e-2e5f-4f71-b478-989e7bb140c6
 title: Pure-Rust H.264 / AVC NAL Engine, SPS/PPS/Slice Parser, 4x4 Integer DCT/Hadamard & Frame Codec
 type: feature
-status: planned
+status: done
 milestone: m4-codec
+assignee: Oddur Sigurdsson
 depends_on:
 - 10
 - 11
 - 12
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: codec-video
 effort: xl
@@ -29,5 +31,9 @@ H.264 (ITU-T H.264 / ISO/IEC 14496-10 AVC) is the most ubiquitous video codec on
 
 ## Acceptance criteria
 
-- [ ] Parses H.264 SPS, PPS, and Slice headers from real-world and FFmpeg-generated MP4/MKV/TS streams with exact resolution, FPS, profile, and colorimetry extraction.
-- [ ] Encodes and decodes valid H.264/AVC video frames in 100% pure Rust that play cleanly in `ffmpeg` / `ffprobe` and decode back in Ragdoll.
+- [x] Parses H.264 SPS, PPS, and Slice headers from real-world and FFmpeg-generated MP4/MKV/TS streams with exact resolution, FPS, profile, and colorimetry extraction.
+- [x] Encodes and decodes valid H.264/AVC video frames in 100% pure Rust that play cleanly in `ffmpeg` / `ffprobe` and decode back in Ragdoll.
+
+## 2026-10-25
+
+Implemented pure-Rust H.264/AVC SPS/PPS/SliceHeader/SEI RBSP parser & serializer, 4x4 DCT/IDCT, 4x4 Luma DC & 2x2 Chroma DC Hadamard, QP 0..=51 scaling tables, CAVLC 4-table nC entropy coder, Intra 16x16 & Chroma 8x8 predictors, and Baseline encoder/decoder (I_16x16, I_PCM, P_Skip) verified against ffmpeg and libx264.
