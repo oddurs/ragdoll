@@ -20,4 +20,4 @@ All foundational primitives in `ragdoll-core` and `ragdoll-simd` compile cleanly
 
 ## Result
 
-Completed Milestone 1 (M1 — Foundation, Memory & SIMD Runtime), production-caliber reference hardening (`SIMD-0024`), and public repository & brand identity setup (`0025`) across all 7 workspace crates.
+M1 Foundation & SIMD Architecture complete, reference-hardened against FFmpeg 9.0.2, published to GitHub with custom SVG branding, and equipped with an agent-friendly Git PR + Light CI workflow.
