@@ -360,11 +360,11 @@ impl<'a> OpusRangeDecoder<'a> {
         let sym = ft - 1 - s;
         let fl = sym;
         let fh = sym + 1;
-        self.val -= r * (ft - fh);
+        self.val = self.val.saturating_sub(r * (ft - fh));
         if fl > 0 {
             self.rng = r * (fh - fl);
         } else {
-            self.rng -= r * (ft - fh);
+            self.rng = self.rng.saturating_sub(r * (ft - fh));
         }
         self.normalize();
         sym
@@ -377,8 +377,8 @@ impl<'a> OpusRangeDecoder<'a> {
         if bit {
             self.rng = r;
         } else {
-            self.val -= r;
-            self.rng -= r;
+            self.val = self.val.saturating_sub(r);
+            self.rng = self.rng.saturating_sub(r);
         }
         self.normalize();
         bit

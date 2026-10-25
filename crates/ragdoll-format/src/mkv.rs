@@ -206,6 +206,7 @@ impl<'a> MkvDemuxer<'a> {
             ));
         }
 
+        timestamp_scale_ns = timestamp_scale_ns.clamp(1, 1_000_000_000);
         let seg_timebase = Rational64::new(timestamp_scale_ns as i64, 1_000_000_000);
         let seg_dur_ticks = duration_float.map(|d| d.round() as i64);
         let mut default_durations_ticks = Vec::with_capacity(tracks.len());

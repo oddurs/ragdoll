@@ -357,7 +357,15 @@ impl DeflateHuffmanTable {
             code |= br.read_bits(1)? as i32;
             let count = self.counts[len] as i32;
             if code - count < first {
-                return Ok(self.symbols[(index + (code - first)) as usize]);
+                let sym_idx = index.saturating_add(code - first);
+                if sym_idx >= 0
+                    && let Some(&sym) = self.symbols.get(sym_idx as usize)
+                {
+                    return Ok(sym);
+                }
+                return Err(RagdollError::InvalidData(
+                    "DEFLATE Huffman symbol index out of bounds".into(),
+                ));
             }
             index += count;
             first += count;
@@ -775,7 +783,13 @@ pub fn read_png_image(data: &[u8]) -> Result<VideoFrame> {
                 let bit_depth = body[8];
                 color_type = body[9];
                 let interlace = body[12];
-                if width == 0 || height == 0 || bit_depth != 8 || interlace != 0 {
+                if width == 0
+                    || height == 0
+                    || width > 16384
+                    || height > 16384
+                    || bit_depth != 8
+                    || interlace != 0
+                {
                     return Err(RagdollError::Unsupported(format!(
                         "PNG IHDR unsupported parameters: {width}x{height} depth={bit_depth} interlace={interlace}"
                     )));

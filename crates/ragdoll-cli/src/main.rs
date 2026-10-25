@@ -18,33 +18,35 @@ use std::process::Command;
 use std::time::Instant;
 
 use ragdoll_codec::{
-    FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, H264Profile, RateControlMode,
+    AacEncoder, EbuR128Meter, FlacDecoder, FlacEncoder, H264Decoder, H264Encoder, H264Profile,
+    PolyphaseResampler, RateControlMode, normalize_audio_frame, resample_and_rematrix_frame,
 };
 use ragdoll_core::{
-    AudioFrame, BitReader, BitWriter, CodecId, ColorRange, Colorimetry, CpuTopology, FramePool,
-    HardwareMetrics, MatrixCoefficients, PacketFlags, PacketSlice, PixelFormat, Plane, PowerMode,
-    ProcessRusageSnapshot, RagdollError, Rational64, Result, SampleFormat, Timestamp, TrackInfo,
-    TrackType, VideoFrame, VideoTrackParams, crc16_flac, crc32_mpeg2, escape_rbsp,
-    measure_hardware_metrics, optimal_plane_stride, parse_macos_time_l_stderr,
-    set_global_power_mode, unescape_rbsp, unescape_rbsp_scalar, with_power_mode,
+    AudioFrame, AudioTrackParams, BitReader, BitWriter, ChannelLayout, CodecId, ColorRange,
+    Colorimetry, CpuTopology, FramePool, HardwareMetrics, MatrixCoefficients, PacketFlags,
+    PacketSlice, PixelFormat, Plane, PowerMode, ProcessRusageSnapshot, RagdollError, Rational64,
+    Result, SampleFormat, Timestamp, TrackInfo, TrackType, VideoFrame, VideoTrackParams,
+    crc16_flac, crc32_mpeg2, escape_rbsp, measure_hardware_metrics, optimal_plane_stride,
+    parse_macos_time_l_stderr, set_global_power_mode, unescape_rbsp, unescape_rbsp_scalar,
+    with_power_mode,
 };
 use ragdoll_format::{
-    MkvDemuxer, Mp4Demuxer, Mp4Muxer, Y4mMuxer, build_avcc_from_sps_pps, is_stdout_path,
-    transmux_mp4_to_mkv, transmux_mp4_to_mpegts,
+    MkvDemuxer, Mp4Demuxer, Mp4Muxer, WavMuxer, Y4mMuxer, build_avcc_from_sps_pps, is_stdout_path,
+    transmux_mp4_to_mkv, transmux_mp4_to_mpegts, write_png_image,
 };
 use ragdoll_pipeline::{
-    CutOptions, PackageOptions, PipelineRecipe, PipelineTelemetry, ProbeReport, RotationMode,
-    TranscodeOptions, concat_media, cut_media, evaluate_media_metrics, execute_recipe,
-    extract_media, package_abr, parallel_gop_map, parallel_scale_frames, parse_scale_filter,
-    probe_file_detailed, remux_file, remux_file_with_format, synth_media, synth_video_frame,
-    transcode_file, transcode_file_with_options,
+    CutOptions, GopRingPipeline, PackageOptions, PipelineRecipe, PipelineTelemetry, ProbeReport,
+    RotationMode, TranscodeOptions, concat_media, cut_media, evaluate_media_metrics,
+    execute_recipe, extract_media, package_abr, parallel_gop_map, parallel_scale_frames,
+    parse_scale_filter, probe_file_detailed, remux_file, remux_file_with_format, synth_media,
+    synth_video_frame, transcode_file, transcode_file_with_options,
 };
 use ragdoll_pix::{
     PolyphaseFilterBank, ScaleFilter, YuvRgbMatrix, dither_plane_u16le_to_u8_bayer,
     dither_plane_u16le_to_u8_bayer_scalar, evaluate_frame_quality, hscale_row_8tap_q14,
-    hscale_row_8tap_q14_scalar, nv12_to_rgb24, nv12_to_rgb24_scalar, rgb24_to_yuv420p,
-    rgb24_to_yuv420p_scalar, scale_plane, yuv420p_to_rgb24, yuv420p_to_rgb24_scalar,
-    yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
+    hscale_row_8tap_q14_scalar, nv12_to_rgb24, nv12_to_rgb24_scalar, overlay_rgba_onto_frame,
+    rgb24_to_yuv420p, rgb24_to_yuv420p_scalar, scale_plane, tonemap_hdr_to_sdr_oklab,
+    yuv420p_to_rgb24, yuv420p_to_rgb24_scalar, yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
 };
 use ragdoll_simd::{
     SimdLevel, find_annex_b_start_code, find_annex_b_start_code_scalar, flac_eval_fixed_orders_l1,
@@ -1674,7 +1676,552 @@ fn cmd_bench(args: &[String]) -> Result<()> {
         speedup_eff: metrics_speedup_eff,
     };
 
-    rows.extend([row2, row3, row4, row5, row6, row7]);
+    // -------------------------------------------------------------------------
+    // Workload 8: Smart-GOP Frame-Accurate Trim (`ragdoll cut` vs `ffmpeg` re-encode)
+    // -------------------------------------------------------------------------
+    let row8 = {
+        let cut_in_mp4 = tmp_dir.join("cut_src_640p.mp4");
+        let cut_rag_mp4 = tmp_dir.join("cut_rag.mp4");
+        let cut_ff_mp4 = tmp_dir.join("cut_ff.mp4");
+        synth_media(&cut_in_mp4, 640, 360, 30, 6.0)?;
+        let cut_opts = CutOptions {
+            from_sec: Some(0.25),
+            to_sec: Some(5.75),
+            keyframes_only: false,
+            qp: 22,
+        };
+        // Warm up page cache / inode allocation once so P-Core and E-Core measure identical steady-state work
+        let _ = cut_media(&cut_in_mp4, &cut_rag_mp4, &cut_opts)?;
+
+        let (_, cut_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| {
+                let _ = cut_media(&cut_in_mp4, &cut_rag_mp4, &cut_opts).unwrap();
+            })
+        });
+        let rag_cut_rate = 1000.0 / cut_perf_hw.wall_ms;
+
+        let (_, cut_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let _ = cut_media(&cut_in_mp4, &cut_rag_mp4, &cut_opts).unwrap();
+            })
+        });
+        let rag_cut_eff_rate = 1000.0 / cut_eff_hw.wall_ms;
+
+        let (ff_cut_hw, ff_cut_rate, cut_speedup_perf, cut_speedup_eff) = if compare_ffmpeg {
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-ss".into(),
+                        "0.25".into(),
+                        "-to".into(),
+                        "5.75".into(),
+                        "-i".into(),
+                        cut_in_mp4.to_string_lossy().into_owned(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-qp".into(),
+                        "22".into(),
+                        cut_ff_mp4.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let rate = 1000.0 / hw.wall_ms;
+            (
+                Some(hw),
+                Some(rate),
+                Some(hw.wall_ms / cut_perf_hw.wall_ms),
+                Some(hw.wall_ms / cut_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let _ = std::fs::remove_file(&cut_in_mp4);
+        let _ = std::fs::remove_file(&cut_rag_mp4);
+        let _ = std::fs::remove_file(&cut_ff_mp4);
+        BenchRow {
+            workload: "8. Smart-GOP Frame-Accurate Trim (ragdoll cut)",
+            unit: "clips/s",
+            ragdoll_perf_hw: cut_perf_hw,
+            ragdoll_perf_rate: rag_cut_rate,
+            ragdoll_eff_hw: cut_eff_hw,
+            ragdoll_eff_rate: rag_cut_eff_rate,
+            ffmpeg_hw: ff_cut_hw,
+            ffmpeg_rate: ff_cut_rate,
+            speedup_perf: cut_speedup_perf,
+            speedup_eff: cut_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 9: Multi-Track Audio Resample (44.1->48kHz) + EBU R128 (-14 LUFS) + AAC
+    // -------------------------------------------------------------------------
+    let row9 = {
+        let dur_s = 10.0f64;
+        let in_sr = 44_100u32;
+        let in_samples = (in_sr as usize) * 10;
+        let mut af_44k = AudioFrame::new(in_sr, 2, SampleFormat::S16le, in_samples);
+        af_44k.layout = ChannelLayout::Stereo;
+        for (i, s) in af_44k.as_i16_mut_slice().iter_mut().enumerate() {
+            let t = (i / 2) as f64 / (in_sr as f64);
+            *s = ((t * 440.0 * std::f64::consts::TAU).sin() * 12_000.0) as i16;
+        }
+        let wav_44k = tmp_dir.join("audio_44k_10s.wav");
+        {
+            let f = std::fs::File::create(&wav_44k)?;
+            let mut wmux = WavMuxer::new(AudioTrackParams {
+                sample_rate: in_sr,
+                channels: 2,
+                channel_layout: ChannelLayout::Stereo,
+                sample_format: SampleFormat::S16le,
+                bits_per_coded_sample: 16,
+            });
+            wmux.write_pcm_bytes(af_44k.data.as_slice());
+            wmux.finish(BufWriter::new(f))?;
+        }
+
+        let run_audio_dsp = |src: &AudioFrame| {
+            let mut rs = PolyphaseResampler::new(44_100, 48_000, 2, 32);
+            let resampled =
+                resample_and_rematrix_frame(src, Some(&mut rs), None, SampleFormat::F32le).unwrap();
+            let mut meter = EbuR128Meter::new(48_000, 2);
+            meter.process_audio_frame(&resampled).unwrap();
+            let (gain, _) = meter.compute_normalization_gain(-14.0, -1.0);
+            let norm = normalize_audio_frame(&resampled, gain, -1.0).unwrap();
+            let mut aac_enc = AacEncoder::new(48_000, 2, 128_000);
+            let pkts = aac_enc.encode_stream_frames(&norm).unwrap();
+            assert!(!pkts.is_empty());
+        };
+
+        let (_, dsp_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| run_audio_dsp(&af_44k))
+        });
+        let rag_dsp_xrt = dur_s / (dsp_perf_hw.wall_ms / 1000.0);
+
+        let (_, dsp_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| run_audio_dsp(&af_44k))
+        });
+        let rag_dsp_eff_xrt = dur_s / (dsp_eff_hw.wall_ms / 1000.0);
+
+        let (ff_dsp_hw, ff_dsp_xrt, dsp_speedup_perf, dsp_speedup_eff) = if compare_ffmpeg {
+            let ff_m4a = tmp_dir.join("audio_ff_norm.m4a");
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        wav_44k.to_string_lossy().into_owned(),
+                        "-af".into(),
+                        "aresample=48000,loudnorm=I=-14:TP=-1.0".into(),
+                        "-c:a".into(),
+                        "aac".into(),
+                        ff_m4a.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let _ = std::fs::remove_file(&ff_m4a);
+            let xrt = dur_s / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(xrt),
+                Some(hw.wall_ms / dsp_perf_hw.wall_ms),
+                Some(hw.wall_ms / dsp_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let _ = std::fs::remove_file(&wav_44k);
+        BenchRow {
+            workload: "9. Audio Resample 44.1->48k + R128 + AAC (10s)",
+            unit: "x RT",
+            ragdoll_perf_hw: dsp_perf_hw,
+            ragdoll_perf_rate: rag_dsp_xrt,
+            ragdoll_eff_hw: dsp_eff_hw,
+            ragdoll_eff_rate: rag_dsp_eff_xrt,
+            ffmpeg_hw: ff_dsp_hw,
+            ffmpeg_rate: ff_dsp_xrt,
+            speedup_perf: dsp_speedup_perf,
+            speedup_eff: dsp_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 10: Fused HDR10 (BT.2020 PQ) -> SDR (BT.709) Oklab Tonemap + Watermark Overlay
+    // -------------------------------------------------------------------------
+    let row10 = {
+        let hdr_count = 30usize;
+        let hdr_indices: Vec<usize> = (0..hdr_count).collect();
+        let hdr_frames: Vec<VideoFrame> = parallel_gop_map(&hdr_indices, 0, |_, &idx| {
+            let mut f = VideoFrame::new(1280, 720, PixelFormat::Yuv420p10le);
+            f.colorimetry = Colorimetry::bt2020_pq_hdr10();
+            for y in 0..720 {
+                let row = f.plane_mut(0).row_mut(y);
+                for (x, p) in row[..1280 * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let v = (64 + ((x + y + idx * 8) % 900)) as u16;
+                    *p = v.to_le_bytes();
+                }
+            }
+            for c in 1..=2 {
+                for y in 0..360 {
+                    let row = f.plane_mut(c).row_mut(y);
+                    for p in row[..640 * 2].as_chunks_mut::<2>().0 {
+                        *p = 512u16.to_le_bytes();
+                    }
+                }
+            }
+            f
+        });
+        let mut watermark = VideoFrame::new(128, 64, PixelFormat::Rgba8);
+        for px in watermark.plane_mut(0).data_mut().as_chunks_mut::<4>().0 {
+            *px = [240, 180, 40, 192];
+        }
+
+        let (_, hdr_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| {
+                let out: Vec<VideoFrame> = parallel_gop_map(&hdr_frames, 0, |_, f| {
+                    let mut sdr = tonemap_hdr_to_sdr_oklab(f, PixelFormat::Yuv420p);
+                    overlay_rgba_onto_frame(&mut sdr, &watermark, 16, 16);
+                    sdr
+                });
+                assert_eq!(out.len(), hdr_count);
+            })
+        });
+        let rag_hdr_fps = (hdr_count as f64) / (hdr_perf_hw.wall_ms / 1000.0);
+
+        let (_, hdr_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let out: Vec<VideoFrame> = parallel_gop_map(&hdr_frames, 0, |_, f| {
+                    let mut sdr = tonemap_hdr_to_sdr_oklab(f, PixelFormat::Yuv420p);
+                    overlay_rgba_onto_frame(&mut sdr, &watermark, 16, 16);
+                    sdr
+                });
+                assert_eq!(out.len(), hdr_count);
+            })
+        });
+        let rag_hdr_eff_fps = (hdr_count as f64) / (hdr_eff_hw.wall_ms / 1000.0);
+
+        let (ff_hdr_hw, ff_hdr_fps, hdr_speedup_perf, hdr_speedup_eff) = if compare_ffmpeg {
+            let hdr_y4m = tmp_dir.join("hdr10_720p.y4m");
+            let wm_png = tmp_dir.join("wm.png");
+            {
+                let f = std::fs::File::create(&hdr_y4m)?;
+                let mut mux = Y4mMuxer::new(
+                    BufWriter::with_capacity(1024 * 1024, f),
+                    1280,
+                    720,
+                    PixelFormat::Yuv420p10le,
+                    Rational64::FPS_30,
+                    Colorimetry::bt2020_pq_hdr10(),
+                )?;
+                for fr in &hdr_frames {
+                    mux.write_frame(fr)?;
+                }
+                mux.finish()?;
+                let mut png_bytes = Vec::new();
+                write_png_image(&mut png_bytes, &watermark)?;
+                std::fs::write(&wm_png, &png_bytes)?;
+            }
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        hdr_y4m.to_string_lossy().into_owned(),
+                        "-i".into(),
+                        wm_png.to_string_lossy().into_owned(),
+                        "-filter_complex".into(),
+                        "[0:v]format=gbrpf32le,tonemap=hable,format=yuv420p[v];[v][1:v]overlay=16:16".into(),
+                        "-f".into(),
+                        "null".into(),
+                        "-".into(),
+                    ],
+                )],
+                1,
+            )?;
+            let _ = std::fs::remove_file(&hdr_y4m);
+            let _ = std::fs::remove_file(&wm_png);
+            let fps = (hdr_count as f64) / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(fps),
+                Some(hw.wall_ms / hdr_perf_hw.wall_ms),
+                Some(hw.wall_ms / hdr_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        BenchRow {
+            workload: "10. HDR10 -> SDR Oklab Tonemap + Overlay (30f)",
+            unit: "fps",
+            ragdoll_perf_hw: hdr_perf_hw,
+            ragdoll_perf_rate: rag_hdr_fps,
+            ragdoll_eff_hw: hdr_eff_hw,
+            ragdoll_eff_rate: rag_hdr_eff_fps,
+            ffmpeg_hw: ff_hdr_hw,
+            ffmpeg_rate: ff_hdr_fps,
+            speedup_perf: hdr_speedup_perf,
+            speedup_eff: hdr_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 11: Multi-Rendition CMAF HLS + DASH ABR Ladder Packaging (3 Renditions)
+    // -------------------------------------------------------------------------
+    let row11 = {
+        let abr_in_mp4 = tmp_dir.join("abr_src.mp4");
+        let abr_rag_dir = tmp_dir.join("abr_rag");
+        let abr_ff_dir = tmp_dir.join("abr_ff");
+        synth_media(&abr_in_mp4, 640, 360, 30, 1.0)?;
+        let pkg_opts = PackageOptions {
+            ladder_spec: Some("360p:800k,240p:400k,180p:200k".into()),
+            segment_duration_sec: 0.5,
+            generate_thumbnails: true,
+        };
+
+        let (pkg_rep, abr_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            measure_hardware_metrics(|| package_abr(&abr_in_mp4, &abr_rag_dir, &pkg_opts).unwrap())
+        });
+        let total_segs = (pkg_rep.renditions * pkg_rep.segments_per_rendition) as f64;
+        let rag_abr_rate = total_segs / (abr_perf_hw.wall_ms / 1000.0);
+
+        let (_, abr_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            measure_hardware_metrics(|| {
+                let _ = package_abr(&abr_in_mp4, &abr_rag_dir, &pkg_opts).unwrap();
+            })
+        });
+        let rag_abr_eff_rate = total_segs / (abr_eff_hw.wall_ms / 1000.0);
+
+        let (ff_abr_hw, ff_abr_rate, abr_speedup_perf, abr_speedup_eff) = if compare_ffmpeg {
+            std::fs::create_dir_all(&abr_ff_dir)?;
+            let r0 = abr_ff_dir.join("r0.m3u8");
+            let r1 = abr_ff_dir.join("r1.m3u8");
+            let r2 = abr_ff_dir.join("r2.m3u8");
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        abr_in_mp4.to_string_lossy().into_owned(),
+                        "-map".into(),
+                        "0:v".into(),
+                        "-vf".into(),
+                        "scale=640:360".into(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-f".into(),
+                        "hls".into(),
+                        "-hls_time".into(),
+                        "0.5".into(),
+                        "-hls_segment_type".into(),
+                        "fmp4".into(),
+                        r0.to_string_lossy().into_owned(),
+                        "-map".into(),
+                        "0:v".into(),
+                        "-vf".into(),
+                        "scale=426:240".into(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-f".into(),
+                        "hls".into(),
+                        "-hls_time".into(),
+                        "0.5".into(),
+                        "-hls_segment_type".into(),
+                        "fmp4".into(),
+                        r1.to_string_lossy().into_owned(),
+                        "-map".into(),
+                        "0:v".into(),
+                        "-vf".into(),
+                        "scale=320:180".into(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-f".into(),
+                        "hls".into(),
+                        "-hls_time".into(),
+                        "0.5".into(),
+                        "-hls_segment_type".into(),
+                        "fmp4".into(),
+                        r2.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let rate = total_segs / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(rate),
+                Some(hw.wall_ms / abr_perf_hw.wall_ms),
+                Some(hw.wall_ms / abr_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        BenchRow {
+            workload: "11. CMAF HLS+DASH ABR Packager (3 Renditions)",
+            unit: "seg/s",
+            ragdoll_perf_hw: abr_perf_hw,
+            ragdoll_perf_rate: rag_abr_rate,
+            ragdoll_eff_hw: abr_eff_hw,
+            ragdoll_eff_rate: rag_abr_eff_rate,
+            ffmpeg_hw: ff_abr_hw,
+            ffmpeg_rate: ff_abr_rate,
+            speedup_perf: abr_speedup_perf,
+            speedup_eff: abr_speedup_eff,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Workload 12: Bounded-Memory (64 MiB) High-Profile CRF Streaming Transcode (60f 720p)
+    // -------------------------------------------------------------------------
+    let row12 = {
+        let bm_count = 60usize;
+        let bm_seed: Vec<VideoFrame> = (0..15).map(|i| synth_video_frame(1280, 720, i)).collect();
+        let bm_frames: Vec<VideoFrame> = (0..bm_count)
+            .map(|i| bm_seed[i % bm_seed.len()].clone())
+            .collect();
+        let rc = RateControlMode::Crf {
+            crf: 23.0,
+            maxrate_kbps: Some(4000),
+            bufsize_kb: Some(8000),
+        };
+
+        let (_, bm_perf_hw) = with_power_mode(PowerMode::Performance, || {
+            let ring = GopRingPipeline::with_budget_bytes(0, 64 * 1024 * 1024);
+            measure_hardware_metrics(|| {
+                let (gops, stats) = ring
+                    .encode_gops_bounded_with_h264(
+                        &bm_frames,
+                        None,
+                        ScaleFilter::Lanczos3,
+                        "h264",
+                        Rational64::FPS_30,
+                        23,
+                        H264Profile::High,
+                        rc,
+                    )
+                    .unwrap();
+                assert!(!gops.is_empty());
+                assert!(stats.peak_wave_memory_bytes <= 64 * 1024 * 1024);
+            })
+        });
+        let rag_bm_fps = (bm_count as f64) / (bm_perf_hw.wall_ms / 1000.0);
+
+        let (_, bm_eff_hw) = with_power_mode(PowerMode::Efficiency, || {
+            let ring = GopRingPipeline::with_budget_bytes(0, 64 * 1024 * 1024);
+            measure_hardware_metrics(|| {
+                let (gops, stats) = ring
+                    .encode_gops_bounded_with_h264(
+                        &bm_frames,
+                        None,
+                        ScaleFilter::Lanczos3,
+                        "h264",
+                        Rational64::FPS_30,
+                        23,
+                        H264Profile::High,
+                        rc,
+                    )
+                    .unwrap();
+                assert!(!gops.is_empty());
+                assert!(stats.peak_wave_memory_bytes <= 64 * 1024 * 1024);
+            })
+        });
+        let rag_bm_eff_fps = (bm_count as f64) / (bm_eff_hw.wall_ms / 1000.0);
+
+        let (ff_bm_hw, ff_bm_fps, bm_speedup_perf, bm_speedup_eff) = if compare_ffmpeg {
+            let bm_y4m = tmp_dir.join("bm_720p_60f.y4m");
+            let bm_ff_mp4 = tmp_dir.join("bm_ff.mp4");
+            {
+                let f = std::fs::File::create(&bm_y4m)?;
+                let mut mux = Y4mMuxer::new(
+                    BufWriter::with_capacity(1024 * 1024, f),
+                    1280,
+                    720,
+                    PixelFormat::Yuv420p,
+                    Rational64::FPS_30,
+                    Colorimetry::bt709_limited(),
+                )?;
+                for fr in &bm_frames {
+                    mux.write_frame(fr)?;
+                }
+                mux.finish()?;
+            }
+            let hw = run_external_batch_with_telemetry(
+                &[(
+                    "ffmpeg",
+                    vec![
+                        "-y".into(),
+                        "-v".into(),
+                        "error".into(),
+                        "-i".into(),
+                        bm_y4m.to_string_lossy().into_owned(),
+                        "-c:v".into(),
+                        "libx264".into(),
+                        "-preset".into(),
+                        "ultrafast".into(),
+                        "-crf".into(),
+                        "23".into(),
+                        "-maxrate".into(),
+                        "4000k".into(),
+                        "-bufsize".into(),
+                        "8000k".into(),
+                        bm_ff_mp4.to_string_lossy().into_owned(),
+                    ],
+                )],
+                1,
+            )?;
+            let fps = (bm_count as f64) / (hw.wall_ms / 1000.0);
+            (
+                Some(hw),
+                Some(fps),
+                Some(hw.wall_ms / bm_perf_hw.wall_ms),
+                Some(hw.wall_ms / bm_eff_hw.wall_ms),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        BenchRow {
+            workload: "12. Bounded-Mem (64 MiB) High-CRF Transcode",
+            unit: "fps",
+            ragdoll_perf_hw: bm_perf_hw,
+            ragdoll_perf_rate: rag_bm_fps,
+            ragdoll_eff_hw: bm_eff_hw,
+            ragdoll_eff_rate: rag_bm_eff_fps,
+            ffmpeg_hw: ff_bm_hw,
+            ffmpeg_rate: ff_bm_fps,
+            speedup_perf: bm_speedup_perf,
+            speedup_eff: bm_speedup_eff,
+        }
+    };
+
+    rows.extend([
+        row2, row3, row4, row5, row6, row7, row8, row9, row10, row11, row12,
+    ]);
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -1724,7 +2271,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             "=================================================================================================================================="
         );
         println!(
-            "  RAGDOLL v0.1.0 SPEED & BATTERY EFFICIENCY BENCHMARK SUITE — SIMD: {} | CPU: {} P-Cores + {} E-Cores",
+            "  RAGDOLL v1.0.0 12-WORKLOAD SPEED & BATTERY EFFICIENCY BENCHMARK SUITE — SIMD: {} | CPU: {} P-Cores + {} E-Cores",
             SimdLevel::detect().name(),
             topo.p_cores,
             topo.e_cores

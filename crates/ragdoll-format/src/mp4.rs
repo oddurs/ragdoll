@@ -618,6 +618,11 @@ impl<'a> Mp4Demuxer<'a> {
                 let trun_version = p[0];
                 let trun_flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
                 let sample_count = u32::from_be_bytes([p[4], p[5], p[6], p[7]]) as usize;
+                if sample_count > file_len.max(65536) {
+                    return Err(RagdollError::CorruptBitstream(
+                        "fMP4 trun sample_count exceeds file bounds",
+                    ));
+                }
                 let mut pos = 8usize;
 
                 if (trun_flags & 0x0000_0001) != 0 && pos + 4 <= p.len() {
@@ -1516,12 +1521,17 @@ impl<'a> Mp4Demuxer<'a> {
         } else {
             tables.stsz_count
         };
+        if sample_count > file_len.max(65536) {
+            return Err(RagdollError::CorruptBitstream(
+                "MP4 stsz sample_count exceeds file bounds",
+            ));
+        }
 
         if sample_count == 0 || tables.chunk_offsets.is_empty() || tables.stsc.is_empty() {
             return Ok((Vec::new(), 0, 0, 1));
         }
 
-        let mut samples = Vec::with_capacity(sample_count);
+        let mut samples = Vec::with_capacity(sample_count.min(65536));
         let mut total_bytes = 0u64;
 
         // Cursors for run-length tables (stts, ctts, stss)
@@ -1543,12 +1553,15 @@ impl<'a> Mp4Demuxer<'a> {
             if samples_per_chunk == 0 || first_chunk_1b == 0 {
                 continue;
             }
-            let start_chunk = (first_chunk_1b - 1) as usize;
+            let start_chunk = ((first_chunk_1b - 1) as usize).min(num_chunks);
             let end_chunk = if stsc_i + 1 < tables.stsc.len() {
                 ((tables.stsc[stsc_i + 1].0.saturating_sub(1)) as usize).min(num_chunks)
             } else {
                 num_chunks
             };
+            if start_chunk >= end_chunk {
+                continue;
+            }
 
             for &chunk_base_offset in &tables.chunk_offsets[start_chunk..end_chunk] {
                 let mut cur_offset = chunk_base_offset;

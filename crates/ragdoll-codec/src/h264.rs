@@ -329,8 +329,8 @@ impl Sps {
             if chroma_format_idc == 3 {
                 let _separate_colour_plane = r.read_bit()?;
             }
-            bit_depth_luma = (r.read_ue()? as u8) + 8;
-            bit_depth_chroma = (r.read_ue()? as u8) + 8;
+            bit_depth_luma = (r.read_ue()? as u8).saturating_add(8);
+            bit_depth_chroma = (r.read_ue()? as u8).saturating_add(8);
             let _qpprime_y_zero_transform_bypass = r.read_bit()?;
             let seq_scaling_matrix_present = r.read_bit()?;
             if seq_scaling_matrix_present {
@@ -344,7 +344,9 @@ impl Sps {
                         for _ in 0..size {
                             if next_scale != 0 {
                                 let delta_scale = r.read_se()?;
-                                next_scale = (last_scale + delta_scale + 256) % 256;
+                                next_scale =
+                                    (last_scale.wrapping_add(delta_scale).wrapping_add(256))
+                                        .rem_euclid(256);
                             }
                             last_scale = if next_scale == 0 {
                                 last_scale
@@ -357,16 +359,21 @@ impl Sps {
             }
         }
 
-        let log2_max_frame_num = (r.read_ue()? as u8) + 4;
+        let log2_max_frame_num = (r.read_ue()? as u8).saturating_add(4).min(16);
         let pic_order_cnt_type = r.read_ue()? as u8;
         let mut log2_max_pic_order_cnt_lsb = 4u8;
         if pic_order_cnt_type == 0 {
-            log2_max_pic_order_cnt_lsb = (r.read_ue()? as u8) + 4;
+            log2_max_pic_order_cnt_lsb = (r.read_ue()? as u8).saturating_add(4).min(16);
         } else if pic_order_cnt_type == 1 {
             let _delta_pic_order_always_zero = r.read_bit()?;
             let _offset_for_non_ref_pic = r.read_se()?;
             let _offset_for_top_to_bottom = r.read_se()?;
             let cycle_len = r.read_ue()?;
+            if cycle_len > 255 {
+                return Err(RagdollError::InvalidSyntax(
+                    "H.264 num_ref_frames_in_pic_order_cnt_cycle > 255",
+                ));
+            }
             for _ in 0..cycle_len {
                 let _ = r.read_se()?;
             }
@@ -374,8 +381,17 @@ impl Sps {
 
         let max_num_ref_frames = r.read_ue()? as u8;
         let _gaps_in_frame_num_allowed = r.read_bit()?;
-        let pic_width_in_mbs = (r.read_ue()? as u32) + 1;
-        let pic_height_in_map_units = (r.read_ue()? as u32) + 1;
+        let pic_width_in_mbs = (r.read_ue()? as u32).saturating_add(1);
+        let pic_height_in_map_units = (r.read_ue()? as u32).saturating_add(1);
+        if pic_width_in_mbs == 0
+            || pic_height_in_map_units == 0
+            || pic_width_in_mbs > 512
+            || pic_height_in_map_units > 512
+        {
+            return Err(RagdollError::InvalidSyntax(
+                "H.264 SPS macroblock dimensions out of supported range",
+            ));
+        }
         let frame_mbs_only_flag = r.read_bit()?;
         if !frame_mbs_only_flag {
             let _mb_adaptive_frame_field = r.read_bit()?;
@@ -695,7 +711,9 @@ impl Pps {
                         for _ in 0..size {
                             if next_scale != 0 {
                                 let delta_scale = r.read_se()?;
-                                next_scale = (last_scale + delta_scale + 256) % 256;
+                                next_scale =
+                                    (last_scale.wrapping_add(delta_scale).wrapping_add(256))
+                                        .rem_euclid(256);
                             }
                             last_scale = if next_scale == 0 {
                                 last_scale
@@ -867,9 +885,9 @@ impl SliceHeader {
         if pict_type != PictureType::I {
             let mod_l0 = r.read_bit()?;
             if mod_l0 {
-                loop {
+                for _ in 0..32 {
                     let idc = r.read_ue()?;
-                    if idc == 3 {
+                    if idc >= 3 {
                         break;
                     }
                     let _ = r.read_ue()?;
@@ -878,9 +896,9 @@ impl SliceHeader {
             if pict_type == PictureType::B {
                 let mod_l1 = r.read_bit()?;
                 if mod_l1 {
-                    loop {
+                    for _ in 0..32 {
                         let idc = r.read_ue()?;
-                        if idc == 3 {
+                        if idc >= 3 {
                             break;
                         }
                         let _ = r.read_ue()?;
@@ -933,9 +951,9 @@ impl SliceHeader {
             } else {
                 let adaptive_marking = r.read_bit()?;
                 if adaptive_marking {
-                    loop {
+                    for _ in 0..32 {
                         let mmco = r.read_ue()?;
-                        if mmco == 0 {
+                        if mmco == 0 || mmco > 6 {
                             break;
                         }
                         if matches!(mmco, 1..=6) {
@@ -5908,8 +5926,8 @@ impl H264Decoder {
         }
 
         // Crop to exact display dimensions if SPS frame_cropping_flag is set
-        let out_w = sps.width() as usize;
-        let out_h = sps.height() as usize;
+        let out_w = (sps.width() as usize).clamp(2, recon.width);
+        let out_h = (sps.height() as usize).clamp(2, recon.height);
         let mut out_frame = if out_w == recon.width && out_h == recon.height {
             recon
         } else {

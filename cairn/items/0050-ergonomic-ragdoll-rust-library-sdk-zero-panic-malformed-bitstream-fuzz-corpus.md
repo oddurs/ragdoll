@@ -3,8 +3,9 @@ id: 50
 uid: 5edc67ba-080b-471e-8407-0d0e24cff444
 title: Ergonomic ragdoll Rust Library SDK & Zero-Panic Malformed Bitstream Fuzz Corpus
 type: feature
-status: planned
+status: done
 milestone: m10-production-v1
+assignee: Oddur Sigurdsson
 depends_on:
 - 40
 - 44
@@ -12,6 +13,7 @@ depends_on:
 - 49
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: arch
 effort: l
@@ -30,5 +32,9 @@ effort: l
 
 ## Acceptance criteria
 
-- [ ] 10,000+ deterministic bit-flip, truncation, and corrupted-length mutations across all container demuxers and codec decoders complete with `0` panics.
-- [ ] Ergonomic Rust builder API (`TranscodeBuilder`, `CutBuilder`, `PackageBuilder`) is documented and tested in `ragdoll-pipeline`.
+- [x] 10,000+ deterministic bit-flip, truncation, and corrupted-length mutations across all container demuxers and codec decoders complete with `0` panics.
+- [x] Ergonomic Rust builder API (`TranscodeBuilder`, `CutBuilder`, `PackageBuilder`) is documented and tested in `ragdoll-pipeline`.
+
+## 2026-10-25
+
+Implemented ProbeBuilder/TranscodeBuilder/CutBuilder/PackageBuilder (and ProbeJob/TranscodeJob/CutJob/PackageJob) in ragdoll-pipeline, hardened untrusted length/dimension/overflow checks across ragdoll-format and ragdoll-codec, and verified tests::malformed_bitstream_zero_panic_corpus across 10,000+ deterministic mutations with 0 panics.

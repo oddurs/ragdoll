@@ -130,7 +130,7 @@ impl<'a> Y4mDemuxer<'a> {
             }
         }
 
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
             return Err(RagdollError::InvalidHeader(
                 "Y4M header missing valid W or H dimensions".to_string(),
             ));

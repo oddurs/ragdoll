@@ -4,9 +4,10 @@ uid: 70b9ea07-3206-4cb2-941a-8ad596b90873
 key: m10-production-v1
 title: Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
 type: milestone
-status: planned
+status: done
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: arch
 ---
