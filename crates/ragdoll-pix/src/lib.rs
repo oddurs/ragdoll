@@ -6,6 +6,7 @@
 //! - [`metrics`]: SIMD-accelerated `PSNR`, $8\times8$ windowed `SSIM`, and `VMAF-Lite` perceptual quality analyzer.
 
 pub mod color;
+pub mod filter;
 pub mod metrics;
 pub mod scale;
 
@@ -15,6 +16,14 @@ pub use color::{
     nv12_to_rgb24_scalar, oklab_row_to_rgb24, rgb24_row_to_oklab, rgb24_to_yuv420p,
     rgb24_to_yuv420p_scalar, upsample_chroma_420_to_444, yuv420p_to_bgra8, yuv420p_to_bgra8_scalar,
     yuv420p_to_rgb24, yuv420p_to_rgb24_scalar, yuv420p_to_rgba8, yuv420p_to_rgba8_scalar,
+};
+pub use filter::{
+    CropRect, PadSpec, RotationMode, crop_frame, detect_auto_crop, hlg_eotf_normalized,
+    overlay_plane_row_u8, overlay_plane_row_u8_scalar, overlay_rgba_onto_frame,
+    overlay_rgba_onto_frame_scalar, overlay_rgba_row_onto_rgb24,
+    overlay_rgba_row_onto_rgb24_scalar, pad_frame, pq_eotf_normalized_203nits, rotate_frame,
+    tonemap_hdr_to_sdr_oklab, tonemap_hdr_to_sdr_oklab_scalar, tonemap_linear_bt2020_row_oklab,
+    tonemap_linear_bt2020_row_oklab_scalar,
 };
 pub use metrics::{
     MS_SSIM_WEIGHTS, QualityReport, decimate_2x2_u8, decimate_2x2_u8_scalar,
@@ -465,5 +474,164 @@ mod tests {
         decimate_2x2_u8(&src, w, &mut dec_simd, w / 2, w, h);
         decimate_2x2_u8_scalar(&src, w, &mut dec_ref, w / 2, w, h);
         assert_eq!(dec_simd, dec_ref, "decimate_2x2 NEON vs scalar mismatch");
+    }
+
+    #[test]
+    fn simd_0048_crop_autocrop_pad_rotate_overlay_and_oklab_tonemap() {
+        // 1. Auto-crop letterbox/pillarbox detection + even chroma alignment + pad roundtrip
+        let mut content = VideoFrame::new(32, 20, PixelFormat::Yuv420p);
+        for y in 0..20 {
+            content.plane_mut(0).row_mut(y)[..32].fill(180);
+        }
+        let padded = pad_frame(
+            &content,
+            PadSpec {
+                width: 48,
+                height: 36,
+                x: 8,
+                y: 8,
+                color_rgb: [0, 0, 0],
+            },
+        )
+        .unwrap();
+        assert_eq!(padded.width, 48);
+        assert_eq!(padded.height, 36);
+
+        let detected = detect_auto_crop(&padded, 20);
+        assert_eq!(
+            detected,
+            CropRect {
+                width: 32,
+                height: 20,
+                x: 8,
+                y: 8
+            }
+        );
+        let cropped = crop_frame(&padded, detected).unwrap();
+        assert_eq!(cropped.width, 32);
+        assert_eq!(cropped.height, 20);
+        for y in 0..20 {
+            assert_eq!(&cropped.plane(0).row(y)[..32], &[180u8; 32]);
+        }
+
+        // 2. Rotate 90 + 270 and 180 + 180 and hflip/vflip roundtrips across YUV420p and RGB24
+        for fmt in [PixelFormat::Yuv420p, PixelFormat::Rgb24, PixelFormat::Rgba8] {
+            let mut f = VideoFrame::new(24, 16, fmt);
+            for y in 0..16 {
+                let bpp = f.plane(0).row_bytes() / 24;
+                for x in 0..24 * bpp {
+                    f.plane_mut(0).row_mut(y)[x] = ((x * 7 + y * 13) & 0xFF) as u8;
+                }
+            }
+            let r90 = rotate_frame(&f, RotationMode::Rotate90);
+            assert_eq!((r90.width, r90.height), (16, 24));
+            let r360 = rotate_frame(&r90, RotationMode::Rotate270);
+            assert_eq!((r360.width, r360.height), (24, 16));
+            for y in 0..16 {
+                let rb = f.plane(0).row_bytes();
+                assert_eq!(&r360.plane(0).row(y)[..rb], &f.plane(0).row(y)[..rb]);
+            }
+
+            let r180 = rotate_frame(&rotate_frame(&f, RotationMode::HFlip), RotationMode::VFlip);
+            let r180_direct = rotate_frame(&f, RotationMode::Rotate180);
+            for y in 0..16 {
+                let rb = f.plane(0).row_bytes();
+                assert_eq!(
+                    &r180.plane(0).row(y)[..rb],
+                    &r180_direct.plane(0).row(y)[..rb]
+                );
+            }
+        }
+
+        // 3. SIMD vs. scalar alpha-blended overlay across odd dimensions and alpha = 0, 1..254, 255
+        for &(w, h) in &[(13usize, 7usize), (34, 18), (65, 33)] {
+            let mut ov = VideoFrame::new(w, h, PixelFormat::Rgba8);
+            for y in 0..h {
+                let row = ov.plane_mut(0).row_mut(y);
+                for x in 0..w {
+                    row[x * 4] = ((x * 19 + y * 7) & 0xFF) as u8;
+                    row[x * 4 + 1] = ((x * 31 + y * 11) & 0xFF) as u8;
+                    row[x * 4 + 2] = ((x * 43 + y * 23) & 0xFF) as u8;
+                    row[x * 4 + 3] = match (x + y) % 5 {
+                        0 => 0,
+                        1 => 255,
+                        2 => 1,
+                        3 => 254,
+                        _ => ((x * 37 + y * 53) % 253 + 1) as u8,
+                    };
+                }
+            }
+
+            for fmt in [PixelFormat::Rgb24, PixelFormat::Yuv420p] {
+                let bw = (w + 10) & !1;
+                let bh = (h + 8) & !1;
+                let mut base_simd = VideoFrame::new(bw, bh, fmt);
+                for p in 0..base_simd.planes.len() {
+                    let ph = base_simd.plane(p).height();
+                    let rb = base_simd.plane(p).row_bytes();
+                    for y in 0..ph {
+                        for i in 0..rb {
+                            base_simd.plane_mut(p).row_mut(y)[i] =
+                                ((i * 29 + y * 17 + p * 41) & 0xFF) as u8;
+                        }
+                    }
+                }
+                let mut base_ref = base_simd.clone();
+
+                overlay_rgba_onto_frame(&mut base_simd, &ov, 4, 2);
+                overlay_rgba_onto_frame_scalar(&mut base_ref, &ov, 4, 2);
+
+                for p in 0..base_simd.planes.len() {
+                    let ph = base_simd.plane(p).height();
+                    let rb = base_simd.plane(p).row_bytes();
+                    for y in 0..ph {
+                        assert_eq!(
+                            &base_simd.plane(p).row(y)[..rb],
+                            &base_ref.plane(p).row(y)[..rb],
+                            "overlay NEON vs scalar mismatch fmt={fmt:?} {w}x{h} plane={p} row={y}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 4. Perceptual Oklab HDR-to-SDR tonemap NEON vs. scalar differential test
+        let mut hdr = VideoFrame::new(36, 20, PixelFormat::Yuv420p10le);
+        hdr.colorimetry = Colorimetry::bt2020_pq_hdr10();
+        for y in 0..20 {
+            let y_row = hdr.plane_mut(0).row_mut(y);
+            for x in 0..36 {
+                let y10 = (64 + (x * 24 + y * 8)).min(1000) as u16;
+                y_row[x * 2..x * 2 + 2].copy_from_slice(&y10.to_le_bytes());
+            }
+        }
+        for cy in 0..10 {
+            for cx in 0..18 {
+                let u10 = (440 + cx * 8) as u16;
+                let v10 = (560 - cy * 8) as u16;
+                hdr.plane_mut(1).row_mut(cy)[cx * 2..cx * 2 + 2]
+                    .copy_from_slice(&u10.to_le_bytes());
+                hdr.plane_mut(2).row_mut(cy)[cx * 2..cx * 2 + 2]
+                    .copy_from_slice(&v10.to_le_bytes());
+            }
+        }
+
+        let sdr_simd = tonemap_hdr_to_sdr_oklab(&hdr, PixelFormat::Rgb24);
+        let sdr_ref = tonemap_hdr_to_sdr_oklab_scalar(&hdr, PixelFormat::Rgb24);
+        assert_eq!(
+            sdr_simd.colorimetry.primaries,
+            ragdoll_core::ColorPrimaries::BT709
+        );
+        for y in 0..20 {
+            let r_simd = &sdr_simd.plane(0).row(y)[..36 * 3];
+            let r_ref = &sdr_ref.plane(0).row(y)[..36 * 3];
+            for i in 0..36 * 3 {
+                let diff = (r_simd[i] as i32 - r_ref[i] as i32).abs();
+                assert!(
+                    diff <= 1,
+                    "tonemap NEON vs scalar diff {diff} at row={y} byte={i}"
+                );
+            }
+        }
     }
 }

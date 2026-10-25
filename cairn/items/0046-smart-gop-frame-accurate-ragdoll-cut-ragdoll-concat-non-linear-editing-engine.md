@@ -3,13 +3,15 @@ id: 46
 uid: deba5776-f406-44bb-acba-6c39ec4a270b
 title: Smart-GOP Frame-Accurate ragdoll cut & ragdoll concat Non-Linear Editing Engine
 type: feature
-status: planned
+status: done
 milestone: m9-edit-image-package
+assignee: Oddur Sigurdsson
 depends_on:
 - 37
 - 39
 created: 2026-10-25
 updated: 2026-10-25
+closed_at: 2026-10-25
 priority: p0
 area: pipeline
 effort: l
@@ -30,5 +32,9 @@ In `ffmpeg`, cutting a video at arbitrary timestamps (`-ss 00:01:12.400 -to 00:0
 
 ## Acceptance criteria
 
-- [ ] `ragdoll cut` performs frame-exact cuts on mid-GOP timestamps in `< 50 ms` on a 10-minute video by re-encoding only the boundary GOP and zero-copy copying interior GOPs.
-- [ ] `ragdoll concat` seamlessly joins multiple `.mp4`, `.mkv`, or `.ts` clips with monotonic timestamps and zero A/V drift.
+- [x] `ragdoll cut` performs frame-exact cuts on mid-GOP timestamps in `< 50 ms` on a 10-minute video by re-encoding only the boundary GOP and zero-copy copying interior GOPs.
+- [x] `ragdoll concat` seamlessly joins multiple `.mp4`, `.mkv`, or `.ts` clips with monotonic timestamps and zero A/V drift.
+
+## 2026-10-25
+
+Implemented Smart-GOP frame-accurate cut_media (ragdoll cut) re-encoding only boundary GOPs and zero-copy copying interior GOPs, plus zero-copy/normalizing concat_media (ragdoll concat).

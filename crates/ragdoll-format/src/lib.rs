@@ -15,10 +15,12 @@
 
 pub mod flac;
 pub mod io;
+pub mod jpeg;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegts;
 pub mod ogg;
+pub mod png;
 pub mod ppm;
 pub mod subtitle;
 pub mod wav;
@@ -29,6 +31,7 @@ pub use io::{
     MmapSource, OutputSink, STREAM_READ_CHUNK_BYTES, StreamSource, VectoredWriter, is_stdin_path,
     is_stdout_path,
 };
+pub use jpeg::{is_jpeg_bytes, probe_jpeg_header, read_jpeg_image, write_jpeg_image};
 pub use mkv::{MkvDemuxer, MkvMuxer};
 pub use mp4::{FourCC, Mp4Demuxer, Mp4Muxer, Mp4TrackIndex};
 pub use mpegts::{
@@ -38,6 +41,11 @@ pub use mpegts::{
     h264_annex_b_to_avcc_au, h264_avcc_to_annex_b_au, parse_adts_header,
 };
 pub use ogg::{OggDemuxer, OggMuxer, build_ogg_page};
+pub use png::{
+    PNG_SIGNATURE, expand_image_sequence_inputs, format_image_sequence_path,
+    is_image_sequence_pattern, is_png_bytes, probe_png_header, read_png_image, write_png_image,
+    zlib_compress, zlib_decompress,
+};
 pub use ppm::{compose_contact_sheet_rgb24, read_pnm_image, write_pnm_image};
 pub use subtitle::{
     SubtitleCue, SubtitleDemuxer, SubtitleMuxer, format_subtitle_timestamp_ms, is_srt_bytes,
@@ -60,6 +68,8 @@ pub enum ContainerFormat {
     Y4m,
     Ppm,
     Pgm,
+    Png,
+    Jpeg,
     Wav,
     Flac,
     Ogg,
@@ -77,6 +87,8 @@ impl std::fmt::Display for ContainerFormat {
             Self::Y4m => "yuv4mpeg2",
             Self::Ppm => "ppm",
             Self::Pgm => "pgm",
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Ogg => "ogg",
@@ -128,6 +140,12 @@ pub fn detect_container_format(data: &[u8]) -> Option<ContainerFormat> {
     }
     if data.len() >= 3 && &data[0..2] == b"P5" && data[2].is_ascii_whitespace() {
         return Some(ContainerFormat::Pgm);
+    }
+    if is_png_bytes(data) {
+        return Some(ContainerFormat::Png);
+    }
+    if is_jpeg_bytes(data) {
+        return Some(ContainerFormat::Jpeg);
     }
     if is_webvtt_bytes(data) {
         return Some(ContainerFormat::WebVtt);
@@ -195,6 +213,48 @@ pub fn probe_container(data: &[u8]) -> Result<(ContainerFormat, Vec<TrackInfo>)>
                     width: frame.width as u32,
                     height: frame.height as u32,
                     pixel_format: frame.format,
+                    ..Default::default()
+                }),
+                audio: None,
+                sample_count: 1,
+                total_bytes: data.len() as u64,
+            };
+            Ok((fmt, vec![info]))
+        }
+        ContainerFormat::Png => {
+            let (width, height, pixel_format) = probe_png_header(data)?;
+            let info = TrackInfo {
+                index: 0,
+                track_type: ragdoll_core::TrackType::Video,
+                codec_id: ragdoll_core::CodecId::Png,
+                timebase: ragdoll_core::Rational64::ONE,
+                duration_ticks: Some(1),
+                extra_data: Vec::new(),
+                video: Some(ragdoll_core::VideoTrackParams {
+                    width,
+                    height,
+                    pixel_format,
+                    ..Default::default()
+                }),
+                audio: None,
+                sample_count: 1,
+                total_bytes: data.len() as u64,
+            };
+            Ok((fmt, vec![info]))
+        }
+        ContainerFormat::Jpeg => {
+            let (width, height, pixel_format) = probe_jpeg_header(data)?;
+            let info = TrackInfo {
+                index: 0,
+                track_type: ragdoll_core::TrackType::Video,
+                codec_id: ragdoll_core::CodecId::Jpeg,
+                timebase: ragdoll_core::Rational64::ONE,
+                duration_ticks: Some(1),
+                extra_data: Vec::new(),
+                video: Some(ragdoll_core::VideoTrackParams {
+                    width,
+                    height,
+                    pixel_format,
                     ..Default::default()
                 }),
                 audio: None,
@@ -1351,6 +1411,192 @@ mod tests {
 
             let _ = std::fs::remove_file(&tmp_flac);
             let _ = std::fs::remove_file(&tmp_ogg);
+        }
+    }
+
+    #[test]
+    fn format_0047_png_and_jpeg_roundtrip_and_ffmpeg() {
+        let width = 64usize;
+        let height = 48usize;
+
+        // 1. PNG RGB24 & RGBA8 & Gray8 lossless bit-exact roundtrip
+        let mut rgb = VideoFrame::new(width, height, PixelFormat::Rgb24);
+        let mut rgba = VideoFrame::new(width, height, PixelFormat::Rgba8);
+        let mut gray = VideoFrame::new(width, height, PixelFormat::Gray8);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x * 4) ^ (y * 3)) as u8;
+                let g = ((x * 2 + y * 5) & 0xFF) as u8;
+                let b = ((255 - x * 3) ^ y) as u8;
+                let a = ((x + y * 4) & 0xFF) as u8;
+                rgb.plane_mut(0).row_mut(y)[x * 3] = r;
+                rgb.plane_mut(0).row_mut(y)[x * 3 + 1] = g;
+                rgb.plane_mut(0).row_mut(y)[x * 3 + 2] = b;
+
+                rgba.plane_mut(0).row_mut(y)[x * 4] = r;
+                rgba.plane_mut(0).row_mut(y)[x * 4 + 1] = g;
+                rgba.plane_mut(0).row_mut(y)[x * 4 + 2] = b;
+                rgba.plane_mut(0).row_mut(y)[x * 4 + 3] = a;
+
+                gray.plane_mut(0).row_mut(y)[x] = g;
+            }
+        }
+
+        let mut png_rgb_bytes = Vec::new();
+        write_png_image(&mut png_rgb_bytes, &rgb).unwrap();
+        assert_eq!(
+            detect_container_format(&png_rgb_bytes),
+            Some(ContainerFormat::Png)
+        );
+        let (_, png_tracks) = probe_container(&png_rgb_bytes).unwrap();
+        assert_eq!(png_tracks[0].codec_id, CodecId::Png);
+        let dec_png_rgb = read_png_image(&png_rgb_bytes).unwrap();
+        assert_eq!(dec_png_rgb.format, PixelFormat::Rgb24);
+        for y in 0..height {
+            assert_eq!(
+                &dec_png_rgb.plane(0).row(y)[..width * 3],
+                &rgb.plane(0).row(y)[..width * 3]
+            );
+        }
+
+        let mut png_rgba_bytes = Vec::new();
+        write_png_image(&mut png_rgba_bytes, &rgba).unwrap();
+        let dec_png_rgba = read_png_image(&png_rgba_bytes).unwrap();
+        assert_eq!(dec_png_rgba.format, PixelFormat::Rgba8);
+        for y in 0..height {
+            assert_eq!(
+                &dec_png_rgba.plane(0).row(y)[..width * 4],
+                &rgba.plane(0).row(y)[..width * 4]
+            );
+        }
+
+        let mut png_gray_bytes = Vec::new();
+        write_png_image(&mut png_gray_bytes, &gray).unwrap();
+        let dec_png_gray = read_png_image(&png_gray_bytes).unwrap();
+        assert_eq!(dec_png_gray.format, PixelFormat::Gray8);
+        for y in 0..height {
+            assert_eq!(
+                &dec_png_gray.plane(0).row(y)[..width],
+                &gray.plane(0).row(y)[..width]
+            );
+        }
+
+        // 2. JPEG Baseline DCT (SOF0) Q=90 roundtrip with >= 36 dB PSNR
+        let mut smooth_rgb = VideoFrame::new(width, height, PixelFormat::Rgb24);
+        for y in 0..height {
+            for x in 0..width {
+                smooth_rgb.plane_mut(0).row_mut(y)[x * 3] = (40 + x * 3).min(240) as u8;
+                smooth_rgb.plane_mut(0).row_mut(y)[x * 3 + 1] = (30 + y * 4).min(240) as u8;
+                smooth_rgb.plane_mut(0).row_mut(y)[x * 3 + 2] = (200 - x * 2).max(20) as u8;
+            }
+        }
+        let mut jpg_bytes = Vec::new();
+        write_jpeg_image(&mut jpg_bytes, &smooth_rgb, 90).unwrap();
+        assert_eq!(
+            detect_container_format(&jpg_bytes),
+            Some(ContainerFormat::Jpeg)
+        );
+        let (_, jpg_tracks) = probe_container(&jpg_bytes).unwrap();
+        assert_eq!(jpg_tracks[0].codec_id, CodecId::Jpeg);
+        let dec_jpg = read_jpeg_image(&jpg_bytes).unwrap();
+        assert_eq!(dec_jpg.width, width);
+        assert_eq!(dec_jpg.height, height);
+        assert_eq!(dec_jpg.format, PixelFormat::Rgb24);
+
+        let mut mse_sum = 0.0f64;
+        for y in 0..height {
+            let orig = smooth_rgb.plane(0).row(y);
+            let rec = dec_jpg.plane(0).row(y);
+            for i in 0..width * 3 {
+                let d = (orig[i] as f64) - (rec[i] as f64);
+                mse_sum += d * d;
+            }
+        }
+        let mse = mse_sum / ((width * height * 3) as f64);
+        let psnr = if mse <= 1e-9 {
+            99.0
+        } else {
+            10.0 * (255.0f64 * 255.0 / mse).log10()
+        };
+        assert!(
+            psnr >= 36.0,
+            "JPEG Q=90 PSNR should be >= 36 dB, got {psnr:.2} dB"
+        );
+
+        // 3. External ffprobe & ffmpeg interoperability when installed
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            let tmp_png = std::env::temp_dir().join("ragdoll_test_0047.png");
+            let tmp_jpg = std::env::temp_dir().join("ragdoll_test_0047.jpg");
+            let tmp_ff_png = std::env::temp_dir().join("ragdoll_test_0047_ff.png");
+            let tmp_ff_jpg = std::env::temp_dir().join("ragdoll_test_0047_ff.jpg");
+            std::fs::write(&tmp_png, &png_rgba_bytes).unwrap();
+            std::fs::write(&tmp_jpg, &jpg_bytes).unwrap();
+
+            // Verify ffprobe accepts Ragdoll's .png and .jpg
+            let p_png = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                ])
+                .arg(&tmp_png)
+                .output()
+                .unwrap();
+            assert!(p_png.status.success());
+
+            let p_jpg = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                ])
+                .arg(&tmp_jpg)
+                .output()
+                .unwrap();
+            assert!(p_jpg.status.success());
+
+            // Generate .png (with dynamic Huffman codes) and .jpg (4:2:0) using ffmpeg and decode with Ragdoll
+            let st_png = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&tmp_png)
+                .arg(&tmp_ff_png)
+                .status()
+                .unwrap();
+            assert!(st_png.success());
+            let ff_png_bytes = std::fs::read(&tmp_ff_png).unwrap();
+            let ff_png_dec = read_png_image(&ff_png_bytes).unwrap();
+            assert_eq!(ff_png_dec.width, width);
+            assert_eq!(ff_png_dec.height, height);
+            for y in 0..height {
+                assert_eq!(
+                    &ff_png_dec.plane(0).row(y)[..width * 4],
+                    &rgba.plane(0).row(y)[..width * 4]
+                );
+            }
+
+            let st_jpg = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&tmp_jpg)
+                .args(["-q:v", "2"])
+                .arg(&tmp_ff_jpg)
+                .status()
+                .unwrap();
+            assert!(st_jpg.success());
+            let ff_jpg_bytes = std::fs::read(&tmp_ff_jpg).unwrap();
+            let ff_jpg_dec = read_jpeg_image(&ff_jpg_bytes).unwrap();
+            assert_eq!(ff_jpg_dec.width, width);
+            assert_eq!(ff_jpg_dec.height, height);
+
+            let _ = std::fs::remove_file(&tmp_png);
+            let _ = std::fs::remove_file(&tmp_jpg);
+            let _ = std::fs::remove_file(&tmp_ff_png);
+            let _ = std::fs::remove_file(&tmp_ff_jpg);
         }
     }
 }
