@@ -156,3 +156,27 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 - [x] `0057` CLI: reject unknown options and remove or implement no-op flags <sup>chore · p2 · cli</sup>
 - [x] `0058` Remove internal process references from site and README <sup>docs · p2 · arch</sup>
 
+## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
+
+`··········` 0% · 0 of 12 done
+
+Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
+
+### backlog
+
+- [ ] `0063` Conformance runner: H.264.1, FLAC, AAC, Opus, Matroska, ISOBMFF and WebVTT vectors with per-feature results <sup>feature · p1 · arch</sup>
+- [ ] `0064` Bidirectional interop runner against reference implementations in a pinned container <sup>feature · p1 · arch</sup>
+- [ ] `0065` Coverage-guided and differential fuzzing with bounded allocation and time, and OSS-Fuzz <sup>feature · p1 · arch</sup>
+- [ ] `0066` Zero-dependency property engine and output-determinism matrix <sup>feature · p1 · arch</sup>
+- [ ] `BENCH-0067` Rate-distortion regression tracker with BD-rate and libvmaf calibration <sup>benchmark · p2 · bench</sup>
+- [ ] `BENCH-0068` Performance and memory gates: instruction-count budgets, allocation counting and soak tests <sup>benchmark · p2 · bench</sup>
+- [ ] `0069` QA report, generated support matrix and public scorecard, with tiered CI <sup>feature · p1 · arch</sup>
+- [ ] `0070` Formal checks on unsafe code: Miri, Kani proofs and mutation testing <sup>chore · p3 · arch</sup>
+
+### up next
+
+- [ ] `BUG-0060` H.264 decoder disagrees with FFmpeg on Ragdoll-encoded streams (17.3 dB vs 35.1 dB) <sup>bug · p0 · codec-video</sup>
+- [ ] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
+- [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
+- [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
+
