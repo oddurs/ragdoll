@@ -496,7 +496,7 @@ pub fn inverse_idct8x8(coeff: &[i16; 64]) -> [i16; 64] {
 
         let b1 = a1 + (a7 >> 2);
         let b3 = a3 + (a5 >> 2);
-        let b5 = a5 - (a3 >> 2);
+        let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
 
         tmp[i] = b0 + b7;
@@ -537,7 +537,7 @@ pub fn inverse_idct8x8(coeff: &[i16; 64]) -> [i16; 64] {
 
         let b1 = a1 + (a7 >> 2);
         let b3 = a3 + (a5 >> 2);
-        let b5 = a5 - (a3 >> 2);
+        let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
 
         out[c] = ((b0 + b7 + 32) >> 6) as i16;

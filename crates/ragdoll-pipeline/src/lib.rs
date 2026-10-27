@@ -1188,16 +1188,13 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                                     gf.push(f);
                                 }
                             }
-                            if !gf.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
-                                gf.sort_by_key(|f| f.pts.ticks);
-                            }
                             Ok(gf)
                         });
                     let mut out = Vec::with_capacity(pkts.len());
                     for gr in gop_results {
                         out.extend(gr?);
                     }
-                    out
+                    order_h264_frames(out)
                 } else {
                     let mut h264_dec = H264Decoder::new();
                     if let Some(ref hdr) = annex_b_hdr {
@@ -1214,7 +1211,7 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                             out.push(f);
                         }
                     }
-                    out
+                    order_h264_frames(out)
                 }
             } else {
                 Vec::new()
@@ -1252,10 +1249,7 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                     frames.push(f);
                 }
             }
-            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
-                frames.sort_by_key(|f| f.pts.ticks);
-            }
-            Ok((frames, fps))
+            Ok((order_h264_frames(frames), fps))
         }
         ContainerFormat::MpegTs => {
             let mut demux = MpegTsDemuxer::open(data)?;
@@ -1266,10 +1260,7 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
                     frames.push(f);
                 }
             }
-            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
-                frames.sort_by_key(|f| f.pts.ticks);
-            }
-            Ok((frames, Rational64::FPS_30))
+            Ok((order_h264_frames(frames), Rational64::FPS_30))
         }
         ContainerFormat::Wav
         | ContainerFormat::Flac
@@ -1279,6 +1270,23 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
             "audio/subtitle container has no video stream".into(),
         )),
     }
+}
+
+/// Puts decode-order `H264Decoder` frames into presentation order. The decoder stamps PTS from
+/// `pic_order_cnt`, which restarts at every IDR, so it only orders frames within one GOP: sorting
+/// across GOPs interleaves them. Sorts each GOP by POC, then renumbers PTS across the whole stream.
+fn order_h264_frames(mut frames: Vec<VideoFrame>) -> Vec<VideoFrame> {
+    let mut gop_start = 0;
+    for i in 1..=frames.len() {
+        if i == frames.len() || frames[i].keyframe {
+            frames[gop_start..i].sort_by_key(|f| f.pts.ticks);
+            gop_start = i;
+        }
+    }
+    for (idx, f) in frames.iter_mut().enumerate() {
+        f.pts = Timestamp::new(idx as i64, f.pts.timebase);
+    }
+    frames
 }
 
 /// Extracts non-video (Audio and Subtitle) tracks and their packets from a container byte slice
@@ -4360,6 +4368,7 @@ impl PackageBuilder {
 mod tests {
     use super::*;
     use ragdoll_codec::Pps;
+    use ragdoll_pix::psnr_plane_u8;
 
     #[test]
     fn gop_partition_and_parallel_work_stealing_order() {
@@ -4458,6 +4467,45 @@ faststart = true
             stats.pool_recycled_hits > 0,
             "FramePool should recycle scaled frame buffers across GOP frames"
         );
+    }
+
+    #[test]
+    fn multi_gop_h264_decodes_in_presentation_order() {
+        // 2 s at 30 fps spans several GOPs. The decoder's PTS restarts at every IDR, so a global
+        // sort would interleave GOPs (0, 15, 30, 45, 1, ...) and each frame would land beside a
+        // source frame half a second away (BUG-0060).
+        let (w, h) = (160, 96);
+        for ext in ["mp4", "mkv", "ts"] {
+            let path = std::env::temp_dir().join(format!(
+                "ragdoll_multi_gop_order_{}.{ext}",
+                std::process::id()
+            ));
+            synth_media(&path, w, h, 30, 2.0).unwrap();
+            let (frames, _) = decode_video_file(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(frames.len(), 60, "{ext}");
+            assert!(
+                frames.iter().filter(|f| f.keyframe).count() > 1,
+                "{ext}: expected several GOPs"
+            );
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(f.pts.ticks, i as i64, "{ext}: frame {i}");
+                let src = synth_video_frame(w, h, i);
+                let psnr = psnr_plane_u8(
+                    f.plane(0).data(),
+                    f.plane(0).stride(),
+                    src.plane(0).data(),
+                    src.plane(0).stride(),
+                    w,
+                    h,
+                );
+                assert!(
+                    psnr > 40.0,
+                    "{ext}: frame {i} is {psnr:.2} dB from its source"
+                );
+            }
+        }
     }
 
     #[test]

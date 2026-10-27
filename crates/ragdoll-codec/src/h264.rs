@@ -7013,3 +7013,61 @@ pub fn roundtrip_block4x4_dct(
     add4x4_idct_u8(dst, dst_stride, &deq);
     let _ = forward_dct4x4;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Moving diagonal gradient plus a drifting block, so P-frames carry real motion and residuals.
+    fn moving_frame(w: usize, h: usize, t: usize) -> VideoFrame {
+        let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
+        for y in 0..h {
+            let row = f.plane_mut(0).row_mut(y);
+            for (x, p) in row.iter_mut().enumerate() {
+                let in_box = (x + 64 - (t * 3) % 64) % 64 < 20 && (y + t * 2) % 48 < 16;
+                *p = if in_box {
+                    230
+                } else {
+                    (16 + ((x * 3 + y * 2 + t * 5) % 200)) as u8
+                };
+            }
+        }
+        for plane in 1..3 {
+            for y in 0..h / 2 {
+                let row = f.plane_mut(plane).row_mut(y);
+                for (x, p) in row.iter_mut().enumerate() {
+                    *p = (96 + ((x + y * plane + t) % 64)) as u8;
+                }
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn encoder_reconstruction_matches_decoder_every_frame() {
+        let (w, h) = (64, 48);
+        for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+            for qp in [10u8, 22, 30, 40] {
+                let mut enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, qp)
+                    .with_profile(profile);
+                enc.keyint = 4;
+                let mut dec = H264Decoder::new();
+                for t in 0..10 {
+                    let au = enc.encode_frame(&moving_frame(w, h, t)).unwrap();
+                    let decoded = dec.decode_annex_b_packet(&au).unwrap().unwrap();
+                    let recon = enc.prev_recon.as_ref().unwrap();
+                    for p in 0..3 {
+                        let (pw, ph) = if p == 0 { (w, h) } else { (w / 2, h / 2) };
+                        for y in 0..ph {
+                            assert_eq!(
+                                &decoded.plane(p).row(y)[..pw],
+                                &recon.plane(p).row(y)[..pw],
+                                "{profile:?} qp {qp} frame {t} plane {p} row {y}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
