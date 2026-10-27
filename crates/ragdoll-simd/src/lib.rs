@@ -309,6 +309,23 @@ mod tests {
         let coeff8 = forward_dct8x8(&block8);
         let recon8 = inverse_idct8x8(&coeff8);
         assert_eq!(recon8.len(), 64);
+
+        // A lone coefficient exercises the odd half of both passes (ITU-T H.264 8.5.13.2,
+        // `f5 = (e3 >> 2) - e5`); the expected block matches FFmpeg's `h264_idct8_add`.
+        let mut lone = [0i16; 64];
+        lone[10] = 76;
+        #[rustfmt::skip]
+        let expected: [i16; 64] = [
+             2,  1, -1, -2, -2, -1,  1,  2,
+             1,  1, -1, -1, -1, -1,  1,  1,
+             1,  0,  0, -1, -1,  0,  0,  1,
+             0,  0,  0,  0,  0,  0,  0,  0,
+             0,  0,  0,  0,  0,  0,  0,  0,
+            -1,  0,  0,  1,  1,  0,  0, -1,
+            -1, -1,  1,  1,  1,  1, -1, -1,
+            -2, -1,  1,  2,  2,  1, -1, -2,
+        ];
+        assert_eq!(inverse_idct8x8(&lone), expected);
     }
 
     #[test]
