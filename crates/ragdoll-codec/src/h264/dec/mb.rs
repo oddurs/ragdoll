@@ -21,7 +21,6 @@ use super::tables::{
     B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, FIELD_SCAN4X4,
     FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN4X4, SCAN8X8, chroma_qp,
 };
-use ragdoll_simd::h264_avg;
 
 /// A reference picture as seen by one slice.
 pub struct RefPic {
@@ -2267,7 +2266,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// [`Self::mc_rect`] with default weighted prediction for every component (8.4.2.3.1): one
-    /// list is copied, two are averaged.
+    /// list is predicted, a second is averaged into it.
     #[allow(clippy::too_many_arguments)]
     fn mc_rect_default(
         &mut self,
@@ -2286,13 +2285,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         match rp {
             [Some(r), None] | [None, Some(r)] => {
                 let l = rp[0].is_none() as usize;
-                recon::mc_luma(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, ls);
+                recon::mc_luma(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, ls, false);
             }
             [Some(r0), Some(r1)] => {
-                recon::mc_luma(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, ls);
-                let t = &mut self.scratch[0];
-                recon::mc_luma(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], t, 16);
-                h264_avg(dst, ls, t, 16, w, h);
+                recon::mc_luma(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, ls, false);
+                recon::mc_luma(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], dst, ls, true);
             }
             [None, None] => {}
         }
@@ -2318,13 +2315,13 @@ impl<'a, 'c> Dec<'a, 'c> {
             match rp {
                 [Some(r), None] | [None, Some(r)] => {
                     let l = rp[0].is_none() as usize;
-                    recon::mc_chroma(&r.planes[p], cpw, cph, cx, cy, cw, ch, cmv[l], dst, cs);
+                    let mv = cmv[l];
+                    recon::mc_chroma(&r.planes[p], cpw, cph, cx, cy, cw, ch, mv, dst, cs, false);
                 }
                 [Some(r0), Some(r1)] => {
-                    recon::mc_chroma(&r0.planes[p], cpw, cph, cx, cy, cw, ch, cmv[0], dst, cs);
-                    let t = &mut self.scratch[0];
-                    recon::mc_chroma(&r1.planes[p], cpw, cph, cx, cy, cw, ch, cmv[1], t, 16);
-                    h264_avg(dst, cs, t, 16, cw, ch);
+                    let (m0, m1) = (cmv[0], cmv[1]);
+                    recon::mc_chroma(&r0.planes[p], cpw, cph, cx, cy, cw, ch, m0, dst, cs, false);
+                    recon::mc_chroma(&r1.planes[p], cpw, cph, cx, cy, cw, ch, m1, dst, cs, true);
                 }
                 [None, None] => {}
             }
@@ -2379,7 +2376,19 @@ impl<'a, 'c> Dec<'a, 'c> {
             wt,
             &mut self.scratch,
             |list, out, os| {
-                recon::mc_luma(&planes(list)[0], pw, ph, x, y, w, h, mvs[list], out, os)
+                recon::mc_luma(
+                    &planes(list)[0],
+                    pw,
+                    ph,
+                    x,
+                    y,
+                    w,
+                    h,
+                    mvs[list],
+                    out,
+                    os,
+                    false,
+                )
             },
         );
         if self.cx.sps.chroma_array_type() == 0 {
@@ -2425,6 +2434,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                         cmv[list],
                         out,
                         os,
+                        false,
                     )
                 },
             );

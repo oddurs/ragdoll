@@ -3,8 +3,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_idct4_add, h264_luma_mc, h264_weight_bi,
-    h264_weight_uni, luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_idct4_add, h264_luma_mc,
+    h264_luma_mc_avg, h264_weight_bi, h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -254,13 +254,15 @@ pub fn mc_luma(
     mv: [i16; 2],
     dst: &mut [u8],
     ds: usize,
+    avg: bool,
 ) {
+    let kernel = if avg { h264_luma_mc_avg } else { h264_luma_mc };
     let ix = x as isize + (mv[0] as isize >> 2);
     let iy = y as isize + (mv[1] as isize >> 2);
     let (fx, fy) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
     let cols = luma_mc_cols(w);
     if ix >= 2 && iy >= 2 && ix as usize + cols <= width && iy as usize + h + 3 <= height {
-        h264_luma_mc(
+        kernel(
             dst,
             ds,
             src,
@@ -274,7 +276,7 @@ pub fn mc_luma(
         return;
     }
     // Whole-sample blocks at the picture edge need no interpolation margins.
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, avg) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 21];
@@ -288,11 +290,12 @@ pub fn mc_luma(
         cols + 2,
         h + 5,
     );
-    h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
+    kernel(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
 }
 
 /// Whole-sample prediction: copies the `w`x`h` block at `(x, y)` of a `width`x`height` plane to
-/// `dst` when it lies inside the plane, which needs none of the interpolation margins.
+/// `dst` (or, with `avg`, averages it into `dst`) when it lies inside the plane, which needs none
+/// of the interpolation margins.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn copy_inside(
@@ -305,11 +308,16 @@ fn copy_inside(
     h: usize,
     dst: &mut [u8],
     ds: usize,
+    avg: bool,
 ) -> bool {
     if x < 0 || y < 0 || x as usize + w > width || y as usize + h > height {
         return false;
     }
     let o = y as usize * width + x as usize;
+    if avg {
+        h264_avg(dst, ds, &src[o..], width, w, h);
+        return true;
+    }
     fn rows<const W: usize>(src: &[u8], o: usize, ss: usize, h: usize, dst: &mut [u8], ds: usize) {
         for r in 0..h {
             let s: &[u8; W] = src[o + r * ss..][..W].try_into().expect("W samples");
@@ -367,13 +375,19 @@ pub fn mc_chroma(
     mv: [i16; 2],
     dst: &mut [u8],
     ds: usize,
+    avg: bool,
 ) {
+    let kernel = if avg {
+        h264_chroma_mc_avg
+    } else {
+        h264_chroma_mc
+    };
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
     let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
     let cols = chroma_mc_cols(w);
     if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
-        h264_chroma_mc(
+        kernel(
             dst,
             ds,
             src,
@@ -386,12 +400,12 @@ pub fn mc_chroma(
         );
         return;
     }
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, avg) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 9];
     edge_window(&mut win, src, width, height, ix, iy, cols, h + 1);
-    h264_chroma_mc(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
+    kernel(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
 }
 
 /// Predicts a `w`x`h` block from the lists in `used` and combines them into `dst` (stride `ds`)
