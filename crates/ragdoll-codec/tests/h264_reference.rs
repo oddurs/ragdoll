@@ -1,13 +1,14 @@
 //! H.264 decoder output checked against the reference decoders.
 //!
 //! The streams in `tests/data/h264` were encoded with libx264 from FFmpeg's `testsrc2` pattern,
-//! each exercising a different part of the decoder. The expected values are the 64-bit FNV-1a
+//! each exercising a different part of the decoder. The MBAFF streams use interlaced input (half
+//! the picture scrolling vertically) so that field and frame macroblock pairs mix. The expected values are the 64-bit FNV-1a
 //! hash of the JM 19.1 reference decoder's output (all frames, in output order, I420, cropped);
 //! FFmpeg 6.1 produces byte-identical output for each.
 
 use ragdoll_codec::H264Decoder;
 
-const CASES: [(&str, usize, usize, usize, u64); 4] = [
+const CASES: [(&str, usize, usize, usize, u64); 6] = [
     // Main: CABAC, 3 B-frames in a pyramid, explicit weighted prediction, 3 references.
     (
         "cabac_bpyramid_weighted.264",
@@ -40,6 +41,16 @@ const CASES: [(&str, usize, usize, usize, u64); 4] = [
         12,
         0x2b092e8ae3ffbdde,
     ),
+    // MBAFF, CABAC, top field first: temporal direct, B pyramid, weighted prediction, 8x8 transform.
+    (
+        "cabac_mbaff_temporal_weighted.264",
+        128,
+        96,
+        12,
+        0x22508a1cfed19049,
+    ),
+    // MBAFF, CAVLC, bottom field first: spatial direct, 2 references, 8x8 transform.
+    ("cavlc_mbaff_spatial.264", 128, 96, 12, 0x05629c5f77e4e6be),
 ];
 
 fn fnv1a(hash: &mut u64, bytes: &[u8]) {

@@ -51,6 +51,8 @@ pub struct Motion {
     pub mb_intra: Vec<bool>,
     /// Per macroblock: decoded as a field macroblock (field picture or field MB pair).
     pub mb_field: Vec<bool>,
+    /// Decoded as an MBAFF frame (rather than as a frame or two field pictures).
+    pub mbaff: bool,
 }
 
 impl Motion {
@@ -62,6 +64,7 @@ impl Motion {
             ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
             mb_intra: vec![true; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
+            mbaff: false,
         }
     }
 }
@@ -175,6 +178,9 @@ impl FrameStore {
 /// For a field picture the geometry is that of the field.
 pub struct PicState {
     pub structure: Structure,
+    /// Macroblock-adaptive frame/field frame: macroblocks are decoded in vertical pairs and
+    /// `mb_y = 2 * pair_row + (bottom MB)`; a field pair's MBs hold the pair's top and bottom field.
+    pub mbaff: bool,
     pub mb_w: usize,
     pub mb_h: usize,
     pub width: usize,
@@ -183,6 +189,8 @@ pub struct PicState {
 
     pub slice_num: Vec<u32>,
     pub mb_type: Vec<MbType>,
+    /// Field macroblock (field picture, or field pair of an MBAFF frame).
+    pub mb_field: Vec<bool>,
     /// Luma CBP in bits 0..3, chroma CBP in bits 4..5.
     pub cbp: Vec<u8>,
     pub qp: Vec<u8>,
@@ -207,13 +215,14 @@ pub struct PicState {
 }
 
 impl PicState {
-    pub fn new(structure: Structure, mb_w: usize, mb_h: usize) -> Self {
+    pub fn new(structure: Structure, mb_w: usize, mb_h: usize, mbaff: bool) -> Self {
         let mbs = mb_w * mb_h;
         let b4 = mbs * 16;
         let c4 = mbs * 4;
         let (w, h) = (mb_w * 16, mb_h * 16);
         Self {
             structure,
+            mbaff,
             mb_w,
             mb_h,
             width: w,
@@ -221,6 +230,7 @@ impl PicState {
             planes: [vec![0; w * h], vec![128; w * h / 4], vec![128; w * h / 4]],
             slice_num: vec![u32::MAX; mbs],
             mb_type: vec![MbType::None; mbs],
+            mb_field: vec![matches!(structure, Structure::Field(_)); mbs],
             cbp: vec![0; mbs],
             qp: vec![0; mbs],
             qpc: vec![[0; 2]; mbs],
@@ -275,6 +285,7 @@ impl PicState {
             }
         }
         let m = Arc::make_mut(&mut store.motion);
+        m.mbaff = self.mbaff;
         let stride = self.mb_w * 4;
         for mby in 0..self.mb_h {
             let fy = match parity {
@@ -285,7 +296,7 @@ impl PicState {
                 let src_mb = mby * self.mb_w + mbx;
                 let dst_mb = fy * self.mb_w + mbx;
                 m.mb_intra[dst_mb] = self.mb_type[src_mb].is_intra();
-                m.mb_field[dst_mb] = parity.is_some();
+                m.mb_field[dst_mb] = self.mb_field[src_mb];
                 for r in 0..4 {
                     let s = (mby * 4 + r) * stride + mbx * 4;
                     let d = (fy * 4 + r) * stride + mbx * 4;

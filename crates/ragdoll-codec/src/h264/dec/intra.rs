@@ -225,11 +225,24 @@ pub fn predict_16x16(
     out: &mut [u8; 256],
 ) {
     predict_block(
-        plane, stride, x, y, 16, 16, mode, has_left, has_top, has_tl, out, false,
+        plane,
+        stride,
+        x,
+        y,
+        16,
+        16,
+        mode,
+        [has_left; 2],
+        has_top,
+        has_tl,
+        out,
+        false,
     );
 }
 
 /// Chroma intra prediction for a 4:2:0 8x8 block (`intra_chroma_pred_mode`: 0 DC, 1 H, 2 V, 3 Plane).
+/// `has_left` gives the availability of the upper and lower four left samples, which can differ
+/// in MBAFF frames with constrained intra prediction.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_chroma(
     plane: &[u8],
@@ -237,7 +250,7 @@ pub fn predict_chroma(
     x: usize,
     y: usize,
     mode: u8,
-    has_left: bool,
+    has_left: [bool; 2],
     has_top: bool,
     has_tl: bool,
     out: &mut [u8; 64],
@@ -263,12 +276,13 @@ fn predict_block(
     w: usize,
     h: usize,
     mode: u8,
-    has_left: bool,
+    left_avail: [bool; 2],
     has_top: bool,
     has_tl: bool,
     out: &mut [u8],
     chroma: bool,
 ) {
+    let has_left = left_avail[0] && left_avail[1];
     let top = |i: usize| plane[(y - 1) * stride + x + i] as i32;
     let left = |i: usize| plane[(y + i) * stride + x - 1] as i32;
     match mode {
@@ -299,6 +313,7 @@ fn predict_block(
         2 => {
             // Chroma DC per 4x4 block (8.3.4.1 - 8.3.4.3).
             for by in 0..2 {
+                let has_left = left_avail[by];
                 for bx in 0..2 {
                     let st: i32 = if has_top {
                         (0..4).map(|i| top(bx * 4 + i)).sum()

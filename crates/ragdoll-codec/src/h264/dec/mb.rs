@@ -43,7 +43,11 @@ pub struct SliceCtx<'a> {
     pub sh: &'a SliceHeader,
     pub slice_num: u32,
     pub refs: [Vec<RefPic>; 2],
+    /// MBAFF only: the field reference lists of field macroblocks, by MB parity then list.
+    pub field_refs: Option<[[Vec<RefPic>; 2]; 2]>,
     pub cur_poc: i32,
+    /// Top and bottom field POCs of the current frame (field macroblocks of MBAFF frames).
+    pub field_poc: [i32; 2],
     pub dq: &'a Dequant,
 }
 
@@ -75,23 +79,35 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         Entropy::Cavlc(r)
     };
     let total = st.mb_w * st.mb_h;
-    let first = sh.first_mb as usize;
+    let first = sh.first_mb as usize * if st.mbaff { 2 } else { 1 };
     if first >= total {
         return Err(bad("H.264 first_mb_in_slice beyond picture"));
     }
-    let implicit = build_implicit_weights(cx);
+    let implicit = build_implicit_weights(cx, &cx.refs, cx.cur_poc);
+    let implicit_field = match &cx.field_refs {
+        Some(f) => [0, 1].map(|p| build_implicit_weights(cx, &f[p], cx.field_poc[p])),
+        None => [Vec::new(), Vec::new()],
+    };
     let mut d = Dec {
         cx,
         st,
         ent,
         qp: sh.qp,
         last_dqp_nz: false,
-        mb: MbPos::new(first, 0),
+        mb: MbPos {
+            addr: 0,
+            x: 0,
+            y: 0,
+        },
+        field: cx.sh.field_pic,
         implicit,
+        implicit_field,
     };
     d.run(first, total)
 }
 
+/// Position of a macroblock: `addr` indexes per-MB state, `(x, y)` its MB column and row
+/// (for MBAFF, `y = 2 * pair_row + bottom`).
 #[derive(Clone, Copy)]
 struct MbPos {
     addr: usize,
@@ -99,25 +115,16 @@ struct MbPos {
     y: usize,
 }
 
-impl MbPos {
-    fn new(addr: usize, mb_w: usize) -> Self {
-        if mb_w == 0 {
-            return Self { addr, x: 0, y: 0 };
-        }
-        Self {
-            addr,
-            x: addr % mb_w,
-            y: addr / mb_w,
-        }
-    }
-}
-
 /// Implicit bi-prediction weights `[w0, w1]` per `(refIdxL0, refIdxL1)` (8.4.2.3.1), empty when unused.
-fn build_implicit_weights(cx: &SliceCtx<'_>) -> Vec<[i32; 2]> {
+fn build_implicit_weights(
+    cx: &SliceCtx<'_>,
+    refs: &[Vec<RefPic>; 2],
+    cur_poc: i32,
+) -> Vec<[i32; 2]> {
     if !(cx.sh.slice_type.is_b() && cx.pps.weighted_bipred_idc == 2) {
         return Vec::new();
     }
-    let (l0, l1) = (&cx.refs[0], &cx.refs[1]);
+    let (l0, l1) = (&refs[0], &refs[1]);
     let mut out = Vec::with_capacity(l0.len() * l1.len());
     for r0 in l0 {
         for r1 in l1 {
@@ -125,7 +132,7 @@ fn build_implicit_weights(cx: &SliceCtx<'_>) -> Vec<[i32; 2]> {
             let w = if r0.long || r1.long || td == 0 {
                 [32, 32]
             } else {
-                let tb = (cx.cur_poc - r0.poc).clamp(-128, 127);
+                let tb = (cur_poc - r0.poc).clamp(-128, 127);
                 let tx = (16384 + (td / 2).abs()) / td;
                 let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
                 if (dsf >> 2) < -64 || (dsf >> 2) > 128 {
@@ -171,20 +178,32 @@ struct Dec<'a, 'c> {
     qp: i32,
     last_dqp_nz: bool,
     mb: MbPos,
+    /// The current macroblock is a field macroblock (field picture or MBAFF field pair).
+    field: bool,
     implicit: Vec<[i32; 2]>,
+    implicit_field: [Vec<[i32; 2]>; 2],
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
     fn run(&mut self, first: usize, total: usize) -> Result<()> {
         let slice_type = self.cx.sh.slice_type;
+        let mbaff = self.st.mbaff;
         let mut addr = first;
         if !self.is_cabac() {
             loop {
                 if !slice_type.is_intra() {
                     let run = self.reader().read_ue()? as usize;
-                    for _ in 0..run {
+                    for left in (0..run).rev() {
                         if addr >= total {
                             return Err(bad("H.264 mb_skip_run beyond picture"));
+                        }
+                        if mbaff && addr.is_multiple_of(2) {
+                            self.field = self.inferred_field(addr);
+                            // A coded bottom MB follows: its mb_field_decoding_flag also
+                            // applies to this skipped top MB.
+                            if left == 0 && self.reader().more_rbsp_data() {
+                                self.field = self.reader().read_bit()?;
+                            }
                         }
                         self.decode_skip(addr)?;
                         addr += 1;
@@ -196,6 +215,9 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if addr >= total {
                     return Err(bad("H.264 slice data beyond picture"));
                 }
+                if mbaff && addr.is_multiple_of(2) {
+                    self.field = self.reader().read_bit()?;
+                }
                 self.decode_mb(addr)?;
                 addr += 1;
                 if !self.reader().more_rbsp_data() {
@@ -203,40 +225,122 @@ impl<'a, 'c> Dec<'a, 'c> {
                 }
             }
         } else {
+            let mut next_skipped = false;
+            let mut top_skipped = false;
             loop {
                 if addr >= total {
                     return Err(bad("H.264 slice data beyond picture"));
                 }
+                let top = addr.is_multiple_of(2);
+                if mbaff && top {
+                    self.field = self.inferred_field(addr);
+                }
                 let skipped = if slice_type.is_intra() {
                     false
+                } else if mbaff && !top && top_skipped {
+                    next_skipped
                 } else {
-                    self.begin_mb(addr);
-                    let a = self
-                        .mb_left()
-                        .filter(|&m| !self.st.mb_type[m].is_skip())
-                        .is_some() as u8;
-                    let b = self
-                        .mb_top()
-                        .filter(|&m| !self.st.mb_type[m].is_skip())
-                        .is_some() as u8;
-                    let (cd, ctxs) = self.cabac();
-                    if slice_type.is_b() {
-                        cd.decode_b_skip(&mut ctxs[..], a, b)
-                    } else {
-                        cd.decode_p_skip(&mut ctxs[..], a, b)
-                    }
+                    self.decode_skip_flag(addr)
                 };
                 if skipped {
+                    if mbaff && top {
+                        // The bottom MB's skip flag (and the pair's field flag when it is coded)
+                        // precede the skipped top MB's reconstruction.
+                        self.begin_mb(addr);
+                        let m = self.mb.addr;
+                        self.st.mb_type[m] = if slice_type.is_b() {
+                            MbType::BSkip
+                        } else {
+                            MbType::PSkip
+                        };
+                        next_skipped = self.decode_skip_flag(addr + 1);
+                        if !next_skipped {
+                            self.field = self.decode_field_flag(addr);
+                        }
+                    }
                     self.decode_skip(addr)?;
                 } else {
+                    if mbaff && top {
+                        self.field = self.decode_field_flag(addr);
+                    }
                     self.decode_mb(addr)?;
                 }
-                let (cd, _) = self.cabac();
-                if cd.decode_terminate() != 0 {
-                    return Ok(());
+                if top {
+                    top_skipped = skipped;
+                }
+                if !(mbaff && top) {
+                    let (cd, _) = self.cabac();
+                    if cd.decode_terminate() != 0 {
+                        return Ok(());
+                    }
                 }
                 addr += 1;
             }
+        }
+    }
+
+    /// Position of the macroblock at decoding address `addr`.
+    fn pos(&self, addr: usize) -> MbPos {
+        let w = self.st.mb_w;
+        let (x, y) = if self.st.mbaff {
+            let pair = addr / 2;
+            (pair % w, 2 * (pair / w) + addr % 2)
+        } else {
+            (addr % w, addr / w)
+        };
+        MbPos {
+            addr: y * w + x,
+            x,
+            y,
+        }
+    }
+
+    /// Inferred mb_field_decoding_flag of the pair at decoding address `addr` (7.4.4): that of the
+    /// left pair, else of the pair above, else frame.
+    fn inferred_field(&self, addr: usize) -> bool {
+        let p = self.pos(addr);
+        let w = self.st.mb_w;
+        let same = |a: usize| self.st.slice_num[a] == self.cx.slice_num;
+        if p.x > 0 && same(p.addr - 1) {
+            self.st.mb_field[p.addr - 1]
+        } else if p.y >= 2 && same(p.addr - 2 * w) {
+            self.st.mb_field[p.addr - 2 * w]
+        } else {
+            false
+        }
+    }
+
+    /// CABAC mb_field_decoding_flag of the pair whose top MB has decoding address `addr`.
+    fn decode_field_flag(&mut self, addr: usize) -> bool {
+        let p = self.pos(addr);
+        let w = self.st.mb_w;
+        let cond =
+            |a: usize| (self.st.slice_num[a] == self.cx.slice_num && self.st.mb_field[a]) as usize;
+        let inc = if p.x > 0 { cond(p.addr - 1) } else { 0 }
+            + if p.y >= 2 { cond(p.addr - 2 * w) } else { 0 };
+        let (cd, ctxs) = self.cabac();
+        cd.decode_decision(&mut ctxs[70 + inc]) != 0
+    }
+
+    /// CABAC mb_skip_flag of the macroblock at decoding address `addr`.
+    fn decode_skip_flag(&mut self, addr: usize) -> bool {
+        let saved = self.mb;
+        self.mb = self.pos(addr);
+        let a = self
+            .mb_left()
+            .filter(|&m| !self.st.mb_type[m].is_skip())
+            .is_some() as u8;
+        let b = self
+            .mb_top()
+            .filter(|&m| !self.st.mb_type[m].is_skip())
+            .is_some() as u8;
+        self.mb = saved;
+        let is_b = self.cx.sh.slice_type.is_b();
+        let (cd, ctxs) = self.cabac();
+        if is_b {
+            cd.decode_b_skip(&mut ctxs[..], a, b)
+        } else {
+            cd.decode_p_skip(&mut ctxs[..], a, b)
         }
     }
 
@@ -259,9 +363,45 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
     }
 
-    /// Whether the current macroblock is a field macroblock (field picture).
+    /// Whether the current macroblock is a field macroblock.
     fn field_mb(&self) -> bool {
-        matches!(self.st.structure, Structure::Field(_))
+        self.field
+    }
+
+    /// MBAFF field macroblock: uses the field reference lists of its parity.
+    fn mbaff_field(&self) -> bool {
+        self.st.mbaff && self.field
+    }
+
+    /// Reference list `list` as seen by the current macroblock.
+    fn refs(&self, list: usize) -> &[RefPic] {
+        match &self.cx.field_refs {
+            Some(f) if self.field => &f[self.mb.y & 1][list],
+            _ => &self.cx.refs[list],
+        }
+    }
+
+    /// POC of the current picture, or of the current MB's field for MBAFF field macroblocks.
+    fn cur_poc(&self) -> i32 {
+        if self.mbaff_field() {
+            self.cx.field_poc[self.mb.y & 1]
+        } else {
+            self.cx.cur_poc
+        }
+    }
+
+    /// Parity of the current field picture or MBAFF field macroblock; `None` for frame MBs.
+    fn field_parity(&self) -> Option<u8> {
+        match self.st.structure {
+            Structure::Field(p) => Some(p),
+            Structure::Frame if self.field => Some((self.mb.y & 1) as u8),
+            Structure::Frame => None,
+        }
+    }
+
+    /// Number of active references of `list` for the current macroblock.
+    fn num_refs(&self, list: usize) -> u32 {
+        self.cx.sh.num_ref_idx_active[list] * if self.mbaff_field() { 2 } else { 1 }
     }
 
     fn is_cabac(&self) -> bool {
@@ -271,50 +411,105 @@ impl<'a, 'c> Dec<'a, 'c> {
     // ----- neighbourhood -------------------------------------------------------------------
 
     fn begin_mb(&mut self, addr: usize) {
-        self.mb = MbPos::new(addr, self.st.mb_w);
-        self.st.slice_num[addr] = self.cx.slice_num;
+        self.mb = self.pos(addr);
+        let a = self.mb.addr;
+        self.st.slice_num[a] = self.cx.slice_num;
+        self.st.mb_field[a] = self.field;
     }
 
     fn mb_avail(&self, addr: usize) -> bool {
         self.st.slice_num[addr] == self.cx.slice_num && addr != self.mb.addr
     }
 
-    fn mb_left(&self) -> Option<usize> {
-        (self.mb.x > 0)
-            .then(|| self.mb.addr - 1)
+    /// Neighbouring location (6.4.12): the macroblock covering the luma (or, with `chroma`, 4:2:0
+    /// chroma) location `(xn, yn)` relative to the current macroblock's top-left sample, and the
+    /// location `(xw, yw)` inside it. Availability is not checked.
+    fn locate(&self, xn: isize, yn: isize, chroma: bool) -> Option<(usize, usize, usize)> {
+        let s: isize = if chroma { 8 } else { 16 };
+        let (w, h) = (self.st.mb_w as isize, self.st.mb_h as isize);
+        let px = self.mb.x as isize * s + xn;
+        if px < 0 || px >= w * s {
+            return None;
+        }
+        let nx = (px / s) as usize;
+        let xw = (px % s) as usize;
+        if !self.st.mbaff {
+            let py = self.mb.y as isize * s + yn;
+            if py < 0 || py >= h * s {
+                return None;
+            }
+            let addr = (py / s) as usize * self.st.mb_w + nx;
+            return Some((addr, xw, (py % s) as usize));
+        }
+        // MBAFF: the location is geometric in the frame; a field MB of parity p covers the
+        // frame lines `pair_top + p + 2k`.
+        let my = self.mb.y as isize;
+        let line = if self.field {
+            (my & !1) * s + (my & 1) + 2 * yn
+        } else {
+            my * s + yn
+        };
+        if line < 0 || line >= h * s {
+            return None;
+        }
+        let pair_row = (line / (2 * s)) as usize;
+        let top = 2 * pair_row * self.st.mb_w + nx;
+        let pair_field = if pair_row == self.mb.y / 2 && nx == self.mb.x {
+            self.field
+        } else {
+            self.st.mb_field[top]
+        };
+        let l = line % (2 * s);
+        let (bottom, yw) = if pair_field {
+            (l % 2, l / 2)
+        } else {
+            (l / s, l % s)
+        };
+        Some((top + bottom as usize * self.st.mb_w, xw, yw as usize))
+    }
+
+    /// Index into the per-4x4 arrays of the block at `(xw, yw)` (samples) inside MB `addr`.
+    fn b4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
+        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        self.st.b4(x * 4 + xw / 4, y * 4 + yw / 4)
+    }
+
+    /// Index into the per-chroma-4x4 arrays of the block at chroma `(xw, yw)` inside MB `addr`.
+    fn c4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
+        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        self.st.c4(x * 2 + xw / 4, y * 2 + yw / 4)
+    }
+
+    /// Available neighbouring macroblock covering luma `(xn, yn)` (outside the current MB).
+    fn mb_nb(&self, xn: isize, yn: isize) -> Option<usize> {
+        self.locate(xn, yn, false)
+            .map(|n| n.0)
             .filter(|&a| self.mb_avail(a))
+    }
+
+    fn mb_left(&self) -> Option<usize> {
+        self.mb_nb(-1, 0)
     }
 
     fn mb_top(&self) -> Option<usize> {
-        (self.mb.y > 0)
-            .then(|| self.mb.addr - self.st.mb_w)
-            .filter(|&a| self.mb_avail(a))
+        self.mb_nb(0, -1)
     }
 
-    /// Macroblock containing absolute 4x4 position `(x4, y4)`, if inside the picture.
-    fn mb_at4(&self, x4: isize, y4: isize) -> Option<usize> {
-        if x4 < 0
-            || y4 < 0
-            || x4 >= (self.st.mb_w * 4) as isize
-            || y4 >= (self.st.mb_h * 4) as isize
-        {
+    /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
+    /// current MB are available when their bit is set in `done` (by `luma4x4BlkIdx`).
+    fn blk(&self, xn: isize, yn: isize, done: u16) -> Option<(usize, usize)> {
+        let (a, xw, yw) = self.locate(xn, yn, false)?;
+        if a == self.mb.addr {
+            if done & (1 << BLK4_AT[yw / 4][xw / 4]) == 0 {
+                return None;
+            }
+        } else if !self.mb_avail(a) {
             return None;
         }
-        Some((y4 as usize / 4) * self.st.mb_w + x4 as usize / 4)
+        Some((a, self.b4_of(a, xw, yw)))
     }
 
-    /// Whether the 4x4 block at absolute `(x4, y4)` is available; `done` marks decoded blocks of the current MB.
-    fn blk_avail(&self, x4: isize, y4: isize, done: u16) -> bool {
-        match self.mb_at4(x4, y4) {
-            None => false,
-            Some(a) if a == self.mb.addr => {
-                done & (1 << BLK4_AT[y4 as usize % 4][x4 as usize % 4]) != 0
-            }
-            Some(a) => self.mb_avail(a),
-        }
-    }
-
-    /// Availability of a neighbouring macroblock for intra prediction (constrained intra pred).
+    /// Whether a macroblock's samples may be used for intra prediction (constrained intra pred).
     fn intra_ok(&self, addr: Option<usize>) -> bool {
         match addr {
             None => false,
@@ -326,6 +521,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
     }
 
+    /// Intra availability of the samples left of luma rows `y0..y0 + n` of the current MB. In MBAFF
+    /// frames these rows can come from both macroblocks of the left pair.
+    fn left_ok(&self, y0: usize, n: usize) -> bool {
+        let rows = if self.st.mbaff { n } else { 1 };
+        (y0..y0 + rows).all(|y| self.intra_ok(self.locate(-1, y as isize, false).map(|l| l.0)))
+    }
+
     /// Intra availability `(left, top, top_right, top_left)` of the `n`x`n` luma block at MB-relative 4x4 `(bx, by)`.
     fn intra_edges(
         &self,
@@ -334,20 +536,42 @@ impl<'a, 'c> Dec<'a, 'c> {
         n4: usize,
         cur_blk: usize,
     ) -> (bool, bool, bool, bool) {
-        let (mx4, my4) = ((self.mb.x * 4) as isize, (self.mb.y * 4) as isize);
-        let at = |dx: isize, dy: isize| -> bool {
-            let (x, y) = (bx as isize + dx, by as isize + dy);
-            let addr = self.mb_at4(mx4 + x, my4 + y);
-            if (0..4).contains(&x) && (0..4).contains(&y) {
+        let at = |xn: isize, yn: isize| -> bool {
+            match self.locate(xn, yn, false) {
                 // Inside the current MB: decoded iff earlier in block order.
-                BLK4_AT[y as usize][x as usize] < cur_blk
-            } else if x >= 4 && y >= 0 {
-                false
-            } else {
-                self.intra_ok(addr)
+                Some((a, xw, yw)) if a == self.mb.addr => BLK4_AT[yw / 4][xw / 4] < cur_blk,
+                l => self.intra_ok(l.map(|l| l.0)),
             }
         };
-        (at(-1, 0), at(0, -1), at(n4 as isize, -1), at(-1, -1))
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        let left = if bx == 0 {
+            self.left_ok(by * 4, n4 * 4)
+        } else {
+            true
+        };
+        (
+            left,
+            at(x, y - 1),
+            at(x + (n4 * 4) as isize, y - 1),
+            at(x - 1, y - 1),
+        )
+    }
+
+    /// Byte offset of the current MB's sample view in plane `c`, its line stride, and the MB's
+    /// top-left `(x, y)` within that view. A field MB of an MBAFF frame sees its field's lines.
+    fn view(&self, c: usize) -> (usize, usize, usize, usize) {
+        let s = if c == 0 { 16 } else { 8 };
+        let w = if c == 0 {
+            self.st.width
+        } else {
+            self.st.width / 2
+        };
+        if self.mbaff_field() {
+            let p = self.mb.y & 1;
+            (p * w, 2 * w, self.mb.x * s, (self.mb.y / 2) * s)
+        } else {
+            (0, w, self.mb.x * s, self.mb.y * s)
+        }
     }
 
     // ----- syntax helpers -------------------------------------------------------------------
@@ -507,9 +731,9 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Predicted Intra4x4/Intra8x8 mode for the block whose top-left 4x4 is at MB-relative `(bx, by)` (8.3.1.1).
     fn predicted_intra_mode(&self, bx: usize, by: usize) -> u8 {
-        let (x4, y4) = ((self.mb.x * 4 + bx) as isize, (self.mb.y * 4 + by) as isize);
-        let fetch = |nx: isize, ny: isize| -> Option<i8> {
-            let addr = self.mb_at4(nx, ny)?;
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        let fetch = |xn: isize, yn: isize| -> Option<i8> {
+            let (addr, xw, yw) = self.locate(xn, yn, false)?;
             if addr != self.mb.addr {
                 if !self.mb_avail(addr) {
                     return None;
@@ -522,9 +746,9 @@ impl<'a, 'c> Dec<'a, 'c> {
                     return Some(2);
                 }
             }
-            Some(self.st.intra_mode[self.st.b4(nx as usize, ny as usize)])
+            Some(self.st.intra_mode[self.b4_of(addr, xw, yw)])
         };
-        match (fetch(x4 - 1, y4), fetch(x4, y4 - 1)) {
+        match (fetch(x - 1, y), fetch(x, y - 1)) {
             (Some(a), Some(b)) => a.min(b) as u8,
             _ => 2,
         }
@@ -543,14 +767,21 @@ impl<'a, 'c> Dec<'a, 'c> {
             return Ok(if intra { i } else { p });
         }
         // Luma: condTermFlagN = 1 when the neighbouring 8x8 block has its CBP bit clear (skip counts as clear).
-        let luma_bits = |m: Option<usize>| -> u8 {
-            match m {
-                None => 0x0F,
-                Some(a) if self.st.mb_type[a] == MbType::IPcm => 0x0F,
-                Some(a) if self.st.mb_type[a].is_skip() => 0,
-                Some(a) => self.st.cbp[a] & 0x0F,
+        let nb_bit = |xn: isize, yn: isize| -> u8 {
+            let Some((a, xw, yw)) = self.locate(xn, yn, false) else {
+                return 1;
+            };
+            if !self.mb_avail(a) {
+                return 1;
+            }
+            match self.st.mb_type[a] {
+                MbType::IPcm => 1,
+                t if t.is_skip() => 0,
+                _ => (self.st.cbp[a] >> ((yw / 8) * 2 + xw / 8)) & 1,
             }
         };
+        let la = [nb_bit(-1, 0), nb_bit(-1, 8)];
+        let tb = [nb_bit(0, -1), nb_bit(8, -1)];
         let chroma_of = |m: Option<usize>| -> u8 {
             match m {
                 None => 0,
@@ -560,20 +791,19 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         };
         let (left, top) = (self.mb_left(), self.mb_top());
-        let (la, tb) = (luma_bits(left), luma_bits(top));
         let (ca, cb) = (chroma_of(left), chroma_of(top));
         let (cd, ctxs) = self.cabac();
         let mut cbp = 0u8;
         for b8 in 0..4 {
             let a_bit = match b8 {
-                0 => (la >> 1) & 1,
+                0 => la[0],
                 1 => cbp & 1,
-                2 => (la >> 3) & 1,
+                2 => la[1],
                 _ => (cbp >> 2) & 1,
             };
             let b_bit = match b8 {
-                0 => (tb >> 2) & 1,
-                1 => (tb >> 3) & 1,
+                0 => tb[0],
+                1 => tb[1],
                 2 => cbp & 1,
                 _ => (cbp >> 1) & 1,
             };
@@ -718,20 +948,18 @@ impl<'a, 'c> Dec<'a, 'c> {
                 }
             }
         }
-        let w = self.st.width;
-        let (px, py) = (self.mb.x * 16, self.mb.y * 16);
+        let (off, ls, px, py) = self.view(0);
         for y in 0..16 {
-            self.st.planes[0][(py + y) * w + px..(py + y) * w + px + 16]
-                .copy_from_slice(&samples[y * 16..y * 16 + 16]);
+            let o = off + (py + y) * ls + px;
+            self.st.planes[0][o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
         }
         if n == 384 {
-            let cw = w / 2;
+            let (off, cs, cx, cy) = self.view(1);
             for p in 0..2 {
                 for y in 0..8 {
                     let src = &samples[256 + p * 64 + y * 8..256 + p * 64 + y * 8 + 8];
-                    self.st.planes[1 + p]
-                        [(py / 2 + y) * cw + px / 2..(py / 2 + y) * cw + px / 2 + 8]
-                        .copy_from_slice(src);
+                    let o = off + (cy + y) * cs + cx;
+                    self.st.planes[1 + p][o..o + 8].copy_from_slice(src);
                 }
             }
         }
@@ -739,23 +967,23 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn reconstruct_intra(&mut self, kind: MbType, modes: &[u8; 16], res: &Residual) -> Result<()> {
-        let w = self.st.width;
-        let (px, py) = (self.mb.x * 16, self.mb.y * 16);
+        let (off, ls, px, py) = self.view(0);
         match kind {
             MbType::I4x4 => {
                 for (blk, &mode) in modes.iter().enumerate() {
                     let (bx, by) = BLK4_XY[blk];
                     let (l, t, tr, tl) = self.intra_edges(bx, by, 1, blk);
                     let (x, y) = (px + bx * 4, py + by * 4);
-                    let e = Edges::gather(&self.st.planes[0], w, x, y, 4, l, t, tr && t, tl);
+                    let plane = &mut self.st.planes[0][off..];
+                    let e = Edges::gather(plane, ls, x, y, 4, l, t, tr && t, tl);
                     let mut out = [0u8; 16];
                     intra::predict_nxn(4, mode, &e, &mut out);
                     for r in 0..4 {
-                        self.st.planes[0][(y + r) * w + x..(y + r) * w + x + 4]
+                        plane[(y + r) * ls + x..(y + r) * ls + x + 4]
                             .copy_from_slice(&out[r * 4..r * 4 + 4]);
                     }
                     if res.luma_coded & (1 << blk) != 0 {
-                        recon::idct4_add(&mut self.st.planes[0][y * w + x..], w, &res.luma[blk]);
+                        recon::idct4_add(&mut plane[y * ls + x..], ls, &res.luma[blk]);
                     }
                 }
             }
@@ -764,82 +992,60 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
                     let (l, t, tr, tl) = self.intra_edges(bx, by, 2, b8 * 4);
                     let (x, y) = (px + bx * 4, py + by * 4);
-                    let e =
-                        Edges::gather(&self.st.planes[0], w, x, y, 8, l, t, tr && t, tl).filter8();
+                    let plane = &mut self.st.planes[0][off..];
+                    let e = Edges::gather(plane, ls, x, y, 8, l, t, tr && t, tl).filter8();
                     let mut out = [0u8; 64];
                     intra::predict_nxn(8, modes[b8], &e, &mut out);
                     for r in 0..8 {
-                        self.st.planes[0][(y + r) * w + x..(y + r) * w + x + 8]
+                        plane[(y + r) * ls + x..(y + r) * ls + x + 8]
                             .copy_from_slice(&out[r * 8..r * 8 + 8]);
                     }
                     if res.luma_coded & (0xF << (b8 * 4)) != 0 {
-                        recon::idct8_add(&mut self.st.planes[0][y * w + x..], w, &res.luma8[b8]);
+                        recon::idct8_add(&mut plane[y * ls + x..], ls, &res.luma8[b8]);
                     }
                 }
             }
             MbType::I16x16(mode) => {
-                let mb_top = self.mb.y > 0 && self.intra_ok(Some(self.mb.addr - self.st.mb_w));
-                let mb_left = self.mb.x > 0 && self.intra_ok(Some(self.mb.addr - 1));
-                let mb_tl = self.mb.x > 0
-                    && self.mb.y > 0
-                    && self.intra_ok(Some(self.mb.addr - self.st.mb_w - 1));
+                let mb_top = self.intra_ok(self.mb_nb(0, -1));
+                let mb_left = self.left_ok(0, 16);
+                let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
                 if !intra::block_mode_ok(mode, mb_left, mb_top, mb_tl) {
                     return Err(bad("H.264 Intra16x16 mode uses unavailable samples"));
                 }
                 let mut out = [0u8; 256];
-                intra::predict_16x16(
-                    &self.st.planes[0],
-                    w,
-                    px,
-                    py,
-                    mode,
-                    mb_left,
-                    mb_top,
-                    mb_tl,
-                    &mut out,
-                );
+                let plane = &mut self.st.planes[0][off..];
+                intra::predict_16x16(plane, ls, px, py, mode, mb_left, mb_top, mb_tl, &mut out);
                 for r in 0..16 {
-                    self.st.planes[0][(py + r) * w + px..(py + r) * w + px + 16]
+                    plane[(py + r) * ls + px..(py + r) * ls + px + 16]
                         .copy_from_slice(&out[r * 16..r * 16 + 16]);
                 }
                 for blk in 0..16 {
                     if res.luma_coded & (1 << blk) != 0 {
                         let (bx, by) = BLK4_XY[blk];
-                        let off = (py + by * 4) * w + px + bx * 4;
-                        recon::idct4_add(&mut self.st.planes[0][off..], w, &res.luma[blk]);
+                        let o = (py + by * 4) * ls + px + bx * 4;
+                        recon::idct4_add(&mut plane[o..], ls, &res.luma[blk]);
                     }
                 }
             }
             _ => unreachable!(),
         }
         if self.cx.sps.chroma_array_type() != 0 {
-            let mb_top = self.mb.y > 0 && self.intra_ok(Some(self.mb.addr - self.st.mb_w));
-            let mb_left = self.mb.x > 0 && self.intra_ok(Some(self.mb.addr - 1));
-            let mb_tl = self.mb.x > 0
-                && self.mb.y > 0
-                && self.intra_ok(Some(self.mb.addr - self.st.mb_w - 1));
+            let mb_top = self.intra_ok(self.mb_nb(0, -1));
+            let left = [self.left_ok(0, 8), self.left_ok(8, 8)];
+            let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
             let mode = self.st.chroma_pred_mode[self.mb.addr];
             let as_block = [2, 1, 0, 3][mode as usize];
-            if !intra::block_mode_ok(as_block, mb_left, mb_top, mb_tl) {
+            if !intra::block_mode_ok(as_block, left[0] && left[1], mb_top, mb_tl) {
                 return Err(bad("H.264 chroma intra mode uses unavailable samples"));
             }
-            let cw = w / 2;
+            let (off, cs, cx, cy) = self.view(1);
             for p in 0..2 {
                 let mut out = [0u8; 64];
-                intra::predict_chroma(
-                    &self.st.planes[1 + p],
-                    cw,
-                    px / 2,
-                    py / 2,
-                    mode,
-                    mb_left,
-                    mb_top,
-                    mb_tl,
-                    &mut out,
-                );
+                let plane = &mut self.st.planes[1 + p][off..];
+                intra::predict_chroma(plane, cs, cx, cy, mode, left, mb_top, mb_tl, &mut out);
                 for r in 0..8 {
-                    let o = (py / 2 + r) * cw + px / 2;
-                    self.st.planes[1 + p][o..o + 8].copy_from_slice(&out[r * 8..r * 8 + 8]);
+                    let o = (cy + r) * cs + cx;
+                    plane[o..o + 8].copy_from_slice(&out[r * 8..r * 8 + 8]);
                 }
             }
             self.add_chroma_residual(res);
@@ -848,13 +1054,12 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn add_chroma_residual(&mut self, res: &Residual) {
-        let cw = self.st.width / 2;
-        let (cx, cy) = (self.mb.x * 8, self.mb.y * 8);
+        let (off, cs, cx, cy) = self.view(1);
         for p in 0..2 {
             for blk in 0..4 {
                 if res.chroma_coded[p] & (1 << blk) != 0 {
-                    let off = (cy + (blk >> 1) * 4) * cw + cx + (blk & 1) * 4;
-                    recon::idct4_add(&mut self.st.planes[1 + p][off..], cw, &res.chroma[p][blk]);
+                    let o = off + (cy + (blk >> 1) * 4) * cs + cx + (blk & 1) * 4;
+                    recon::idct4_add(&mut self.st.planes[1 + p][o..], cs, &res.chroma[p][blk]);
                 }
             }
         }
@@ -862,56 +1067,60 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     // ----- residual -------------------------------------------------------------------------
 
-    /// CAVLC `nC` for the luma 4x4 block at absolute `(x4, y4)` (9.2.1).
-    fn nc_luma(&self, x4: usize, y4: usize) -> u8 {
-        let (x4, y4) = (x4 as isize, y4 as isize);
-        let get = |nx: isize, ny: isize| -> Option<u8> {
-            let a = self.mb_at4(nx, ny)?;
-            (a == self.mb.addr || self.mb_avail(a))
-                .then(|| self.st.nnz[self.st.b4(nx as usize, ny as usize)])
-        };
-        combine_nc(get(x4 - 1, y4), get(x4, y4 - 1))
-    }
-
-    fn nc_chroma(&self, p: usize, x4: usize, y4: usize) -> u8 {
-        let (x4, y4) = (x4 as isize, y4 as isize);
-        let get = |nx: isize, ny: isize| -> Option<u8> {
-            let a = self.mb_at4(nx * 2, ny * 2)?;
-            (a == self.mb.addr || self.mb_avail(a))
-                .then(|| self.st.nnz_c[p][self.st.c4(nx as usize, ny as usize)])
-        };
-        combine_nc(get(x4 - 1, y4), get(x4, y4 - 1))
-    }
-
-    /// CABAC coded_block_flag condTermFlagN for a luma 4x4 neighbour (9.3.3.1.1.9).
-    fn cbf_luma(&self, nx: isize, ny: isize, intra: bool) -> u8 {
-        match self.mb_at4(nx, ny) {
-            Some(a) if a == self.mb.addr => self.st.nz[self.st.b4(nx as usize, ny as usize)] as u8,
-            Some(a) if self.mb_avail(a) => {
-                if self.st.mb_type[a] == MbType::IPcm {
-                    1
+    /// Neighbours A and B of the 4x4 block at MB-relative 4x4 `(bx, by)` of plane `c` (0 luma,
+    /// 1 chroma): each `(macroblock, block index)` when available.
+    #[allow(clippy::type_complexity)]
+    fn nb_blocks(&self, c: usize, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
+        let chroma = c > 0;
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        [(x - 1, y), (x, y - 1)].map(|(xn, yn)| {
+            let (a, xw, yw) = self.locate(xn, yn, chroma)?;
+            if a != self.mb.addr && !self.mb_avail(a) {
+                return None;
+            }
+            Some((
+                a,
+                if chroma {
+                    self.c4_of(a, xw, yw)
                 } else {
-                    self.st.nz[self.st.b4(nx as usize, ny as usize)] as u8
-                }
-            }
-            _ => intra as u8,
-        }
+                    self.b4_of(a, xw, yw)
+                },
+            ))
+        })
     }
 
-    fn cbf_chroma_ac(&self, p: usize, nx: isize, ny: isize, intra: bool) -> u8 {
-        match self.mb_at4(nx * 2, ny * 2) {
-            Some(a) if a == self.mb.addr => {
-                (self.st.nnz_c[p][self.st.c4(nx as usize, ny as usize)] > 0) as u8
-            }
-            Some(a) if self.mb_avail(a) => {
-                if self.st.mb_type[a] == MbType::IPcm {
-                    1
-                } else {
-                    (self.st.nnz_c[p][self.st.c4(nx as usize, ny as usize)] > 0) as u8
-                }
-            }
-            _ => intra as u8,
-        }
+    /// CAVLC `nC` for the luma 4x4 block at MB-relative 4x4 `(bx, by)` (9.2.1).
+    fn nc_luma(&self, bx: usize, by: usize) -> u8 {
+        let [a, b] = self
+            .nb_blocks(0, bx, by)
+            .map(|n| n.map(|(_, i)| self.st.nnz[i]));
+        combine_nc(a, b)
+    }
+
+    fn nc_chroma(&self, p: usize, bx: usize, by: usize) -> u8 {
+        let [a, b] = self
+            .nb_blocks(1, bx, by)
+            .map(|n| n.map(|(_, i)| self.st.nnz_c[p][i]));
+        combine_nc(a, b)
+    }
+
+    /// CABAC coded_block_flag ctxIdxInc for a luma 4x4 block (9.3.3.1.1.9).
+    fn cbf_luma_inc(&self, bx: usize, by: usize, intra: bool) -> u8 {
+        let [a, b] = self.nb_blocks(0, bx, by).map(|n| match n {
+            Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
+            Some((_, i)) => self.st.nz[i] as u8,
+            None => intra as u8,
+        });
+        a + 2 * b
+    }
+
+    fn cbf_chroma_ac_inc(&self, p: usize, bx: usize, by: usize, intra: bool) -> u8 {
+        let [a, b] = self.nb_blocks(1, bx, by).map(|n| match n {
+            Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
+            Some((_, i)) => (self.st.nnz_c[p][i] > 0) as u8,
+            None => intra as u8,
+        });
+        a + 2 * b
     }
 
     /// condTermFlagN for a DC block (`bit` 0 luma, 1 Cb, 2 Cr) of a neighbouring macroblock.
@@ -977,7 +1186,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
         if is_i16 {
             let mut sc = [0i16; 16];
-            let nc = if cabac { 0 } else { self.nc_luma(mx4, my4) };
+            let nc = if cabac { 0 } else { self.nc_luma(0, 0) };
             let inc = if cabac {
                 self.cbf_dc(self.mb_left(), 0, true) + 2 * self.cbf_dc(self.mb_top(), 0, true)
             } else {
@@ -1024,7 +1233,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     for i in 0..4 {
                         let blk = b8 * 4 + i;
                         let (bx, by) = BLK4_XY[blk];
-                        let nc = self.nc_luma(mx4 + bx, my4 + by);
+                        let nc = self.nc_luma(bx, by);
                         let mut sub = [0i16; 16];
                         let n = {
                             let r = self.reader();
@@ -1062,14 +1271,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                 let max = if is_i16 { 15 } else { 16 };
                 let mut sc = [0i16; 16];
                 let n = if cabac {
-                    let inc = self.cbf_luma(x4 as isize - 1, y4 as isize, intra)
-                        + 2 * self.cbf_luma(x4 as isize, y4 as isize - 1, intra);
+                    let inc = self.cbf_luma_inc(bx, by, intra);
                     let cat = if is_i16 { 1 } else { 2 };
                     let (cd, ctxs) = self.cabac();
                     cd.decode_residual_block(&mut ctxs[..], cat, inc, &mut sc[..max], field)
                         .1
                 } else {
-                    let nc = self.nc_luma(x4, y4);
+                    let nc = self.nc_luma(bx, by);
                     let r = self.reader();
                     decode_cavlc_block(r, &mut sc[..max], nc, false)?
                 };
@@ -1124,16 +1332,16 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (cx4, cy4) = (self.mb.x * 2, self.mb.y * 2);
         for p in 0..2 {
             for blk in 0..4 {
-                let (x4, y4) = (cx4 + (blk & 1), cy4 + (blk >> 1));
+                let (bx, by) = (blk & 1, blk >> 1);
+                let (x4, y4) = (cx4 + bx, cy4 + by);
                 let mut sc = [0i16; 15];
                 let n = if cabac {
-                    let inc = self.cbf_chroma_ac(p, x4 as isize - 1, y4 as isize, intra)
-                        + 2 * self.cbf_chroma_ac(p, x4 as isize, y4 as isize - 1, intra);
+                    let inc = self.cbf_chroma_ac_inc(p, bx, by, intra);
                     let (cd, ctxs) = self.cabac();
                     cd.decode_residual_block(&mut ctxs[..], 4, inc, &mut sc, field)
                         .1
                 } else {
-                    let nc = self.nc_chroma(p, x4, y4);
+                    let nc = self.nc_chroma(p, bx, by);
                     let r = self.reader();
                     decode_cavlc_block(r, &mut sc, nc, false)?
                 };
@@ -1160,7 +1368,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if idx < 0 {
             return Ok(NO_PIC);
         }
-        self.cx.refs[list]
+        self.refs(list)
             .get(idx as usize)
             .map(|r| r.id)
             .ok_or(bad("H.264 ref_idx beyond the reference list"))
@@ -1190,12 +1398,20 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
     }
 
-    fn neighbour(&self, list: usize, x4: isize, y4: isize, done: u16) -> Option<Mv> {
-        if !self.blk_avail(x4, y4, done) {
-            return None;
+    /// Motion of the available block covering luma `(xn, yn)` relative to the current MB, in the
+    /// current MB's frame/field units (8.4.1.3.2): an MBAFF neighbour of the other kind has its
+    /// reference index and vertical vector rescaled.
+    fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Option<Mv> {
+        let (a, i) = self.blk(xn, yn, done)?;
+        let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
+        if r < 0 || !self.st.mbaff {
+            return Some((r, mv));
         }
-        let i = self.st.b4(x4 as usize, y4 as usize);
-        Some((self.st.ref_idx[list][i], self.st.mv[list][i]))
+        Some(match (self.field, self.st.mb_field[a]) {
+            (true, false) => (r * 2, [mv[0], mv[1] / 2]),
+            (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
+            _ => (r, mv),
+        })
     }
 
     /// Motion vector predictor (8.4.1.3) for the MB-relative 4x4 rectangle `(bx, by, w, h)`.
@@ -1210,12 +1426,12 @@ impl<'a, 'c> Dec<'a, 'c> {
         part: Option<(Part, usize)>,
         done: u16,
     ) -> [i16; 2] {
-        let (x4, y4) = ((self.mb.x * 4 + bx) as isize, (self.mb.y * 4 + by) as isize);
-        let a = self.neighbour(list, x4 - 1, y4, done);
-        let b = self.neighbour(list, x4, y4 - 1, done);
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        let a = self.neighbour(list, x - 1, y, done);
+        let b = self.neighbour(list, x, y - 1, done);
         let c = self
-            .neighbour(list, x4 + w as isize, y4 - 1, done)
-            .or_else(|| self.neighbour(list, x4 - 1, y4 - 1, done));
+            .neighbour(list, x + (w * 4) as isize, y - 1, done)
+            .or_else(|| self.neighbour(list, x - 1, y - 1, done));
         match part {
             Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
             Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
@@ -1247,9 +1463,8 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
-        let (x4, y4) = ((self.mb.x * 4) as isize, (self.mb.y * 4) as isize);
-        let a = self.neighbour(0, x4 - 1, y4, 0);
-        let b = self.neighbour(0, x4, y4 - 1, 0);
+        let a = self.neighbour(0, -1, 0, 0);
+        let b = self.neighbour(0, 0, -1, 0);
         match (a, b) {
             (None, _) | (_, None) => [0, 0],
             (Some((0, [0, 0])), _) | (_, Some((0, [0, 0]))) => [0, 0],
@@ -1258,30 +1473,32 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn read_ref_idx(&mut self, list: usize, bx: usize, by: usize) -> Result<i8> {
-        let n = self.cx.sh.num_ref_idx_active[list];
+        let n = self.num_refs(list);
         if !self.is_cabac() {
             return self.read_te(n - 1);
         }
-        let (x4, y4) = ((self.mb.x * 4 + bx) as isize, (self.mb.y * 4 + by) as isize);
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let is_b = self.cx.sh.slice_type.is_b();
-        let cond = |nx: isize, ny: isize| -> u8 {
-            let Some(addr) = self.mb_at4(nx, ny) else {
+        let cond = |xn: isize, yn: isize| -> u8 {
+            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
                 return 0;
             };
-            if addr != self.mb.addr && !self.mb_avail(addr) {
-                return 0;
-            }
             let t = self.st.mb_type[addr];
             if t.is_skip() || t.is_intra() {
                 return 0;
             }
-            let i = self.st.b4(nx as usize, ny as usize);
             if is_b && self.st.direct[i] {
                 return 0;
             }
-            (self.st.ref_idx[list][i] > 0) as u8
+            // A field neighbour of a frame MB counts reference indices in fields (9.3.3.1.1.6).
+            let thresh = if self.st.mbaff && !self.field && self.st.mb_field[addr] {
+                1
+            } else {
+                0
+            };
+            (self.st.ref_idx[list][i] > thresh) as u8
         };
-        let (ca, cb) = (cond(x4 - 1, y4), cond(x4, y4 - 1));
+        let (ca, cb) = (cond(x - 1, y), cond(x, y - 1));
         let (cd, ctxs) = self.cabac();
         let v = cd.decode_ref_idx(&mut ctxs[..], ca, cb);
         if v as u32 >= n {
@@ -1300,17 +1517,20 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             return Ok(([x as i16, y as i16], [0, 0]));
         }
-        let (x4, y4) = ((self.mb.x * 4 + bx) as isize, (self.mb.y * 4 + by) as isize);
-        let absn = |nx: isize, ny: isize, comp: usize| -> u32 {
-            let Some(addr) = self.mb_at4(nx, ny) else {
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        let absn = |xn: isize, yn: isize, comp: usize| -> u32 {
+            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
                 return 0;
             };
-            if addr != self.mb.addr && !self.mb_avail(addr) {
-                return 0;
+            let v = self.st.mvd[list][i][comp] as u32;
+            // Vertical components between frame and field MBs are rescaled (9.3.3.1.1.7).
+            match (comp, self.st.mbaff, self.field, self.st.mb_field[addr]) {
+                (1, true, false, true) => v * 2,
+                (1, true, true, false) => v / 2,
+                _ => v,
             }
-            self.st.mvd[list][self.st.b4(nx as usize, ny as usize)][comp] as u32
         };
-        let sums = [0, 1].map(|comp| absn(x4 - 1, y4, comp) + absn(x4, y4 - 1, comp));
+        let sums = [0, 1].map(|comp| absn(x - 1, y, comp) + absn(x, y - 1, comp));
         let mut mvd = [0i16; 2];
         let mut amvd = [0u8; 2];
         for comp in 0..2 {
@@ -1416,7 +1636,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if pred[p] & (1 << list) == 0 {
                     continue;
                 }
-                let r = if self.cx.sh.num_ref_idx_active[list] > 1 {
+                let r = if self.num_refs(list) > 1 {
                     self.read_ref_idx(list, bx, by)?
                 } else {
                     0
@@ -1464,7 +1684,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     continue;
                 }
                 let (bx, by) = ((i & 1) * 2, (i >> 1) * 2);
-                let r = if self.cx.sh.num_ref_idx_active[list] > 1 && !ref0 {
+                let r = if self.num_refs(list) > 1 && !ref0 {
                     self.read_ref_idx(list, bx, by)?
                 } else {
                     0
@@ -1514,10 +1734,10 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Direct prediction (8.4.1.2) for the 8x8 quadrants in `mask`.
     fn direct_motion(&mut self, mask: u8) -> Result<()> {
-        if self.cx.refs[1].is_empty() || self.cx.refs[0].is_empty() {
+        if self.refs(1).is_empty() || self.refs(0).is_empty() {
             return Err(bad("H.264 direct prediction without reference lists"));
         }
-        let col = &self.cx.refs[1][0];
+        let col_short = !self.refs(1)[0].long;
         let inference = self.cx.sps.direct_8x8_inference;
         let spatial = self.cx.sh.direct_spatial;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
@@ -1528,12 +1748,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         let mut direct_zero = false;
         if spatial {
             for list in 0..2 {
-                let (x4, y4) = (mx4 as isize, my4 as isize);
-                let a = self.neighbour(list, x4 - 1, y4, 0);
-                let b = self.neighbour(list, x4, y4 - 1, 0);
+                let a = self.neighbour(list, -1, 0, 0);
+                let b = self.neighbour(list, 0, -1, 0);
                 let c = self
-                    .neighbour(list, x4 + 4, y4 - 1, 0)
-                    .or_else(|| self.neighbour(list, x4 - 1, y4 - 1, 0));
+                    .neighbour(list, 16, -1, 0)
+                    .or_else(|| self.neighbour(list, -1, -1, 0));
                 let rr = |n: Option<Mv>| n.map_or(-1, |n| n.0);
                 sp_ref[list] = min_positive(rr(a), min_positive(rr(b), rr(c)));
             }
@@ -1549,7 +1768,6 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
 
-        let col_short = !col.long;
         for b8 in 0..4 {
             if mask & (1 << b8) == 0 {
                 continue;
@@ -1581,15 +1799,15 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     // Temporal (8.4.1.2.3): map the co-located reference into RefPicList0 and
                     // convert its vertical vector between frame and field units.
-                    let target = match self.st.structure {
-                        Structure::Frame => col_pic & !3,
-                        Structure::Field(p) if col_pic % 4 == 0 => col_pic + 1 + p as u32,
-                        Structure::Field(_) => col_pic,
+                    let target = match self.field_parity() {
+                        None => col_pic & !3,
+                        Some(p) if col_pic % 4 == 0 => col_pic + 1 + p as u32,
+                        Some(_) => col_pic,
                     };
                     let ref0 = if col_ref < 0 {
                         0
                     } else {
-                        self.cx.refs[0]
+                        self.refs(0)
                             .iter()
                             .position(|r| r.id == target)
                             .unwrap_or(0) as i8
@@ -1599,13 +1817,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                         -1 => [col_mv[0], col_mv[1] / 2],
                         _ => col_mv,
                     };
-                    let p0 = &self.cx.refs[0][ref0 as usize];
-                    let p1 = &self.cx.refs[1][0];
+                    let p0 = &self.refs(0)[ref0 as usize];
+                    let p1 = &self.refs(1)[0];
                     let td = (p1.poc - p0.poc).clamp(-128, 127);
                     let (mv0, mv1) = if p0.long || td == 0 {
                         (col_mv, [0, 0])
                     } else {
-                        let tb = (self.cx.cur_poc - p0.poc).clamp(-128, 127);
+                        let tb = (self.cur_poc() - p0.poc).clamp(-128, 127);
                         let tx = (16384 + (td / 2).abs()) / td;
                         let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
                         let s = |v: i16| ((dsf * v as i32 + 128) >> 8) as i16;
@@ -1637,16 +1855,22 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// vertical scale)` where the scale is `1` for field-to-frame, `-1` for frame-to-field, else `0`.
     /// `(cbx, cby)` is the MB-relative 4x4 block, after the 8x8-inference corner selection.
     fn colocated(&self, cbx: usize, cby: usize) -> (i8, [i16; 2], u32, i32) {
-        let col = &self.cx.refs[1][0];
+        let col = &self.refs(1)[0];
         let Some(m) = &col.motion else {
             return (-1, [0, 0], NO_PIC, 0);
         };
         let mb_w = self.st.mb_w;
         let mbx = self.mb.x;
         // Motion is stored in frame layout; pick the co-located MB row and block row there.
-        let (row, by, vscale) = match self.st.structure {
+        // An MBAFF field MB uses the field of RefPicList1[0] with its own parity, at its pair row.
+        let (structure, cur_row) = if self.mbaff_field() {
+            (Structure::Field((self.mb.y & 1) as u8), self.mb.y / 2)
+        } else {
+            (self.st.structure, self.mb.y)
+        };
+        let (row, by, vscale) = match structure {
             Structure::Frame => {
-                let row = self.mb.y;
+                let row = cur_row;
                 if m.mb_field[row * mb_w + mbx] {
                     let cur = self.cx.cur_poc;
                     let cp = usize::from(
@@ -1657,9 +1881,14 @@ impl<'a, 'c> Dec<'a, 'c> {
                     (row, cby, 0)
                 }
             }
-            Structure::Field(_) => {
-                let cp = col.parity.unwrap_or(0) as usize;
-                let r = self.mb.y;
+            Structure::Field(cur_parity) => {
+                // The co-located field of an MBAFF frame is taken at the current parity (Table 8-6).
+                let cp = if m.mbaff {
+                    cur_parity as usize
+                } else {
+                    col.parity.unwrap_or(0) as usize
+                };
+                let r = cur_row;
                 if m.mb_field[(2 * r + cp) * mb_w + mbx] {
                     (2 * r + cp, cby, 0)
                 } else {
@@ -1696,21 +1925,20 @@ impl<'a, 'c> Dec<'a, 'c> {
             self.set_qp();
         }
         self.inter_predict_mb()?;
-        let w = self.st.width;
-        let (px, py) = (self.mb.x * 16, self.mb.y * 16);
+        let (o, ls, px, py) = self.view(0);
         if t8 {
             for b8 in 0..4 {
                 if res.luma_coded & (0xF << (b8 * 4)) != 0 {
-                    let off = (py + (b8 >> 1) * 8) * w + px + (b8 & 1) * 8;
-                    recon::idct8_add(&mut self.st.planes[0][off..], w, &res.luma8[b8]);
+                    let off = o + (py + (b8 >> 1) * 8) * ls + px + (b8 & 1) * 8;
+                    recon::idct8_add(&mut self.st.planes[0][off..], ls, &res.luma8[b8]);
                 }
             }
         } else {
             for blk in 0..16 {
                 if res.luma_coded & (1 << blk) != 0 {
                     let (bx, by) = BLK4_XY[blk];
-                    let off = (py + by * 4) * w + px + bx * 4;
-                    recon::idct4_add(&mut self.st.planes[0][off..], w, &res.luma[blk]);
+                    let off = o + (py + by * 4) * ls + px + bx * 4;
+                    recon::idct4_add(&mut self.st.planes[0][off..], ls, &res.luma[blk]);
                 }
             }
         }
@@ -1727,12 +1955,14 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 t.chroma_log2
             };
+            // MBAFF field MBs index the table by frame (refIdxL0WP = refIdxL0 >> 1, 8.4.2.3).
+            let shift = self.mbaff_field() as u32;
             let e = |list: usize| -> (i32, i32) {
                 let r = refs[list];
                 if r < 0 {
                     return (1, 0);
                 }
-                let Some(e) = t.l[list].get(r as usize) else {
+                let Some(e) = t.l[list].get((r as usize) >> shift) else {
                     return (1 << log, 0);
                 };
                 if comp == 0 {
@@ -1743,9 +1973,14 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             return Weighting::Weighted(log, [e(0), e(1)]);
         }
-        if !self.implicit.is_empty() && refs[0] >= 0 && refs[1] >= 0 {
-            let n1 = self.cx.refs[1].len();
-            let w = self.implicit[refs[0] as usize * n1 + refs[1] as usize];
+        let implicit = if self.mbaff_field() {
+            &self.implicit_field[self.mb.y & 1]
+        } else {
+            &self.implicit
+        };
+        if !implicit.is_empty() && refs[0] >= 0 && refs[1] >= 0 {
+            let n1 = self.refs(1).len();
+            let w = implicit[refs[0] as usize * n1 + refs[1] as usize];
             return Weighting::Weighted(5, [(w[0], 0), (w[1], 0)]);
         }
         Weighting::Default
@@ -1792,15 +2027,22 @@ impl<'a, 'c> Dec<'a, 'c> {
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
         let (w, h) = (w4 * 4, h4 * 4);
-        let (x, y) = (self.mb.x * 16 + bx * 4, self.mb.y * 16 + by * 4);
-        let (pw, ph) = (self.st.width, self.st.height);
+        let (o, ls, px, py) = self.view(0);
+        let (x, y) = (px + bx * 4, py + by * 4);
+        // Size of the picture (or, for an MBAFF field MB, of the field) the vectors point into.
+        let (pw, ph) = if self.mbaff_field() {
+            (self.st.width, self.st.height / 2)
+        } else {
+            (self.st.width, self.st.height)
+        };
         let mut pred = [[0u8; 256]; 2];
         let mut used = [false; 2];
         for list in 0..2 {
             if refs[list] < 0 {
                 continue;
             }
-            let rp = self.cx.refs[list]
+            let rp = self
+                .refs(list)
                 .get(refs[list] as usize)
                 .ok_or(bad("H.264 ref_idx beyond list"))?;
             recon::mc_luma(
@@ -1828,23 +2070,25 @@ impl<'a, 'c> Dec<'a, 'c> {
             &mut out[..w * h],
         );
         for r in 0..h {
-            self.st.planes[0][(y + r) * pw + x..(y + r) * pw + x + w]
-                .copy_from_slice(&out[r * w..r * w + w]);
+            let d = o + (y + r) * ls + x;
+            self.st.planes[0][d..d + w].copy_from_slice(&out[r * w..r * w + w]);
         }
         if self.cx.sps.chroma_array_type() == 0 {
             return Ok(());
         }
+        let (co, cs, _, _) = self.view(1);
         let (cw, ch, cpw, cph) = (w / 2, h / 2, pw / 2, ph / 2);
         let (cx, cy) = (x / 2, y / 2);
+        let cur_parity = self.field_parity();
         for p in 0..2 {
             let mut pc = [[0u8; 64]; 2];
             for list in 0..2 {
                 if used[list] {
-                    let rp = &self.cx.refs[list][refs[list] as usize];
+                    let rp = &self.refs(list)[refs[list] as usize];
                     // Between fields of opposite parity the chroma vector is offset by a
                     // quarter chroma sample (Table 8-9).
                     let mut mv = mvs[list];
-                    if let (Structure::Field(cur), Some(r)) = (self.st.structure, rp.parity) {
+                    if let (Some(cur), Some(r)) = (cur_parity, rp.parity) {
                         mv[1] = mv[1].wrapping_add(2 * (cur as i16 - r as i16));
                     }
                     recon::mc_chroma(
@@ -1861,16 +2105,16 @@ impl<'a, 'c> Dec<'a, 'c> {
                 }
             }
             let wt = self.weighting(refs, 1 + p);
-            let mut o = [0u8; 64];
+            let mut out = [0u8; 64];
             recon::weighted_combine(
                 used[0].then_some(&pc[0][..cw * ch]),
                 used[1].then_some(&pc[1][..cw * ch]),
                 wt,
-                &mut o[..cw * ch],
+                &mut out[..cw * ch],
             );
             for r in 0..ch {
-                self.st.planes[1 + p][(cy + r) * cpw + cx..(cy + r) * cpw + cx + cw]
-                    .copy_from_slice(&o[r * cw..r * cw + cw]);
+                let d = co + (cy + r) * cs + cx;
+                self.st.planes[1 + p][d..d + cw].copy_from_slice(&out[r * cw..r * cw + cw]);
             }
         }
         Ok(())

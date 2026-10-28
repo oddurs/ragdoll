@@ -175,11 +175,6 @@ impl Core {
             ));
         }
         let sh = SliceHeader::parse(rbsp, nal_unit_type, nal_ref_idc, &sps, &pps)?;
-        if sps.mbaff && !sh.field_pic {
-            return Err(RagdollError::Unsupported(
-                "H.264 MBAFF (macroblock-adaptive frame/field) is not supported yet".into(),
-            ));
-        }
         if sh.redundant_pic_cnt > 0 {
             return Ok(());
         }
@@ -201,6 +196,24 @@ impl Core {
             max_frame_num,
             Some(cur.store_id),
         )?;
+        // Field macroblocks of an MBAFF frame use field lists derived from the frame lists
+        // (8.2.4.2.5): each frame becomes its field of the MB's parity followed by the other field.
+        let field_refs = cur.st.mbaff.then(|| {
+            [0u8, 1].map(|parity| {
+                [&lists[0], &lists[1]].map(|l| {
+                    l.iter()
+                        .flat_map(|sel| [parity, parity ^ 1].map(|p| (sel.store, p)))
+                        .map(|(store, p)| {
+                            let sel = RefSel {
+                                store,
+                                parity: Some(p),
+                            };
+                            ref_pic(&self.dpb.pics[store], sel)
+                        })
+                        .collect()
+                })
+            })
+        });
         let refs = lists.map(|l| {
             l.into_iter()
                 .map(|sel| ref_pic(&self.dpb.pics[sel.store], sel))
@@ -225,7 +238,9 @@ impl Core {
             sh: &sh,
             slice_num,
             refs,
+            field_refs,
             cur_poc,
+            field_poc: [cur.top, cur.bottom],
             dq: &cur.dq,
         };
         mb::decode_slice(&cx, &mut cur.st, rbsp)
@@ -278,7 +293,7 @@ impl Core {
             PictureType::P
         };
         self.cur = Some(CurPic {
-            st: PicState::new(structure, mb_w, mb_h),
+            st: PicState::new(structure, mb_w, mb_h, sps.mbaff && !sh.field_pic),
             first: sh.clone(),
             sps,
             pps,
