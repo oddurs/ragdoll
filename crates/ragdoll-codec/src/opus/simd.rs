@@ -805,27 +805,45 @@ mod avx2_i16 {
         unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
     }
 
-    /// Applies the lane-wise `f` to all of `x` and `y` (equal lengths) in place: whole
-    /// vectors, then the last 16 lanes once more from their original values; below 16 lanes,
-    /// on a zero-padded copy.
     #[inline]
     #[target_feature(enable = "avx2")]
-    pub fn map2(x: &mut [i16], y: &mut [i16], f: impl Fn(__m256i, __m256i) -> (__m256i, __m256i)) {
+    pub unsafe fn ld8(p: *const i16) -> __m256i {
+        unsafe { _mm256_castsi128_si256(_mm_loadu_si128(p as *const __m128i)) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn st8(p: *mut i16, v: __m256i) {
+        unsafe { _mm_storeu_si128(p as *mut __m128i, _mm256_castsi256_si128(v)) }
+    }
+
+    /// Applies the lane-wise `f` to all of `x` and `y` (equal lengths) in place: whole
+    /// vectors, then the last 16 lanes once more from their original values (below 16 lanes,
+    /// the first and the last 8). Returns false, doing nothing, below 8 lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn map2(
+        x: &mut [i16],
+        y: &mut [i16],
+        f: impl Fn(__m256i, __m256i) -> (__m256i, __m256i),
+    ) -> bool {
         let n = x.len();
         assert!(y.len() == n);
+        if n < 8 {
+            return false;
+        }
         if n < 16 {
-            let (mut a, mut b) = ([0i16; 16], [0i16; 16]);
-            a[..n].copy_from_slice(x);
-            b[..n].copy_from_slice(y);
-            // Safety: `a` and `b` hold 16 values.
+            // Safety: both accesses are to 8 values at or below n - 8.
             unsafe {
-                let (u, v) = f(ld(a.as_ptr()), ld(b.as_ptr()));
-                st(a.as_mut_ptr(), u);
-                st(b.as_mut_ptr(), v);
+                let (xp, yp) = (x.as_mut_ptr(), y.as_mut_ptr());
+                let a = f(ld8(xp), ld8(yp));
+                let b = f(ld8(xp.add(n - 8)), ld8(yp.add(n - 8)));
+                st8(xp, a.0);
+                st8(yp, a.1);
+                st8(xp.add(n - 8), b.0);
+                st8(yp.add(n - 8), b.1);
             }
-            x.copy_from_slice(&a[..n]);
-            y.copy_from_slice(&b[..n]);
-            return;
+            return true;
         }
         // Safety: every access is to 16 values at or below n - 16.
         unsafe {
@@ -841,20 +859,27 @@ mod avx2_i16 {
             st(xp.add(n - 16), last.0);
             st(yp.add(n - 16), last.1);
         }
+        true
     }
 
     /// [`map2`] for one slice.
     #[inline]
     #[target_feature(enable = "avx2")]
-    pub fn map1(x: &mut [i16], f: impl Fn(__m256i) -> __m256i) {
+    pub fn map1(x: &mut [i16], f: impl Fn(__m256i) -> __m256i) -> bool {
         let n = x.len();
+        if n < 8 {
+            return false;
+        }
         if n < 16 {
-            let mut a = [0i16; 16];
-            a[..n].copy_from_slice(x);
-            // Safety: `a` holds 16 values.
-            unsafe { st(a.as_mut_ptr(), f(ld(a.as_ptr()))) };
-            x.copy_from_slice(&a[..n]);
-            return;
+            // Safety: both accesses are to 8 values at or below n - 8.
+            unsafe {
+                let xp = x.as_mut_ptr();
+                let a = f(ld8(xp));
+                let b = f(ld8(xp.add(n - 8)));
+                st8(xp, a);
+                st8(xp.add(n - 8), b);
+            }
+            return true;
         }
         // Safety: every access is to 16 values at or below n - 16.
         unsafe {
@@ -867,33 +892,35 @@ mod avx2_i16 {
             }
             st(xp.add(n - 16), last);
         }
+        true
     }
 }
 
-/// AVX2 [`super::vq::scale_shr_scalar`].
+/// AVX2 [`super::vq::scale_shr_scalar`]; returns false, doing nothing, below 8 values.
 ///
 /// # Safety
 ///
 /// The CPU must support AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn scale_shr_avx2(x: &mut [i16], g: i32, sh: i32) {
+pub unsafe fn scale_shr_avx2(x: &mut [i16], g: i32, sh: i32) -> bool {
     use avx2_i16::*;
     use std::arch::x86_64::*;
     let gv = _mm256_set1_epi16(g as i16);
     let round = _mm256_set1_epi32((1i32 << sh) >> 1);
     let cnt = _mm_cvtsi32_si128(sh);
-    map1(x, |v| pshr_mul(v, gv, round, cnt));
+    map1(x, |v| pshr_mul(v, gv, round, cnt))
 }
 
-/// AVX2 [`super::bands::mul_q15_scalar`] (`out` and `x` of equal lengths).
+/// AVX2 [`super::bands::mul_q15_scalar`] (`out` and `x` of equal lengths); returns false,
+/// doing nothing, below 8 values.
 ///
 /// # Safety
 ///
 /// The CPU must support AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn mul_q15_avx2(out: &mut [i16], x: &[i16], g: i32) {
+pub unsafe fn mul_q15_avx2(out: &mut [i16], x: &[i16], g: i32) -> bool {
     use avx2_i16::*;
     use std::arch::x86_64::*;
     let gv = _mm256_set1_epi16(g as i16);
@@ -905,13 +932,16 @@ pub unsafe fn mul_q15_avx2(out: &mut [i16], x: &[i16], g: i32) {
     };
     let n = x.len();
     assert!(out.len() == n);
+    if n < 8 {
+        return false;
+    }
     if n < 16 {
-        let mut a = [0i16; 16];
-        a[..n].copy_from_slice(x);
-        // Safety: `a` holds 16 values.
-        unsafe { st(a.as_mut_ptr(), f(ld(a.as_ptr()))) };
-        out.copy_from_slice(&a[..n]);
-        return;
+        // Safety: both accesses are to 8 values at or below n - 8.
+        unsafe {
+            st8(out.as_mut_ptr(), f(ld8(x.as_ptr())));
+            st8(out.as_mut_ptr().add(n - 8), f(ld8(x.as_ptr().add(n - 8))));
+        }
+        return true;
     }
     // Safety: every access is to 16 values at or below n - 16; the last vector may repeat
     // some outputs, from the unchanged input.
@@ -923,9 +953,11 @@ pub unsafe fn mul_q15_avx2(out: &mut [i16], x: &[i16], g: i32) {
         }
         st(out.as_mut_ptr().add(n - 16), f(ld(x.as_ptr().add(n - 16))));
     }
+    true
 }
 
-/// AVX2 final loop of [`super::bands`] `stereo_merge` (`x` and `y` of equal lengths).
+/// AVX2 final loop of [`super::bands`] `stereo_merge` (`x` and `y` of equal lengths);
+/// returns false, doing nothing, below 8 values.
 ///
 /// # Safety
 ///
@@ -940,7 +972,7 @@ pub unsafe fn stereo_merge_avx2(
     lsh: i32,
     rgain: i32,
     rsh: i32,
-) {
+) -> bool {
     use avx2_i16::*;
     use std::arch::x86_64::*;
     let midv = _mm256_set1_epi16(mid as i16);
@@ -957,7 +989,7 @@ pub unsafe fn stereo_merge_avx2(
             pshr_mul(_mm256_sub_epi16(l, r), lg, lr, lc),
             pshr_mul(_mm256_add_epi16(l, r), rg, rr, rc),
         )
-    });
+    })
 }
 
 /// AVX2 [`super::bands::haar1_scalar`] for strides 1, 2, 4, 8 and multiples of 16 over the

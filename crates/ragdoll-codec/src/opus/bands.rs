@@ -242,8 +242,9 @@ fn mul_q15(out: &mut [i16], x: &[i16], g: i32) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
-        unsafe { super::simd::mul_q15_avx2(out, x, g) };
-        return;
+        if unsafe { super::simd::mul_q15_avx2(out, x, g) } {
+            return;
+        }
     }
     mul_q15_scalar(out, x, g);
 }
@@ -314,10 +315,11 @@ fn stereo_merge(x: &mut [i16], y: &mut [i16], mid: i32, n: usize) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
-        unsafe {
+        if unsafe {
             super::simd::stereo_merge_avx2(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1)
-        };
-        return;
+        } {
+            return;
+        }
     }
     stereo_merge_scalar(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1);
 }

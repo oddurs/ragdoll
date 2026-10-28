@@ -443,8 +443,9 @@ pub fn scale_shr(x: &mut [i16], g: i32, sh: i32) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
-        unsafe { super::simd::scale_shr_avx2(x, g, sh) };
-        return;
+        if unsafe { super::simd::scale_shr_avx2(x, g, sh) } {
+            return;
+        }
     }
     scale_shr_scalar(x, g, sh);
 }
