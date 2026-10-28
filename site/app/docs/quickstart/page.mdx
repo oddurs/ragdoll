@@ -2,11 +2,11 @@ export const metadata = { title: "Quickstart" };
 
 # Quickstart
 
-This walkthrough generates its own test media, so you don't need any sample files. It takes about five minutes and touches every subcommand.
+This walkthrough generates its own test media, so you don't need any sample files. It takes about five minutes and touches every media subcommand. The output shown comes from a four-thread x86_64 machine; your timings will differ.
 
 ## 1. Generate test media
 
-[`synth`](/docs/cli/synth/) writes procedural video (SMPTE-style bars and moving patterns) or audio (a stereo tone). The output format follows the file extension.
+[`synth`](/docs/cli/synth/) writes procedural video (step bars and a moving pattern) or audio (a stereo tone). The output format follows the file extension.
 
 ```sh
 ragdoll synth sample.mp4 --resolution 1280x720 --fps 30 --duration 2
@@ -14,11 +14,11 @@ ragdoll synth tone.wav --duration 3
 ```
 
 ```text
-[ragdoll synth] procedural://1280x720@30fps -> sample.mp4 | frames=60 gops=4 threads=10 | ... | 71.74 ms (836.4 fps, 1.266 GB/s)
-[ragdoll synth-audio] procedural://audio -> tone.wav | frames=1 gops=1 threads=1 | ... | 1.45 ms
+[ragdoll synth] procedural://1280x720@30fps -> sample.mp4 | frames=60 gops=4 threads=4 | in=82944000 B out=137757 B (602.10:1) | 308.84 ms (194.3 fps, 0.269 GB/s)
+[ragdoll synth-audio] procedural://audio -> tone.wav | frames=1 gops=1 threads=1 | in=576000 B out=576044 B (1.00:1) | 5.16 ms (27921955.0 fps, 0.223 GB/s)
 ```
 
-Every command ends with a one-line report: frames processed, GOPs, worker threads, bytes in and out, and wall time.
+Most commands end with a one-line report: frames processed, GOPs, worker threads, bytes in and out, and wall time.
 
 ## 2. Inspect it
 
@@ -32,19 +32,21 @@ ragdoll probe sample.mp4 --gop-map
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ RAGDOLL PROBE : sample.mp4                                                   │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ Container     : mp4/isobmff        File Size :      7844139 B (7.48 MB)      │
-│ Probe Latency :   112.00 µs         GOP Count :           10                 │
+│ Container     : mp4/isobmff        File Size :       137757 B (0.13 MB)      │
+│ Probe Latency :   229.91 µs         GOP Count :            4                 │
 │ H.264 Profile : Constrained Baseline (level 4.0)                             │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Track #0  [Video] codec=h264 1280x720 @ 30.000 fps (30/1) fmt=yuv420p        │
 │   Colorimetry : primaries=BT709, transfer=BT709, matrix=BT709, range=Limited
-│   Samples     : 60 packets (7842908 bytes)
+│   Samples     : 60 packets (136550 bytes)
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Bitrate Spark : ▆▂▁▁▂▁▁▁▁▁▁▁▁▁▆▂▁▁▂▁▁▁▁▁▁▁▂▁▇▃▂▁▁▁▂▁▁▂▁▁▁▁█▂▂▂▁▁▁▁▁▁▂▁▁▁     │
 └──────────────────────────────────────────────────────────────────────────────┘
 
 ASCII GOP Waterfall (I/P Packet Size Distribution):
-  #000 [GOP 01 I-KEY]  573266 B |███████████████████████████████
-  #001 [GOP 01 P-INT]    7190 B |▒
-  #002 [GOP 01 P-INT]   33834 B |▒
+  #000 [GOP 01 I-KEY]    8930 B |█████████████████████████████
+  #001 [GOP 01 P-INT]    2970 B |▒▒▒▒▒▒▒▒▒
+  #002 [GOP 01 P-INT]    1088 B |▒▒▒
   ...
 ```
 
@@ -60,13 +62,13 @@ ragdoll remux sample.mp4 sample.ts
 ```
 
 ```text
-[ragdoll remux] sample.mp4 -> sample.mkv | frames=60 | in=7844139 B out=7843927 B | 1.10 ms (14.230 GB/s)
-[ragdoll remux] sample.mp4 -> sample.ts  | frames=60 | in=7844139 B out=8024780 B | 1.45 ms (10.962 GB/s)
+[ragdoll remux] sample.mp4 -> sample.mkv | frames=60 gops=1 threads=1 | in=137757 B out=137352 B (1.00:1) | 0.31 ms (193562.7 fps, 0.888 GB/s)
+[ragdoll remux] sample.mp4 -> sample.ts | frames=60 gops=1 threads=1 | in=137757 B out=147956 B (0.93:1) | 0.29 ms (204192.8 fps, 0.972 GB/s)
 ```
 
 ## 4. Re-encode
 
-[`transcode`](/docs/cli/transcode/) decodes, optionally scales, and re-encodes across GOP-parallel workers.
+[`transcode`](/docs/cli/transcode/) decodes, optionally filters and scales, and re-encodes across GOP-parallel workers.
 
 ```sh
 ragdoll transcode sample.mp4 small.mp4 --scale 640x360 --qp 24
@@ -74,20 +76,48 @@ ragdoll transcode tone.wav tone.flac
 ```
 
 ```text
-[ragdoll transcode] sample.mp4 -> small.mp4 | frames=60 gops=10 threads=10 | ... | 30.45 ms (1970.6 fps)
-[ragdoll transcode-audio] tone.wav -> tone.flac | ... | in=576044 B out=137827 B (4.18:1) | 0.81 ms
+[ragdoll transcode] sample.mp4 -> small.mp4 | frames=60 gops=4 threads=4 | in=137757 B out=45166 B (3.05:1) | 345.05 ms (173.9 fps, 0.001 GB/s)
+[ragdoll transcode-audio] tone.wav -> tone.flac | frames=1 gops=1 threads=1 | in=576044 B out=138504 B (4.16:1) | 7.48 ms (19241075.8 fps, 0.095 GB/s)
 ```
 
-## 5. Pull out frames
+The encoded file is the same whatever the thread count, so `--threads` and the power mode only change how long it takes.
+
+## 5. Cut and join
+
+[`cut`](/docs/cli/cut/) trims a clip, re-encoding only the GOP the cut starts in. [`concat`](/docs/cli/concat/) joins files, by packet copy when they match.
+
+```sh
+ragdoll cut sample.mp4 clip.mp4 --from 0.7 --to 1.6
+ragdoll concat clip.mp4 clip.mp4 -o twice.mp4
+```
+
+```text
+RAGDOLL CUT: sample.mp4 -> clip.mp4 | 27 video pkts (18 zero-copy copied, 9 boundary frames re-encoded), 0 audio pkts (84373 B in 318.43 ms)
+RAGDOLL CONCAT: 2 segments -> twice.mp4 | 54 video pkts, 0 audio pkts (reencoded=false, 168035 B in 0.50 ms)
+```
+
+## 6. Package for streaming
+
+[`package`](/docs/cli/package/) encodes an adaptive-bitrate ladder into CMAF segments with HLS and DASH manifests.
+
+```sh
+ragdoll package sample.mp4 -o hls
+```
+
+```text
+RAGDOLL PACKAGE: sample.mp4 -> hls | 2 CMAF renditions x 1 segments | HLS=hls/master.m3u8 | DASH=hls/manifest.mpd (810089 B in 1216.47 ms)
+```
+
+## 7. Pull out frames
 
 [`extract`](/docs/cli/extract/) writes a single frame at a timestamp, or a tiled contact sheet.
 
 ```sh
-ragdoll extract sample.mp4 frame.ppm --at 1.0
-ragdoll extract sample.mp4 -o sheet.ppm --thumbnails 16 --grid 4x4
+ragdoll extract sample.mp4 frame.png --at 1.0
+ragdoll extract sample.mp4 -o sheet.png --thumbnails 16 --grid 4x4
 ```
 
-## 6. Measure quality
+## 8. Measure quality
 
 [`metrics`](/docs/cli/metrics/) compares a distorted file against a reference. A remux is lossless, so this pair scores perfectly:
 
@@ -96,14 +126,18 @@ ragdoll metrics sample.mp4 sample.mkv
 ```
 
 ```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ RAGDOLL PERCEPTUAL QUALITY METRICS (60 frames in 659.83 ms / 90.9 fps)
+├──────────────────────────────────────────────────────────────────────────────┤
 │ PSNR (dB)     : Y=inf dB | U=inf dB | V=inf dB | Avg=inf dB (6:1:1=inf dB)
 │ SSIM (8x8)    : Y=1.00000 (inf dB) | Avg=1.00000 | 5-Scale MS-SSIM=1.00000
 │ VMAF-Lite     : 100.00 / 100.0
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 7. Use pipes
+## 9. Use pipes
 
-Use `-` as a path to read from stdin or write to stdout. When stdout is the output and no format is given, Ragdoll writes MPEG-TS.
+`probe`, `remux` and `transcode` accept `-` as a path to read from stdin or write to stdout. When stdout is the output and no format is given, Ragdoll writes MPEG-TS.
 
 ```sh
 ragdoll transcode sample.mp4 - --format ts | ragdoll probe -
@@ -112,8 +146,8 @@ ragdoll transcode sample.mp4 - --format ts | ragdoll probe -
 ## Next steps
 
 <Cards>
-  <Card title="CLI overview" href="/docs/cli/">Global options, conventions and output formats.</Card>
+  <Card title="CLI overview" href="/docs/cli/">Global options, conventions and exit status.</Card>
   <Card title="Pipeline recipes" href="/docs/cli/recipes/">Describe a multi-output job in TOML.</Card>
   <Card title="Formats & codecs" href="/docs/formats/">What each container and codec supports today.</Card>
-  <Card title="Benchmarks" href="/docs/benchmarks/">Run the end-to-end suite on your machine.</Card>
+  <Card title="Benchmarks" href="/docs/benchmarks/">Speed measurements and how they were taken.</Card>
 </Cards>

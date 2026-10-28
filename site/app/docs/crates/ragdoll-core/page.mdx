@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll-core" };
 
 # ragdoll-core
 
-The shared vocabulary of the workspace: time, color, frames, packets, bit I/O, checksums, errors and power management. It has no dependencies.
+The shared vocabulary of the workspace: time, color, frames, packets, bit I/O, checksums, errors, power management and SIMD dispatch. It has no dependencies.
 
 [Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-core)
 
@@ -13,11 +13,13 @@ The shared vocabulary of the workspace: time, color, frames, packets, bit I/O, c
 | `time` | `Rational64`, `Timestamp`, `Rounding`, `rescale_q`, `rescale_delta`, `compare_ts`, `bessel_i0` |
 | `color` | `Colorimetry`, `ColorPrimaries`, `TransferCharacteristics`, `MatrixCoefficients`, `ColorRange`, `ChromaLocation`, `Chromaticities` |
 | `format` | `PixelFormat`, `SampleFormat`, `ChannelLayout` |
-| `frame` | `AlignedBuffer`, `Plane`, `VideoFrame`, `AudioFrame`, `FramePool`, `PooledVideoFrame`, `optimal_plane_stride` |
-| `packet` | `PacketSlice`, `PacketPayload`, `PacketFlags`, `SampleEntry`, `TrackInfo`, `CodecId`, `TrackType` |
+| `frame` | `AlignedBuffer`, `Plane`, `VideoFrame`, `AudioFrame`, `PictureType`, `FramePool`, `PooledVideoFrame`, `optimal_plane_stride` |
+| `packet` | `PacketSlice`, `PacketPayload`, `PacketFlags`, `SampleEntry`, `TrackInfo`, `VideoTrackParams`, `AudioTrackParams`, `CodecId`, `TrackType` |
 | `bitstream` | `BitReader`, `BitWriter`, RBSP escaping, EBML VINT and LEB128 helpers |
-| `crc` | CRC-8 and CRC-16 (FLAC), CRC-32 (MPEG-2 and Ogg) |
-| `power` | `PowerMode`, `CpuTopology`, `HardwareMetrics`, `measure_hardware_metrics` |
+| `crc` | CRC-8 and CRC-16 (FLAC), CRC-32 (MPEG-2, Ogg and PNG), Adler-32 |
+| `power` | `PowerMode`, `with_power_mode`, `set_global_power_mode`, `CpuTopology`, `HardwareMetrics`, `measure_hardware_metrics` |
+| `dispatch` | `SimdDispatch`, `neon()`, `avx2()`: which SIMD path kernels take, overridable with `RAGDOLL_SIMD` |
+| `testing` | `require_tool`, `tool_succeeded`: helpers for tests that run `ffmpeg` or `ffprobe` |
 | `error` | `RagdollError`, `Result` |
 
 ## Time
@@ -44,7 +46,7 @@ assert_eq!(pts.format_hms(), "48:00:00.000");
 
 - `AlignedBuffer`: 64-byte-aligned, zero-initialized, with 64 bytes of zeroed tail padding.
 - `Plane`: a buffer plus width, height and stride.
-- `VideoFrame`: up to four planes, a `PixelFormat`, `Colorimetry`, timestamp and picture type.
+- `VideoFrame`: up to three planes, a `PixelFormat`, `Colorimetry`, timestamp and picture type.
 - `AudioFrame`: interleaved samples with rate, channel count, layout and sample format.
 - `FramePool`: thread-safe recycling of `VideoFrame`s with frame-count and byte limits.
 
@@ -52,8 +54,22 @@ See [Memory model](/docs/architecture/memory/) for why these are shaped the way 
 
 ## Bit I/O
 
-`BitReader` reads big-endian bit fields with a 64-bit cache refilled in one load, and decodes Exp-Golomb (`ue(v)`, `se(v)`) and Rice codes with a single count-leading-zeros instruction. `BitWriter` is the inverse. `unescape_rbsp` and `escape_rbsp` remove and insert H.264 / HEVC emulation-prevention bytes; the unescape path uses a NEON fast path for long runs without `00 00 03`.
+`BitReader` reads big-endian bit fields with a 64-bit cache refilled in one load, and decodes Exp-Golomb (`ue(v)`, `se(v)`) and Rice codes with a single count-leading-zeros instruction. `BitWriter` is the inverse. `unescape_rbsp` and `escape_rbsp` remove and insert H.264 / HEVC emulation-prevention bytes; the unescape path has NEON and AVX2 fast paths for long runs without `00 00 03`.
 
 ## Power
 
-`PowerMode` selects a scheduling profile; `with_power_mode` applies one for the duration of a closure. `CpuTopology::detect()` reports logical, performance and efficiency core counts and cache sizes. `measure_hardware_metrics` wraps a closure and returns wall and CPU time, instructions, cycles, IPC, estimated energy and peak RSS. See [Power modes](/docs/power/).
+`PowerMode` selects a scheduling profile; `with_power_mode` applies one for the duration of a closure. `CpuTopology::detect()` reports logical, performance and efficiency core counts and cache sizes. `measure_hardware_metrics` wraps a closure and returns wall and CPU time, instructions, cycles, IPC, estimated energy and peak RSS. Instruction and cycle counts come from `proc_pid_rusage` and are only available on macOS (elsewhere they are `0`), and energy is a model estimate from cycles or CPU time, not a measurement. See [Power modes](/docs/power/).
+
+## SIMD dispatch
+
+Every kernel with a SIMD path asks `dispatch::neon()` or `dispatch::avx2()` before taking it. By default that is the best level the CPU supports; the `RAGDOLL_SIMD` environment variable (`scalar`, `neon` or `avx2`) forces a level instead, which is how CI runs the whole test suite on the scalar reference paths. The variable is read once, on first use, and naming a level the CPU does not support panics.
+
+```rust
+use ragdoll_core::dispatch::SimdDispatch;
+
+println!("detected {}, using {}", SimdDispatch::detected().name(), SimdDispatch::active().name());
+```
+
+## Testing helpers
+
+`testing::require_tool("ffmpeg")` and `testing::tool_succeeded(status, what)` make an interop test fail when a reference tool is missing or its command fails, so such tests never pass without testing anything. Setting `RAGDOLL_ALLOW_MISSING_TOOLS=1` turns those failures into skips.

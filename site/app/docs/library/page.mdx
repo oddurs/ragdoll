@@ -5,7 +5,7 @@ export const metadata = { title: "Library usage" };
 Everything the CLI does is available from Rust. The crates are layered, so you can depend on just the part you need: a demuxer without codecs, or color conversion without containers.
 
 <Callout kind="status" title="Unstable API">
-The public API will change before 1.0. A smaller, deliberately stable facade (`Transcoder`, `Prober`, `Editor`, `Packager`) is planned for 1.0. Until then, pin a git revision.
+The public API will change before 1.0. The builders in `ragdoll-pipeline` (`TranscodeBuilder`, `ProbeBuilder`, `CutBuilder`, `PackageBuilder`) are the smallest surface and the one most likely to stay put. Until 1.0, pin a git revision.
 </Callout>
 
 ```toml title="Cargo.toml"
@@ -71,11 +71,29 @@ println!("{}", ts.format_hms()); // 00:00:10.000
 
 ## Transcode a file
 
-`ragdoll-pipeline` exposes the same engine the CLI uses. `TranscodeOptions` mirrors the command-line flags.
+`ragdoll-pipeline` exposes the same engine the CLI uses. The builders cover the common jobs:
 
 ```rust
-use ragdoll_pipeline::{TranscodeOptions, transcode_file_with_options};
-use ragdoll_pix::ScaleFilter;
+use ragdoll_pipeline::{ScaleFilter, TranscodeBuilder};
+
+fn main() -> ragdoll_core::Result<()> {
+    let report = TranscodeBuilder::new("input.mp4", "output.mp4")
+        .scale(1280, 720, ScaleFilter::Lanczos3)
+        .crf(21.0)
+        .audio_codec("aac")
+        .normalize_lufs(-14.0)
+        .run()?;
+    println!("{} frames, {} bytes out", report.frames_processed, report.bytes_out);
+    Ok(())
+}
+```
+
+`ProbeBuilder::new(path).run()` returns a `ProbeReport`, `CutBuilder` trims (`from_seconds`, `to_seconds`, `keyframes_only`), and `PackageBuilder` writes an HLS and DASH ladder (`ladder`, `segment_duration`, `thumbnails`).
+
+Underneath, `TranscodeOptions` mirrors the command-line flags:
+
+```rust
+use ragdoll_pipeline::{ScaleFilter, TranscodeOptions, transcode_file_with_options};
 
 fn main() -> ragdoll_core::Result<()> {
     let opts = TranscodeOptions {
@@ -94,7 +112,28 @@ fn main() -> ragdoll_core::Result<()> {
 }
 ```
 
-Other entry points: `remux_file`, `extract_media`, `evaluate_media_metrics`, `synth_media`, `probe_file_detailed`, and `execute_recipe` for [TOML recipes](/docs/cli/recipes/).
+Other entry points: `remux_file`, `cut_media`, `concat_media`, `package_abr`, `extract_media`, `evaluate_media_metrics`, `synth_media`, `probe_file_detailed`, and `execute_recipe` for [TOML recipes](/docs/cli/recipes/).
+
+## Decode video a batch at a time
+
+`with_video_stream` maps a file and hands you a `VideoFrameStream` that decodes it in presentation order, a batch at a time, with each batch sized by the byte budget you pass (at least one frame, and for MP4 at least one whole GOP). This is how the CLI keeps memory flat on long inputs.
+
+```rust
+use ragdoll_pipeline::with_video_stream;
+
+fn main() -> ragdoll_core::Result<()> {
+    // Batches of at most 64 MiB of decoded frames; 0 threads = automatic.
+    let frames = with_video_stream("input.mp4", 64 << 20, 0, |mut stream| {
+        let mut count = 0;
+        while let Some(batch) = stream.next_batch()? {
+            count += batch.len();
+        }
+        Ok(count)
+    })?;
+    println!("{frames} frames");
+    Ok(())
+}
+```
 
 ## Parallelize your own work
 
@@ -115,7 +154,7 @@ assert_eq!(squares[999], 998_001);
 | :-- | :-- |
 | Parse or write a container | `ragdoll-format` (pulls in `ragdoll-core`, `ragdoll-simd`) |
 | Convert color, scale, or compute PSNR / SSIM | `ragdoll-pix` |
-| Encode or decode FLAC, H.264 or RGDI | `ragdoll-codec` |
+| Encode or decode H.264, AAC-LC, Opus, FLAC or RGDI | `ragdoll-codec` |
 | Do whole-file operations like the CLI | `ragdoll-pipeline` |
 | Use only the SIMD kernels | `ragdoll-simd` |
 

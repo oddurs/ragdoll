@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll-pipeline" };
 
 # ragdoll-pipeline
 
-Parallel scheduling, A/V synchronization, TOML recipes, and the whole-file operations the CLI is built on.
+Parallel scheduling, bounded-memory decoding and encoding, A/V synchronization, TOML recipes, the whole-file operations the CLI is built on, and the builder API over them.
 
 [Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-pipeline)
 
@@ -26,7 +26,7 @@ Runs `worker_fn(index, &item)` for every item on `std::thread::scope` threads. W
 
 ### `GopRingPipeline`
 
-A bounded-memory executor. Given source and destination dimensions, `max_gops_per_wave` works out how many GOPs fit in the memory budget at once. `encode_gops_bounded` then scales and encodes the frames wave by wave, recycling buffers through a `FramePool`, and returns the encoded GOPs together with `GopRingStats` (waves, peak wave memory, pool hits and allocations).
+A bounded-memory executor. `GopRingPipeline::new(threads)` takes its budget from the current [power mode](/docs/power/) (256 MiB, or 64 MiB in efficiency mode); `with_budget_bytes` sets one explicitly. Given source and destination dimensions, `max_gops_per_wave` works out how many GOPs fit in the budget at once (never more than twice the worker count). `encode_gops_bounded` and `encode_gops_bounded_with_h264` (which add an `H264Profile` and a `RateControlMode`) then scale and encode a slice of frames wave by wave in 15-frame GOPs (`GOP_FRAMES`), recycling buffers through a `FramePool`, and return the encoded GOPs together with `GopRingStats` (waves, peak wave memory, pool hits and allocations).
 
 ```rust
 use ragdoll_pipeline::GopRingPipeline;
@@ -34,11 +34,15 @@ use ragdoll_pipeline::GopRingPipeline;
 let ring = GopRingPipeline::with_budget_bytes(8, 128 * 1024 * 1024);
 ```
 
-`streaming_encoder` returns a `GopRingEncoder` that takes frames a batch at a time with `push` and returns the same GOPs from `finish`, holding only the current wave.
+### `GopRingEncoder`
+
+`streaming_encoder` returns a `GopRingEncoder` for a stream whose frames arrive in batches. `push` encodes as many complete waves as it has, `finish` encodes the rest and returns every GOP in order with the stats, and only the current wave of frames is held in between. The output is exactly what `encode_gops_bounded_with_h264` produces for the same frames. With average-bitrate rate control, which needs one rate-controlled chain of GOPs, frames are encoded as they arrive instead of in parallel waves.
 
 ### `VideoFrameStream`
 
-Decodes a container a batch at a time, in presentation order, so a caller holds one batch of frames rather than the whole input. MP4 is decoded a wave of whole GOPs at a time in parallel; Matroska and MPEG-TS through one decoder with a 17-picture reorder window; Y4M frames are copied out of the mapping and their pages released. `transcode`, `metrics`, `extract`, `concat` and `package` all decode this way, so their peak memory follows the memory budget, not the input length.
+Decodes a container a batch at a time, in presentation order, so a caller holds one batch of frames rather than the whole input. A batch is sized by a byte budget: at least one frame, and for MP4 at least one GOP. MP4 is decoded a wave of whole GOPs at a time in parallel; Matroska and MPEG-TS through one decoder with a 17-picture reorder window; Y4M frames are copied out of the mapping and their pages released; numbered image sequences are read a file at a time. The frames and their order are exactly what `decode_video_bytes` returns. `transcode`, `metrics`, `extract`, `concat` and `package` all decode this way, so their peak memory follows the memory budget, not the input length.
+
+`VideoFrameStream::open(data, budget_bytes, threads)` works on any byte slice, `open_mapped` on an `MmapSource`, and `open_image_sequence` on a pattern such as `frame_%04d.png`. `with_video_stream` opens a path and keeps it mapped while your closure runs:
 
 ```rust
 use ragdoll_pipeline::with_video_stream;
@@ -46,10 +50,13 @@ use ragdoll_pipeline::with_video_stream;
 with_video_stream("input.mp4", 64 << 20, 0, |mut stream| {
     while let Some(batch) = stream.next_batch()? {
         // batch: Vec<VideoFrame>, presentation order
+        let _ = batch;
     }
     Ok(())
 })?;
 ```
+
+`VideoFilterChain` applies the `transcode` filters (crop, pad, rotate, overlay, tone mapping, frame-rate changes) batch by batch.
 
 ## A/V sync
 
@@ -66,10 +73,27 @@ with_video_stream("input.mp4", 64 << 20, 0, |mut stream| {
 | `probe_file_detailed(path)` → `ProbeReport` | `probe` |
 | `remux_file(in, out)`, `remux_file_with_format(in, out, format)` | `remux` |
 | `transcode_file_with_options(in, out, &TranscodeOptions)` | `transcode` |
+| `cut_media(in, out, &CutOptions)` → `CutReport` | `cut` |
+| `concat_media(&inputs, out)` → `ConcatReport` | `concat` |
+| `package_abr(in, out_dir, &PackageOptions)` → `PackageReport` | `package` |
 | `extract_media(in, out, at_seconds, thumbnails)` | `extract` |
-| `evaluate_media_metrics(reference, distorted)` | `metrics` |
+| `evaluate_media_metrics(reference, distorted)` → `(QualityReport, frames, ms)` | `metrics` |
 | `synth_media(out, width, height, fps, seconds)` | `synth` |
 
-Each one except `probe_file_detailed` and `evaluate_media_metrics` returns a `PipelineTelemetry` with frame, GOP, thread and byte counts, elapsed time, frame rate, bandwidth and compression ratio.
+`remux_file`, `transcode_file_with_options`, `extract_media` and `synth_media` return a `PipelineTelemetry` with frame, GOP, thread and byte counts, elapsed time, frame rate, bandwidth and compression ratio. `evaluate_media_metrics_with_budget` takes an explicit memory budget.
 
-Lower-level helpers are public too: `decode_video_file` and `decode_video_bytes` (which decode the whole input at once), `parallel_scale_frames`, `extract_auxiliary_tracks` and `synth_video_frame`.
+## Builders
+
+`ProbeBuilder`, `TranscodeBuilder`, `CutBuilder` and `PackageBuilder` wrap the operations above (`ProbeJob`, `TranscodeJob`, `CutJob` and `PackageJob` are aliases). `TranscodeBuilder` covers scaling, codec and profile, `qp`, `crf`, `bitrate_kbps` and `vbv_constraints`, the video filters, audio codec, sample rate, channels and loudness, threads and the memory budget. Each `run()` calls the matching function.
+
+```rust
+use ragdoll_pipeline::CutBuilder;
+
+let report = CutBuilder::new("input.mp4", "clip.mp4")
+    .from_seconds(10.0)
+    .to_seconds(25.0)
+    .run()?;
+println!("{} packets copied, {} frames re-encoded", report.copied_video_packets, report.reencoded_video_frames);
+```
+
+Lower-level helpers are public too: `decode_video_file` and `decode_video_bytes` (which decode the whole input at once), `decode_audio_bytes`, `decode_audio_track_packets` and `encode_audio_track_packets` (which hold a whole audio track), `apply_video_filters`, `apply_audio_dsp`, `parallel_scale_frames`, `extract_auxiliary_tracks` and `synth_video_frame`.

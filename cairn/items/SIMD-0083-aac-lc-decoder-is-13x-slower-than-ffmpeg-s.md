@@ -3,8 +3,10 @@ id: 83
 uid: 347f6db3-6bca-4b44-afc1-1a39a914e752
 title: AAC-LC decoder is 13x slower than FFmpeg's
 type: kernel
-status: backlog
+status: doing
 milestone: m11-validation
+assignee: Claude
+claimed: 2026-10-28
 created: 2026-10-28
 updated: 2026-10-28
 priority: p2

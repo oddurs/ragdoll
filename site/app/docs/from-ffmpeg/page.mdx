@@ -9,10 +9,10 @@ If you already know FFmpeg, most of Ragdoll will feel familiar. The library boun
 | FFmpeg | Ragdoll | Notes |
 | :-- | :-- | :-- |
 | `libavutil` | [`ragdoll-core`](/docs/crates/ragdoll-core/) | Rationals, timestamps, frames, packets, CRCs, bit I/O. `Rational64` reduction follows `av_reduce`; `Timestamp::rescale_to` is `av_rescale_q` computed in 128-bit. |
-| `libavutil` DSP, `*/aarch64/*.S` | [`ragdoll-simd`](/docs/crates/ragdoll-simd/) | Intrinsics in Rust instead of hand-written assembly, each paired with a scalar reference. |
-| `libswscale`, parts of `libavfilter` | [`ragdoll-pix`](/docs/crates/ragdoll-pix/) | Color conversion, scaling, dithering, PSNR / SSIM. |
+| `libavutil` DSP, `*/aarch64/*.S`, `*/x86/*.asm` | [`ragdoll-simd`](/docs/crates/ragdoll-simd/) | NEON and AVX2 intrinsics in Rust instead of hand-written assembly, each paired with a scalar reference it must match bit for bit. |
+| `libswscale`, parts of `libavfilter` | [`ragdoll-pix`](/docs/crates/ragdoll-pix/) | Color conversion, scaling, dithering, crop / pad / rotate / overlay, HDR tone-mapping, PSNR / SSIM. |
 | `libavformat` | [`ragdoll-format`](/docs/crates/ragdoll-format/) | Demuxers borrow from an `mmap`; muxers use `writev`. |
-| `libavcodec` | [`ragdoll-codec`](/docs/crates/ragdoll-codec/) | H.264, FLAC, PCM, RGDI; AV1 OBU inspection. |
+| `libavcodec`, `libswresample` | [`ragdoll-codec`](/docs/crates/ragdoll-codec/) | H.264, AAC-LC, Opus, FLAC, PCM, RGDI; AV1 OBU inspection; resampling and EBU R128 loudness. |
 | `fftools` threading | [`ragdoll-pipeline`](/docs/crates/ragdoll-pipeline/) | GOP-parallel scheduling with a bounded memory budget. |
 | `ffmpeg`, `ffprobe` | `ragdoll` | One binary with subcommands. |
 | `AV_NOPTS_VALUE` | `Timestamp::NONE` | |
@@ -20,7 +20,7 @@ If you already know FFmpeg, most of Ragdoll will feel familiar. The library boun
 
 ## Commands side by side
 
-These are equivalent in intent. Ragdoll does not try to accept FFmpeg's argument syntax, though a few short aliases (`-c:v`, `-c:a`, `-c:s`, `-f`, `-s`) are accepted where they mean the same thing.
+These are equivalent in intent. Ragdoll does not try to accept FFmpeg's argument syntax, though a few short aliases (`-c:v`, `-c:a`, `-c:s`, `-b:v`, `-profile:v`, `-ar`, `-ac`, `-r:v`, `-f` and `-s` for `transcode`; `-ss` and `-to` for `cut`) are accepted where they mean the same thing. Watch out for `-r`: in `transcode` it means `--recipe`, not a frame rate. Unknown options are rejected with exit status `2` rather than ignored.
 
 | Task | FFmpeg | Ragdoll |
 | :-- | :-- | :-- |
@@ -29,10 +29,17 @@ These are equivalent in intent. Ragdoll does not try to accept FFmpeg's argument
 | Change container | `ffmpeg -i in.mp4 -c copy out.mkv` | `ragdoll remux in.mp4 out.mkv` |
 | Scale and re-encode | `ffmpeg -i in.mp4 -vf scale=1280:720:flags=lanczos out.mp4` | `ragdoll transcode in.mp4 out.mp4 --scale 1280x720` |
 | Pick the scaler | `-vf scale=...:flags=spline` | `--filter spline36` |
+| Quality or bitrate target | `-crf 23` / `-b:v 2M -maxrate 3M -bufsize 4M` | `--crf 23` / `--bitrate 2M --maxrate 3M --bufsize 4M` |
+| Crop, pad, rotate | `-vf crop=...,pad=...,transpose=1` | `--crop W:H:X:Y --pad W:H:X:Y --rotate 90` |
+| Watermark | `-i logo.png -filter_complex overlay=16:16` | `--overlay logo.png --overlay-xy 16:16` |
+| Resample and normalize audio | `-af aresample=48000,loudnorm=I=-16` | `--sample-rate 48000 --loudness -16` |
 | Drop audio / subtitles | `-an` / `-sn` | `--an` / `--sn` |
 | WAV to FLAC | `ffmpeg -i in.wav out.flac` | `ragdoll transcode in.wav out.flac` |
+| Trim a clip | `ffmpeg -ss 10 -to 20 -i in.mp4 out.mp4` | `ragdoll cut in.mp4 out.mp4 --from 10 --to 20` |
+| Join files | `ffmpeg -f concat -i list.txt -c copy out.mp4` | `ragdoll concat a.mp4 b.mp4 -o out.mp4` |
+| HLS + DASH ladder | several `ffmpeg -f hls` / `-f dash` encodes | `ragdoll package in.mp4 -o out/ --ladder 720p:2500k,360p:600k` |
 | Grab one frame | `ffmpeg -ss 5 -i in.mp4 -frames:v 1 out.ppm` | `ragdoll extract in.mp4 out.ppm --at 5` |
-| Contact sheet | `ffmpeg -i in.mp4 -vf fps=...,scale=...,tile=4x4 out.ppm` | `ragdoll extract in.mp4 out.ppm --thumbnails 16 --grid 4x4` |
+| Contact sheet | `ffmpeg -i in.mp4 -vf fps=...,scale=...,tile=4x4 out.png` | `ragdoll extract in.mp4 out.png --thumbnails 16 --grid 4x4` |
 | PSNR and SSIM | `ffmpeg -i dist.mp4 -i ref.mp4 -lavfi "psnr;ssim" -f null -` | `ragdoll metrics ref.mp4 dist.mp4` |
 | Pipe to stdout | `ffmpeg -i in.mp4 -f mpegts -` | `ragdoll transcode in.mp4 - --format ts` |
 
@@ -41,10 +48,11 @@ Note the argument order for `metrics`: the reference comes first.
 ## What is different on purpose
 
 - **Subcommands, not one overloaded entry point.** Each verb has its own small option set, so there is no global ordering of `-i` and per-stream flags to get right.
-- **Opinionated defaults.** `transcode` keeps audio and subtitle tracks and re-times them against the new video timebase unless you pass `--an` or `--sn`. Scaling and encoding run in bounded waves of GOPs (256 MiB working set by default).
+- **Opinionated defaults.** `transcode` keeps audio and subtitle tracks and re-times them against the new video timebase unless you pass `--an` or `--sn`. Video is decoded, scaled and encoded in bounded batches (256 MiB working set by default, 64 MiB in efficiency mode).
+- **Reproducible output.** The H.264 encoder uses a fixed 15-frame GOP, so a file encodes to the same bytes whatever the thread count or power mode.
 - **One license.** There is no build matrix of LGPL, GPL and non-free components. Everything is MIT or Apache-2.0.
 - **No external codec libraries.** There is no equivalent of `--enable-libx264`. If Ragdoll supports a codec, the implementation is in this repository.
 
 ## What is not there yet
 
-Ragdoll is pre-1.0 and far narrower than FFmpeg. In particular, there is no HEVC, VP9, AV1 decoding, AAC or Opus decoding, filter graph, or hardware acceleration. The H.264 encoder is Constrained Baseline only and does not yet compress competitively. Check [Formats & codecs](/docs/formats/) before you plan around a feature, and the [Roadmap](/docs/roadmap/) for what is planned.
+Ragdoll is pre-1.0 and far narrower than FFmpeg. In particular, there is no HEVC, VP9 or AV1 decoding, no filter graph, and no hardware acceleration. The H.264 encoder (Constrained Baseline, Main and High) compresses about as well as x264's `ultrafast` preset, well behind `veryfast`. The H.264 decoder is bit-exact but single-threaded and several times slower than FFmpeg's. The AAC encoder has no rate control yet, and audio that is re-encoded or processed is decoded whole into memory. Check [Formats & codecs](/docs/formats/) before you plan around a feature, and the [Roadmap](/docs/roadmap/) for what is planned.

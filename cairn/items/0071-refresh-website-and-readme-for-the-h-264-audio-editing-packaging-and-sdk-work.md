@@ -3,10 +3,12 @@ id: 71
 uid: 84c0492e-dd8a-468d-99fe-36d0d32e9db9
 title: Refresh website and README for the H.264, audio, editing, packaging and SDK work
 type: docs
-status: planned
+status: done
 milestone: m11-validation
+assignee: Claude
 created: 2026-10-25
 updated: 2026-10-28
+closed_at: 2026-10-28
 priority: p1
 effort: s
 area: arch
@@ -23,7 +25,11 @@ Two findings change what the pages should say:
 
 ## Acceptance criteria
 
-- [ ] Every page re-checked against `main`; new subcommands and codecs documented with real output.
-- [ ] Roadmap and known limitations updated: no H.264 decoder mismatch is described, and unbounded decode memory is listed as a known limitation until BUG-0072 is fixed.
-- [ ] Quality and performance figures for H.264 are re-measured on code that includes the BUG-0060 fix.
-- [ ] No internal process references reintroduced.
+- [x] Every page re-checked against `main`; new subcommands and codecs documented with real output.
+- [x] Roadmap and known limitations updated: no H.264 decoder mismatch is described, and unbounded decode memory is listed as a known limitation until BUG-0072 is fixed.
+- [x] Quality and performance figures for H.264 are re-measured on code that includes the BUG-0060 fix.
+- [x] No internal process references reintroduced.
+
+## Result
+
+Site docs, README and home page re-checked against main: real command output, cut/concat/package pages, like-for-like codec benchmark table replacing the unverifiable bench/M4 figures, honest known limitations.

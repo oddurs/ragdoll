@@ -13,9 +13,9 @@ ragdoll extract <IN> -o <OUT> --thumbnails <N> [--grid <CxR>] [--json]
 
 | Option | Default | Description |
 | :-- | :-- | :-- |
-| `<IN>` | | Input video file. |
-| `<OUT>`, `-o`, `--output` | | Output path. `.ppm` writes an RGB image; `.y4m` writes YUV frames. |
-| `--at <TIME>` | `0` | Timestamp of the frame to extract, in seconds or `HH:MM:SS.mmm`. |
+| `<IN>` | | Input video file, or an image-sequence pattern. |
+| `<OUT>`, `-o`, `--output` | | Output path. `.png`, `.jpg` / `.jpeg` and `.ppm` write an RGB image; `.y4m` writes one YUV frame. Other extensions get PPM data. |
+| `--at <TIME>` | `0` | Timestamp of the frame to extract, in seconds or `HH:MM:SS.mmm`. Past the end, the last frame is used. |
 | `--thumbnails <N>` | | Build a contact sheet of `N` frames sampled evenly across the video. |
 | `--grid <CxR>` | `4x4` | Columns and rows of the contact sheet. |
 | `--json`, `-j` | | Print the summary as JSON. |
@@ -24,24 +24,25 @@ ragdoll extract <IN> -o <OUT> --thumbnails <N> [--grid <CxR>] [--json]
 
 ```sh
 # One frame, one second in.
-ragdoll extract talk.mp4 still.ppm --at 1.0
+ragdoll extract sample.mp4 still.png --at 1.0
 
-# The same, with an HH:MM:SS timestamp.
-ragdoll extract talk.mp4 still.ppm --at 00:12:30.000
+# The same, with an HH:MM:SS timestamp, as JPEG.
+ragdoll extract talk.mp4 still.jpg --at 00:12:30.000
 
 # A 4×4 contact sheet.
-ragdoll extract talk.mp4 -o sheet.ppm --thumbnails 16 --grid 4x4
+ragdoll extract sample.mp4 -o sheet.png --thumbnails 16 --grid 4x4
 
 # A 6×2 strip of thumbnails.
-ragdoll extract talk.mp4 -o strip.ppm --thumbnails 12 --grid 6x2
+ragdoll extract talk.mp4 -o strip.jpg --thumbnails 12 --grid 6x2
 ```
 
 ```text
-[ragdoll extract] sample.mp4 -> sheet.ppm | frames=16 gops=1 threads=10 | in=7844139 B out=2886016 B | 26.06 ms (613.9 fps)
+[ragdoll extract] sample.mp4 -> still.png | frames=1 gops=1 threads=4 | in=137757 B out=182167 B (1.00:1) | 127.33 ms (7.9 fps, 0.003 GB/s)
+[ragdoll extract] sample.mp4 -> sheet.png | frames=16 gops=1 threads=4 | in=137757 B out=894160 B (1.00:1) | 312.43 ms (51.2 fps, 0.003 GB/s)
 ```
 
 ## Notes
 
-- Each thumbnail is the source frame scaled to `width / columns` by `height / rows` (at least 64×36) with the polyphase scaler, then converted to RGB using the track's colorimetry.
-- PPM is the binary Netpbm `P6` format. Most image viewers open it directly; convert it to PNG with any image tool. Native PNG and JPEG output are planned.
-- The whole video is currently decoded before frames are selected. For long inputs this is slower and uses more memory than a keyframe seek would.
+- For a single frame from an H.264 MP4, `extract` seeks: it decodes only the GOP that contains the frame. Other inputs, and contact sheets, are decoded a batch at a time up to the last frame needed, keeping only the selected frames, so memory stays bounded on long inputs.
+- Each thumbnail is the source frame scaled to `width / columns` by `height / rows` (at least 64×36) with the Lanczos-3 polyphase scaler, then converted to RGB using the track's colorimetry. Tiles are separated by a 4-pixel dark border, so a 4×4 sheet of a 1280×720 video is 1300×740.
+- PPM is the binary Netpbm `P6` format. JPEG output uses quality 90.

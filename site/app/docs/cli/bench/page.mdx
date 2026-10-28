@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll bench" };
 
 # ragdoll bench
 
-Run the end-to-end benchmark suite. `bench` synthesizes its own inputs in a temporary directory, runs seven workloads in both performance and efficiency [power modes](/docs/power/), and records wall time, throughput and hardware counters for each.
+Run the end-to-end benchmark suite. `bench` synthesizes its own inputs in a temporary directory, runs twelve workloads through Ragdoll's library calls in both performance and efficiency [power modes](/docs/power/), and prints the wall time and throughput of each. It is a quick smoke test of a build's speed on your machine, not a fair comparison with FFmpeg; for like-for-like codec numbers see [Benchmarks](/docs/benchmarks/).
 
 ```sh
 ragdoll bench [--compare-ffmpeg] [--json]
@@ -12,31 +12,64 @@ ragdoll bench [--compare-ffmpeg] [--json]
 
 | Option | Description |
 | :-- | :-- |
-| `--compare-ffmpeg`, `-c` | Also run the equivalent `ffmpeg` / `ffprobe` command for each workload and report the speedup. Requires both on your `PATH`. |
+| `--compare-ffmpeg`, `-c` | Also run an `ffmpeg` / `ffprobe` command for each workload and print the time ratio. Requires both on your `PATH`. |
 | `--json`, `-j` | Emit the results as JSON. |
 
 ## Workloads
 
-| # | Workload | Ragdoll | FFmpeg equivalent |
+| # | Workload | Ragdoll | FFmpeg command run with `--compare-ffmpeg` |
 | :-- | :-- | :-- | :-- |
-| 1 | Container probe and GOP index of a 300-frame 4K MP4 | `probe` | `ffprobe -show_streams -show_packets -of json` |
-| 2 | Zero-copy remux, MP4 → MKV, 16 MB 4K | `remux` | `ffmpeg -c copy` |
-| 3 | 4K → 1080p Lanczos-3 scaling, 30 frames | `transcode --scale` | `ffmpeg -vf scale=1920:1080:flags=lanczos` |
-| 4 | Lossless FLAC encode and decode, 30 s 48 kHz stereo | `transcode` | `ffmpeg -c:a flac` |
-| 5 | 4×4 contact sheet, 16 thumbnails | `extract --thumbnails` | `ffmpeg -vf ...,tile=4x4` |
-| 6 | 4K PSNR + SSIM, 20 frames | `metrics` | `ffmpeg -lavfi psnr,ssim -f null -` |
-| 7 | 1080p H.264 transcode, 60 frames, Y4M → MP4 | `transcode` | `ffmpeg -c:v libx264` |
+| 1 | Container probe and GOP index of a 300-packet 4K MP4 (50 runs) | `probe` | `ffprobe -show_streams -show_packets -of json` |
+| 2 | Remux, MP4 → MKV, 16 MB (5 runs) | `remux` | `ffmpeg -c copy` |
+| 3 | 4K → 1080p Lanczos-3 scaling of 30 frames already in memory | scaler | `ffmpeg -vf scale=1920:1080:flags=lanczos -f null -` |
+| 4 | Lossless FLAC encode and decode, 30 s 48 kHz stereo, in memory | FLAC encoder and decoder | `ffmpeg -c:a flac`, then decode back to WAV |
+| 5 | 4×4 contact sheet, 16 thumbnails, 640×360 source | `extract --thumbnails` | `ffmpeg -vf scale=160:90:flags=lanczos,tile=4x4` |
+| 6 | 4K PSNR + SSIM, 20 frames | `metrics` | `ffmpeg -lavfi psnr;ssim -f null -` |
+| 7 | 1080p H.264 encode, 60 frames, Y4M → MP4 | `transcode` | `ffmpeg -c:v libx264 -preset ultrafast -qp 24` |
+| 8 | Frame-accurate trim of a 6 s 360p clip | `cut` | `ffmpeg -ss 0.25 -to 5.75` re-encoding with `libx264 -preset ultrafast` |
+| 9 | Resample 44.1 → 48 kHz, R128 normalize to −14 LUFS, AAC, 10 s | resampler, loudness meter, AAC encoder | `ffmpeg -af aresample=48000,loudnorm=I=-14:TP=-1.0 -c:a aac` |
+| 10 | HDR10 → SDR tone-map plus watermark overlay, 30 frames in memory | tone-map and overlay kernels | `ffmpeg -filter_complex ...tonemap=hable...overlay=16:16` |
+| 11 | Three-rendition CMAF HLS + DASH ladder | `package` | three `ffmpeg -f hls -hls_segment_type fmp4` encodes with `libx264 -preset ultrafast` |
+| 12 | High-profile CRF encode, 60 frames 720p, 64 MiB budget | streaming GOP encoder | `ffmpeg -c:v libx264 -preset ultrafast -crf 23 -maxrate 4000k -bufsize 8000k` |
 
-## What is measured
+Several Ragdoll workloads time a library call on data already in memory, while every FFmpeg command decodes its input from a file, and several of the FFmpeg commands do different work (x264 `ultrafast` against Ragdoll's encoder, a different tone-mapping curve, a full re-encode for the trim, FFmpeg's own HLS muxer). Treat their times as context rather than a race.
 
-- **Wall time** and a workload-specific rate (files/s, GB/s, fps, × real time).
-- **Instructions retired, cycles and IPC**, from `proc_pid_rusage(RUSAGE_INFO_V4)` on macOS.
-- **Estimated energy and average power**, and the share of execution time spent on efficiency cores.
-- **Peak resident memory.**
-- For FFmpeg runs, the same counters are collected by wrapping each process in `/usr/bin/time -l`.
+## Example output
 
-Hardware counters are available on macOS only. On Linux the suite still reports wall time, throughput and RSS.
+Four-thread x86_64 VM (AVX2), without `--compare-ffmpeg`, first table only:
 
-<Callout title="Read the comparison carefully">
-Ragdoll workloads run in-process. FFmpeg workloads run as child processes, so their timings include process start-up and, for `ffprobe`, JSON serialization of every packet. That overhead dominates the shortest workloads, especially probe. See [Benchmarks](/docs/benchmarks/) for the full methodology and caveats.
-</Callout>
+```text
+==================================================================================================================================
+  RAGDOLL v1.0.0 12-WORKLOAD SPEED & BATTERY EFFICIENCY BENCHMARK SUITE — SIMD: x86_64 AVX2 (256-bit) | CPU: 2 P-Cores + 2 E-Cores
+==================================================================================================================================
+Workload                                        P-Core (ms)    P-Core Rate E-Core (ms) FFmpeg (ms) Speedup(P) Speedup(E)
+----------------------------------------------------------------------------------------------------------------------------------
+1. Container Probe & GOP Index (300f 4K MP4)        0.06 ms 18156.64 files/s     0.05 ms         N/A        N/A        N/A
+2. Zero-Copy Remux (MP4 -> MKV 16 MB 4K)            8.73 ms     1.80 GB/s      8.46 ms         N/A        N/A        N/A
+3. 4K -> 1080p Lanczos-3 Scaling (30 frames)      355.14 ms    84.47 fps     437.44 ms         N/A        N/A        N/A
+4. Lossless FLAC Encode+Decode (30s 48kHz 2ch)    127.33 ms   235.61 x RT     97.18 ms         N/A        N/A        N/A
+5. 4x4 Contact Sheet Extraction (16 Thumbs)        44.57 ms   358.97 thumbs/s    53.14 ms         N/A        N/A        N/A
+6. 4K Perceptual Metrics (PSNR + 8x8 SSIM 20f)     74.00 ms   270.27 fps      75.91 ms         N/A        N/A        N/A
+7. 1080p H.264 Inter Transcode (60f Y4M->MP4)    1001.72 ms    59.90 fps    1433.97 ms         N/A        N/A        N/A
+8. Smart-GOP Frame-Accurate Trim (ragdoll cut)     42.62 ms    23.46 clips/s    46.72 ms         N/A        N/A        N/A
+9. Audio Resample 44.1->48k + R128 + AAC (10s)     85.86 ms   116.47 x RT    107.08 ms         N/A        N/A        N/A
+10. HDR10 -> SDR Oklab Tonemap + Overlay (30f)   1038.73 ms    28.88 fps    1084.25 ms         N/A        N/A        N/A
+11. CMAF HLS+DASH ABR Packager (3 Renditions)     138.76 ms    43.24 seg/s   230.85 ms         N/A        N/A        N/A
+12. Bounded-Mem (64 MiB) High-CRF Transcode       643.25 ms    93.28 fps     459.44 ms         N/A        N/A        N/A
+==================================================================================================================================
+```
+
+The whole run took about nine seconds on that machine.
+
+## What is measured, and what is not
+
+- **Wall time and a workload rate** (files/s, GB/s, fps, × real time) for each Ragdoll workload, once with the performance profile (`P-Core`) and once with the efficiency profile (`E-Core`). These are the numbers to look at.
+- **The FFmpeg column and the speedups** compare in-process Ragdoll library calls with whole FFmpeg command-line processes, which include process start-up, probing and file I/O, and, for `ffprobe`, JSON serialization of every packet. Those fixed costs dominate the short workloads, so the speedups mostly measure FFmpeg's start-up time. They are not codec-against-codec measurements and should not be quoted as such.
+- **The second table** ("hardware PMU telemetry and battery efficiency") is mostly not measured:
+  - instruction and cycle counts (and so IPC and GHz) print as `0` on Linux;
+  - energy and power are estimates from a fixed model (CPU time, or cycles where available, times a constant), not readings from an energy counter, and the efficiency-mode constant is lower, which is where the `x vs P` savings come from;
+  - the `E-Core%` column reads 100% whenever efficiency mode is selected unless the OS reports core residency;
+  - `Mem(MiB)` is the peak resident memory of the whole `bench` process so far, so it only ever grows from row to row;
+  - the FFmpeg row's version label is fixed text, not the version on your `PATH`.
+
+For measurements you can rely on, time Ragdoll and FFmpeg the same way, in-process and single-threaded, as described in [Benchmarks](/docs/benchmarks/).

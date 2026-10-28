@@ -4,15 +4,15 @@ import { site } from "@/lib/site";
 const probeOutput = `┌──────────────────────────────────────────────────────────┐
 │ RAGDOLL PROBE : sample.mp4                               │
 ├──────────────────────────────────────────────────────────┤
-│ Container     : mp4/isobmff      File Size : 7.48 MB     │
-│ Probe Latency :  42.75 µs        GOP Count : 10          │
+│ Container     : mp4/isobmff      File Size : 0.13 MB     │
+│ Probe Latency : 223.93 µs        GOP Count : 4           │
 │ H.264 Profile : Constrained Baseline (level 4.0)         │
 ├──────────────────────────────────────────────────────────┤
 │ Track #0 [Video] h264 1280x720 @ 30.000 fps  yuv420p     │
 │   Colorimetry : BT709 / BT709 / BT709, Limited           │
-│   Samples     : 60 packets (7842908 bytes)               │
+│   Samples     : 60 packets (136550 bytes)                │
 ├──────────────────────────────────────────────────────────┤
-│ Bitrate Spark : ▇▁▁▁▁▁▆▁▁▁▁▁▇▁▂▁▁▇▁▁▁▂▁▇▁▁▁▁▆▁▁▁▁▁▇▁▁▂▁▁ │
+│ Bitrate Spark : ▆▂▁▁▂▁▁▁▁▁▁▁▁▁▆▂▁▁▂▁▁▁▁▁▁▁▂▁▇▃▂▁▁▁▂▁▁▂▁▁ │
 └──────────────────────────────────────────────────────────┘`;
 
 const principles = [
@@ -23,7 +23,7 @@ const principles = [
   },
   {
     title: "Explicit SIMD, proven against scalar",
-    body: "Hot loops are hand-written NEON intrinsics behind safe slice APIs. Each one ships with a scalar reference and a differential test that must match bit for bit.",
+    body: "Hot loops are hand-written NEON intrinsics behind safe slice APIs, with AVX2 versions of the hottest on x86_64. Each one ships with a scalar reference and a differential test that must match bit for bit.",
     code: "sad_plane_u8 ≡ sad_plane_u8_scalar",
   },
   {
@@ -33,17 +33,17 @@ const principles = [
   },
   {
     title: "A command line with verbs",
-    body: "probe, remux, transcode, extract, metrics. Each task is a subcommand with named options, JSON output, and a declarative TOML form for repeatable pipelines.",
+    body: "probe, remux, transcode, cut, concat, package, extract, metrics. Each task is a subcommand with named options, JSON output, and a declarative TOML form for repeatable pipelines.",
     code: "ragdoll transcode in.mp4 out.mkv --scale 1280x720",
   },
 ];
 
 const stages = [
-  { k: "Read", crate: "ragdoll-format", body: "mmap demux of MP4, Matroska/WebM, MPEG-TS, Y4M, WAV, FLAC, WebVTT and SRT." },
-  { k: "Decode", crate: "ragdoll-codec", body: "H.264, FLAC, PCM and the RGDI intra codec. AV1 OBU inspection." },
-  { k: "Transform", crate: "ragdoll-pix", body: "Color matrices, polyphase scaling, dithering, PSNR / SSIM / MS-SSIM." },
-  { k: "Encode", crate: "ragdoll-codec", body: "GOP-parallel H.264 and RGDI encode, FLAC encode, PCM conversion." },
-  { k: "Write", crate: "ragdoll-format", body: "Vectored writev muxers with fast-start MP4 and Cues-indexed Matroska." },
+  { k: "Read", crate: "ragdoll-format", body: "mmap demux of MP4, Matroska/WebM, MPEG-TS, Ogg, Y4M, WAV, FLAC, PNG, JPEG, WebVTT and SRT." },
+  { k: "Decode", crate: "ragdoll-codec", body: "H.264, AAC-LC, Opus, FLAC, PCM and the RGDI intra codec. AV1 OBU inspection." },
+  { k: "Transform", crate: "ragdoll-pix", body: "Color matrices, polyphase scaling, filters, tone mapping, PSNR / SSIM / MS-SSIM." },
+  { k: "Encode", crate: "ragdoll-codec", body: "GOP-parallel H.264 and RGDI encode; AAC-LC, Opus, FLAC and PCM." },
+  { k: "Write", crate: "ragdoll-format", body: "Vectored writev muxers: fast-start and fragmented MP4, Cues-indexed Matroska, MPEG-TS, Ogg." },
 ];
 
 const commands = [
@@ -52,17 +52,14 @@ const commands = [
   { name: "transcode", href: "/docs/cli/transcode/", body: "Scale and re-encode video across GOP-parallel workers, keeping audio and subtitles in sync." },
   { name: "extract", href: "/docs/cli/extract/", body: "Pull a frame at a timestamp or tile a contact sheet of thumbnails." },
   { name: "metrics", href: "/docs/cli/metrics/", body: "Score a distorted file against a reference: PSNR, SSIM, MS-SSIM, VMAF-Lite." },
-  { name: "bench", href: "/docs/cli/bench/", body: "Run the end-to-end benchmark suite, optionally head to head with a local FFmpeg." },
+  { name: "bench", href: "/docs/cli/bench/", body: "Time twelve end-to-end workloads in-process on this machine." },
 ];
 
 const bench = [
-  { name: "Annex-B start-code scan", ours: "32.61 GB/s", theirs: "7.21 GB/s", x: 4.52 },
-  { name: "MPEG-TS CRC-32", ours: "2.56 GB/s", theirs: "0.59 GB/s", x: 4.34 },
-  { name: "4K → 1080p Lanczos-3 scale", ours: "506.5 fps", theirs: "214.8 fps", x: 2.36 },
-  { name: "H.264 RBSP unescape", ours: "10.65 GB/s", theirs: "5.14 GB/s", x: 2.07 },
-  { name: "4K plane SSIM", ours: "10.06 Gpx/s", theirs: "5.04 Gpx/s", x: 2.0 },
-  { name: "H.264 4×4 DCT + IDCT", ours: "191.0 Mblk/s", theirs: "125.5 Mblk/s", x: 1.52 },
-  { name: "1080p RGB24 → YUV420p", ours: "6.02 Gpx/s", theirs: "4.03 Gpx/s", x: 1.49 },
+  { name: "H.264 decode, 1080p High (CABAC)", ours: "29 fps", theirs: "FFmpeg 181 fps", x: 0.16 },
+  { name: "H.264 decode, 720p Baseline", ours: "77 fps", theirs: "FFmpeg 834 fps", x: 0.09 },
+  { name: "H.264 encode, 720p QP 26", ours: "59 fps", theirs: "x264 ultrafast 489 fps", x: 0.12 },
+  { name: "AAC-LC decode", ours: "176× real time", theirs: "FFmpeg 2367×", x: 0.07 },
 ];
 
 const status = [
@@ -70,33 +67,32 @@ const status = [
     s: "done",
     title: "Available today",
     items: [
-      "MP4, Matroska / WebM, MPEG-TS, Y4M, WAV",
-      "FLAC, PCM, H.264 Baseline, RGDI",
-      "Color conversion, scaling, dithering",
-      "PSNR, SSIM, MS-SSIM, VMAF-Lite",
-      "GOP-parallel pipeline, pipes, multi-track sync",
+      "MP4, Matroska / WebM, MPEG-TS, Ogg, WAV, PNG, JPEG",
+      "H.264 Baseline / Main / High decode and encode",
+      "AAC-LC, Opus, FLAC, PCM; EBU R128 loudness",
+      "Cut, concat, HLS and DASH packaging",
+      "Filters, HDR tone mapping, quality metrics",
     ],
   },
   {
     s: "doing",
     title: "In development",
     items: [
-      "H.264 residual coding and intra 4×4",
-      "Quarter-pel motion and deblocking",
-      "Main and High profiles with CABAC",
-      "B-frame decoding",
-      "CRF and VBV rate control",
+      "H.264 decoder speed: SIMD reconstruction",
+      "Partition-sized motion compensation",
+      "AAC-LC decoder speed",
+      "FLAC and Opus decoder speed",
     ],
   },
   {
     s: "planned",
-    title: "Planned for 1.0",
+    title: "Planned",
     items: [
-      "AAC-LC and Opus, EBU R128 loudness",
-      "Frame-accurate cut and concat",
-      "PNG / JPEG, filters, HDR tone mapping",
-      "HLS and DASH packaging",
-      "AVX2 kernels, stable library API",
+      "Conformance and interop runners",
+      "Coverage-guided fuzzing",
+      "Performance and memory regression gates",
+      "AAC rate control, bounded-memory audio",
+      "Multithreaded H.264 decoding",
     ],
   },
 ];
@@ -112,7 +108,7 @@ export default function Home() {
             <p className="hero__lede">
               Ragdoll is a media framework and command-line tool written entirely in Rust. Containers,
               codecs, scaling, color and quality metrics are built from the bitstream up, with
-              hand-written SIMD in every hot loop and no C libraries anywhere.
+              hand-written SIMD in the hot loops and no C libraries anywhere.
             </p>
             <div className="hero__actions">
               <Link className="button button--primary" href="/docs/quickstart/">
@@ -144,8 +140,8 @@ export default function Home() {
               <span className="c">ragdoll remux sample.mp4 sample.mkv</span>
               {"\n"}
               <span className="k">[ragdoll remux]</span>
-              <span className="d"> sample.mp4 -&gt; sample.mkv | frames=60 | 1.10 ms </span>
-              <span className="g">(14.2 GB/s)</span>
+              <span className="d"> sample.mp4 -&gt; sample.mkv | frames=60 | 0.32 ms </span>
+              <span className="g">(0.865 GB/s)</span>
             </pre>
           </div>
         </div>
@@ -162,8 +158,8 @@ export default function Home() {
             <span>third-party crates</span>
           </div>
           <div className="fact">
-            <strong>28</strong>
-            <span>hand-written NEON kernels</span>
+            <strong>3</strong>
+            <span>SIMD levels: scalar, NEON, AVX2</span>
           </div>
           <div className="fact">
             <strong>1:1</strong>
@@ -214,7 +210,7 @@ export default function Home() {
                 <strong>ragdoll-pipeline</strong> schedules GOPs across cores
               </span>
               <span>
-                <strong>ragdoll-simd</strong> NEON kernels with scalar twins
+                <strong>ragdoll-simd</strong> NEON and AVX2 kernels with scalar twins
               </span>
               <span>
                 <strong>ragdoll-core</strong> time, color, frames, packets, bits
@@ -254,19 +250,19 @@ export default function Home() {
             <p className="eyebrow">Performance</p>
             <h2>Measured, not promised.</h2>
             <p>
-              Kernel throughput on an Apple M4, against FFmpeg 9.0.2 built with clang -O3
-              -mcpu=native, on identical 4K planes and 16 MB bitstreams. Every Ragdoll result is
-              checked against its scalar reference.
+              Single-threaded codec throughput against libavcodec 6.1.1 and x264, both called
+              in-process on the same inputs, on an x86_64 AVX2 Xeon at 2.1 GHz. The H.264 decoder
+              matches the reference bit for bit; it does not yet match FFmpeg&apos;s speed.
             </p>
           </div>
           <div className="table-wrap" style={{ border: 0 }}>
             <table className="bench-table">
               <thead>
                 <tr>
-                  <th>Kernel</th>
+                  <th>Codec</th>
                   <th>Ragdoll</th>
-                  <th>FFmpeg 9.0.2</th>
-                  <th>Speedup</th>
+                  <th>Reference</th>
+                  <th>Ratio</th>
                 </tr>
               </thead>
               <tbody>
@@ -279,7 +275,7 @@ export default function Home() {
                     </td>
                     <td>
                       <div className="bench-bar">
-                        <i style={{ width: `${(b.x / 4.52) * 120}px` }} />
+                        <i style={{ width: `${b.x * 120}px` }} />
                         <b>{b.x.toFixed(2)}×</b>
                       </div>
                     </td>
@@ -289,8 +285,10 @@ export default function Home() {
             </table>
           </div>
           <p className="footnote">
-            One machine. Ragdoll figures are reproducible with <code>ragdoll self-test</code>; read
-            the <Link href="/docs/benchmarks/">methodology and caveats</Link> before quoting them.
+            One machine, ±15% run to run; a ratio of 1.00× is parity. Opus decodes at about 0.8× and
+            encodes at about 1× libopus; FLAC encodes 1.5× faster than FFmpeg (level 5) with ~11%
+            larger files and decodes 2.5× slower. Read the{" "}
+            <Link href="/docs/benchmarks/">methodology and caveats</Link> before quoting them.
           </p>
         </section>
 
@@ -299,8 +297,8 @@ export default function Home() {
             <p className="eyebrow">Status</p>
             <h2>Where things stand.</h2>
             <p>
-              Ragdoll is pre-1.0. The foundations are complete and production-grade H.264 encoding
-              is in active development.
+              Ragdoll is pre-1.0. The codecs and tools below work and are checked against reference
+              implementations; current work is on speed and on validation.
             </p>
           </div>
           <div className="status">

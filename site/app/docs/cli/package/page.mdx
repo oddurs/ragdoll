@@ -1,0 +1,75 @@
+export const metadata = { title: "ragdoll package" };
+
+# ragdoll package
+
+Encode a video into an adaptive-bitrate ladder and write it as CMAF fragmented MP4, with an HLS master playlist and a DASH manifest that point at the same segments, plus a WebVTT trick-play thumbnail track.
+
+```sh
+ragdoll package <IN> -o <OUT_DIR> [--ladder <SPEC>] [--segment-duration <SEC>] [--no-thumbnails] [--json]
+```
+
+## Options
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `<IN>` | | Input video: any format [`transcode`](/docs/cli/transcode/) decodes, such as MP4, Matroska, MPEG-TS or Y4M. |
+| `-o <OUT_DIR>`, `--output` | | Output directory, created if needed. A second positional path also works. |
+| `--ladder <SPEC>` | source + half size | Comma-separated renditions, each `<RES>:<BITRATE>`. `RES` is `WxH` or `NNNp` (the width follows the source aspect ratio); `BITRATE` is in kbit/s with an optional `k` suffix. Example: `1080p:4500k,720p:2500k,360p:600k`. |
+| `--segment-duration <SEC>`, `--seg-dur` | `2` | Target segment length in seconds (minimum `0.2`), rounded to a whole number of frames. |
+| `--no-thumbnails` | | Skip `thumbnails.vtt` and `sprites.jpg`. |
+| `--json`, `-j` | | Print the summary as JSON. |
+
+Without `--ladder`, the ladder has two renditions: the source size at 2400 kbit/s and half the source size at 800 kbit/s. Dimensions are rounded down to even numbers.
+
+## What it writes
+
+```text
+OUT_DIR/
+├── master.m3u8          HLS master playlist, one EXT-X-STREAM-INF per rendition
+├── manifest.mpd         DASH manifest (static, SegmentTemplate)
+├── thumbnails.vtt       WebVTT cues pointing into sprites.jpg
+├── sprites.jpg          160x90 thumbnails, five per row, one per segment
+├── stream_0/
+│   ├── index.m3u8       HLS media playlist (VOD)
+│   ├── init.mp4         CMAF initialization segment
+│   ├── seg_0001.m4s
+│   └── ...
+└── stream_1/
+    └── ...
+```
+
+Each rendition is encoded as H.264 Main profile with an average bitrate target and a VBV ceiling of twice that bitrate. Every segment starts with an IDR frame, and segment boundaries are the same in every rendition, so players can switch at any segment. The output is video only; audio tracks in the input are not packaged.
+
+The input is decoded once, a wave of segments at a time; each wave is scaled and encoded for every rendition in parallel and written out before the next is decoded, so memory stays within the pipeline's budget.
+
+## Example
+
+```sh
+ragdoll package sample.mp4 -o hls
+```
+
+```text
+RAGDOLL PACKAGE: sample.mp4 -> hls | 2 CMAF renditions x 1 segments | HLS=hls/master.m3u8 | DASH=hls/manifest.mpd (810089 B in 1216.47 ms)
+```
+
+```text title="hls/master.m3u8"
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=2400000,AVERAGE-BANDWIDTH=2160000,RESOLUTION=1280x720,FRAME-RATE=30.000,CODECS="avc1.4D4028"
+stream_0/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=720000,RESOLUTION=640x360,FRAME-RATE=30.000,CODECS="avc1.4D4028"
+stream_1/index.m3u8
+```
+
+A custom three-rung ladder with one-second segments:
+
+```sh
+ragdoll package sample.mp4 -o hls2 --ladder 720p:2500k,360p:600k,320x180:300k --segment-duration 1 --no-thumbnails --json
+```
+
+```json
+{"operation":"package","renditions":3,"segments_per_rendition":2,"master_m3u8":"hls2/master.m3u8","mpd":"hls2/manifest.mpd","total_bytes":858331,"elapsed_ms":776.557}
+```
+
+FFmpeg opens the HLS playlists of both examples and decodes all 60 frames of every rendition.

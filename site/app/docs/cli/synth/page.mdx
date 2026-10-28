@@ -22,13 +22,13 @@ ragdoll synth <OUT> [--resolution <WxH>] [--fps <N>] [--duration <SEC>] [--json]
 
 | Extension | Content |
 | :-- | :-- |
-| `.mp4`, `.mkv`, `.ts`, other video | Procedural color bars and moving patterns, encoded as H.264 at QP 20. |
+| `.mp4`, `.mkv`, `.webm`, `.ts`, other video | Procedural step bars and a moving diagonal pattern, encoded as H.264 (Constrained Baseline, QP 20, an IDR every 15 frames). Video only, no audio track. |
 | `.y4m` | The same frames, uncompressed YUV 4:2:0. |
-| `.ppm` | A single frame as an RGB image. |
-| `.wav` | 48 kHz 16-bit stereo: a 440 Hz tone with harmonics, slightly different in each channel. |
+| `.ppm`, `.png`, `.jpg` | The first frame as an RGB image. |
+| `.wav` | 48 kHz 16-bit stereo: a 440 Hz tone with harmonics, slightly different in each channel. `--resolution` and `--fps` are ignored. |
 | `.flac` | The same audio, FLAC-encoded. |
 
-Generation is deterministic: the same arguments produce the same frames on every run, so the output works as a fixed test input.
+Generation is deterministic: the same arguments produce the same file on every run, whatever the thread count or power mode, so the output works as a fixed test input. Frames are generated and encoded a batch at a time, so long or large outputs do not need memory for the whole clip.
 
 ## Examples
 
@@ -36,4 +36,16 @@ Generation is deterministic: the same arguments produce the same frames on every
 ragdoll synth sample.mp4
 ragdoll synth uhd.y4m --resolution 3840x2160 --fps 60 --duration 1
 ragdoll synth tone.flac --duration 30
+```
+
+The two-second `sample.mp4` and `tone.wav` used in the examples throughout these docs come from:
+
+```sh
+ragdoll synth sample.mp4 --resolution 1280x720 --fps 30 --duration 2
+ragdoll synth tone.wav --duration 3
+```
+
+```text
+[ragdoll synth] procedural://1280x720@30fps -> sample.mp4 | frames=60 gops=4 threads=4 | in=82944000 B out=137757 B (602.10:1) | 308.84 ms (194.3 fps, 0.269 GB/s)
+[ragdoll synth-audio] procedural://audio -> tone.wav | frames=1 gops=1 threads=1 | in=576000 B out=576044 B (1.00:1) | 5.16 ms (27921955.0 fps, 0.223 GB/s)
 ```

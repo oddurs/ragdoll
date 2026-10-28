@@ -140,9 +140,17 @@ Introduce Ragdoll's opinionated workflow upgrades over FFmpeg: frame-accurate Sm
 
 ## m10-production-v1 — Phase 10 — Ergonomic Rust SDK, Zero-Panic Fuzz Hardening & v1.0 Production Release
 
-`##########` 100% · 9 of 9 done
+`#######···` 64% · 9 of 14 done
 
 Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic, zero-unsafe-required Rust library SDK (`ragdoll` crate / builder API), enforce a Zero-Panic Malformed Bitstream Guarantee across all container demuxers and codec decoders via deterministic mutation/fuzz corpus tests, and validate speed, perceptual quality, and E-core battery efficiency across a 12-workload benchmark suite against FFmpeg 9.0.2.
+
+### backlog
+
+- [ ] `BUG-0092` metrics panics (exit 134) when the two inputs differ in resolution <sup>bug · p2 · cli</sup>
+- [ ] `BUG-0093` remux of MPEG-TS to .vtt/.srt overflows the stack: remux and transcode hand the job to each other <sup>bug · p2 · pipeline</sup>
+- [ ] `BUG-0094` probe detects a raw ADTS .aac file as mpegts <sup>bug · p2 · format</sup>
+- [ ] `BUG-0095` CLI help and banners are stale: remux --faststart listed, bench says 7 workloads and v1.0.0, package --no-thumbnails missing, self-test labels the SIMD column NEON on x86_64 <sup>bug · p2 · cli</sup>
+- [ ] `BUG-0096` transcode --pad with an invalid spec is silently ignored (--crop fails with exit 1) <sup>bug · p2 · cli</sup>
 
 ### shipped
 
@@ -158,7 +166,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`####······` 32% · 8 of 25 done
+`####······` 33% · 10 of 30 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -172,25 +180,30 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `BENCH-0068` Performance and memory gates: instruction-count budgets, allocation counting and soak tests <sup>benchmark · p2 · bench</sup>
 - [ ] `0069` QA report, generated support matrix and public scorecard, with tiered CI <sup>feature · p1 · arch</sup>
 - [ ] `0070` Formal checks on unsafe code: Miri, Kani proofs and mutation testing <sup>chore · p3 · arch</sup>
-- [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
 - [ ] `BUG-0082` AAC encoder ignores its target bitrate (no rate control; 35 kbit/s at 128k) <sup>bug · p2 · codec-audio</sup>
-- [ ] `SIMD-0083` AAC-LC decoder is 13x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
-- [ ] `SIMD-0084` FLAC decoder is 2.5x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
 - [ ] `BUG-0085` ragdoll bench --compare-ffmpeg prints made-up hardware telemetry and compares in-process calls with whole FFmpeg processes <sup>bug · p1 · bench</sup>
 - [ ] `BUG-0086` Audio transcode decodes the whole track into one AudioFrame, so peak RSS grows with duration <sup>bug · p2 · pipeline</sup>
+- [ ] `0088` H.264 decoder: multithreaded decoding to beat FFmpeg's frame-threaded throughput <sup>feature · p1</sup>
+- [ ] `SIMD-0089` H.264 encoder slower than x264 at equal compression (0.12x ultrafast) <sup>kernel · p1</sup>
+- [ ] `SIMD-0090` Opus encoder: beat libopus float speed (0.93x) <sup>kernel · p1</sup>
+- [ ] `SIMD-0091` FLAC encoder: match FFmpeg level 5 compression while staying faster <sup>kernel · p1</sup>
 
 ### up next
 
 - [ ] `BUG-0060` H.264 decoder disagrees with FFmpeg on Ragdoll-encoded streams (17.3 dB vs 35.1 dB) <sup>bug · p0 · codec-video</sup>
-- [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
 
 ### in progress
 
-- [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
+- [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
+- [ ] `SIMD-0083` AAC-LC decoder is 13x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
+- [ ] `SIMD-0084` FLAC decoder is 2.5x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
+- [ ] `SIMD-0087` Opus decoder slower than FFmpeg's native decoder (0.58x CELT, 0.69x SILK) <sup>kernel · p1</sup>
 
 ### shipped
 
 - [x] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
+- [x] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
+- [x] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
 - [x] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
 - [x] `0075` H.264 decoder: bit-exact with FFmpeg on the JVT conformance suite and x264 streams <sup>feature · p0 · codec-video</sup>
 - [x] `0077` Opus decoder: RFC 6716 decoding, sample-exact with fixed-point libopus on the RFC 8251 test vectors <sup>feature · p0 · codec-audio</sup>

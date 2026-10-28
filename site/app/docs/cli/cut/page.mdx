@@ -1,0 +1,72 @@
+export const metadata = { title: "ragdoll cut" };
+
+# ragdoll cut
+
+Trim a clip out of a video without re-encoding all of it. When the start time falls inside a GOP, `cut` decodes only that GOP, drops the frames before the start, and re-encodes the rest of it so the clip begins on a fresh IDR frame. Every later GOP is copied packet for packet.
+
+```sh
+ragdoll cut <IN> <OUT> [--from <TIME>] [--to <TIME>] [--keyframes-only] [--qp <N>] [--json]
+```
+
+## Options
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `<IN>` | | Input file: MP4, Matroska / WebM or MPEG-TS with a video track. |
+| `<OUT>` | | Output file. `.mkv` / `.webm` write Matroska, `.ts` writes MPEG-TS, anything else MP4. |
+| `--from <TIME>`, `-ss` | start of file | First frame to keep, in seconds, `MM:SS.mmm` or `HH:MM:SS.mmm`. |
+| `--to <TIME>`, `-to` | end of file | End of the clip; the frame at exactly this time is not included. |
+| `--keyframes-only` | | Never re-encode: start at the keyframe at or before `--from`, so the clip may begin a little early. |
+| `--qp <N>` | `20` | Quantizer for the re-encoded frames, `1`–`51`. |
+| `--json`, `-j` | | Print the summary as JSON. |
+
+Times that do not parse are ignored, so check the spelling if a cut starts at zero.
+
+## How it works
+
+1. The input is demuxed and the video packets are grouped into GOPs at keyframes.
+2. If `--from` lands on a keyframe, or `--keyframes-only` is set, every packet from that keyframe up to `--to` is copied unchanged.
+3. Otherwise the GOP containing `--from` is decoded, the frames from `--from` onward are re-encoded with the H.264 encoder (Constrained Baseline, fixed QP), and the GOPs after it are copied. Only H.264 is re-encoded this way.
+4. Audio and subtitle packets between the start and `--to` are copied, and every timestamp is shifted so the clip starts at zero.
+
+Packets are copied, never re-encoded, beyond the first GOP, so a cut is usually far faster than a transcode, and the copied frames keep their original quality.
+
+## Example
+
+`av.mp4` is a two-second 30 fps clip with keyframes every half second and an AAC track:
+
+```sh
+ragdoll cut av.mp4 avclip.mp4 --from 0.7 --to 1.6
+```
+
+```text
+RAGDOLL CUT: av.mp4 -> avclip.mp4 | 27 video pkts (18 zero-copy copied, 9 boundary frames re-encoded), 42 audio pkts (99539 B in 220.36 ms)
+```
+
+The cut starts at frame 21, inside the GOP that begins at 0.5 s: frames 21–29 are re-encoded and frames 30–47, from the following GOPs, are copied. With `--keyframes-only` the same cut starts at 0.5 s and copies everything:
+
+```sh
+ragdoll cut av.mp4 avkey.mp4 --from 0.7 --to 1.6 --keyframes-only
+```
+
+```text
+RAGDOLL CUT: av.mp4 -> avkey.mp4 | 33 video pkts (33 zero-copy copied, 0 boundary frames re-encoded), 51 audio pkts (104435 B in 0.59 ms)
+```
+
+## JSON output
+
+```sh
+ragdoll cut av.mp4 avclip.mkv --from 00:00:00.500 --json
+```
+
+```json
+{"operation":"cut","output_bytes":129274,"total_video_packets":45,"copied_video_packets":45,"reencoded_video_frames":0,"audio_packets":69,"elapsed_ms":0.774}
+```
+
+`audio_packets` counts every non-video packet that was kept, subtitles included.
+
+## Notes
+
+- Use [`ragdoll probe --gop-map`](/docs/cli/probe/) to see where the keyframes are.
+- The `[input]` `start` and `duration` keys of a [pipeline recipe](/docs/cli/recipes/) run the same cut before transcoding.
+- The whole input is demuxed into memory before the cut; only the boundary GOP is decoded.

@@ -14,12 +14,15 @@ ragdoll <SUBCOMMAND> [OPTIONS]
 | :-- | :-- |
 | [`probe`](/docs/cli/probe/) | Inspect a container: tracks, codecs, colorimetry, GOP structure. No decoding. |
 | [`remux`](/docs/cli/remux/) | Copy packets into a different container without re-encoding. |
-| [`transcode`](/docs/cli/transcode/) | Decode, optionally scale, and re-encode; or run a [TOML recipe](/docs/cli/recipes/). |
+| [`transcode`](/docs/cli/transcode/) | Decode, filter, scale and re-encode video and audio; or run a [TOML recipe](/docs/cli/recipes/). |
+| [`cut`](/docs/cli/cut/) | Trim a clip, re-encoding only the GOP the cut starts in and copying the rest. |
+| [`concat`](/docs/cli/concat/) | Join several files into one, by packet copy when their video parameters match. |
+| [`package`](/docs/cli/package/) | Encode an adaptive-bitrate ladder into CMAF segments with HLS and DASH manifests. |
 | [`extract`](/docs/cli/extract/) | Write one frame at a timestamp, or a tiled contact sheet. |
 | [`metrics`](/docs/cli/metrics/) | Compare a distorted video with a reference: PSNR, SSIM, MS-SSIM, VMAF-Lite. |
 | [`synth`](/docs/cli/synth/) | Generate procedural test video or audio. |
-| [`bench`](/docs/cli/bench/) | Run the seven end-to-end benchmark workloads, optionally against FFmpeg. |
-| [`self-test`](/docs/cli/self-test/) | Check every SIMD kernel against its scalar reference on this machine. |
+| [`bench`](/docs/cli/bench/) | Run the twelve end-to-end benchmark workloads, optionally next to FFmpeg. |
+| [`self-test`](/docs/cli/self-test/) | Check the SIMD kernels against their scalar references on this machine. |
 
 ## Global options
 
@@ -27,16 +30,26 @@ These are accepted anywhere on the command line, before or after the subcommand.
 
 | Option | Description |
 | :-- | :-- |
-| `--power-mode <MODE>`, `-P <MODE>` | Scheduling profile for worker threads: `performance` (default), `balanced`, or `efficiency`. See [Power modes](/docs/power/). |
+| `--power-mode <MODE>`, `-P <MODE>` | Scheduling profile for worker threads: `performance` (default), `balanced`, or `efficiency`. Unrecognized values mean `performance`. See [Power modes](/docs/power/). |
 | `--battery-saver`, `--efficiency` | Shorthand for `--power-mode efficiency`. |
 | `-h`, `--help`, `help` | Print usage. |
-| `-V`, `--version`, `version` | Print the version, detected SIMD level and core counts. |
+| `-V`, `--version`, `version` | Print the version, active SIMD level and core counts. |
+
+The `RAGDOLL_SIMD` environment variable forces the SIMD dispatch level: `scalar` runs the portable reference kernels on any machine, and `neon` or `avx2` select those kernels where the CPU supports them. Naming an unknown level, or one the CPU does not support, aborts at start-up.
+
+```sh
+RAGDOLL_SIMD=scalar ragdoll --version
+```
+
+```text
+ragdoll 0.1.0 (Scalar Reference | 2 P-cores + 2 E-cores)
+```
 
 ## Conventions
 
 ### Paths and pipes
 
-A path of `-` means stdin for inputs and stdout for outputs. Seekable formats are read through a memory map; stdin is buffered into an aligned buffer first. When the output is stdout and no `--format` is given, `transcode` writes MPEG-TS.
+For `probe`, `remux` and `transcode`, a path of `-` means stdin for inputs and stdout for outputs. Files are read through a memory map; stdin is read into an aligned buffer first. When the output is stdout and no `--format` is given, `remux` and `transcode` write MPEG-TS. The other subcommands take file paths only.
 
 ```sh
 cat input.ts | ragdoll transcode - - --scale 1280x720 | ragdoll probe -
@@ -44,25 +57,44 @@ cat input.ts | ragdoll transcode - - --scale 1280x720 | ragdoll probe -
 
 ### Formats follow extensions
 
-The output container is chosen from the output file's extension (`.mp4`, `.mkv`, `.ts`, `.y4m`, `.wav`, `.flac`, `.ppm`, `.rgdi`, `.vtt`, `.srt`). `remux` and `transcode` accept `--format <EXT>` (`-f`) to override it, which you need when writing to stdout. Input containers are detected from their magic bytes, not their names.
+The output container is chosen from the output file's extension, for example `.mp4`, `.mkv`, `.ts`, `.y4m`, `.wav`, `.flac`, `.ogg`, `.png`, `.vtt` or `.srt`; each subcommand page lists what it writes. `remux` and `transcode` accept `--format <EXT>` (`-f`) to override it, which you need when writing to stdout. Input containers are detected from their magic bytes, not their names.
 
 ### Dimensions and times
 
 - Dimensions are written `WIDTHxHEIGHT`, for example `1920x1080`. Grids use the same form: `4x4` is four columns by four rows.
 - Times are either seconds (`12.5`) or `HH:MM:SS.mmm` (`00:01:12.500`).
 
+### Threads, memory and determinism
+
+Worker threads default to a count chosen from the CPU topology and power mode; `transcode --threads` overrides it. Video is decoded, filtered and encoded in batches bounded by a memory budget of 256 MiB (64 MiB in efficiency mode), so memory use follows the budget rather than the length of the input. Audio is the exception: when an audio track is re-encoded or processed, it is decoded whole into memory (about 1.4 GB per hour of 48 kHz stereo).
+
+Output is byte-identical whatever `--threads` and power mode you choose; only the run time changes.
+
 ### Output and exit status
 
 Commands that process media print a one-line summary to stdout:
 
 ```text
-[ragdoll transcode] in.mp4 -> out.mp4 | frames=60 gops=10 threads=10 | in=7844139 B out=2579726 B (3.04:1) | 30.45 ms (1970.6 fps, 0.342 GB/s)
+[ragdoll transcode] sample.mp4 -> out.mp4 | frames=60 gops=4 threads=4 | in=137757 B out=157185 B (0.88:1) | 650.56 ms (92.2 fps, 0.000 GB/s)
 ```
 
-Pass `--json` (`-j`) to any subcommand except `self-test` to get a JSON object instead. When the output is stdout, the summary is suppressed so it does not corrupt the stream.
+`cut`, `concat` and `package` print their own summary lines, described on their pages. Pass `--json` (`-j`) to any subcommand except `self-test` to get a JSON object instead. When the output is stdout, the summary is suppressed so it does not corrupt the stream.
 
-Errors are printed as `error: <message>` and the process exits with status `1`.
+Errors are printed to stderr as `error: <message>`. The exit status is:
 
-### Unknown options
+| Status | Meaning |
+| :-- | :-- |
+| `0` | Success. |
+| `1` | The command failed: an I/O error, or input it could not read or process. |
+| `2` | Usage error: an unknown subcommand or option, or a missing argument. The message is followed by a hint to run `ragdoll --help`. |
 
-The argument parser is deliberately small and silently ignores options it does not recognize, so check the spelling if a flag seems to have no effect.
+```sh
+ragdoll remux in.mp4 out.mkv --faststart
+```
+
+```text
+error: unknown option: --faststart
+run `ragdoll --help` for usage
+```
+
+Most option values are parsed leniently: a value that does not parse, such as `--qp abc` or `cut --from abc`, leaves that option at its default without an error. Specs that are checked, such as `--crop`, `--rotate` and `package --ladder`, fail with status `1` instead.
