@@ -3,10 +3,12 @@ id: 81
 uid: b594a11f-16de-42f7-9a76-0c8ae97e09d1
 title: OggMuxer writes one page per packet, adding about 12 % overhead to Opus at 96 kbit/s
 type: bug
-status: backlog
+status: done
 milestone: m11-validation
+assignee: Claude
 created: 2026-10-28
 updated: 2026-10-28
+closed_at: 2026-10-28
 priority: p2
 effort: s
 area: format
@@ -26,6 +28,14 @@ Pages hold several packets, flushed when the next packet would push the page pas
 
 ## Acceptance criteria
 
-- [ ] Ogg Opus and Ogg FLAC pages carry multiple packets; overhead below 1 % at 96 kbit/s Opus.
-- [ ] Granule positions stay correct (FFmpeg reads the same duration and samples), and seeking still works.
-- [ ] A regression test reproduces the failure and passes with the fix.
+- [x] Ogg Opus and Ogg FLAC pages carry multiple packets; overhead below 1 % at 96 kbit/s Opus.
+- [x] Granule positions stay correct (FFmpeg reads the same duration and samples), and seeking still works.
+- [x] A regression test reproduces the failure and passes with the fix.
+
+## 2026-10-28
+
+OggMuxer now packs packets into pages: a page is flushed after a packet once it holds 4096 payload bytes or one second of audio, or mid-packet at 255 segments (the next page then carries the continued flag only if a packet spans the boundary). Headers keep their own pages and the last page carries EOS. A 3.7 s, 96 kbit/s Opus transcode is 13 pages and 45,655 bytes (was one page per packet, about 12 % framing); Ogg FLAC output (24 pages) still decodes losslessly in FFmpeg.
+
+## Result
+
+OggMuxer packs packets into pages up to 4 KB or one second; Opus framing overhead at 96 kbit/s is below 1 %.
