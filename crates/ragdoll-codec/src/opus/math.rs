@@ -176,7 +176,7 @@ pub const fn shl16(a: i32, s: i32) -> i32 {
 
 /// `FRAC_MUL16`.
 #[inline(always)]
-pub fn frac_mul16(a: i32, b: i32) -> i32 {
+pub const fn frac_mul16(a: i32, b: i32) -> i32 {
     (16384 + (a as i16 as i32) * (b as i16 as i32)) >> 15
 }
 

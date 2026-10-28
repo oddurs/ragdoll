@@ -17,7 +17,7 @@ pub const BITRES: i32 = 3;
 
 /// Number of significant bits of `v` (`EC_ILOG`), 0 for 0.
 #[inline]
-pub fn ilog(v: u32) -> i32 {
+pub const fn ilog(v: u32) -> i32 {
     (32 - v.leading_zeros()) as i32
 }
 

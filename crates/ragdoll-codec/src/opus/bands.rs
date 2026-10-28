@@ -28,7 +28,7 @@ fn eb(i: usize) -> i32 {
 }
 
 /// `bitexact_cos`.
-fn bitexact_cos(x: i32) -> i32 {
+const fn bitexact_cos(x: i32) -> i32 {
     let tmp = (4096 + (x as i16 as i32) * (x as i16 as i32)) >> 13;
     let x2 = tmp as i16 as i32;
     let x2 = (32767 - x2) + frac_mul16(x2, -7651 + frac_mul16(x2, 8277 + frac_mul16(-626, x2)));
@@ -36,13 +36,60 @@ fn bitexact_cos(x: i32) -> i32 {
 }
 
 /// `bitexact_log2tan`.
-fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
+const fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
     let lc = ilog(icos as u32);
     let ls = ilog(isin as u32);
     let icos = icos << (15 - lc);
     let isin = isin << (15 - ls);
     (ls - lc) * (1 << 11) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932)
         - frac_mul16(icos, frac_mul16(icos, -2597) + 7932)
+}
+
+/// The split angles strictly between 0 and 16384 that a coded theta can take (`qn <= 256`
+/// steps) lie in `THETA_MIN..=THETA_MAX`, where both cosines stay below 32768.
+const THETA_MIN: usize = 64;
+const THETA_MAX: usize = 16384 - THETA_MIN;
+
+/// `bitexact_cos(t)` for `t` in `THETA_MIN..=THETA_MAX`, at `t - THETA_MIN`.
+static THETA_COS: [i16; THETA_MAX - THETA_MIN + 1] = {
+    let mut c = [0i16; THETA_MAX - THETA_MIN + 1];
+    let mut t = THETA_MIN;
+    while t <= THETA_MAX {
+        c[t - THETA_MIN] = bitexact_cos(t as i32) as i16;
+        t += 1;
+    }
+    c
+};
+
+/// `bitexact_log2tan(bitexact_cos(16384 - t), bitexact_cos(t))` for `t` in
+/// `THETA_MIN..=THETA_MAX`, at `t - THETA_MIN`.
+static THETA_LOG2TAN: [i16; THETA_MAX - THETA_MIN + 1] = {
+    let mut l = [0i16; THETA_MAX - THETA_MIN + 1];
+    let mut t = THETA_MIN;
+    while t <= THETA_MAX {
+        let (imid, iside) = (bitexact_cos(t as i32), bitexact_cos(16384 - t as i32));
+        l[t - THETA_MIN] = bitexact_log2tan(iside, imid) as i16;
+        t += 1;
+    }
+    l
+};
+
+/// The mid and side gains of the split angle `itheta` (strictly between 0 and 16384) and
+/// their `bitexact_log2tan`. Every split's bit division waits on these polynomials, so the
+/// angles a coded theta can take come from tables.
+#[inline]
+fn theta_gains(itheta: i32) -> (i32, i32, i32) {
+    match itheta as usize {
+        t @ THETA_MIN..=THETA_MAX => (
+            THETA_COS[t - THETA_MIN] as i32,
+            THETA_COS[THETA_MAX - t] as i32,
+            THETA_LOG2TAN[t - THETA_MIN] as i32,
+        ),
+        _ => {
+            let (imid, iside) = (bitexact_cos(itheta), bitexact_cos(16384 - itheta));
+            (imid, iside, bitexact_log2tan(iside, imid))
+        }
+    }
 }
 
 /// `compute_band_energies`: Q`SIG_SHIFT`-free band amplitudes of the MDCT output.
@@ -633,9 +680,9 @@ fn compute_theta(
         *fill &= ((1 << bb) - 1) << bb;
         delta = 16384;
     } else {
-        imid = bitexact_cos(itheta);
-        iside = bitexact_cos(16384 - itheta);
-        delta = frac_mul16((ni - 1) << 7, bitexact_log2tan(iside, imid));
+        let l2t;
+        (imid, iside, l2t) = theta_gains(itheta);
+        delta = frac_mul16((ni - 1) << 7, l2t);
     }
     Split {
         inv,
@@ -1376,4 +1423,28 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         ctx.avoid_split_noise = false;
     }
     *seed = ctx.seed;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theta_gains_match_polynomials() {
+        for t in THETA_MIN as i32..=THETA_MAX as i32 {
+            let (imid, iside) = (bitexact_cos(t), bitexact_cos(16384 - t));
+            assert_eq!(
+                theta_gains(t),
+                (imid, iside, bitexact_log2tan(iside, imid)),
+                "{t}"
+            );
+        }
+        // Every angle a coded theta takes is either an edge or in the tables' range.
+        for qn in 2..=256 {
+            for q in 1..qn {
+                let t = (q * 16384 / qn) as usize;
+                assert!((THETA_MIN..=THETA_MAX).contains(&t), "{q} / {qn}");
+            }
+        }
+    }
 }
