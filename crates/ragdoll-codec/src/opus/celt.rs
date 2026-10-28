@@ -574,41 +574,12 @@ impl CeltDecoder {
             tmp
         };
         if cc == 2 && ds == 1 && !accum {
-            // The common case: both channels at once so their recurrences overlap, with the
-            // conversion to 16 bits (off the recurrence) done a block at a time.
-            const BLOCK: usize = 64;
-            let [mut m0, mut m1] = self.preemph_mem;
-            let mut tmp = [0i32; 2 * BLOCK];
-            for ((o, a), b) in pcm[..2 * n]
-                .chunks_mut(2 * BLOCK)
-                .zip(x(0).chunks(BLOCK))
-                .zip(x(1).chunks(BLOCK))
-            {
-                let t = &mut tmp[..o.len()];
-                // The sums stay in 32 bits in practice (|x| <= SIG_SAT keeps them below
-                // 2.1e9), so the recurrence runs in 64 bits without the sign extension on its
-                // chain, checking each sum; one that wraps leaves for the exact loop.
-                let (mut f0, mut f1) = (m0 as i64, m1 as i64);
-                let mut k = 0;
-                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b) {
-                    let (s0, s1) = (a as i64 + f0, b as i64 + f1);
-                    if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
-                        break;
-                    }
-                    t[0] = s0 as i32;
-                    t[1] = s1 as i32;
-                    f0 = (PREEMPH as i64 * s0) >> 15;
-                    f1 = (PREEMPH as i64 * s1) >> 15;
-                    k += 1;
-                }
-                (m0, m1) = (f0 as i32, f1 as i32);
-                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b).skip(k) {
-                    t[0] = step(&mut m0, a);
-                    t[1] = step(&mut m1, b);
-                }
-                sig2word16_slice(o, t);
-            }
-            self.preemph_mem = [m0, m1];
+            // The common case: the filter outputs of both channels, interleaved, then their
+            // conversion to 16 bits.
+            let mut t = [0i32; 2 * 960];
+            let t = &mut t[..2 * n];
+            self.preemph_mem = deemph_stereo(x(0), x(1), self.preemph_mem, t);
+            sig2word16_slice(&mut pcm[..2 * n], t);
             return;
         }
         for ch in 0..cc {
@@ -881,6 +852,51 @@ pub(super) fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
         return;
     }
     sig2word16_slice_scalar(out, x);
+}
+
+/// The de-emphasis filter of both channels from states `mem`: `t` gets the interleaved outputs
+/// `x[k] + m` (before the conversion to 16 bits); returns the new states.
+pub(super) fn deemph_stereo(x0: &[i32], x1: &[i32], mem: [i32; 2], t: &mut [i32]) -> [i32; 2] {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && x0.len() == super::simd::DEEMPH_N {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        if let Some(m) = unsafe { super::simd::deemph_stereo_avx2(x0, x1, mem, PREEMPH, t) } {
+            return m;
+        }
+    }
+    deemph_stereo_scalar(x0, x1, mem, t)
+}
+
+/// Scalar reference of [`deemph_stereo`].
+pub fn deemph_stereo_scalar(x0: &[i32], x1: &[i32], mem: [i32; 2], t: &mut [i32]) -> [i32; 2] {
+    let t = &mut t[..2 * x0.len()];
+    // The sums stay in 32 bits in practice (|x| <= SIG_SAT keeps them below 2.1e9), so the
+    // two recurrences run in 64 bits without the sign extension on their chains, checking
+    // each sum; one that wraps leaves for the exact loop.
+    let (mut f0, mut f1) = (mem[0] as i64, mem[1] as i64);
+    let mut k = 0;
+    for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(x0).zip(x1) {
+        let (s0, s1) = (a as i64 + f0, b as i64 + f1);
+        if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
+            break;
+        }
+        t[0] = s0 as i32;
+        t[1] = s1 as i32;
+        f0 = (PREEMPH as i64 * s0) >> 15;
+        f1 = (PREEMPH as i64 * s1) >> 15;
+        k += 1;
+    }
+    let (mut m0, mut m1) = (f0 as i32, f1 as i32);
+    let step = |mm: &mut i32, v: i32| {
+        let tmp = v.wrapping_add(*mm);
+        *mm = mul16_32_q15(PREEMPH, tmp);
+        tmp
+    };
+    for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(x0).zip(x1).skip(k) {
+        t[0] = step(&mut m0, a);
+        t[1] = step(&mut m1, b);
+    }
+    [m0, m1]
 }
 
 /// Scalar reference of [`sig2word16_slice`].
