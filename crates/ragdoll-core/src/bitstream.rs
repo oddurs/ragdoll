@@ -93,6 +93,27 @@ impl<'a> BitReader<'a> {
         Ok(self.bit_buf >> (64 - n))
     }
 
+    /// The next 32 bits without consuming them; bits past the end of the data read as zero.
+    #[inline(always)]
+    pub fn peek32(&mut self) -> u32 {
+        if self.bits_in_buf < 32 {
+            self.refill();
+        }
+        (self.bit_buf >> 32) as u32
+    }
+
+    /// Consumes `n` (`0..=32`) bits seen by [`Self::peek32`]; fails if they run past the end of
+    /// the data.
+    #[inline(always)]
+    pub fn consume_peeked(&mut self, n: u32) -> Result<()> {
+        if n > self.bits_in_buf {
+            return Err(RagdollError::BitstreamEndOfData);
+        }
+        self.bit_buf <<= n & 63;
+        self.bits_in_buf -= n;
+        Ok(())
+    }
+
     /// Advances the stream by `n` bits (`n <= bits_in_buf`).
     #[inline(always)]
     pub fn consume_buffered(&mut self, n: u32) {

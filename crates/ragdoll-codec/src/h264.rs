@@ -2336,40 +2336,36 @@ fn cavlc_block(
     is_chroma_dc: bool,
     mut put: impl FnMut(usize, i16),
 ) -> Result<usize> {
-    let tbl = nc_to_table_idx(nc);
-
-    // Match coeff_token prefix
+    let bad = |what| RagdollError::InvalidSyntax(what);
     let tables = cavlc_tables();
-    let (total_coeff, trailing_ones) = if is_chroma_dc {
-        match tables.chroma_dc_coeff_token.decode(r, 20) {
-            Some(i) => (i / 4, i % 4),
-            None => match_vlc_pair(
-                r,
-                &CHROMA_DC_COEFF_TOKEN_LEN,
-                &CHROMA_DC_COEFF_TOKEN_BITS,
-                20,
-            )?,
-        }
+    // Every element is decoded from one 32-bit peek (zero past the end of the data, which
+    // consuming then rejects).
+    let (token, count) = if is_chroma_dc {
+        (&tables.chroma_dc_coeff_token, 20)
     } else {
-        match tables.coeff_token[tbl].decode(r, 68) {
-            Some(i) => (i / 4, i % 4),
-            None => match_vlc_pair(r, &COEFF_TOKEN_LEN[tbl], &COEFF_TOKEN_BITS[tbl], 68)?,
-        }
+        (&tables.coeff_token[nc_to_table_idx(nc)], 68)
     };
+    let sym = token
+        .symbol(r, count)
+        .ok_or(bad("CAVLC invalid coeff_token"))??;
+    let (total_coeff, trailing_ones) = (sym / 4, sym % 4);
 
     if total_coeff == 0 {
         return Ok(0);
     }
     if total_coeff > max_coeff {
-        return Err(RagdollError::InvalidSyntax(
+        return Err(bad(
             "CAVLC total_coeff exceeds the block's coefficient count",
         ));
     }
 
     let mut levels = [0i16; 16];
-    for lv in levels.iter_mut().take(trailing_ones) {
-        let sign = r.read_bit()?;
-        *lv = if sign { -1 } else { 1 };
+    if trailing_ones > 0 {
+        let v = r.peek32();
+        for (k, lv) in levels.iter_mut().enumerate().take(trailing_ones) {
+            *lv = if (v << k) >> 31 != 0 { -1 } else { 1 };
+        }
+        r.consume_peeked(trailing_ones as u32)?;
     }
 
     let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
@@ -2377,24 +2373,38 @@ fn cavlc_block(
     } else {
         0u32
     };
-    for (i, lv_slot) in levels
-        .iter_mut()
-        .enumerate()
-        .take(total_coeff)
-        .skip(trailing_ones)
-    {
-        let level_prefix = r.read_unary_zeros()? as u32;
-        let level_suffix_size = if level_prefix == 14 && suffix_length == 0 {
-            4
-        } else if level_prefix >= 15 {
-            level_prefix - 3
+    #[allow(clippy::needless_range_loop)]
+    for i in trailing_ones..total_coeff {
+        let v = r.peek32();
+        let (level_prefix, level_suffix) = if v >> 16 != 0 {
+            // level_prefix <= 15: prefix, stop bit and suffix (at most 12 bits) are all in `v`.
+            let level_prefix = v.leading_zeros();
+            let size = if level_prefix == 14 && suffix_length == 0 {
+                4
+            } else if level_prefix == 15 {
+                12
+            } else {
+                suffix_length
+            };
+            let after = v << (level_prefix + 1);
+            let suffix = if size > 0 { after >> (32 - size) } else { 0 };
+            r.consume_peeked(level_prefix + 1 + size)?;
+            (level_prefix, suffix)
         } else {
-            suffix_length
-        };
-        let level_suffix = if level_suffix_size > 0 {
-            r.read_bits(level_suffix_size)? as u32
-        } else {
-            0
+            let level_prefix = r.read_unary_zeros()? as u32;
+            let size = if level_prefix == 14 && suffix_length == 0 {
+                4
+            } else if level_prefix >= 15 {
+                level_prefix - 3
+            } else {
+                suffix_length
+            };
+            let suffix = if size > 0 {
+                r.read_bits(size)? as u32
+            } else {
+                0
+            };
+            (level_prefix, suffix)
         };
         let mut code_u = (level_prefix.min(15) << suffix_length) + level_suffix;
         if level_prefix >= 15 && suffix_length == 0 {
@@ -2413,7 +2423,7 @@ fn cavlc_block(
         } else {
             -(level_code + 1) >> 1
         };
-        *lv_slot = lv as i16;
+        levels[i] = lv as i16;
 
         if suffix_length == 0 {
             suffix_length = 1;
@@ -2426,49 +2436,32 @@ fn cavlc_block(
 
     let mut zeros_left = if total_coeff == max_coeff {
         0usize
-    } else if is_chroma_dc {
-        let count = max_coeff - total_coeff + 1;
-        match tables.chroma_dc_total_zeros[total_coeff - 1].decode(r, count) {
-            Some(z) => z,
-            None => match_vlc_index(
-                r,
-                &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1],
-                &CHROMA_DC_TOTAL_ZEROS_BITS[total_coeff - 1],
-                count,
-            )?,
-        }
     } else {
         let count = max_coeff - total_coeff + 1;
-        match tables.total_zeros[total_coeff - 1].decode(r, count) {
-            Some(z) => z,
-            None => match_vlc_index(
-                r,
-                &TOTAL_ZEROS_LEN[total_coeff - 1],
-                &TOTAL_ZEROS_BITS[total_coeff - 1],
-                count,
-            )?,
-        }
+        let t = if is_chroma_dc {
+            &tables.chroma_dc_total_zeros[total_coeff - 1]
+        } else {
+            &tables.total_zeros[total_coeff - 1]
+        };
+        t.symbol(r, count)
+            .ok_or(bad("CAVLC invalid total_zeros"))??
     };
 
     let mut pos = total_coeff + zeros_left - 1;
     if pos >= max_coeff {
-        return Err(RagdollError::InvalidSyntax(
-            "CAVLC coefficient position exceeds block size",
-        ));
+        return Err(bad("CAVLC coefficient position exceeds block size"));
     }
     put(pos, levels[0]);
-    for lv in levels.iter().copied().take(total_coeff).skip(1) {
+    for &lv in &levels[1..total_coeff] {
         let run_before = if zeros_left > 0 {
-            let vlc_idx = (zeros_left - 1).min(6);
-            match tables.run[vlc_idx].decode(r, zeros_left + 1) {
-                Some(run) => run,
-                None => match_vlc_index(r, &RUN_LEN[vlc_idx], &RUN_BITS[vlc_idx], zeros_left + 1)?,
-            }
+            let t = &tables.run[(zeros_left - 1).min(6)];
+            t.symbol(r, zeros_left + 1)
+                .ok_or(bad("CAVLC invalid run_before"))??
         } else {
             0
         };
         if run_before > zeros_left || pos < 1 + run_before {
-            return Err(RagdollError::InvalidSyntax("CAVLC invalid run_before"));
+            return Err(bad("CAVLC invalid run_before"));
         }
         zeros_left -= run_before;
         pos -= 1 + run_before;
@@ -2535,28 +2528,24 @@ impl VlcTable {
         t
     }
 
-    /// The symbol of the next code if it is below `count`, consuming the code; `None` (nothing
-    /// consumed) when the stream has fewer than `max_len` bits left or holds no such code.
-    #[inline]
-    fn decode(&self, r: &mut BitReader<'_>, count: usize) -> Option<usize> {
-        let peek = r.peek_bits(self.max_len).ok()? as u32;
-        let e = if self.max_len <= 8 {
-            self.l1[(peek << (8 - self.max_len)) as usize]
+    /// The symbol of the next code, consumed, from a 32-bit peek; `None` when no code below
+    /// `count` starts there, an error when the code runs past the end of the data.
+    #[inline(always)]
+    fn symbol(&self, r: &mut BitReader<'_>, count: usize) -> Option<Result<usize>> {
+        let v = r.peek32();
+        let e = self.l1[(v >> 24) as usize];
+        let e = if e & VLC_SUB != 0 {
+            let sub_bits = self.max_len - 8;
+            let sub = (v >> (32 - self.max_len)) & ((1 << sub_bits) - 1);
+            self.l2[(e & !VLC_SUB) as usize + sub as usize]
         } else {
-            let e = self.l1[(peek >> (self.max_len - 8)) as usize];
-            if e & VLC_SUB != 0 {
-                let sub = peek & ((1 << (self.max_len - 8)) - 1);
-                self.l2[(e & !VLC_SUB) as usize + sub as usize]
-            } else {
-                e
-            }
+            e
         };
         let sym = (e & 0xffff) as usize;
         if e == 0 || sym >= count {
             return None;
         }
-        r.consume_buffered(e >> 16);
-        Some(sym)
+        Some(r.consume_peeked(e >> 16).map(|()| sym))
     }
 }
 
@@ -2596,29 +2585,7 @@ fn cavlc_tables() -> &'static CavlcTables {
     })
 }
 
-fn match_vlc_pair(
-    r: &mut BitReader<'_>,
-    lens: &[u8],
-    bits: &[u8],
-    count: usize,
-) -> Result<(usize, usize)> {
-    for idx in 0..count {
-        let l = lens[idx] as u32;
-        if l == 0 {
-            continue;
-        }
-        if let Ok(peek) = r.peek_bits(l)
-            && peek == (bits[idx] as u64)
-        {
-            r.consume_buffered(l);
-            return Ok((idx / 4, idx % 4));
-        }
-    }
-    Err(RagdollError::InvalidSyntax(
-        "unmatched CAVLC coeff_token VLC",
-    ))
-}
-
+#[cfg(test)]
 fn match_vlc_index(r: &mut BitReader<'_>, lens: &[u8], bits: &[u8], count: usize) -> Result<usize> {
     for idx in 0..count.min(lens.len()) {
         let l = lens[idx] as u32;
@@ -5231,7 +5198,7 @@ mod tests {
             for &(table, lens, bits) in &tables {
                 for count in [lens.len(), lens.len() / 2 + 1, 1] {
                     let (mut a, mut b) = (BitReader::new(&bytes), BitReader::new(&bytes));
-                    let fast = table.decode(&mut a, count);
+                    let fast = table.symbol(&mut a, count).and_then(|r| r.ok());
                     let slow = match_vlc_index(&mut b, lens, bits, count).ok();
                     if let Some(sym) = fast {
                         assert_eq!(Some(sym), slow, "{bytes:?} count {count}");
