@@ -2,7 +2,7 @@
 
 use ragdoll_core::{RagdollError, Result};
 
-use super::picture::{Picture, RefKind};
+use super::picture::{FrameStore, RefKind, Structure};
 use super::ps::Sps;
 use super::slice::{Mmco, RefMod, SliceHeader, SliceType};
 
@@ -15,26 +15,17 @@ pub struct PocState {
     pub prev_frame_num: u32,
 }
 
-/// Computes `(TopFieldOrderCnt, BottomFieldOrderCnt, FrameNumOffset)` for a frame.
-pub fn compute_poc(
-    st: &PocState,
-    sps: &Sps,
-    sh: &SliceHeader,
-    prev_had_mmco5: bool,
-) -> (i32, i32, i32) {
+/// Computes `(TopFieldOrderCnt, BottomFieldOrderCnt, FrameNumOffset, PicOrderCntMsb)`. For a field
+/// picture only the entry of its own parity is meaningful.
+pub fn compute_poc(st: &PocState, sps: &Sps, sh: &SliceHeader) -> (i32, i32, i32, i32) {
     let max_frame_num = 1i32 << sps.log2_max_frame_num;
     let frame_num = sh.frame_num as i32;
-    let prev_offset = if prev_had_mmco5 {
-        0
-    } else {
-        st.prev_frame_num_offset
-    };
     let frame_num_offset = if sh.idr {
         0
     } else if st.prev_frame_num as i32 > frame_num {
-        prev_offset + max_frame_num
+        st.prev_frame_num_offset + max_frame_num
     } else {
-        prev_offset
+        st.prev_frame_num_offset
     };
     match sps.poc_type {
         0 => {
@@ -53,7 +44,12 @@ pub fn compute_poc(
                 prev_msb
             };
             let top = msb + lsb;
-            (top, top + sh.delta_poc_bottom, frame_num_offset)
+            let bottom = if sh.field_pic {
+                msb + lsb
+            } else {
+                top + sh.delta_poc_bottom
+            };
+            (top, bottom, frame_num_offset, msb)
         }
         1 => {
             let cycle_len = sps.offset_for_ref_frame.len() as i32;
@@ -78,9 +74,21 @@ pub fn compute_poc(
             if sh.nal_ref_idc == 0 {
                 expected += sps.offset_for_non_ref_pic;
             }
-            let top = expected + sh.delta_poc[0];
-            let bottom = top + sps.offset_for_top_to_bottom_field + sh.delta_poc[1];
-            (top, bottom, frame_num_offset)
+            if !sh.field_pic {
+                let top = expected + sh.delta_poc[0];
+                (
+                    top,
+                    top + sps.offset_for_top_to_bottom_field + sh.delta_poc[1],
+                    frame_num_offset,
+                    0,
+                )
+            } else if !sh.bottom_field {
+                let top = expected + sh.delta_poc[0];
+                (top, top, frame_num_offset, 0)
+            } else {
+                let bottom = expected + sps.offset_for_top_to_bottom_field + sh.delta_poc[0];
+                (bottom, bottom, frame_num_offset, 0)
+            }
         }
         _ => {
             let temp = if sh.idr {
@@ -90,14 +98,21 @@ pub fn compute_poc(
             } else {
                 2 * (frame_num_offset + frame_num)
             };
-            (temp, temp, frame_num_offset)
+            (temp, temp, frame_num_offset, 0)
         }
     }
 }
 
-/// The decoded picture buffer: reference pictures only (output happens when a picture completes).
+/// One entry of a reference picture list: a frame store, as a frame or as one of its fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefSel {
+    pub store: usize,
+    pub parity: Option<u8>,
+}
+
+/// The decoded picture buffer: frame stores holding at least one reference field.
 pub struct Dpb {
-    pub pics: Vec<Picture>,
+    pub pics: Vec<FrameStore>,
     /// `MaxLongTermFrameIdx`, `None` meaning "no long-term frame indices".
     pub max_long_term_frame_idx: Option<u32>,
 }
@@ -115,14 +130,15 @@ impl Dpb {
         self.max_long_term_frame_idx = None;
     }
 
-    fn drop_unused(&mut self) {
-        self.pics.retain(|p| p.kind != RefKind::Unused);
+    /// Removes frame stores with no reference field, except the store with id `keep`.
+    pub fn drop_unused(&mut self, keep: Option<u32>) {
+        self.pics.retain(|p| p.is_reference() || Some(p.id) == keep);
     }
 
     /// Updates `FrameNumWrap` of short-term references relative to the current `frame_num` (8.2.4.1).
     pub fn update_frame_num_wrap(&mut self, cur_frame_num: u32, max_frame_num: u32) {
         for p in &mut self.pics {
-            if p.is_short() {
+            if p.any(RefKind::Short) {
                 p.frame_num_wrap = if p.frame_num > cur_frame_num {
                     p.frame_num as i32 - max_frame_num as i32
                 } else {
@@ -132,158 +148,266 @@ impl Dpb {
         }
     }
 
-    /// Sliding window marking (8.2.5.3), applied before storing a new short-term reference.
-    pub fn sliding_window(&mut self, max_num_ref_frames: u32) {
-        let num_short = self.pics.iter().filter(|p| p.is_short()).count();
-        let num_long = self.pics.iter().filter(|p| p.is_long()).count();
+    /// Sliding window marking (8.2.5.3), applied before marking a new short-term reference.
+    /// The store with id `exclude` (the current picture) neither counts nor is removed.
+    pub fn sliding_window(&mut self, max_num_ref_frames: u32, exclude: Option<u32>) {
+        let num_short = self
+            .pics
+            .iter()
+            .filter(|p| p.any(RefKind::Short) && Some(p.id) != exclude)
+            .count();
+        let num_long = self
+            .pics
+            .iter()
+            .filter(|p| p.any(RefKind::Long) && Some(p.id) != exclude)
+            .count();
         if num_short > 0
             && num_short + num_long >= max_num_ref_frames.max(1) as usize
             && let Some(oldest) = self
                 .pics
                 .iter_mut()
-                .filter(|p| p.is_short())
+                .filter(|p| p.any(RefKind::Short) && Some(p.id) != exclude)
                 .min_by_key(|p| p.frame_num_wrap)
         {
-            oldest.kind = RefKind::Unused;
+            for k in &mut oldest.kind {
+                if *k == RefKind::Short {
+                    *k = RefKind::Unused;
+                }
+            }
         }
-        self.drop_unused();
     }
 
-    /// Applies memory management control operations (8.2.5.4). Returns `true` if the current
-    /// picture was marked long-term (MMCO 6).
-    pub fn apply_mmcos(&mut self, ops: &[Mmco], cur_frame_num: u32, cur: &mut Picture) -> bool {
-        let curr_pic_num = cur_frame_num as i32;
+    /// The short-term picture (frame, or field for field decoding) with `PicNum == pic_num`.
+    fn short_by_pic_num(&self, pic_num: i32, st: Structure) -> Option<(usize, Option<u8>)> {
+        match st {
+            Structure::Frame => self
+                .pics
+                .iter()
+                .position(|p| p.kind == [RefKind::Short; 2] && p.frame_num_wrap == pic_num)
+                .map(|i| (i, None)),
+            Structure::Field(cur) => {
+                for (i, p) in self.pics.iter().enumerate() {
+                    for par in 0..2u8 {
+                        let num = 2 * p.frame_num_wrap + i32::from(par == cur);
+                        if p.kind[par as usize] == RefKind::Short && num == pic_num {
+                            return Some((i, Some(par)));
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// The long-term picture with `LongTermPicNum == num`.
+    fn long_by_pic_num(&self, num: u32, st: Structure) -> Option<(usize, Option<u8>)> {
+        match st {
+            Structure::Frame => self
+                .pics
+                .iter()
+                .position(|p| p.kind == [RefKind::Long; 2] && p.long_term_frame_idx == num)
+                .map(|i| (i, None)),
+            Structure::Field(cur) => {
+                for (i, p) in self.pics.iter().enumerate() {
+                    for par in 0..2u8 {
+                        let n = 2 * p.long_term_frame_idx + u32::from(par == cur);
+                        if p.kind[par as usize] == RefKind::Long && n == num {
+                            return Some((i, Some(par)));
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn set_kind(&mut self, i: usize, parity: Option<u8>, k: RefKind) {
+        match parity {
+            None => self.pics[i].kind = [k; 2],
+            Some(p) => self.pics[i].kind[p as usize] = k,
+        }
+    }
+
+    /// Unmarks long-term references using `idx`, except fields of the store with id `keep`.
+    fn free_long_term_idx(&mut self, idx: u32, keep: Option<u32>) {
+        for p in &mut self.pics {
+            if Some(p.id) != keep && p.long_term_frame_idx == idx {
+                for k in &mut p.kind {
+                    if *k == RefKind::Long {
+                        *k = RefKind::Unused;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies memory management control operations (8.2.5.4) for the current picture, whose store
+    /// (id `cur_id`) is already in the DPB. Returns `true` if the current picture was marked long-term.
+    pub fn apply_mmcos(
+        &mut self,
+        ops: &[Mmco],
+        cur_frame_num: u32,
+        st: Structure,
+        cur_id: u32,
+    ) -> bool {
+        let curr_pic_num = match st {
+            Structure::Frame => cur_frame_num as i32,
+            Structure::Field(_) => 2 * cur_frame_num as i32 + 1,
+        };
         let mut cur_long = false;
         for op in ops {
             match *op {
                 Mmco::UnmarkShort {
                     diff_pic_nums_minus1,
                 } => {
-                    let pic_num = curr_pic_num - (diff_pic_nums_minus1 as i32 + 1);
-                    for p in &mut self.pics {
-                        if p.is_short() && p.frame_num_wrap == pic_num {
-                            p.kind = RefKind::Unused;
-                        }
+                    let num = curr_pic_num - (diff_pic_nums_minus1 as i32 + 1);
+                    if let Some((i, par)) = self.short_by_pic_num(num, st) {
+                        self.set_kind(i, par, RefKind::Unused);
                     }
                 }
                 Mmco::UnmarkLong { long_term_pic_num } => {
-                    for p in &mut self.pics {
-                        if p.is_long() && p.long_term_frame_idx == long_term_pic_num {
-                            p.kind = RefKind::Unused;
-                        }
+                    if let Some((i, par)) = self.long_by_pic_num(long_term_pic_num, st) {
+                        self.set_kind(i, par, RefKind::Unused);
                     }
                 }
                 Mmco::ShortToLong {
                     diff_pic_nums_minus1,
                     long_term_frame_idx,
                 } => {
-                    let pic_num = curr_pic_num - (diff_pic_nums_minus1 as i32 + 1);
-                    let target = self
-                        .pics
-                        .iter()
-                        .position(|p| p.is_short() && p.frame_num_wrap == pic_num);
-                    for (i, p) in self.pics.iter_mut().enumerate() {
-                        if p.is_long()
-                            && p.long_term_frame_idx == long_term_frame_idx
-                            && Some(i) != target
-                        {
-                            p.kind = RefKind::Unused;
-                        }
-                    }
-                    if let Some(i) = target {
-                        self.pics[i].kind = RefKind::Long;
+                    let num = curr_pic_num - (diff_pic_nums_minus1 as i32 + 1);
+                    if let Some((i, par)) = self.short_by_pic_num(num, st) {
+                        // A long-term index may be shared only by the two fields of one frame.
+                        let p = &self.pics[i];
+                        let keep = (par.is_some()
+                            && p.any(RefKind::Long)
+                            && p.long_term_frame_idx == long_term_frame_idx)
+                            .then_some(p.id);
+                        self.free_long_term_idx(long_term_frame_idx, keep);
+                        self.set_kind(i, par, RefKind::Long);
                         self.pics[i].long_term_frame_idx = long_term_frame_idx;
                     }
                 }
                 Mmco::MaxLongTermIdx { max_plus1 } => {
                     self.max_long_term_frame_idx = max_plus1.checked_sub(1);
+                    let max = self.max_long_term_frame_idx;
                     for p in &mut self.pics {
-                        if p.is_long()
-                            && self
-                                .max_long_term_frame_idx
-                                .is_none_or(|m| p.long_term_frame_idx > m)
-                        {
-                            p.kind = RefKind::Unused;
+                        if max.is_none_or(|m| p.long_term_frame_idx > m) {
+                            for k in &mut p.kind {
+                                if *k == RefKind::Long {
+                                    *k = RefKind::Unused;
+                                }
+                            }
                         }
                     }
                 }
                 Mmco::Reset => {
                     for p in &mut self.pics {
-                        p.kind = RefKind::Unused;
+                        if p.id != cur_id {
+                            p.kind = [RefKind::Unused; 2];
+                        }
                     }
                     self.max_long_term_frame_idx = None;
                 }
                 Mmco::CurrentToLong {
                     long_term_frame_idx,
                 } => {
-                    for p in &mut self.pics {
-                        if p.is_long() && p.long_term_frame_idx == long_term_frame_idx {
-                            p.kind = RefKind::Unused;
-                        }
+                    self.free_long_term_idx(long_term_frame_idx, Some(cur_id));
+                    if let Some(i) = self.pics.iter().position(|p| p.id == cur_id) {
+                        let par = match st {
+                            Structure::Frame => None,
+                            Structure::Field(p) => Some(p),
+                        };
+                        self.set_kind(i, par, RefKind::Long);
+                        self.pics[i].long_term_frame_idx = long_term_frame_idx;
                     }
-                    cur.kind = RefKind::Long;
-                    cur.long_term_frame_idx = long_term_frame_idx;
                     cur_long = true;
                 }
             }
         }
-        self.drop_unused();
         cur_long
     }
 
-    /// Builds `RefPicList0` / `RefPicList1` for a slice as indices into [`Self::pics`] (8.2.4.2, 8.2.4.3).
+    /// Builds `RefPicList0` / `RefPicList1` for a slice (8.2.4.2, 8.2.4.3). `cur_id` is the store
+    /// of the current picture; when decoding a second field its first field is a reference.
     pub fn build_lists(
         &self,
         sh: &SliceHeader,
+        st: Structure,
         cur_poc: i32,
         max_frame_num: u32,
-    ) -> Result<[Vec<usize>; 2]> {
-        let mut lists: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        cur_id: Option<u32>,
+    ) -> Result<[Vec<RefSel>; 2]> {
+        let mut lists: [Vec<RefSel>; 2] = [Vec::new(), Vec::new()];
         if sh.slice_type.is_intra() {
             return Ok(lists);
         }
-        let short: Vec<usize> = (0..self.pics.len())
-            .filter(|&i| self.pics[i].is_short())
-            .collect();
-        let mut long: Vec<usize> = (0..self.pics.len())
-            .filter(|&i| self.pics[i].is_long())
-            .collect();
+        let candidates = |k: RefKind| -> Vec<usize> {
+            (0..self.pics.len())
+                .filter(|&i| {
+                    let p = &self.pics[i];
+                    match st {
+                        Structure::Frame => p.kind == [k; 2] && Some(p.id) != cur_id,
+                        Structure::Field(_) => p.any(k),
+                    }
+                })
+                .collect()
+        };
+        let short = candidates(RefKind::Short);
+        let mut long = candidates(RefKind::Long);
         long.sort_by_key(|&i| self.pics[i].long_term_frame_idx);
 
+        let is_b = sh.slice_type == SliceType::B;
         let mut init: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
-        if matches!(sh.slice_type, SliceType::P | SliceType::Sp) {
-            let mut s = short.clone();
+        if !is_b {
+            let mut s = short;
             s.sort_by_key(|&i| std::cmp::Reverse(self.pics[i].frame_num_wrap));
             init[0] = s;
-            init[0].extend(&long);
         } else {
+            // Field decoding puts entries with POC equal to the current field's before it.
+            let le = matches!(st, Structure::Field(_));
+            let poc = |i: usize| self.pics[i].poc();
             let mut before: Vec<usize> = short
                 .iter()
                 .copied()
-                .filter(|&i| self.pics[i].poc < cur_poc)
+                .filter(|&i| {
+                    if le {
+                        poc(i) <= cur_poc
+                    } else {
+                        poc(i) < cur_poc
+                    }
+                })
                 .collect();
             let mut after: Vec<usize> = short
                 .iter()
                 .copied()
-                .filter(|&i| self.pics[i].poc > cur_poc)
+                .filter(|&i| poc(i) > cur_poc)
                 .collect();
-            before.sort_by_key(|&i| std::cmp::Reverse(self.pics[i].poc));
-            after.sort_by_key(|&i| self.pics[i].poc);
-            init[0] = before
-                .iter()
-                .chain(after.iter())
-                .chain(long.iter())
-                .copied()
-                .collect();
-            init[1] = after
-                .iter()
-                .chain(before.iter())
-                .chain(long.iter())
-                .copied()
-                .collect();
-            if init[1].len() > 1 && init[1] == init[0] {
-                init[1].swap(0, 1);
-            }
+            before.sort_by_key(|&i| std::cmp::Reverse(poc(i)));
+            after.sort_by_key(|&i| poc(i));
+            init[0] = before.iter().chain(after.iter()).copied().collect();
+            init[1] = after.iter().chain(before.iter()).copied().collect();
+        }
+
+        let mut full: [Vec<RefSel>; 2] = [Vec::new(), Vec::new()];
+        for list in 0..if is_b { 2 } else { 1 } {
+            full[list] = match st {
+                Structure::Frame => init[list]
+                    .iter()
+                    .chain(long.iter())
+                    .map(|&i| RefSel {
+                        store: i,
+                        parity: None,
+                    })
+                    .collect(),
+                Structure::Field(cur) => {
+                    let mut v = self.alternate_fields(&init[list], RefKind::Short, cur);
+                    v.extend(self.alternate_fields(&long, RefKind::Long, cur));
+                    v
+                }
+            };
+        }
+        if is_b && full[1].len() > 1 && full[1] == full[0] {
+            full[1].swap(0, 1);
         }
 
         for list in 0..2 {
@@ -291,21 +415,21 @@ impl Dpb {
             if n == 0 {
                 continue;
             }
-            let mut l: Vec<Option<usize>> = init[list].iter().copied().map(Some).collect();
+            let mut l: Vec<Option<RefSel>> = full[list].iter().copied().map(Some).collect();
             l.resize(n.max(l.len()), None);
             l.truncate(n);
-            self.modify_list(&mut l, &sh.ref_mods[list], sh.frame_num, max_frame_num)?;
+            self.modify_list(&mut l, &sh.ref_mods[list], sh.frame_num, max_frame_num, st)?;
             // Missing entries point at the first available reference so damaged streams still decode.
             let fallback = l
                 .iter()
                 .flatten()
                 .copied()
                 .next()
-                .or_else(|| init[list].first().copied());
+                .or_else(|| full[list].first().copied());
             let mut out = Vec::with_capacity(n);
             for e in l {
                 match e.or(fallback) {
-                    Some(i) => out.push(i),
+                    Some(r) => out.push(r),
                     None => {
                         return Err(RagdollError::InvalidData(
                             "H.264 slice references pictures but the DPB is empty".into(),
@@ -318,16 +442,52 @@ impl Dpb {
         Ok(lists)
     }
 
+    /// Field list from an ordered frame list: alternate parities starting with `cur` (8.2.4.2.5).
+    fn alternate_fields(&self, frames: &[usize], k: RefKind, cur: u8) -> Vec<RefSel> {
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        let has = |idx: usize, par: u8| self.pics[frames[idx]].kind[par as usize] == k;
+        loop {
+            while i < frames.len() && !has(i, cur) {
+                i += 1;
+            }
+            while j < frames.len() && !has(j, cur ^ 1) {
+                j += 1;
+            }
+            if i >= frames.len() && j >= frames.len() {
+                break;
+            }
+            if i < frames.len() {
+                out.push(RefSel {
+                    store: frames[i],
+                    parity: Some(cur),
+                });
+                i += 1;
+            }
+            if j < frames.len() {
+                out.push(RefSel {
+                    store: frames[j],
+                    parity: Some(cur ^ 1),
+                });
+                j += 1;
+            }
+        }
+        out
+    }
+
     fn modify_list(
         &self,
-        l: &mut Vec<Option<usize>>,
+        l: &mut Vec<Option<RefSel>>,
         mods: &[RefMod],
         cur_frame_num: u32,
         max_frame_num: u32,
+        st: Structure,
     ) -> Result<()> {
         let n = l.len();
-        let max_pic_num = max_frame_num as i32;
-        let curr_pic_num = cur_frame_num as i32;
+        let (max_pic_num, curr_pic_num) = match st {
+            Structure::Frame => (max_frame_num as i32, cur_frame_num as i32),
+            Structure::Field(_) => (2 * max_frame_num as i32, 2 * cur_frame_num as i32 + 1),
+        };
         let mut pred = curr_pic_num;
         for (ref_idx, op) in mods.iter().enumerate() {
             if ref_idx >= n {
@@ -352,33 +512,25 @@ impl Dpb {
                     } else {
                         no_wrap
                     };
-                    let found = self
-                        .pics
-                        .iter()
-                        .position(|p| p.is_short() && p.frame_num_wrap == pic_num);
-                    found.map(|i| (i, true))
+                    self.short_by_pic_num(pic_num, st)
                 }
-                RefMod::LongTerm(lt) => self
-                    .pics
-                    .iter()
-                    .position(|p| p.is_long() && p.long_term_frame_idx == lt)
-                    .map(|i| (i, false)),
+                RefMod::LongTerm(lt) => self.long_by_pic_num(lt, st),
             };
-            let Some((pic, _)) = pic else {
+            let Some((store, parity)) = pic else {
                 return Err(RagdollError::InvalidData(
                     "H.264 reference list modification names a missing picture".into(),
                 ));
             };
+            let sel = Some(RefSel { store, parity });
             // Insert at ref_idx, then remove the later duplicate of the same picture.
-            l.insert(ref_idx, Some(pic));
+            l.insert(ref_idx, sel);
             let mut w = ref_idx + 1;
             for c in ref_idx + 1..l.len() {
-                if l[c] != Some(pic) {
+                if l[c] != sel {
                     l[w] = l[c];
                     w += 1;
                 }
             }
-            l.truncate(w.max(n));
             l.truncate(n);
         }
         Ok(())

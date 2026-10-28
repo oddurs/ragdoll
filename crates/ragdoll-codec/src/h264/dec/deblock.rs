@@ -1,6 +1,6 @@
 //! Deblocking filter for frame macroblocks (ITU-T H.264 8.7).
 
-use super::picture::{MbType, NO_PIC, PicState};
+use super::picture::{MbType, NO_PIC, PicState, Structure};
 use super::tables::{ALPHA, BETA, TC0};
 
 /// Per-slice deblocking controls.
@@ -66,6 +66,10 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
 /// Boundary strengths of the four 4-sample segments of `edge` (0..4) in direction `dir` (0 vertical, 1 horizontal).
 fn edge_strengths(st: &PicState, mb_x: usize, mb_y: usize, dir: usize, edge: usize) -> [u8; 4] {
     let addr = mb_y * st.mb_w + mb_x;
+    // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and vertical
+    // vectors are compared in field units (4 quarter frame samples = 2 quarter field samples).
+    let field = matches!(st.structure, Structure::Field(_));
+    let mvy_limit = if field { 2 } else { 4 };
     let mut bs = [0u8; 4];
     for (k, slot) in bs.iter_mut().enumerate() {
         let (qx, qy) = if dir == 0 {
@@ -80,10 +84,14 @@ fn edge_strengths(st: &PicState, mb_x: usize, mb_y: usize, dir: usize, edge: usi
         let p_intra = st.mb_type[p_addr].is_intra();
         let q_intra = st.mb_type[addr].is_intra();
         *slot = if p_intra || q_intra {
-            if mb_edge { 4 } else { 3 }
+            if mb_edge && !(field && dir == 1) {
+                4
+            } else {
+                3
+            }
         } else if st.nz[pi] || st.nz[qi] {
             2
-        } else if motion_differs(st, pi, qi) {
+        } else if motion_differs(st, pi, qi, mvy_limit) {
             1
         } else {
             0
@@ -92,12 +100,12 @@ fn edge_strengths(st: &PicState, mb_x: usize, mb_y: usize, dir: usize, edge: usi
     bs
 }
 
-fn mv_far(a: [i16; 2], b: [i16; 2]) -> bool {
-    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4
+fn mv_far(a: [i16; 2], b: [i16; 2], ylim: i32) -> bool {
+    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= ylim
 }
 
 /// Whether two inter blocks predict from different pictures or with vectors 4 or more quarter samples apart.
-fn motion_differs(st: &PicState, p: usize, q: usize) -> bool {
+fn motion_differs(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
     let rp = [st.ref_pic[0][p], st.ref_pic[1][p]];
     let rq = [st.ref_pic[0][q], st.ref_pic[1][q]];
     let mp = [st.mv[0][p], st.mv[1][p]];
@@ -112,7 +120,7 @@ fn motion_differs(st: &PicState, p: usize, q: usize) -> bool {
             if rp[0] != NO_PIC { 0 } else { 1 },
             if rq[0] != NO_PIC { 0 } else { 1 },
         );
-        return rp[lp] != rq[lq] || mv_far(mp[lp], mq[lq]);
+        return rp[lp] != rq[lq] || mv_far(mp[lp], mq[lq], ylim);
     }
     let same_set = (rp[0] == rq[0] && rp[1] == rq[1]) || (rp[0] == rq[1] && rp[1] == rq[0]);
     if !same_set {
@@ -120,13 +128,13 @@ fn motion_differs(st: &PicState, p: usize, q: usize) -> bool {
     }
     if rp[0] != rp[1] {
         if rp[0] == rq[0] {
-            mv_far(mp[0], mq[0]) || mv_far(mp[1], mq[1])
+            mv_far(mp[0], mq[0], ylim) || mv_far(mp[1], mq[1], ylim)
         } else {
-            mv_far(mp[0], mq[1]) || mv_far(mp[1], mq[0])
+            mv_far(mp[0], mq[1], ylim) || mv_far(mp[1], mq[0], ylim)
         }
     } else {
-        (mv_far(mp[0], mq[0]) || mv_far(mp[1], mq[1]))
-            && (mv_far(mp[0], mq[1]) || mv_far(mp[1], mq[0]))
+        (mv_far(mp[0], mq[0], ylim) || mv_far(mp[1], mq[1], ylim))
+            && (mv_far(mp[0], mq[1], ylim) || mv_far(mp[1], mq[0], ylim))
     }
 }
 

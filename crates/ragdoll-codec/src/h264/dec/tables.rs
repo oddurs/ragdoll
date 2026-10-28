@@ -318,3 +318,15 @@ pub const BLK4_XY: [(usize, usize); 16] = [
 
 /// `luma4x4BlkIdx` at 4x4-block position `[y][x]` within a macroblock.
 pub const BLK4_AT: [[usize; 4]; 4] = [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
+
+/// Field scan of a 4x4 block: scan index -> raster index (Table 8-13, field macroblocks).
+pub const FIELD_SCAN4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
+/// Field scan of an 8x8 block: scan index -> raster index (Table 8-14, field macroblocks).
+#[rustfmt::skip]
+pub const FIELD_SCAN8X8: [usize; 64] = [
+    0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3,
+    18, 41, 49, 57, 26, 11, 4, 19, 34, 42, 50, 58, 27, 12, 5, 20,
+    35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37,
+    45, 53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
+];

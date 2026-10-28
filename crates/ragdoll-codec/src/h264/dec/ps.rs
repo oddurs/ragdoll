@@ -58,6 +58,7 @@ pub struct Sps {
     pub width_mbs: u32,
     pub height_map_units: u32,
     pub frame_mbs_only: bool,
+    pub mbaff: bool,
     pub direct_8x8_inference: bool,
     pub crop: [u32; 4],
     pub fps: Option<Rational64>,
@@ -194,9 +195,7 @@ impl Sps {
                 "H.264 picture dimensions out of range",
             ));
         }
-        if !frame_mbs_only {
-            r.read_bit()?; // mb_adaptive_frame_field_flag
-        }
+        let mbaff = !frame_mbs_only && r.read_bit()?;
         let direct_8x8_inference = r.read_bit()?;
         let mut crop = [0u32; 4];
         if r.read_bit()? {
@@ -222,6 +221,7 @@ impl Sps {
             width_mbs,
             height_map_units,
             frame_mbs_only,
+            mbaff,
             direct_8x8_inference,
             crop,
             fps: None,

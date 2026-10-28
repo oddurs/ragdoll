@@ -11,22 +11,29 @@ use crate::h264::decode_cavlc_block;
 
 use super::cabac_se;
 use super::intra::{self, Edges};
-use super::picture::{MbType, Motion, NO_PIC, PicState};
+use super::picture::{MbType, Motion, NO_PIC, PicState, Structure};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
 use super::tables::{
-    B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, P_SUB_TYPES, PRED_L0, Part,
-    SCAN4X4, SCAN8X8, chroma_qp,
+    B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, FIELD_SCAN4X4,
+    FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN4X4, SCAN8X8, chroma_qp,
 };
 
 /// A reference picture as seen by one slice.
 pub struct RefPic {
+    /// Frame or field reference id (see `FrameStore::frame_ref_id`).
     pub id: u32,
     pub poc: i32,
     pub long: bool,
+    /// Samples of the frame, or of the field for a field reference.
     pub planes: Arc<[Vec<u8>; 3]>,
+    /// Motion of the frame store, in frame layout.
     pub motion: Option<Arc<Motion>>,
+    /// Field parity for a field reference.
+    pub parity: Option<u8>,
+    /// POCs of the store's two fields.
+    pub field_poc: [i32; 2],
 }
 
 /// Everything a slice needs besides the picture state.
@@ -250,6 +257,11 @@ impl<'a, 'c> Dec<'a, 'c> {
             Entropy::Cabac(cd, ctxs) => (cd, ctxs),
             Entropy::Cavlc(_) => unreachable!("CABAC syntax read in a CAVLC slice"),
         }
+    }
+
+    /// Whether the current macroblock is a field macroblock (field picture).
+    fn field_mb(&self) -> bool {
+        matches!(self.st.structure, Structure::Field(_))
     }
 
     fn is_cabac(&self) -> bool {
@@ -933,11 +945,12 @@ impl<'a, 'c> Dec<'a, 'c> {
         cat: usize,
         inc: u8,
     ) -> Result<usize> {
+        let field = self.field_mb();
         match &mut self.ent {
             Entropy::Cavlc(r) => decode_cavlc_block(r, out, nc, chroma_dc),
-            Entropy::Cabac(cd, ctxs) => {
-                Ok(cd.decode_residual_block_cat(&mut ctxs[..], cat, inc, out).1)
-            }
+            Entropy::Cabac(cd, ctxs) => Ok(cd
+                .decode_residual_block(&mut ctxs[..], cat, inc, out, field)
+                .1),
         }
     }
 
@@ -949,6 +962,12 @@ impl<'a, 'c> Dec<'a, 'c> {
         intra: bool,
         res: &mut Residual,
     ) -> Result<()> {
+        let field = self.field_mb();
+        let (scan4, scan8) = if field {
+            (&FIELD_SCAN4X4, &FIELD_SCAN8X8)
+        } else {
+            (&SCAN4X4, &SCAN8X8)
+        };
         let a = self.mb.addr;
         let qp = self.qp;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
@@ -970,7 +989,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             let mut c = [0i32; 16];
             for k in 0..16 {
-                c[SCAN4X4[k]] = sc[k] as i32;
+                c[scan4[k]] = sc[k] as i32;
             }
             let dc = recon::luma_dc(dq, qp, &c);
             for blk in 0..16 {
@@ -991,7 +1010,9 @@ impl<'a, 'c> Dec<'a, 'c> {
                 let mut total = 0;
                 if cabac {
                     let (cd, ctxs) = self.cabac();
-                    total = cd.decode_residual_block_cat(&mut ctxs[..], 5, 0, &mut sc).1;
+                    total = cd
+                        .decode_residual_block(&mut ctxs[..], 5, 0, &mut sc, field)
+                        .1;
                     for i in 0..4 {
                         let blk = b8 * 4 + i;
                         let (bx, by) = BLK4_XY[blk];
@@ -1026,7 +1047,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let l8 = if intra { 0 } else { 1 };
                     for k in 0..64 {
                         if sc[k] != 0 {
-                            let pos = SCAN8X8[k];
+                            let pos = scan8[k];
                             res.luma8[b8][pos] = dq.scale8(l8, qp, pos, sc[k] as i32);
                         }
                     }
@@ -1045,7 +1066,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                         + 2 * self.cbf_luma(x4 as isize, y4 as isize - 1, intra);
                     let cat = if is_i16 { 1 } else { 2 };
                     let (cd, ctxs) = self.cabac();
-                    cd.decode_residual_block_cat(&mut ctxs[..], cat, inc, &mut sc[..max])
+                    cd.decode_residual_block(&mut ctxs[..], cat, inc, &mut sc[..max], field)
                         .1
                 } else {
                     let nc = self.nc_luma(x4, y4);
@@ -1059,7 +1080,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let off = 16 - max;
                     for k in 0..max {
                         if sc[k] != 0 {
-                            let pos = SCAN4X4[k + off];
+                            let pos = scan4[k + off];
                             res.luma[blk][pos] = dq.scale4(lst, qp, pos, sc[k] as i32);
                         }
                     }
@@ -1109,7 +1130,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let inc = self.cbf_chroma_ac(p, x4 as isize - 1, y4 as isize, intra)
                         + 2 * self.cbf_chroma_ac(p, x4 as isize, y4 as isize - 1, intra);
                     let (cd, ctxs) = self.cabac();
-                    cd.decode_residual_block_cat(&mut ctxs[..], 4, inc, &mut sc)
+                    cd.decode_residual_block(&mut ctxs[..], 4, inc, &mut sc, field)
                         .1
                 } else {
                     let nc = self.nc_chroma(p, x4, y4);
@@ -1121,7 +1142,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if n > 0 {
                     for k in 0..15 {
                         if sc[k] != 0 {
-                            let pos = SCAN4X4[k + 1];
+                            let pos = scan4[k + 1];
                             res.chroma[p][blk][pos] =
                                 dq.scale4(lst + 1 + p, qpc[p] as i32, pos, sc[k] as i32);
                         }
@@ -1497,7 +1518,6 @@ impl<'a, 'c> Dec<'a, 'c> {
             return Err(bad("H.264 direct prediction without reference lists"));
         }
         let col = &self.cx.refs[1][0];
-        let col_motion = col.motion.clone();
         let inference = self.cx.sps.direct_8x8_inference;
         let spatial = self.cx.sh.direct_spatial;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
@@ -1543,18 +1563,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     (bx, by)
                 };
-                let ci = self.st.b4(mx4 + cbx, my4 + cby);
-                let col_mb = (my4 + cby) / 4 * self.st.mb_w + (mx4 + cbx) / 4;
-                let (col_ref, col_mv, col_pic) = match &col_motion {
-                    Some(m) if !m.mb_intra[col_mb] => {
-                        if m.ref_idx[0][ci] >= 0 {
-                            (m.ref_idx[0][ci], m.mv[0][ci], m.ref_pic[0][ci])
-                        } else {
-                            (m.ref_idx[1][ci], m.mv[1][ci], m.ref_pic[1][ci])
-                        }
-                    }
-                    _ => (-1, [0, 0], NO_PIC),
-                };
+                let (col_ref, col_mv, col_pic, vscale) = self.colocated(cbx, cby);
                 let (refs, mvs) = if spatial {
                     let col_zero = col_short
                         && col_ref == 0
@@ -1570,14 +1579,25 @@ impl<'a, 'c> Dec<'a, 'c> {
                     }
                     (sp_ref, mvs)
                 } else {
-                    // Temporal (8.4.1.2.3).
+                    // Temporal (8.4.1.2.3): map the co-located reference into RefPicList0 and
+                    // convert its vertical vector between frame and field units.
+                    let target = match self.st.structure {
+                        Structure::Frame => col_pic & !3,
+                        Structure::Field(p) if col_pic % 4 == 0 => col_pic + 1 + p as u32,
+                        Structure::Field(_) => col_pic,
+                    };
                     let ref0 = if col_ref < 0 {
                         0
                     } else {
                         self.cx.refs[0]
                             .iter()
-                            .position(|r| r.id == col_pic)
+                            .position(|r| r.id == target)
                             .unwrap_or(0) as i8
+                    };
+                    let col_mv = match vscale {
+                        1 => [col_mv[0], col_mv[1].wrapping_mul(2)],
+                        -1 => [col_mv[0], col_mv[1] / 2],
+                        _ => col_mv,
                     };
                     let p0 = &self.cx.refs[0][ref0 as usize];
                     let p1 = &self.cx.refs[1][0];
@@ -1611,6 +1631,49 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
         Ok(())
+    }
+
+    /// Co-located block for direct prediction (8.4.1.2.1): `(refIdxCol, mvCol, referenced picture id,
+    /// vertical scale)` where the scale is `1` for field-to-frame, `-1` for frame-to-field, else `0`.
+    /// `(cbx, cby)` is the MB-relative 4x4 block, after the 8x8-inference corner selection.
+    fn colocated(&self, cbx: usize, cby: usize) -> (i8, [i16; 2], u32, i32) {
+        let col = &self.cx.refs[1][0];
+        let Some(m) = &col.motion else {
+            return (-1, [0, 0], NO_PIC, 0);
+        };
+        let mb_w = self.st.mb_w;
+        let mbx = self.mb.x;
+        // Motion is stored in frame layout; pick the co-located MB row and block row there.
+        let (row, by, vscale) = match self.st.structure {
+            Structure::Frame => {
+                let row = self.mb.y;
+                if m.mb_field[row * mb_w + mbx] {
+                    let cur = self.cx.cur_poc;
+                    let cp = usize::from(
+                        (col.field_poc[0] - cur).abs() >= (col.field_poc[1] - cur).abs(),
+                    );
+                    ((row & !1) + cp, 2 * (row % 2) + cby / 2, 1)
+                } else {
+                    (row, cby, 0)
+                }
+            }
+            Structure::Field(_) => {
+                let cp = col.parity.unwrap_or(0) as usize;
+                let r = self.mb.y;
+                if m.mb_field[(2 * r + cp) * mb_w + mbx] {
+                    (2 * r + cp, cby, 0)
+                } else {
+                    (2 * r + cby / 2, 2 * (cby % 2), -1)
+                }
+            }
+        };
+        let mb = row * mb_w + mbx;
+        if mb >= m.mb_intra.len() || m.mb_intra[mb] {
+            return (-1, [0, 0], NO_PIC, vscale);
+        }
+        let i = (row * 4 + by) * mb_w * 4 + mbx * 4 + cbx;
+        let l = if m.ref_idx[0][i] >= 0 { 0 } else { 1 };
+        (m.ref_idx[l][i], m.mv[l][i], m.ref_pic[l][i], vscale)
     }
 
     /// Coded block pattern, optional transform_size_8x8_flag, residual and reconstruction of an inter MB.
@@ -1778,6 +1841,12 @@ impl<'a, 'c> Dec<'a, 'c> {
             for list in 0..2 {
                 if used[list] {
                     let rp = &self.cx.refs[list][refs[list] as usize];
+                    // Between fields of opposite parity the chroma vector is offset by a
+                    // quarter chroma sample (Table 8-9).
+                    let mut mv = mvs[list];
+                    if let (Structure::Field(cur), Some(r)) = (self.st.structure, rp.parity) {
+                        mv[1] = mv[1].wrapping_add(2 * (cur as i16 - r as i16));
+                    }
                     recon::mc_chroma(
                         &rp.planes[1 + p],
                         cpw,
@@ -1786,7 +1855,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                         cy,
                         cw,
                         ch,
-                        mvs[list],
+                        mv,
                         &mut pc[list],
                     );
                 }
