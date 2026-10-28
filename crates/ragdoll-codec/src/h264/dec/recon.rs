@@ -243,7 +243,7 @@ const EMU_STRIDE: usize = 24;
 /// written to `dst` with stride `ds`. Blocks whose filter taps reach past the picture read an
 /// edge-extended copy (8.4.2.2.1 clamps reference coordinates to the picture).
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma(
+pub fn mc_luma<const AVG: bool>(
     src: &[u8],
     width: usize,
     height: usize,
@@ -254,9 +254,14 @@ pub fn mc_luma(
     mv: [i16; 2],
     dst: &mut [u8],
     ds: usize,
-    avg: bool,
 ) {
-    let kernel = if avg { h264_luma_mc_avg } else { h264_luma_mc };
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_luma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_luma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
+    };
     let ix = x as isize + (mv[0] as isize >> 2);
     let iy = y as isize + (mv[1] as isize >> 2);
     let (fx, fy) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
@@ -276,7 +281,7 @@ pub fn mc_luma(
         return;
     }
     // Whole-sample blocks at the picture edge need no interpolation margins.
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, avg) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 21];
@@ -364,7 +369,7 @@ fn edge_window(
 /// Chroma (4:2:0) prediction samples for a `w`x`h` chroma block at chroma pixel `(x, y)`,
 /// written to `dst` with stride `ds`.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma(
+pub fn mc_chroma<const AVG: bool>(
     src: &[u8],
     width: usize,
     height: usize,
@@ -375,12 +380,13 @@ pub fn mc_chroma(
     mv: [i16; 2],
     dst: &mut [u8],
     ds: usize,
-    avg: bool,
 ) {
-    let kernel = if avg {
-        h264_chroma_mc_avg
-    } else {
-        h264_chroma_mc
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_chroma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_chroma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
     };
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
@@ -400,7 +406,7 @@ pub fn mc_chroma(
         );
         return;
     }
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, avg) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 9];

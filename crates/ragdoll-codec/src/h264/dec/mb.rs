@@ -550,12 +550,24 @@ impl<'a, 'c> Dec<'a, 'c> {
             .filter(|&a| self.mb_avail(a))
     }
 
+    /// The available macroblock left of the current one.
+    #[inline]
     fn mb_left(&self) -> Option<usize> {
-        self.mb_nb(-1, 0)
+        if self.st.mbaff {
+            return self.mb_nb(-1, 0);
+        }
+        let a = self.mb.addr;
+        (self.mb.x > 0 && self.st.slice_num[a - 1] == self.cx.slice_num).then(|| a - 1)
     }
 
+    /// The available macroblock above the current one.
+    #[inline]
     fn mb_top(&self) -> Option<usize> {
-        self.mb_nb(0, -1)
+        if self.st.mbaff {
+            return self.mb_nb(0, -1);
+        }
+        let (a, w) = (self.mb.addr, self.st.mb_w);
+        (self.mb.y > 0 && self.st.slice_num[a - w] == self.cx.slice_num).then(|| a - w)
     }
 
     /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
@@ -1107,7 +1119,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 }
             }
             MbType::I16x16(mode) => {
-                let mb_top = self.intra_ok(self.mb_nb(0, -1));
+                let mb_top = self.intra_ok(self.mb_top());
                 let mb_left = self.left_ok(0, 16);
                 let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
                 if !intra::block_mode_ok(mode, mb_left, mb_top, mb_tl) {
@@ -1131,7 +1143,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             _ => unreachable!(),
         }
         if self.cx.sps.chroma_array_type() != 0 {
-            let mb_top = self.intra_ok(self.mb_nb(0, -1));
+            let mb_top = self.intra_ok(self.mb_top());
             let left = [self.left_ok(0, 8), self.left_ok(8, 8)];
             let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
             let mode = self.st.chroma_pred_mode[self.mb.addr];
@@ -1178,19 +1190,18 @@ impl<'a, 'c> Dec<'a, 'c> {
             // Blocks per MB side: 1 << sh.
             let sh = if chroma { 1 } else { 2 };
             let w4 = self.st.mb_w << sh;
-            let (x4, y4) = ((self.mb.x << sh) + bx, (self.mb.y << sh) + by);
-            let at = |x4: usize, y4: usize, inside: bool| {
-                let a = if inside {
-                    self.mb.addr
-                } else {
-                    (y4 >> sh) * self.st.mb_w + (x4 >> sh)
-                };
-                (inside || self.mb_avail(a)).then_some((a, y4 * w4 + x4))
+            let i = ((self.mb.y << sh) + by) * w4 + (self.mb.x << sh) + bx;
+            let left = if bx > 0 {
+                Some(self.mb.addr)
+            } else {
+                self.mb_left()
             };
-            return [
-                (x4 > 0).then(|| at(x4 - 1, y4, bx > 0)).flatten(),
-                (y4 > 0).then(|| at(x4, y4 - 1, by > 0)).flatten(),
-            ];
+            let top = if by > 0 {
+                Some(self.mb.addr)
+            } else {
+                self.mb_top()
+            };
+            return [left.map(|a| (a, i - 1)), top.map(|a| (a, i - w4))];
         }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         [(x - 1, y), (x, y - 1)].map(|(xn, yn)| {
@@ -2285,11 +2296,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         match rp {
             [Some(r), None] | [None, Some(r)] => {
                 let l = rp[0].is_none() as usize;
-                recon::mc_luma(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, ls, false);
+                recon::mc_luma::<false>(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, ls);
             }
             [Some(r0), Some(r1)] => {
-                recon::mc_luma(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, ls, false);
-                recon::mc_luma(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], dst, ls, true);
+                recon::mc_luma::<false>(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, ls);
+                recon::mc_luma::<true>(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], dst, ls);
             }
             [None, None] => {}
         }
@@ -2316,12 +2327,12 @@ impl<'a, 'c> Dec<'a, 'c> {
                 [Some(r), None] | [None, Some(r)] => {
                     let l = rp[0].is_none() as usize;
                     let mv = cmv[l];
-                    recon::mc_chroma(&r.planes[p], cpw, cph, cx, cy, cw, ch, mv, dst, cs, false);
+                    recon::mc_chroma::<false>(&r.planes[p], cpw, cph, cx, cy, cw, ch, mv, dst, cs);
                 }
                 [Some(r0), Some(r1)] => {
                     let (m0, m1) = (cmv[0], cmv[1]);
-                    recon::mc_chroma(&r0.planes[p], cpw, cph, cx, cy, cw, ch, m0, dst, cs, false);
-                    recon::mc_chroma(&r1.planes[p], cpw, cph, cx, cy, cw, ch, m1, dst, cs, true);
+                    recon::mc_chroma::<false>(&r0.planes[p], cpw, cph, cx, cy, cw, ch, m0, dst, cs);
+                    recon::mc_chroma::<true>(&r1.planes[p], cpw, cph, cx, cy, cw, ch, m1, dst, cs);
                 }
                 [None, None] => {}
             }
@@ -2376,19 +2387,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             wt,
             &mut self.scratch,
             |list, out, os| {
-                recon::mc_luma(
-                    &planes(list)[0],
-                    pw,
-                    ph,
-                    x,
-                    y,
-                    w,
-                    h,
-                    mvs[list],
-                    out,
-                    os,
-                    false,
-                )
+                recon::mc_luma::<false>(&planes(list)[0], pw, ph, x, y, w, h, mvs[list], out, os)
             },
         );
         if self.cx.sps.chroma_array_type() == 0 {
@@ -2423,7 +2422,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 wt,
                 &mut self.scratch,
                 |list, out, os| {
-                    recon::mc_chroma(
+                    recon::mc_chroma::<false>(
                         &planes(list)[1 + p],
                         cpw,
                         cph,
@@ -2434,7 +2433,6 @@ impl<'a, 'c> Dec<'a, 'c> {
                         cmv[list],
                         out,
                         os,
-                        false,
                     )
                 },
             );
