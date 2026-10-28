@@ -1792,6 +1792,179 @@ mod tests {
         }
     }
 
+    /// Deterministic 16-bit test values, including the extremes.
+    fn signal16(n: usize, seed: u32) -> Vec<i16> {
+        signal(n, seed, 1 << 16)
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| match k % 29 {
+                3 => i16::MIN,
+                4 => i16::MAX,
+                _ => v as i16,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn band_kernels_match_scalar() {
+        use super::super::bands::*;
+        use super::super::vq::{scale_shr, scale_shr_scalar};
+        for n in (1..40).chain([48, 64, 96, 176]) {
+            let x = signal16(n, n as u32);
+            let y = signal16(n, 7 * n as u32 + 1);
+            for (g, sh) in [(32767, 1), (-32768, 15), (12345, 9), (-777, 3)] {
+                let (mut a, mut b) = (x.clone(), x.clone());
+                scale_shr(&mut a, g, sh);
+                scale_shr_scalar(&mut b, g, sh);
+                assert_eq!(a, b, "scale_shr n {n}");
+                let (mut a, mut b) = (vec![0i16; n], vec![0i16; n]);
+                mul_q15(&mut a, &x, g);
+                mul_q15_scalar(&mut b, &x, g);
+                assert_eq!(a, b, "mul_q15 n {n}");
+                for shift in [-2, -1, 0, 3, 17] {
+                    let (mut a, mut b) = (vec![0i32; n], vec![0i32; n]);
+                    denormalise_band(&mut a, &x, g, shift);
+                    denormalise_band_scalar(&mut b, &x, g, shift);
+                    assert_eq!(a, b, "denormalise n {n} shift {shift}");
+                }
+            }
+            for mid in [0, 1, 16384, 32767, -32768] {
+                let (mut xb, mut yb) = (x.clone(), y.clone());
+                stereo_merge_scalar(&mut xb, &mut yb, mid, 23170, 9, -18000, 12);
+                let (mut xc, mut yc) = (x.clone(), y.clone());
+                #[cfg(target_arch = "x86_64")]
+                if ragdoll_core::dispatch::avx2() {
+                    // Safety: AVX2 is available.
+                    if unsafe {
+                        super::stereo_merge_avx2(&mut xc, &mut yc, mid, 23170, 9, -18000, 12)
+                    } {
+                        assert_eq!((&xc, &yc), (&xb, &yb), "stereo_merge n {n}");
+                    }
+                }
+                let _ = (&mut xc, &mut yc);
+            }
+            for stride in [1usize, 2, 4, 8, 16, 32] {
+                let n0 = n / stride;
+                if n0 < 2 {
+                    continue;
+                }
+                let (mut a, mut b) = (x.clone(), x.clone());
+                haar1(&mut a, n0, stride);
+                haar1_scalar(&mut b, n0, stride, 0);
+                assert_eq!(a, b, "haar1 n0 {n0} stride {stride}");
+            }
+        }
+    }
+
+    #[test]
+    fn signal_kernels_match_scalar() {
+        use super::super::celt::{saturate_slice, sig2word16_slice, sig2word16_slice_scalar};
+        use super::super::celt_tables::WINDOW;
+        use super::super::mdct::{tdac_mirror, tdac_mirror_scalar};
+        use super::super::plc::{
+            COMBFILTER_MINPERIOD, Comb, SIG_SAT, comb_filter_inplace, comb_filter_inplace_scalar,
+        };
+        for n in (1..40).chain([120, 240, 960, 1000]) {
+            let x = signal(n, n as u32, i32::MAX);
+            let (mut a, mut b) = (vec![0i16; n], vec![0i16; n]);
+            sig2word16_slice(&mut a, &x);
+            sig2word16_slice_scalar(&mut b, &x);
+            assert_eq!(a, b, "sig2word16 n {n}");
+            let mut s = x.clone();
+            saturate_slice(&mut s);
+            let r: Vec<i32> = x.iter().map(|&v| v.clamp(-SIG_SAT, SIG_SAT)).collect();
+            assert_eq!(s, r, "saturate n {n}");
+        }
+        for overlap in [120usize, 24, 8] {
+            let x = signal(overlap, 3, 1 << 30);
+            let (mut a, mut b) = (x.clone(), x.clone());
+            tdac_mirror(&mut a, &WINDOW[..overlap]);
+            tdac_mirror_scalar(&mut b, &WINDOW[..overlap], 0);
+            assert_eq!(a, b, "tdac overlap {overlap}");
+        }
+        let combs = [
+            (15, 15, 3072, 3072, 0, 0),
+            (15, 300, 0, 24576, 1, 2),
+            (1023, 17, -24576, 9216, 2, 0),
+            (100, 100, 6144, 0, 1, 1),
+            (40, 1022, 12288, -3072, 0, 2),
+        ];
+        for (t0, t1, g0, g1, tapset0, tapset1) in combs {
+            for n in [120usize, 240, 840, 13] {
+                let base = signal(1200 + n, t0 as u32 + n as u32, SIG_SAT);
+                let c = Comb {
+                    t0,
+                    t1,
+                    g0,
+                    g1,
+                    tapset0,
+                    tapset1,
+                };
+                let (mut a, mut b) = (base.clone(), base.clone());
+                comb_filter_inplace(&mut a, 1100, n, c, &WINDOW, 120);
+                comb_filter_inplace_scalar(&mut b, 1100, n, c, &WINDOW, 120);
+                assert_eq!(a, b, "comb t0 {t0} t1 {t1} n {n}");
+            }
+        }
+        let _ = COMBFILTER_MINPERIOD;
+    }
+
+    #[test]
+    fn silk_kernels_match_scalar() {
+        use super::super::silk::{lpc_synthesis, lpc_synthesis_scalar};
+        use super::super::silk_dsp::{
+            fir_interpol, fir_interpol_scalar, lpc_analysis_filter, lpc_analysis_filter_scalar,
+        };
+        // Resampler interpolation: the 16 -> 48 kHz step and others.
+        for (inc, n_in) in [
+            (43691, 160),
+            (43691, 16),
+            (43691, 144),
+            (65537, 80),
+            (21846, 120),
+        ] {
+            let buf = signal16(2 * n_in + 8, inc as u32);
+            let max = (n_in as i32) << 17;
+            let (mut a, mut b) = (vec![0i16; 8 * n_in + 8], vec![0i16; 8 * n_in + 8]);
+            let na = fir_interpol(&mut a, &buf, max, inc);
+            let nb = fir_interpol_scalar(&mut b, &buf, max, inc, 0, 0);
+            assert_eq!((na, &a), (nb, &b), "fir_interpol inc {inc} n_in {n_in}");
+        }
+        for d in [10usize, 16] {
+            for len in [16usize, 17, 23, 40, 80, 320] {
+                let input = signal16(len, len as u32 + d as u32);
+                let coef: Vec<i16> = signal16(d, 99).iter().map(|&v| v >> 3).collect();
+                let (mut a, mut b) = (vec![0i16; len], vec![0i16; len]);
+                lpc_analysis_filter(&mut a, &input, &coef, len, d);
+                lpc_analysis_filter_scalar(&mut b, &input, &coef, len, d, d);
+                assert_eq!(a, b, "lpc_analysis d {d} len {len}");
+            }
+        }
+        for sub in [40usize, 60, 80, 7] {
+            let mut a_q12 = [0i16; 16];
+            for (k, v) in signal16(16, sub as u32).iter().enumerate() {
+                a_q12[k] = v >> 2;
+            }
+            for amp in [1 << 10, 1 << 20, i32::MAX] {
+                let r = signal(sub, amp as u32, amp);
+                let hist = signal(16, 5, amp);
+                let mut sa = hist.clone();
+                sa.resize(16 + sub, 0);
+                let mut sb = sa.clone();
+                let (mut xa, mut xb) = (vec![0i16; sub], vec![0i16; sub]);
+                lpc_synthesis::<16>(&mut sa, &a_q12, &r, &mut xa, 12345);
+                lpc_synthesis_scalar::<16>(&mut sb, &a_q12, &r, &mut xb, 12345, 0);
+                assert_eq!((&sa, &xa), (&sb, &xb), "lpc_synthesis 16 sub {sub}");
+                let mut sa = hist.clone();
+                sa.resize(16 + sub, 0);
+                let mut sb = sa.clone();
+                lpc_synthesis::<10>(&mut sa, &a_q12, &r, &mut xa, -4321);
+                lpc_synthesis_scalar::<10>(&mut sb, &a_q12, &r, &mut xb, -4321, 0);
+                assert_eq!((&sa, &xa), (&sb, &xb), "lpc_synthesis 10 sub {sub}");
+            }
+        }
+    }
+
     #[test]
     fn bitrev_tables_are_permutations() {
         for st in &FFT_STATES {

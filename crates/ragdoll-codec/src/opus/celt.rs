@@ -859,7 +859,7 @@ impl CeltDecoder {
 }
 
 /// `SATURATE(x, SIG_SAT)` in place.
-fn saturate_slice(x: &mut [i32]) {
+pub(super) fn saturate_slice(x: &mut [i32]) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
@@ -872,7 +872,7 @@ fn saturate_slice(x: &mut [i32]) {
 }
 
 /// `out[i] = SIG2WORD16(x[i])`.
-fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
+pub(super) fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.

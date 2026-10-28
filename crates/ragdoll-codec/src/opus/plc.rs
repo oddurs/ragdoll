@@ -537,6 +537,38 @@ pub(super) unsafe fn comb_const_scalar(
     }
 }
 
+/// Scalar reference of [`comb_filter_inplace`].
+#[cfg(test)]
+pub(super) fn comb_filter_inplace_scalar(
+    buf: &mut [i32],
+    off: usize,
+    n: usize,
+    c: Comb,
+    window: &[i16],
+    overlap: usize,
+) {
+    if c.g0 == 0 && c.g1 == 0 {
+        return;
+    }
+    let t0 = c.t0.max(COMBFILTER_MINPERIOD) as usize;
+    let t1 = c.t1.max(COMBFILTER_MINPERIOD) as usize;
+    let (g0, g1) = comb_gains(&c);
+    let overlap = if c.g0 == c.g1 && t0 == t1 && c.tapset0 == c.tapset1 {
+        0
+    } else {
+        overlap.min(n)
+    };
+    assert!(off >= t0.max(t1) + 2 && off + n <= buf.len());
+    // Safety: bounded by the assert.
+    unsafe {
+        let p = buf.as_mut_ptr().add(off);
+        comb_overlap_tail(p, p, 0, overlap, t0, t1, g0, g1, window);
+        if c.g1 != 0 {
+            comb_const_scalar(p.add(overlap), p.add(overlap), n - overlap, t1, g1);
+        }
+    }
+}
+
 /// `comb_filter` in place: `buf[off..off + n]` is filtered with its own (already filtered)
 /// history before `off`, as libopus does when input and output alias.
 pub fn comb_filter_inplace(

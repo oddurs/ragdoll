@@ -720,7 +720,7 @@ pub const FIR_12_TAPS: [[i16; 8]; 12] = {
 /// The fractional-delay interpolation of `silk_resampler_private_IIR_FIR`: one output per
 /// `inc` step of the Q16 position below `max_index_q16` in the 2x upsampled `buf`. Returns the
 /// number of outputs.
-fn fir_interpol(out: &mut [i16], buf: &[i16], max_index_q16: i32, inc: i32) -> usize {
+pub(super) fn fir_interpol(out: &mut [i16], buf: &[i16], max_index_q16: i32, inc: i32) -> usize {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         let n_in = (max_index_q16 >> 17) as usize;

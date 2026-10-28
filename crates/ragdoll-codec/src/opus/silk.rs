@@ -885,7 +885,7 @@ impl ChannelState {
 /// The short-term synthesis of `silk_decode_core` for one subframe: `s_lpc` holds the
 /// `MAX_LPC_ORDER` previous outputs (Q14) followed by room for the `r.len()` new ones.
 #[inline(always)]
-fn lpc_synthesis<const ORDER: usize>(
+pub(super) fn lpc_synthesis<const ORDER: usize>(
     s_lpc: &mut [i32],
     a_q12: &[i16; MAX_LPC_ORDER],
     r: &[i32],
@@ -903,7 +903,7 @@ fn lpc_synthesis<const ORDER: usize>(
 }
 
 /// Scalar reference of [`lpc_synthesis`], from output `i0` on.
-fn lpc_synthesis_scalar<const ORDER: usize>(
+pub(super) fn lpc_synthesis_scalar<const ORDER: usize>(
     s_lpc: &mut [i32],
     a_q12: &[i16; MAX_LPC_ORDER],
     r: &[i32],

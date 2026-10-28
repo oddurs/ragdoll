@@ -147,7 +147,7 @@ pub fn denormalise_bands(
 
 /// One band of [`denormalise_bands`]: `out[i] = MULT16_16(x[i], g)` shifted right by `shift`
 /// (left for a negative one).
-fn denormalise_band(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
+pub(super) fn denormalise_band(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
@@ -238,7 +238,7 @@ pub fn anti_collapse(
 }
 
 /// `out[i] = MULT16_16_Q15(g, x[i])` truncated to 16 bits.
-fn mul_q15(out: &mut [i16], x: &[i16], g: i32) {
+pub(super) fn mul_q15(out: &mut [i16], x: &[i16], g: i32) {
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
