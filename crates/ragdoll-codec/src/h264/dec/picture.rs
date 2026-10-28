@@ -320,24 +320,27 @@ impl PicState {
         self.cbf_dc[addr] = 0;
         self.uniform[addr] = false;
         let (x, y) = (addr % self.mb_w, addr / self.mb_w);
-        for r in 0..4 {
-            let i = self.b4(x * 4, y * 4 + r);
-            self.nnz[i..i + 4].copy_from_slice(&[0; 4]);
-            self.nz[i..i + 4].copy_from_slice(&[false; 4]);
-            self.intra_mode[i..i + 4].copy_from_slice(&[-1; 4]);
-            self.direct[i..i + 4].copy_from_slice(&[false; 4]);
-            for l in 0..2 {
-                self.mv[l][i..i + 4].copy_from_slice(&[[0; 2]; 4]);
-                self.mvd[l][i..i + 4].copy_from_slice(&[[0; 2]; 4]);
-                self.ref_idx[l][i..i + 4].copy_from_slice(&[-1; 4]);
-                self.ref_pic[l][i..i + 4].copy_from_slice(&[NO_PIC; 4]);
+        // One bounds check per array: the macroblock's rows lie in `[i, i + 3w + 4)`.
+        fn rows<T: Copy, const N: usize>(v: &mut [T], i: usize, w: usize, val: T) {
+            let s = &mut v[i..i + (N - 1) * w + N];
+            for r in 0..N {
+                s[r * w..r * w + N].copy_from_slice(&[val; N]);
             }
         }
-        for r in 0..2 {
-            let i = self.c4(x * 2, y * 2 + r);
-            for c in &mut self.nnz_c {
-                c[i..i + 2].copy_from_slice(&[0; 2]);
-            }
+        let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
+        rows::<_, 4>(&mut self.nnz, i, w, 0);
+        rows::<_, 4>(&mut self.nz, i, w, false);
+        rows::<_, 4>(&mut self.intra_mode, i, w, -1);
+        rows::<_, 4>(&mut self.direct, i, w, false);
+        for l in 0..2 {
+            rows::<_, 4>(&mut self.mv[l], i, w, [0; 2]);
+            rows::<_, 4>(&mut self.mvd[l], i, w, [0; 2]);
+            rows::<_, 4>(&mut self.ref_idx[l], i, w, -1);
+            rows::<_, 4>(&mut self.ref_pic[l], i, w, NO_PIC);
+        }
+        let i = self.c4(x * 2, y * 2);
+        for c in &mut self.nnz_c {
+            rows::<_, 2>(c, i, self.mb_w * 2, 0);
         }
     }
 

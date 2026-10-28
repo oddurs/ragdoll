@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use ragdoll_core::{BitReader, RagdollError, Result};
 
-use crate::cabac::{CabacContext, CabacDecoder, NUM_CABAC_CONTEXTS, init_cabac_contexts};
+use crate::cabac::{
+    CabacContext, CabacDecoder, NUM_CABAC_CONTEXTS, ResidualCoeffs, init_cabac_contexts,
+};
 use crate::h264::decode_cavlc_block;
 
 use super::cabac_se;
@@ -104,6 +106,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         implicit_field,
         scratch: [[0; 256]; 2],
         partial_motion: false,
+        res: None,
     };
     d.run(first, total)
 }
@@ -162,6 +165,12 @@ struct Residual {
 }
 
 impl Residual {
+    fn is_clear(&self) -> bool {
+        self.luma.iter().flatten().all(|&v| v == 0)
+            && self.luma8.iter().flatten().all(|&v| v == 0)
+            && self.chroma.iter().flatten().flatten().all(|&v| v == 0)
+    }
+
     fn new() -> Self {
         Self {
             luma: [[0; 16]; 16],
@@ -188,6 +197,9 @@ struct Dec<'a, 'c> {
     scratch: [[u8; 256]; 2],
     /// The current MB's motion was stored for less than the whole MB, so it may vary.
     partial_motion: bool,
+    /// Residual blocks, kept zeroed between macroblocks: the inverse transforms clear what they
+    /// read, so only coded coefficients are ever written.
+    res: Option<Box<Residual>>,
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -970,7 +982,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         self.st.cbp[a] = cbp;
         let is_i16 = matches!(kind, MbType::I16x16(_));
-        let mut res = Residual::new();
+        let mut res = self.take_residual();
         if cbp != 0 || is_i16 {
             self.read_qp_delta()?;
             self.set_qp();
@@ -979,7 +991,18 @@ impl<'a, 'c> Dec<'a, 'c> {
             self.last_dqp_nz = false;
             self.set_qp();
         }
-        self.reconstruct_intra(kind, &modes, &res)
+        self.reconstruct_intra(kind, &modes, &mut res)?;
+        self.res = Some(res);
+        Ok(())
+    }
+
+    /// The zeroed residual buffer; a macroblock that fails part-way drops it, dirty.
+    fn take_residual(&mut self) -> Box<Residual> {
+        let mut res = self.res.take().unwrap_or_else(|| Box::new(Residual::new()));
+        debug_assert!(res.is_clear());
+        res.luma_coded = 0;
+        res.chroma_coded = [0; 2];
+        res
     }
 
     fn decode_pcm(&mut self) -> Result<()> {
@@ -1039,7 +1062,12 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
-    fn reconstruct_intra(&mut self, kind: MbType, modes: &[u8; 16], res: &Residual) -> Result<()> {
+    fn reconstruct_intra(
+        &mut self,
+        kind: MbType,
+        modes: &[u8; 16],
+        res: &mut Residual,
+    ) -> Result<()> {
         let (off, ls, px, py) = self.view(0);
         match kind {
             MbType::I4x4 => {
@@ -1056,7 +1084,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                             .copy_from_slice(&out[r * 4..r * 4 + 4]);
                     }
                     if res.luma_coded & (1 << blk) != 0 {
-                        recon::idct4_add(&mut plane[y * ls + x..], ls, &res.luma[blk]);
+                        recon::idct4_add(&mut plane[y * ls + x..], ls, &mut res.luma[blk]);
                     }
                 }
             }
@@ -1074,7 +1102,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                             .copy_from_slice(&out[r * 8..r * 8 + 8]);
                     }
                     if res.luma_coded & (0xF << (b8 * 4)) != 0 {
-                        recon::idct8_add(&mut plane[y * ls + x..], ls, &res.luma8[b8]);
+                        recon::idct8_add(&mut plane[y * ls + x..], ls, &mut res.luma8[b8]);
                     }
                 }
             }
@@ -1096,7 +1124,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     if res.luma_coded & (1 << blk) != 0 {
                         let (bx, by) = BLK4_XY[blk];
                         let o = (py + by * 4) * ls + px + bx * 4;
-                        recon::idct4_add(&mut plane[o..], ls, &res.luma[blk]);
+                        recon::idct4_add(&mut plane[o..], ls, &mut res.luma[blk]);
                     }
                 }
             }
@@ -1126,13 +1154,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
-    fn add_chroma_residual(&mut self, res: &Residual) {
+    fn add_chroma_residual(&mut self, res: &mut Residual) {
         let (off, cs, cx, cy) = self.view(1);
         for p in 0..2 {
             for blk in 0..4 {
                 if res.chroma_coded[p] & (1 << blk) != 0 {
                     let o = off + (cy + (blk >> 1) * 4) * cs + cx + (blk & 1) * 4;
-                    recon::idct4_add(&mut self.st.planes[1 + p][o..], cs, &res.chroma[p][blk]);
+                    recon::idct4_add(&mut self.st.planes[1 + p][o..], cs, &mut res.chroma[p][blk]);
                 }
             }
         }
@@ -1275,6 +1303,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let lst = if intra { 0 } else { 3 };
         let cabac = self.is_cabac();
         let dq = self.cx.dq;
+        let mut coeffs = ResidualCoeffs::new();
 
         if is_i16 {
             let mut sc = [0i16; 16];
@@ -1307,21 +1336,29 @@ impl<'a, 'c> Dec<'a, 'c> {
                 continue;
             }
             if t8 {
-                let mut sc = [0i16; 64];
-                let mut total = 0;
+                let l8 = if intra { 0 } else { 1 };
                 if cabac {
                     let (cd, ctxs) = self.cabac();
-                    total = cd
-                        .decode_residual_block(&mut ctxs[..], 5, 0, &mut sc, field)
-                        .1;
-                    for i in 0..4 {
-                        let blk = b8 * 4 + i;
-                        let (bx, by) = BLK4_XY[blk];
-                        let j = self.st.b4(mx4 + bx, my4 + by);
+                    let total =
+                        cd.decode_residual_coeffs(&mut ctxs[..], 5, 0, 64, field, &mut coeffs);
+                    let (bx, by) = BLK4_XY[b8 * 4];
+                    let (j0, j1) = (
+                        self.st.b4(mx4 + bx, my4 + by),
+                        self.st.b4(mx4 + bx, my4 + by + 1),
+                    );
+                    for j in [j0, j0 + 1, j1, j1 + 1] {
                         self.st.nnz[j] = total as u8;
                         self.st.nz[j] = total > 0;
                     }
-                } else {
+                    if total > 0 {
+                        dq.scale8_coeffs(l8, qp, &coeffs, total, scan8, &mut res.luma8[b8]);
+                        res.luma_coded |= 0xF << (b8 * 4);
+                    }
+                    continue;
+                }
+                let mut sc = [0i16; 64];
+                let mut total = 0;
+                {
                     for i in 0..4 {
                         let blk = b8 * 4 + i;
                         let (bx, by) = BLK4_XY[blk];
@@ -1345,7 +1382,6 @@ impl<'a, 'c> Dec<'a, 'c> {
                     }
                 }
                 if total > 0 {
-                    let l8 = if intra { 0 } else { 1 };
                     dq.scale8_block(l8, qp, &sc, scan8, &mut res.luma8[b8]);
                     res.luma_coded |= 0xF << (b8 * 4);
                 }
@@ -1356,24 +1392,30 @@ impl<'a, 'c> Dec<'a, 'c> {
                 let (bx, by) = BLK4_XY[blk];
                 let (x4, y4) = (mx4 + bx, my4 + by);
                 let max = if is_i16 { 15 } else { 16 };
-                let mut sc = [0i16; 16];
+                // Intra_16x16 blocks keep their DC at position 0 (scan offset 1).
+                let out = &mut res.luma[blk];
                 let n = if cabac {
                     let inc = self.cbf_luma_inc(bx, by, intra);
                     let cat = if is_i16 { 1 } else { 2 };
                     let (cd, ctxs) = self.cabac();
-                    cd.decode_residual_block(&mut ctxs[..], cat, inc, &mut sc[..max], field)
-                        .1
+                    let n =
+                        cd.decode_residual_coeffs(&mut ctxs[..], cat, inc, max, field, &mut coeffs);
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
+                    n
                 } else {
+                    let mut sc = [0i16; 16];
                     let nc = self.nc_luma(bx, by);
                     let r = self.reader();
-                    decode_cavlc_block(r, &mut sc[..max], nc, false)?
+                    let n = decode_cavlc_block(r, &mut sc[..max], nc, false)?;
+                    if n > 0 {
+                        dq.scale4_block(lst, qp, &sc[..max], 16 - max, scan4, out);
+                    }
+                    n
                 };
                 let j = self.st.b4(x4, y4);
                 self.st.nnz[j] = n as u8;
                 self.st.nz[j] = n > 0;
                 if n > 0 {
-                    // Intra_16x16 blocks keep their DC at position 0 (scan offset 1).
-                    dq.scale4_block(lst, qp, &sc[..max], 16 - max, scan4, &mut res.luma[blk]);
                     res.luma_coded |= 1 << blk;
                 }
             }
@@ -1416,22 +1458,27 @@ impl<'a, 'c> Dec<'a, 'c> {
             for blk in 0..4 {
                 let (bx, by) = (blk & 1, blk >> 1);
                 let (x4, y4) = (cx4 + bx, cy4 + by);
-                let mut sc = [0i16; 15];
+                let out = &mut res.chroma[p][blk];
                 let n = if cabac {
                     let inc = self.cbf_chroma_ac_inc(p, bx, by, intra);
                     let (cd, ctxs) = self.cabac();
-                    cd.decode_residual_block(&mut ctxs[..], 4, inc, &mut sc, field)
-                        .1
+                    let n =
+                        cd.decode_residual_coeffs(&mut ctxs[..], 4, inc, 15, field, &mut coeffs);
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
+                    n
                 } else {
+                    let mut sc = [0i16; 15];
                     let nc = self.nc_chroma(p, bx, by);
                     let r = self.reader();
-                    decode_cavlc_block(r, &mut sc, nc, false)?
+                    let n = decode_cavlc_block(r, &mut sc, nc, false)?;
+                    if n > 0 {
+                        dq.scale4_block(lst + 1 + p, qpc[p] as i32, &sc, 1, scan4, out);
+                    }
+                    n
                 };
                 let j = self.st.c4(x4, y4);
                 self.st.nnz_c[p][j] = n as u8;
                 if n > 0 {
-                    let out = &mut res.chroma[p][blk];
-                    dq.scale4_block(lst + 1 + p, qpc[p] as i32, &sc, 1, scan4, out);
                     res.chroma_coded[p] |= 1 << blk;
                 }
             }
@@ -2055,7 +2102,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             t8 = self.read_transform_8x8()?;
         }
         self.st.t8x8[a] = t8;
-        let mut res = Residual::new();
+        let mut res = self.take_residual();
         if cbp != 0 {
             self.read_qp_delta()?;
             self.set_qp();
@@ -2070,7 +2117,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             for b8 in 0..4 {
                 if res.luma_coded & (0xF << (b8 * 4)) != 0 {
                     let off = o + (py + (b8 >> 1) * 8) * ls + px + (b8 & 1) * 8;
-                    recon::idct8_add(&mut self.st.planes[0][off..], ls, &res.luma8[b8]);
+                    recon::idct8_add(&mut self.st.planes[0][off..], ls, &mut res.luma8[b8]);
                 }
             }
         } else {
@@ -2078,13 +2125,14 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if res.luma_coded & (1 << blk) != 0 {
                     let (bx, by) = BLK4_XY[blk];
                     let off = o + (py + by * 4) * ls + px + bx * 4;
-                    recon::idct4_add(&mut self.st.planes[0][off..], ls, &res.luma[blk]);
+                    recon::idct4_add(&mut self.st.planes[0][off..], ls, &mut res.luma[blk]);
                 }
             }
         }
         if self.cx.sps.chroma_array_type() != 0 {
-            self.add_chroma_residual(&res);
+            self.add_chroma_residual(&mut res);
         }
+        self.res = Some(res);
         Ok(())
     }
 

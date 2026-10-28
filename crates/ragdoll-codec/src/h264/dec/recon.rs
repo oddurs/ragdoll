@@ -9,6 +9,7 @@ use ragdoll_simd::{
 
 use super::ps::WeightScales;
 use super::tables::{NORM_ADJUST_4X4, NORM_ADJUST_8X8, SCAN4X4, SCAN8X8, norm4_class, norm8_class};
+use crate::cabac::ResidualCoeffs;
 
 /// `LevelScale4x4` and `LevelScale8x8` for the active scaling matrices, indexed by raster position.
 pub struct Dequant {
@@ -67,6 +68,65 @@ impl Dequant {
             let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
             for (&c, &pos) in sc.iter().zip(scan) {
                 out[pos] = (c as i32 * ls[pos] + rnd) >> sh;
+            }
+        }
+    }
+
+    /// [`Dequant::scale4_block`] for the `n` nonzero coefficients of `c`, whose scan positions
+    /// start at `off`; other positions of `out` are left as they are.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale4_coeffs(
+        &self,
+        list: usize,
+        qp: i32,
+        c: &ResidualCoeffs,
+        n: usize,
+        off: usize,
+        scan: &[usize; 16],
+        out: &mut [i32; 16],
+    ) {
+        let ls = &self.ls4[list][(qp % 6) as usize];
+        let (pos, level) = (&c.pos[..n], &c.level[..n]);
+        if qp >= 24 {
+            let sh = qp / 6 - 4;
+            for (&k, &v) in pos.iter().zip(level) {
+                let p = scan[(k as usize + off) & 15] & 15;
+                out[p] = (v as i32 * ls[p]) << sh;
+            }
+        } else {
+            let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
+            for (&k, &v) in pos.iter().zip(level) {
+                let p = scan[(k as usize + off) & 15] & 15;
+                out[p] = (v as i32 * ls[p] + rnd) >> sh;
+            }
+        }
+    }
+
+    /// [`Dequant::scale4_coeffs`] for an 8x8 block.
+    #[inline]
+    pub fn scale8_coeffs(
+        &self,
+        list: usize,
+        qp: i32,
+        c: &ResidualCoeffs,
+        n: usize,
+        scan: &[usize; 64],
+        out: &mut [i32; 64],
+    ) {
+        let ls = &self.ls8[list][(qp % 6) as usize];
+        let (pos, level) = (&c.pos[..n], &c.level[..n]);
+        if qp >= 36 {
+            let sh = qp / 6 - 6;
+            for (&k, &v) in pos.iter().zip(level) {
+                let p = scan[k as usize & 63];
+                out[p & 63] = (v as i32 * ls[p & 63]) << sh;
+            }
+        } else {
+            let (sh, rnd) = (6 - qp / 6, 1 << (5 - qp / 6));
+            for (&k, &v) in pos.iter().zip(level) {
+                let p = scan[k as usize & 63];
+                out[p & 63] = (v as i32 * ls[p & 63] + rnd) >> sh;
             }
         }
     }
@@ -148,10 +208,12 @@ fn clip(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-/// Inverse 4x4 transform of raster coefficients `d` and addition to `dst` (8.5.12.2).
+/// Inverse 4x4 transform of raster coefficients `d` and addition to `dst` (8.5.12.2); `d` is
+/// zeroed for the next block.
 #[inline]
-pub fn idct4_add(dst: &mut [u8], stride: usize, d: &[i32; 16]) {
+pub fn idct4_add(dst: &mut [u8], stride: usize, d: &mut [i32; 16]) {
     h264_idct4_add(dst, stride, d);
+    *d = [0; 16];
 }
 
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
@@ -183,8 +245,9 @@ fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
     ]
 }
 
-/// Inverse 8x8 transform of raster coefficients `d` and addition to `dst` (8.5.13.2).
-pub fn idct8_add(dst: &mut [u8], stride: usize, d: &[i32; 64]) {
+/// Inverse 8x8 transform of raster coefficients `d` and addition to `dst` (8.5.13.2); `d` is
+/// zeroed for the next block.
+pub fn idct8_add(dst: &mut [u8], stride: usize, d: &mut [i32; 64]) {
     let mut g = [0i32; 64];
     for i in 0..8 {
         let mut row = [0i32; 8];
@@ -198,6 +261,7 @@ pub fn idct8_add(dst: &mut [u8], stride: usize, d: &[i32; 64]) {
             *p = clip(*p as i32 + ((v + 32) >> 6));
         }
     }
+    *d = [0; 64];
 }
 
 /// Columns of the stack window an edge-extended luma or chroma block is copied into.
