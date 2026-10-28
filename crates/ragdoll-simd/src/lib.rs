@@ -4,9 +4,11 @@
 //!
 //! - [`scan`]: Vectorized Annex-B NAL start-code (`0x000001` / `0x00000001`) and MPEG-TS `0x47` sync-byte scanners.
 //! - [`metrics`]: NEON-accelerated block/plane SAD, SSE, and single-pass $8\times8$ SSIM window statistics.
+//! - [`dct4`]: Power-of-two DCT-IV (the AAC-LC IMDCT core) through a precomputed-twiddle complex FFT.
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
 pub mod audio_dsp;
+pub mod dct4;
 pub mod fixed;
 pub mod h264_dsp;
 pub mod metrics;
@@ -26,6 +28,7 @@ pub use audio_dsp::{
     window_overlap_add_f32_scalar,
 };
 
+pub use dct4::{Dct4Plan, imdct_window, imdct_window_scalar};
 pub use fixed::{
     Q14_HALF, Q14_ONE, add4x4_idct_u8, clamp_u8, convolve_8tap_q14_u8, convolve_8tap_q14_u8_scalar,
     forward_dct4x4, forward_dct4x4_scalar, forward_dct8x8, hadamard4x4, hadamard4x4_scalar,

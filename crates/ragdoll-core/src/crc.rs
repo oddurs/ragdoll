@@ -107,9 +107,101 @@ pub fn crc8_flac(data: &[u8]) -> u8 {
     crc8_flac_update(0, data)
 }
 
+/// Updates a running FLAC CRC-16 (`poly = 0x8005`, MSB-first).
+///
+/// Inputs of 64 bytes or more fold 16 bytes per carry-less multiply on CPUs with `PCLMULQDQ`
+/// (x86_64 AVX2 dispatch level) or `PMULL` (aarch64 NEON level with the AES extension); everything
+/// else uses Slicing-by-8 ([`crc16_flac_update_scalar`]).
+#[inline]
+pub fn crc16_flac_update(crc: u16, data: &[u8]) -> u16 {
+    if data.len() >= 64 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::dispatch::avx2() && std::is_x86_feature_detected!("pclmulqdq") {
+            // Safety: AVX2 implies SSSE3/SSE4.1, and PCLMULQDQ was detected just above.
+            return unsafe { crc16_flac_update_clmul(crc, data) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        if crate::dispatch::neon() && std::arch::is_aarch64_feature_detected!("aes") {
+            // Safety: NEON is baseline on aarch64 and the AES extension (PMULL) was detected.
+            return unsafe { crc16_flac_update_pmull(crc, data) };
+        }
+    }
+    crc16_flac_update_scalar(crc, data)
+}
+
+/// `x^n mod P(x)` for the FLAC CRC-16 polynomial `P = x^16 + x^15 + x^2 + 1`.
+const fn crc16_flac_xpow_mod(n: u32) -> u64 {
+    let mut r = 1u32;
+    let mut i = 0;
+    while i < n {
+        r <<= 1;
+        if r & 0x1_0000 != 0 {
+            r ^= 0x1_8005;
+        }
+        i += 1;
+    }
+    r as u64
+}
+
+/// Folding constants: a 128-bit block `X = hi * x^64 + lo` followed by 128 more message bits is
+/// congruent to `hi * (x^192 mod P) + lo * (x^128 mod P)` modulo `P`.
+const CRC16_FLAC_FOLD_HI: u64 = crc16_flac_xpow_mod(192);
+const CRC16_FLAC_FOLD_LO: u64 = crc16_flac_xpow_mod(128);
+
+/// Carry-less folding CRC-16 (Intel, "Fast CRC Computation for Generic Polynomials Using
+/// PCLMULQDQ"): the message is reduced 16 bytes at a time to a congruent 16-byte remainder, whose
+/// CRC (followed by the unaligned tail) is the CRC of the whole message. The running `crc` enters
+/// by XOR into the first two message bytes, as the CRC has no reflection or output XOR.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,ssse3,sse4.1")]
+unsafe fn crc16_flac_update_clmul(crc: u16, data: &[u8]) -> u16 {
+    use std::arch::x86_64::*;
+    let (blocks, tail) = data.as_chunks::<16>();
+    let reverse = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    // Message byte 0 becomes the most significant byte of the 128-bit polynomial.
+    let load = |b: &[u8; 16]| unsafe {
+        _mm_shuffle_epi8(_mm_loadu_si128(b.as_ptr() as *const __m128i), reverse)
+    };
+    let k = _mm_set_epi64x(CRC16_FLAC_FOLD_HI as i64, CRC16_FLAC_FOLD_LO as i64);
+    let mut x = _mm_xor_si128(
+        load(&blocks[0]),
+        _mm_set_epi64x(((crc as u64) << 48) as i64, 0),
+    );
+    for b in &blocks[1..] {
+        let hi = _mm_clmulepi64_si128(x, k, 0x11);
+        let lo = _mm_clmulepi64_si128(x, k, 0x00);
+        x = _mm_xor_si128(_mm_xor_si128(hi, lo), load(b));
+    }
+    let mut rem = [0u8; 16];
+    unsafe {
+        _mm_storeu_si128(
+            rem.as_mut_ptr() as *mut __m128i,
+            _mm_shuffle_epi8(x, reverse),
+        )
+    };
+    crc16_flac_update_scalar(crc16_flac_update_scalar(0, &rem), tail)
+}
+
+/// aarch64 `PMULL` twin of [`crc16_flac_update_clmul`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,aes")]
+unsafe fn crc16_flac_update_pmull(crc: u16, data: &[u8]) -> u16 {
+    use std::arch::aarch64::*;
+    let (blocks, tail) = data.as_chunks::<16>();
+    // Message byte 0 becomes the most significant byte of the 128-bit polynomial.
+    let load = |b: &[u8; 16]| -> u128 { u128::from_be_bytes(*b) };
+    let mut x = load(&blocks[0]) ^ ((crc as u128) << 112);
+    for b in &blocks[1..] {
+        let hi = vmull_p64((x >> 64) as u64, CRC16_FLAC_FOLD_HI);
+        let lo = vmull_p64(x as u64, CRC16_FLAC_FOLD_LO);
+        x = hi ^ lo ^ load(b);
+    }
+    crc16_flac_update_scalar(crc16_flac_update_scalar(0, &x.to_be_bytes()), tail)
+}
+
 /// Updates a running FLAC CRC-16 (`poly = 0x8005`, MSB-first) using Slicing-by-8 (`libFLAC` algorithm).
 #[inline]
-pub fn crc16_flac_update(mut crc: u16, data: &[u8]) -> u16 {
+pub fn crc16_flac_update_scalar(mut crc: u16, data: &[u8]) -> u16 {
     let (chunks, remainder) = data.as_chunks::<8>();
     for chunk in chunks {
         crc ^= ((chunk[0] as u16) << 8) | (chunk[1] as u16);
@@ -243,4 +335,37 @@ pub fn adler32(data: &[u8]) -> u32 {
         s2 %= MOD_ADLER;
     }
     (s2 << 16) | s1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc16_flac_dispatch_matches_scalar() {
+        // Odd lengths around the 64-byte dispatch threshold and the 16-byte fold, running CRCs and
+        // extremal bytes.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = vec![0u8; 5000];
+        for b in &mut data {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = seed as u8;
+        }
+        for len in (0..300).chain([1023, 1024, 1025, 4096, 4999, 5000]) {
+            for init in [0u16, 1, 0x8005, 0xFFFF] {
+                let msg = &data[..len];
+                assert_eq!(
+                    crc16_flac_update(init, msg),
+                    crc16_flac_update_scalar(init, msg),
+                    "len {len} init {init:#06x}"
+                );
+            }
+        }
+        for fill in [0x00u8, 0xFF] {
+            let msg = vec![fill; 777];
+            assert_eq!(crc16_flac(&msg), crc16_flac_update_scalar(0, &msg));
+        }
+    }
 }
