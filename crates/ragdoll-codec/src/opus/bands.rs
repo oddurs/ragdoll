@@ -1093,6 +1093,9 @@ pub struct AllBands<'a> {
     pub disable_inv: bool,
     /// Encoder complexity; 8 and above enables the stereo theta RDO search.
     pub complexity: i32,
+    /// Working memory for the normalised spectrum that later bands fold from, at least
+    /// `C * 8 * 78` values. It needs no clearing: every value read is written first.
+    pub norm: &'a mut [i16],
 }
 
 /// `quant_all_bands`: codes every band of `x` (`C` channels of `120 << LM` coefficients).
@@ -1115,13 +1118,13 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         coded_bands,
         disable_inv,
         complexity,
+        norm: norm_scratch,
     } = p;
     let m = 1usize << lm;
     let bb: i32 = if short_blocks { m as i32 } else { 1 };
     let norm_offset = m * EBANDS[start] as usize;
     let nsize = m * EBANDS[NB_EBANDS - 1] as usize - norm_offset;
-    let mut norm_buf = [0i16; 2 * 8 * 78];
-    let norm = &mut norm_buf[..c * nsize];
+    let norm = &mut norm_scratch[..c * nsize];
     let norm2_off = nsize;
     let theta_rdo = encode && c == 2 && !dual_stereo && complexity >= 8;
     let resynth = !encode || theta_rdo;

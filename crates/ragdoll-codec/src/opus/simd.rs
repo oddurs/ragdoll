@@ -621,6 +621,68 @@ unsafe fn fft5_neon(f: *mut i32, tw: &[i32], s: &Stage) {
     }
 }
 
+/// AVX2 [`super::mdct::tdac_mirror_scalar`] over whole vectors of eight pairs; returns how
+/// many pairs it did.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn tdac_mirror_avx2(out: &mut [i32], window: &[i16]) -> usize {
+    use avx2::*;
+    use std::arch::x86_64::*;
+    let overlap = out.len();
+    let half = overlap / 2;
+    assert!(window.len() >= overlap);
+    let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    let op = out.as_mut_ptr();
+    let wp = window.as_ptr();
+    let mut i = 0;
+    while i + 8 <= half {
+        // Safety: the front values i..i + 8 and the back values overlap - 8 - i..overlap - i
+        // are in `out` and disjoint (i + 8 <= overlap / 2), and so are the window reads.
+        unsafe {
+            let w16 = |p: *const i16| _mm256_cvtepi16_epi32(_mm_loadu_si128(p as *const __m128i));
+            let back = overlap - 8 - i;
+            let x2 = ld(op.add(i));
+            let x1 = _mm256_permutevar8x32_epi32(ld(op.add(back)), rev);
+            let w1 = w16(wp.add(i));
+            let w2 = _mm256_permutevar8x32_epi32(w16(wp.add(back)), rev);
+            let a = _mm256_sub_epi32(mulq15(x2, w2), mulq15(x1, w1));
+            let b = _mm256_add_epi32(mulq15(x2, w1), mulq15(x1, w2));
+            st(op.add(i), a);
+            st(op.add(back), _mm256_permutevar8x32_epi32(b, rev));
+        }
+        i += 8;
+    }
+    i
+}
+
+/// AVX2 `SATURATE(x, lim)` in place.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn saturate_avx2(x: &mut [i32], lim: i32) {
+    use std::arch::x86_64::*;
+    let (hi, lo) = (_mm256_set1_epi32(lim), _mm256_set1_epi32(-lim));
+    let mut chunks = x.chunks_exact_mut(8);
+    for c in &mut chunks {
+        // Safety: `c` holds 8 values.
+        unsafe {
+            let v = _mm256_loadu_si256(c.as_ptr() as *const __m256i);
+            let v = _mm256_max_epi32(_mm256_min_epi32(v, hi), lo);
+            _mm256_storeu_si256(c.as_mut_ptr() as *mut __m256i, v);
+        }
+    }
+    for v in chunks.into_remainder() {
+        *v = (*v).clamp(-lim, lim);
+    }
+}
+
 /// AVX2 [`super::mdct::pre_rotate`].
 ///
 /// # Safety
@@ -1063,6 +1125,48 @@ pub unsafe fn sig2word16_avx2(out: &mut [i16], x: &[i32]) -> usize {
         }
     }
     n
+}
+
+/// AVX2 [`super::rate::bits2pulses_scalar`] on the band's pulse cache `c`: the cache is
+/// non-decreasing, so the binary search ends where the entries reach `bits - 1`, which a
+/// vector compare counts without the search's dependent loads and branches.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn bits2pulses_avx2(c: &[u8], bits: i32) -> i32 {
+    use std::arch::x86_64::*;
+    let max = c[0] as usize;
+    let t = (bits - 1).clamp(0, 256);
+    let lo = if t == 0 {
+        0
+    } else {
+        // The entries c[1..=max] (at most 40), read 64 at a time; near the end of the table
+        // they are copied out first. Lanes past `max` are masked off below.
+        let mut buf = [0u8; 64];
+        let src: &[u8] = if c.len() > 64 {
+            &c[1..65]
+        } else {
+            buf[..max].copy_from_slice(&c[1..=max]);
+            &buf
+        };
+        let lim = _mm256_set1_epi8((t - 1) as u8 as i8);
+        // Safety: `src` is 64 bytes.
+        let (a, b) = unsafe {
+            (
+                _mm256_loadu_si256(src.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(32) as *const __m256i),
+            )
+        };
+        // Entries at most t - 1 are those below t.
+        let ma = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(a, lim), a)) as u32;
+        let mb = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(b, lim), b)) as u32;
+        let m = (ma as u64 | ((mb as u64) << 32)) & ((1u64 << max) - 1);
+        m.count_ones() as i32
+    };
+    super::rate::bits2pulses_pick(c, bits, lo)
 }
 
 /// One sample of the constant-gain comb filter, as [`comb_const_avx2`] defines it.
@@ -1567,6 +1671,26 @@ mod tests {
                 fft_impl_scalar(st, &mut a);
                 fft_impl(st, &mut b);
                 assert_eq!(a, b, "nfft {} amp {amp}", n / 2);
+            }
+        }
+    }
+
+    #[test]
+    fn bits2pulses_matches_scalar() {
+        use super::super::rate::{bits2pulses, bits2pulses_scalar};
+        use super::super::celt_tables::CACHE_INDEX;
+        for lm in -1..=3 {
+            for band in 0..21 {
+                if CACHE_INDEX[(lm + 1) as usize * 21 + band] < 0 {
+                    continue;
+                }
+                for bits in -300..3000 {
+                    assert_eq!(
+                        bits2pulses(band, lm, bits),
+                        bits2pulses_scalar(band, lm, bits),
+                        "band {band} lm {lm} bits {bits}"
+                    );
+                }
             }
         }
     }

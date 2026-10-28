@@ -422,11 +422,27 @@ pub fn mdct_backward(
     );
     fft_impl(st, &mut out[yo..yo + n2]);
     post_rotate(&mut out[yo..yo + n2], t);
-    // Mirror on both sides for TDAC.
-    let (head, _) = out.split_at_mut(overlap);
-    let (lo, hi) = head.split_at_mut(overlap / 2);
+    tdac_mirror(&mut out[..overlap], &window[..overlap]);
+}
+
+/// The TDAC mirroring at the start of the inverse MDCT output: `out` and `window` hold
+/// `overlap` values, folded about the middle.
+pub(super) fn tdac_mirror(out: &mut [i32], window: &[i16]) {
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        done = unsafe { super::simd::tdac_mirror_avx2(out, window) };
+    }
+    tdac_mirror_scalar(out, window, done);
+}
+
+/// Scalar reference of [`tdac_mirror`], from pair `i0` on.
+pub fn tdac_mirror_scalar(out: &mut [i32], window: &[i16], i0: usize) {
+    let overlap = out.len();
+    let (lo, hi) = out.split_at_mut(overlap / 2);
     let (wlo, whi) = window[..overlap].split_at(overlap / 2);
-    for (i, (x2, x1)) in lo.iter_mut().zip(hi.iter_mut().rev()).enumerate() {
+    for (i, (x2, x1)) in lo.iter_mut().zip(hi.iter_mut().rev()).enumerate().skip(i0) {
         let (w1, w2) = (wlo[i] as i32, whi[overlap / 2 - 1 - i] as i32);
         let (v1, v2) = (*x1, *x2);
         *x2 = mul16_32_q15(w2, v2).wrapping_sub(mul16_32_q15(w1, v1));

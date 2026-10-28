@@ -33,6 +33,16 @@ fn cache(band: usize, lm: i32) -> &'static [u8] {
 
 /// `bits2pulses`.
 pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd::bits2pulses_avx2(cache(band, lm), bits) };
+    }
+    bits2pulses_scalar(band, lm, bits)
+}
+
+/// Scalar reference of [`bits2pulses`]: a binary search of the band's pulse cache.
+pub fn bits2pulses_scalar(band: usize, lm: i32, bits: i32) -> i32 {
     let c = cache(band, lm);
     let mut lo = 0i32;
     let mut hi = c[0] as i32;
@@ -45,6 +55,21 @@ pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
             lo = mid;
         }
     }
+    let lo_bits = if lo == 0 { -1 } else { c[lo as usize] as i32 };
+    if bits - lo_bits <= c[hi as usize] as i32 - bits {
+        lo
+    } else {
+        hi
+    }
+}
+
+/// The end of [`bits2pulses`] once the search has found `lo`, the number of cache entries
+/// (`c[1..=c[0]]`, non-decreasing) below `bits - 1`.
+#[inline]
+pub(super) fn bits2pulses_pick(c: &[u8], bits: i32, lo: i32) -> i32 {
+    let bits = bits - 1;
+    let max = c[0] as i32;
+    let (lo, hi) = if lo == max { (max, max) } else { (lo, lo + 1) };
     let lo_bits = if lo == 0 { -1 } else { c[lo as usize] as i32 };
     if bits - lo_bits <= c[hi as usize] as i32 - bits {
         lo

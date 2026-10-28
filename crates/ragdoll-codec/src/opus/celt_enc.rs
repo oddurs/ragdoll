@@ -669,6 +669,7 @@ impl CeltEncoder {
                 coded_bands,
                 disable_inv: self.disable_inv,
                 complexity: self.complexity,
+                norm: &mut [0; 2 * 8 * 78],
             },
             &mut x,
             c,
