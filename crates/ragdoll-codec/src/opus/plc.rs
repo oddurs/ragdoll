@@ -517,7 +517,13 @@ unsafe fn comb_filter_raw(
 /// # Safety
 ///
 /// As [`super::simd::comb_const_avx2`].
-pub(super) unsafe fn comb_const_scalar(y: *mut i32, x: *const i32, n: usize, t: usize, g: [i32; 3]) {
+pub(super) unsafe fn comb_const_scalar(
+    y: *mut i32,
+    x: *const i32,
+    n: usize,
+    t: usize,
+    g: [i32; 3],
+) {
     for i in 0..n {
         // Safety: per the function contract.
         unsafe {

@@ -29,8 +29,8 @@ mod range;
 mod rate;
 mod silk;
 mod silk_dsp;
-mod simd;
 mod silk_tables;
+mod simd;
 mod vq;
 
 use ragdoll_core::{

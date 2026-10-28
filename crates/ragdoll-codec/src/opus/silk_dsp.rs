@@ -776,7 +776,12 @@ fn up2_hq(s: &mut [i32; 6], out: &mut [i16], input: &[i16]) {
         *st = x + xx;
         o
     };
-    for (o, &x) in out[..2 * input.len()].chunks_exact_mut(2).zip(input) {
+    for (o, &x) in out[..2 * input.len()]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(input)
+    {
         let in32 = (x as i32) << 10;
         let a = section(&mut st[0], in32, UP2_HQ_0[0], false);
         let a = section(&mut st[1], a, UP2_HQ_0[1], false);

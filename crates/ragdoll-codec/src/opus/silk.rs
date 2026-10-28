@@ -1435,7 +1435,7 @@ impl SilkDecoder {
                     *o = v;
                 }
             } else {
-                for o in out[..2 * n_out].chunks_exact_mut(2) {
+                for o in out[..2 * n_out].as_chunks_mut::<2>().0 {
                     o[1] = o[0];
                 }
             }

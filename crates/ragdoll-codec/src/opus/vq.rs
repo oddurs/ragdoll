@@ -3,11 +3,11 @@
 
 use std::sync::OnceLock;
 
+use super::bands::MAX_BAND;
 use super::math::{
     add16, atan2p, cos_norm, div, ilog2, inner_prod, mac16, mul16, mul16_32_q16, mul16_p15,
     mul16_q15, pshr32, rcp, rsqrt_norm, sqrt, vshr32,
 };
-use super::bands::MAX_BAND;
 use super::range::Ec;
 
 pub const SPREAD_NONE: i32 = 0;

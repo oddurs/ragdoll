@@ -516,30 +516,12 @@ impl CeltDecoder {
             }
         };
         if cc == 2 && c == 1 {
-            denormalise_bands(
-                x,
-                freq,
-                &self.old_band_e,
-                start,
-                eff_end,
-                m,
-                ds,
-                silence,
-            );
+            denormalise_bands(x, freq, &self.old_band_e, start, eff_end, m, ds, silence);
             backward(&mut self.decode_mem, 0, freq);
             backward(&mut self.decode_mem, 1, freq);
         } else if cc == 1 && c == 2 {
             let freq2 = &mut freq2[..n];
-            denormalise_bands(
-                x,
-                freq,
-                &self.old_band_e,
-                start,
-                eff_end,
-                m,
-                ds,
-                silence,
-            );
+            denormalise_bands(x, freq, &self.old_band_e, start, eff_end, m, ds, silence);
             denormalise_bands(
                 &x[n..],
                 freq2,
@@ -583,7 +565,9 @@ impl CeltDecoder {
         let ds = self.downsample;
         let nd = n / ds;
         let mem = &self.decode_mem;
-        let x = |ch: usize| &mem[ch * STRIDE + DECODE_BUFFER_SIZE - n..ch * STRIDE + DECODE_BUFFER_SIZE];
+        let x = |ch: usize| {
+            &mem[ch * STRIDE + DECODE_BUFFER_SIZE - n..ch * STRIDE + DECODE_BUFFER_SIZE]
+        };
         let step = |mm: &mut i32, v: i32| {
             let tmp = v.wrapping_add(*mm);
             *mm = mul16_32_q15(PREEMPH, tmp);
@@ -606,7 +590,7 @@ impl CeltDecoder {
                 // chain, checking each sum; one that wraps leaves for the exact loop.
                 let (mut f0, mut f1) = (m0 as i64, m1 as i64);
                 let mut k = 0;
-                for ((t, &a), &b) in t.chunks_exact_mut(2).zip(a).zip(b) {
+                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b) {
                     let (s0, s1) = (a as i64 + f0, b as i64 + f1);
                     if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
                         break;
@@ -618,7 +602,7 @@ impl CeltDecoder {
                     k += 1;
                 }
                 (m0, m1) = (f0 as i32, f1 as i32);
-                for ((t, &a), &b) in t.chunks_exact_mut(2).zip(a).zip(b).skip(k) {
+                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b).skip(k) {
                     t[0] = step(&mut m0, a);
                     t[1] = step(&mut m1, b);
                 }
@@ -636,7 +620,11 @@ impl CeltDecoder {
                 for &xv in &xs[1..] {
                     step(&mut mm, xv);
                 }
-                *o = if accum { sat16(*o as i32 + v as i32) } else { v };
+                *o = if accum {
+                    sat16(*o as i32 + v as i32)
+                } else {
+                    v
+                };
             }
             for &xv in &x(ch)[nd * ds..] {
                 step(&mut mm, xv);

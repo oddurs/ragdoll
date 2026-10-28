@@ -38,6 +38,11 @@ pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
         // Safety: avx2() is true only when the CPU supports AVX2.
         return unsafe { super::simd::bits2pulses_avx2(cache(band, lm), bits) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd::bits2pulses_neon(cache(band, lm), bits) };
+    }
     bits2pulses_scalar(band, lm, bits)
 }
 

@@ -316,7 +316,15 @@ fn stereo_merge(x: &mut [i16], y: &mut [i16], mid: i32, n: usize) {
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
         if unsafe {
-            super::simd::stereo_merge_avx2(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1)
+            super::simd::stereo_merge_avx2(
+                &mut x[..n],
+                &mut y[..n],
+                mid,
+                lgain,
+                kl + 1,
+                rgain,
+                kr + 1,
+            )
         } {
             return;
         }

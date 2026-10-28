@@ -428,13 +428,14 @@ pub fn mdct_backward(
 /// The TDAC mirroring at the start of the inverse MDCT output: `out` and `window` hold
 /// `overlap` values, folded about the middle.
 pub(super) fn tdac_mirror(out: &mut [i32], window: &[i16]) {
-    let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: avx2() is true only when the CPU supports AVX2.
-        done = unsafe { super::simd::tdac_mirror_avx2(out, window) };
+        let done = unsafe { super::simd::tdac_mirror_avx2(out, window) };
+        tdac_mirror_scalar(out, window, done);
+        return;
     }
-    tdac_mirror_scalar(out, window, done);
+    tdac_mirror_scalar(out, window, 0);
 }
 
 /// Scalar reference of [`tdac_mirror`], from pair `i0` on.
@@ -599,7 +600,7 @@ pub fn mdct_forward(
     fft_impl(st, f2);
     let mut yp1 = 0usize;
     let mut yp2 = stride * (n2 - 1);
-    for (i, fp) in f2.chunks_exact(2).enumerate() {
+    for (i, fp) in f2.as_chunks::<2>().0.iter().enumerate() {
         let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
         let yr = smul(fp[1], t1).wrapping_sub(smul(fp[0], t0));
         let yi = smul(fp[0], t1).wrapping_add(smul(fp[1], t0));

@@ -171,8 +171,8 @@ pub unsafe fn fft_avx2(st: &FftState, f: &mut [i32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fft4_m1_avx2(f: &mut [i32], n: usize) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let neg3 = _mm256_setr_epi32(1, 1, 1, -1, 1, 1, 1, -1);
     let pairs = n / 2;
     let p = f.as_mut_ptr();
@@ -203,8 +203,8 @@ unsafe fn fft4_m1_avx2(f: &mut [i32], n: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fft2_avx2(f: &mut [i32], n: usize) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let tw = _mm256_set1_epi32(23170);
     let sign = _mm256_setr_epi32(1, 1, 1, 1, 1, -1, -1, -1);
     assert!(f.len() >= 16 * n);
@@ -235,11 +235,11 @@ unsafe fn fft2_avx2(f: &mut [i32], n: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fft4_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let m = s.m;
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(24).enumerate() {
+        for (q, t) in tw.as_chunks::<24>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -268,12 +268,12 @@ unsafe fn fft4_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fft3_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let m = s.m;
     let epi3 = _mm256_set1_epi32(-28378);
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(16).enumerate() {
+        for (q, t) in tw.as_chunks::<16>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -299,15 +299,15 @@ unsafe fn fft3_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fft5_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let m = s.m;
     let yar = _mm256_set1_epi32(10126);
     let yai = _mm256_set1_epi32(-31164);
     let ybr = _mm256_set1_epi32(-26510);
     let ybi = _mm256_set1_epi32(-19261);
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(32).enumerate() {
+        for (q, t) in tw.as_chunks::<32>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -322,19 +322,14 @@ unsafe fn fft5_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
                 let s8 = _mm256_add_epi32(s2, s3);
                 let s9 = _mm256_sub_epi32(s2, s3);
                 st(p0, _mm256_add_epi32(s0, _mm256_add_epi32(s7, s8)));
-                let s5 = _mm256_add_epi32(
-                    s0,
-                    _mm256_add_epi32(mulq15c(s7, yar), mulq15c(s8, ybr)),
-                );
+                let s5 = _mm256_add_epi32(s0, _mm256_add_epi32(mulq15c(s7, yar), mulq15c(s8, ybr)));
                 let qv = _mm256_add_epi32(mulq15c(s10, yai), mulq15c(s9, ybi));
                 // s6 = (q.i, -q.r): out1 = s5 - s6, out4 = s5 + s6.
                 let (o4, o1) = rot_pair(s5, qv);
                 st(p1, o1);
                 st(p4, o4);
-                let s11 = _mm256_add_epi32(
-                    s0,
-                    _mm256_add_epi32(mulq15c(s7, ybr), mulq15c(s8, yar)),
-                );
+                let s11 =
+                    _mm256_add_epi32(s0, _mm256_add_epi32(mulq15c(s7, ybr), mulq15c(s8, yar)));
                 let w = _mm256_sub_epi32(mulq15c(s9, yai), mulq15c(s10, ybi));
                 // s12 = (w.i, -w.r): out2 = s11 + s12, out3 = s11 - s12.
                 let (o2, o3) = rot_pair(s11, w);
@@ -353,13 +348,13 @@ unsafe fn fft5_avx2(f: *mut i32, tw: &[i32], s: &Stage) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn post_rotate_avx2(y: &mut [i32], t: &[i16]) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let n2 = y.len();
     let n4 = n2 >> 1;
     let count = (n4 + 1) >> 1;
     let blocks = count / 4;
-    assert!(t.len() >= n2 && n2 % 4 == 0);
+    assert!(t.len() >= n2 && n2.is_multiple_of(4));
     let rev = _mm256_setr_epi32(6, 7, 4, 5, 2, 3, 0, 1);
     let rev16 = _mm_setr_epi8(6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8, 9);
     let yp = y.as_mut_ptr();
@@ -520,7 +515,7 @@ unsafe fn fft4_neon(f: *mut i32, tw: &[i32], s: &Stage) {
     use neon::*;
     let m = s.m;
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(24).enumerate() {
+        for (q, t) in tw.as_chunks::<24>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -554,7 +549,7 @@ unsafe fn fft3_neon(f: *mut i32, tw: &[i32], s: &Stage) {
     let m = s.m;
     let epi3 = vdupq_n_s32(-28378 << 16);
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(16).enumerate() {
+        for (q, t) in tw.as_chunks::<16>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -591,7 +586,7 @@ unsafe fn fft5_neon(f: *mut i32, tw: &[i32], s: &Stage) {
     let ybr = vdupq_n_s32(-26510 << 16);
     let ybi = vdupq_n_s32(-19261 << 16);
     for i in 0..s.n {
-        for (q, t) in tw.chunks_exact(32).enumerate() {
+        for (q, t) in tw.as_chunks::<32>().0.iter().enumerate() {
             // Safety: per the function contract.
             unsafe {
                 let p0 = f.add(2 * (i * s.mm + 4 * q));
@@ -669,8 +664,8 @@ pub unsafe fn tdac_mirror_avx2(out: &mut [i32], window: &[i16]) -> usize {
 pub unsafe fn saturate_avx2(x: &mut [i32], lim: i32) {
     use std::arch::x86_64::*;
     let (hi, lo) = (_mm256_set1_epi32(lim), _mm256_set1_epi32(-lim));
-    let mut chunks = x.chunks_exact_mut(8);
-    for c in &mut chunks {
+    let (chunks, rest) = x.as_chunks_mut::<8>();
+    for c in chunks {
         // Safety: `c` holds 8 values.
         unsafe {
             let v = _mm256_loadu_si256(c.as_ptr() as *const __m256i);
@@ -678,7 +673,7 @@ pub unsafe fn saturate_avx2(x: &mut [i32], lim: i32) {
             _mm256_storeu_si256(c.as_mut_ptr() as *mut __m256i, v);
         }
     }
-    for v in chunks.into_remainder() {
+    for v in rest {
         *v = (*v).clamp(-lim, lim);
     }
 }
@@ -696,10 +691,7 @@ pub unsafe fn pre_rotate_avx2(x: &[i32], y: &mut [i32], t: &[i16], bitrev: &[i16
     let n2 = y.len();
     let n4 = n2 >> 1;
     assert!(
-        n2 % 2 == 0
-            && x.len() > stride * (n2 - 1)
-            && t.len() >= n2
-            && bitrev.len() >= n4
+        n2.is_multiple_of(2) && x.len() > stride * (n2 - 1) && t.len() >= n2 && bitrev.len() >= n4
     );
     let odd = _mm256_setr_epi32(7, 7, 5, 5, 3, 3, 1, 1);
     let (xp, tp) = (x.as_ptr(), t.as_ptr());
@@ -746,7 +738,10 @@ pub unsafe fn pre_rotate_avx2(x: &[i32], y: &mut [i32], t: &[i16], bitrev: &[i16
             let r = |k: usize| 2 * *bitrev.get_unchecked(i + k) as usize;
             debug_assert!((0..4).all(|k| r(k) + 2 <= n2));
             _mm_storel_epi64(yp.add(r(0)) as *mut __m128i, _mm256_castsi256_si128(v));
-            _mm_storeh_pd(yp.add(r(1)) as *mut f64, _mm_castsi128_pd(_mm256_castsi256_si128(v)));
+            _mm_storeh_pd(
+                yp.add(r(1)) as *mut f64,
+                _mm_castsi128_pd(_mm256_castsi256_si128(v)),
+            );
             let hi = _mm256_extracti128_si256::<1>(v);
             _mm_storel_epi64(yp.add(r(2)) as *mut __m128i, hi);
             _mm_storeh_pd(yp.add(r(3)) as *mut f64, _mm_castsi128_pd(hi));
@@ -976,7 +971,10 @@ pub unsafe fn stereo_merge_avx2(
     use avx2_i16::*;
     use std::arch::x86_64::*;
     let midv = _mm256_set1_epi16(mid as i16);
-    let (lg, rg) = (_mm256_set1_epi16(lgain as i16), _mm256_set1_epi16(rgain as i16));
+    let (lg, rg) = (
+        _mm256_set1_epi16(lgain as i16),
+        _mm256_set1_epi16(rgain as i16),
+    );
     let (lr, rr) = (
         _mm256_set1_epi32((1i32 << lsh) >> 1),
         _mm256_set1_epi32((1i32 << rsh) >> 1),
@@ -1017,10 +1015,15 @@ pub unsafe fn haar1_avx2(x: &mut [i16], n0: usize, stride: usize) -> usize {
             pack_trunc(f(_mm256_sub_epi32(a0, b0)), f(_mm256_sub_epi32(a1, b1))),
         )
     };
-    if stride % 16 == 0 {
+    if stride.is_multiple_of(16) {
         for blk in x[..total].chunks_exact_mut(2 * stride) {
             let (a, b) = blk.split_at_mut(stride);
-            for (av, bv) in a.chunks_exact_mut(16).zip(b.chunks_exact_mut(16)) {
+            for (av, bv) in a
+                .as_chunks_mut::<16>()
+                .0
+                .iter_mut()
+                .zip(b.as_chunks_mut::<16>().0)
+            {
                 // Safety: `av` and `bv` hold 16 values each.
                 unsafe {
                     let (na, nb) = pair(ld(av.as_ptr()), ld(bv.as_ptr()));
@@ -1067,7 +1070,7 @@ pub unsafe fn haar1_avx2(x: &mut [i16], n0: usize, stride: usize) -> usize {
         ),
     };
     let n = total & !15;
-    for v in x[..n].chunks_exact_mut(16) {
+    for v in x[..n].as_chunks_mut::<16>().0 {
         // Safety: `v` holds 16 values.
         unsafe {
             let w = ld(v.as_ptr());
@@ -1140,7 +1143,12 @@ pub unsafe fn sig2word16_avx2(out: &mut [i16], x: &[i32]) -> usize {
     use std::arch::x86_64::*;
     let n = out.len().min(x.len()) & !15;
     let r = _mm256_set1_epi32(2048);
-    for (o, v) in out[..n].chunks_exact_mut(16).zip(x[..n].chunks_exact(16)) {
+    for (o, v) in out[..n]
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(x[..n].as_chunks::<16>().0)
+    {
         // Safety: `o` and `v` hold 16 values each.
         unsafe {
             // PSHR32(x, 12) then saturation, which the pack does.
@@ -1201,6 +1209,50 @@ pub unsafe fn bits2pulses_avx2(c: &[u8], bits: i32) -> i32 {
     super::rate::bits2pulses_pick(c, bits, lo)
 }
 
+/// NEON [`bits2pulses_avx2`].
+///
+/// # Safety
+///
+/// NEON must be available (it is on every aarch64 CPU).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn bits2pulses_neon(c: &[u8], bits: i32) -> i32 {
+    use std::arch::aarch64::*;
+    let max = c[0] as usize;
+    let t = (bits - 1).clamp(0, 256);
+    let lo = if t == 0 {
+        0
+    } else {
+        let mut buf = [0u8; 64];
+        let src: &[u8] = if c.len() > 64 {
+            &c[1..65]
+        } else {
+            buf[..max].copy_from_slice(&c[1..=max]);
+            &buf
+        };
+        const IDX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // Safety: `src` is 64 bytes and `IDX` 16.
+        unsafe {
+            let lim = vdupq_n_u8((t - 1) as u8);
+            let idx = vld1q_u8(IDX.as_ptr());
+            let one = vdupq_n_u8(1);
+            let mut count = 0u32;
+            for k in 0..4 {
+                let x = vld1q_u8(src.as_ptr().add(16 * k));
+                // Entries at most t - 1 are those below t; lanes past `max` do not count.
+                let valid = vcltq_u8(
+                    vaddq_u8(idx, vdupq_n_u8(16 * k as u8)),
+                    vdupq_n_u8(max as u8),
+                );
+                let m = vandq_u8(vandq_u8(vcleq_u8(x, lim), valid), one);
+                count += vaddvq_u8(m) as u32;
+            }
+            count as i32
+        }
+    };
+    super::rate::bits2pulses_pick(c, bits, lo)
+}
+
 /// One sample of the constant-gain comb filter, as [`comb_const_avx2`] defines it.
 ///
 /// # Safety
@@ -1233,8 +1285,8 @@ unsafe fn comb_const_one(y: *mut i32, x: *const i32, i: usize, t: usize, g: [i32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn comb_const_avx2(y: *mut i32, x: *const i32, n: usize, t: usize, g: [i32; 3]) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     let g = g.map(|v| v as i16 as i32);
     let (g0, g1, g2) = (
         _mm256_set1_epi32(g[0]),
@@ -1249,14 +1301,8 @@ pub unsafe fn comb_const_avx2(y: *mut i32, x: *const i32, n: usize, t: usize, g:
         unsafe {
             let h = x.add(i).sub(t);
             let v = _mm256_add_epi32(ld(x.add(i)), mulq15c(ld(h), g0));
-            let v = _mm256_add_epi32(
-                v,
-                mulq15c(_mm256_add_epi32(ld(h.add(1)), ld(h.sub(1))), g1),
-            );
-            let v = _mm256_add_epi32(
-                v,
-                mulq15c(_mm256_add_epi32(ld(h.add(2)), ld(h.sub(2))), g2),
-            );
+            let v = _mm256_add_epi32(v, mulq15c(_mm256_add_epi32(ld(h.add(1)), ld(h.sub(1))), g1));
+            let v = _mm256_add_epi32(v, mulq15c(_mm256_add_epi32(ld(h.add(2)), ld(h.sub(2))), g2));
             st(y.add(i), _mm256_max_epi32(_mm256_min_epi32(v, lim), nlim));
         }
         i += 8;
@@ -1286,8 +1332,8 @@ pub unsafe fn comb_overlap_avx2(
     g1: [i32; 3],
     window: &[i16],
 ) {
-    use std::arch::x86_64::*;
     use avx2::*;
+    use std::arch::x86_64::*;
     assert!(window.len() >= n);
     let gv = |g: [i32; 3]| g.map(|v| _mm256_set1_epi32(v as i16 as i32));
     let (g0v, g1v) = (gv(g0), gv(g1));
@@ -1299,9 +1345,8 @@ pub unsafe fn comb_overlap_avx2(
     while i + 8 <= n {
         // Safety: per the function contract; window[i..i + 8] is in bounds.
         unsafe {
-            let w = _mm256_cvtepi16_epi32(_mm_loadu_si128(
-                window.as_ptr().add(i) as *const __m128i
-            ));
+            let w =
+                _mm256_cvtepi16_epi32(_mm_loadu_si128(window.as_ptr().add(i) as *const __m128i));
             let f = _mm256_srai_epi32::<15>(_mm256_mullo_epi32(w, w));
             let nf = _mm256_sub_epi32(one, f);
             let h0 = x.add(i).sub(t0);
@@ -1393,7 +1438,12 @@ pub unsafe fn comb_const_neon(y: *mut i32, x: *const i32, n: usize, t: usize, g:
 /// The CPU must support AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn fir_interpol_avx2(out: &mut [i16], buf: &[i16], max_index_q16: i32, inc: i32) -> usize {
+pub unsafe fn fir_interpol_avx2(
+    out: &mut [i16],
+    buf: &[i16],
+    max_index_q16: i32,
+    inc: i32,
+) -> usize {
     use super::silk_dsp::{FIR_12_TAPS, fir_interpol_scalar};
     use std::arch::x86_64::*;
     let mut index_q16 = 0i32;
@@ -1479,7 +1529,12 @@ pub unsafe fn fir_interpol_3x_avx2(out: &mut [i16], buf: &[i16], n_in: usize) ->
             _mm_storeu_si128(t[1].as_mut_ptr() as *mut __m128i, b);
             _mm_storeu_si128(t[2].as_mut_ptr() as *mut __m128i, c);
         }
-        for (k, o) in out[3 * j0..3 * j0 + 24].chunks_exact_mut(3).enumerate() {
+        for (k, o) in out[3 * j0..3 * j0 + 24]
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             o.copy_from_slice(&[t[0][k], t[1][k], t[2][k]]);
         }
         j0 += 8;
@@ -1530,12 +1585,17 @@ pub unsafe fn lpc_synthesis_avx2(
         let mut acc = _mm256_set1_epi32((order >> 1) as i32);
         for j in 0..order {
             // Safety: reads s_lpc[16 + i0 - 1 - j..][..8], within 0..16 + n.
-            let x = unsafe { _mm256_loadu_si256(s_lpc.as_ptr().add(16 + i0 - 1 - j) as *const __m256i) };
+            let x = unsafe {
+                _mm256_loadu_si256(s_lpc.as_ptr().add(16 + i0 - 1 - j) as *const __m256i)
+            };
             let even = _mm256_srli_epi64::<16>(_mm256_mul_epi32(x, av[j]));
             let odd = _mm256_slli_epi64::<16>(_mm256_mul_epi32(_mm256_srli_epi64::<32>(x), av[j]));
             let mut t = _mm256_blend_epi32::<0xAA>(even, odd);
             if j < 7 {
-                t = _mm256_and_si256(t, _mm256_cmpgt_epi32(_mm256_set1_epi32(j as i32 + 1), lanes));
+                t = _mm256_and_si256(
+                    t,
+                    _mm256_cmpgt_epi32(_mm256_set1_epi32(j as i32 + 1), lanes),
+                );
             }
             acc = _mm256_add_epi32(acc, t);
         }
@@ -1648,7 +1708,12 @@ pub unsafe fn lpc_analysis_filter_avx2(
 /// NEON must be available (it is on every aarch64 CPU).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub unsafe fn fir_interpol_neon(out: &mut [i16], buf: &[i16], max_index_q16: i32, inc: i32) -> usize {
+pub unsafe fn fir_interpol_neon(
+    out: &mut [i16],
+    buf: &[i16],
+    max_index_q16: i32,
+    inc: i32,
+) -> usize {
     use super::silk_dsp::{FIR_12_TAPS, rshift_round, sat16};
     use std::arch::aarch64::*;
     let mut index_q16 = 0i32;
@@ -1709,8 +1774,8 @@ mod tests {
 
     #[test]
     fn bits2pulses_matches_scalar() {
-        use super::super::rate::{bits2pulses, bits2pulses_scalar};
         use super::super::celt_tables::CACHE_INDEX;
+        use super::super::rate::{bits2pulses, bits2pulses_scalar};
         for lm in -1..=3 {
             for band in 0..21 {
                 if CACHE_INDEX[(lm + 1) as usize * 21 + band] < 0 {
