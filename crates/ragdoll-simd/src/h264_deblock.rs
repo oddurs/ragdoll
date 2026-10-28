@@ -471,8 +471,12 @@ unsafe fn luma_avx2(
     s[5] = out(nq1, q1);
     s[6] = out(nq2, q2);
     if ystride == 1 {
-        for (i, v) in s.iter().enumerate().take(7).skip(1) {
-            unsafe { _mm_storeu_si128(base.sub(4 * xstride).add(i * xstride) as *mut __m128i, *v) };
+        // Rows p2..q2 (an iterator adaptor here is not inlined into this target_feature function).
+        #[allow(clippy::needless_range_loop)]
+        for i in 1..7 {
+            unsafe {
+                _mm_storeu_si128(base.sub(4 * xstride).add(i * xstride) as *mut __m128i, s[i])
+            };
         }
     } else {
         let rows = unsafe { transpose_8x16(&s) };
