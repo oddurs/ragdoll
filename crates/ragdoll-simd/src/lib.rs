@@ -61,7 +61,8 @@ pub use h264_dsp::{
 };
 pub use h264_enc::{
     HPEL_WIN_H, HPEL_WIN_W, HpelWindow, Quant4x4, add_idct4x4_8x8, add_idct4x4_8x8_scalar,
-    dequant_4x4_x4, dequant_4x4_x4_scalar, hpel_window, hpel_window_scalar, nonzero_mask_4x4_x4,
+    dequant_4x4_x4, dequant_4x4_x4_scalar, hadamard4x4_16x4, hadamard4x4_16x4_scalar, hpel_window,
+    hpel_window_scalar, intra_satd_x3_16x16, intra_satd_x3_16x16_scalar, nonzero_mask_4x4_x4,
     nonzero_mask_4x4_x4_scalar, pixel_avg_16x16, pixel_avg_16x16_scalar, pixel_sad_8x8,
     pixel_sad_8x8_scalar, pixel_sad_16x16, pixel_sad_16x16_scalar, pixel_sad_x4_16x16,
     pixel_sad_x4_16x16_scalar, pixel_satd_4x4, pixel_satd_4x4_scalar, pixel_satd_16x16,

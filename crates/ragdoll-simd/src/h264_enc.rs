@@ -232,8 +232,8 @@ pub fn sub_dct4x4_16x4(src: &[u8], ss: usize, pred: &[u8], ps: usize, out: &mut 
     if ragdoll_core::dispatch::neon() {
         // Safety: bounds checked above; NEON is baseline on aarch64.
         unsafe {
-            dct_strip_neon(src.as_ptr(), ss, pred.as_ptr(), ps, 0, &mut out[..2]);
-            dct_strip_neon(
+            dct_strip_neon::<false>(src.as_ptr(), ss, pred.as_ptr(), ps, 0, &mut out[..2]);
+            dct_strip_neon::<false>(
                 src.as_ptr().add(8),
                 ss,
                 pred.as_ptr().add(8),
@@ -247,7 +247,7 @@ pub fn sub_dct4x4_16x4(src: &[u8], ss: usize, pred: &[u8], ps: usize, out: &mut 
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { dct_strip_avx2(src.as_ptr(), ss, pred.as_ptr(), ps, false, out) };
+        unsafe { dct_strip_avx2::<false>(src.as_ptr(), ss, pred.as_ptr(), ps, false, out) };
         return;
     }
     sub_dct4x4_16x4_scalar(src, ss, pred, ps, out);
@@ -279,15 +279,15 @@ pub fn sub_dct4x4_8x8(src: &[u8], ss: usize, pred: &[u8], ps: usize, out: &mut [
     if ragdoll_core::dispatch::neon() {
         // Safety: bounds checked above; NEON is baseline on aarch64.
         unsafe {
-            dct_strip_neon(src.as_ptr(), ss, pred.as_ptr(), ps, 0, &mut out[..2]);
-            dct_strip_neon(src.as_ptr(), ss, pred.as_ptr(), ps, 4, &mut out[2..]);
+            dct_strip_neon::<false>(src.as_ptr(), ss, pred.as_ptr(), ps, 0, &mut out[..2]);
+            dct_strip_neon::<false>(src.as_ptr(), ss, pred.as_ptr(), ps, 4, &mut out[2..]);
         }
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { dct_strip_avx2(src.as_ptr(), ss, pred.as_ptr(), ps, true, out) };
+        unsafe { dct_strip_avx2::<false>(src.as_ptr(), ss, pred.as_ptr(), ps, true, out) };
         return;
     }
     sub_dct4x4_8x8_scalar(src, ss, pred, ps, out);
@@ -318,6 +318,55 @@ fn sub_dct4x4_scalar(src: &[u8], ss: usize, pred: &[u8], ps: usize) -> [i16; 16]
         }
     }
     crate::forward_dct4x4_scalar(&d)
+}
+
+/// Unnormalized $4\times4$ Hadamard transforms of the four $4\times4$ blocks of the $16\times4$
+/// strip at the start of `src` (stride `ss`), left to right, as `out[b][4 v + h]` for vertical and
+/// horizontal sequency `v`, `h`. The 1-D transform of `x` is `[x0 + x1 + x2 + x3,
+/// x0 + x1 - x2 - x3, x0 - x1 + x2 - x3, x0 - x1 - x2 + x3]`, so a block's SATD against a
+/// prediction is half the sum of `|out - transform(pred)|` (`x264_intra_satd_x3`).
+///
+/// # Panics
+/// If `src` is shorter than 4 rows of 16 samples at its stride.
+#[inline]
+pub fn hadamard4x4_16x4(src: &[u8], ss: usize, out: &mut [[i16; 16]; 4]) {
+    static ZERO: [u8; 16] = [0; 16];
+    check_block(src, ss, 16, 4);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above (the zero row is read at stride 0); NEON is baseline.
+        unsafe {
+            dct_strip_neon::<true>(src.as_ptr(), ss, ZERO.as_ptr(), 0, 0, &mut out[..2]);
+            dct_strip_neon::<true>(src.as_ptr().add(8), ss, ZERO.as_ptr(), 0, 0, &mut out[2..]);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above (the zero row is read at stride 0); avx2() is true only
+        // when the CPU supports AVX2.
+        unsafe { dct_strip_avx2::<true>(src.as_ptr(), ss, ZERO.as_ptr(), 0, false, out) };
+        return;
+    }
+    hadamard4x4_16x4_scalar(src, ss, out);
+}
+
+/// Scalar reference for [`hadamard4x4_16x4`].
+pub fn hadamard4x4_16x4_scalar(src: &[u8], ss: usize, out: &mut [[i16; 16]; 4]) {
+    let h1 = |x: [i32; 4]| {
+        let (s01, d01, s23, d23) = (x[0] + x[1], x[0] - x[1], x[2] + x[3], x[2] - x[3]);
+        [s01 + s23, s01 - s23, d01 + d23, d01 - d23]
+    };
+    for (b, o) in out.iter_mut().enumerate() {
+        let rows: [[i32; 4]; 4] =
+            std::array::from_fn(|y| h1(std::array::from_fn(|x| src[y * ss + b * 4 + x] as i32)));
+        for h in 0..4 {
+            let col = h1(std::array::from_fn(|y| rows[y][h]));
+            for v in 0..4 {
+                o[4 * v + h] = col[v] as i16;
+            }
+        }
+    }
 }
 
 /// Quantization of a $4\times4$ block at one QP: `level = sign(c) ((|c| mf[i] + bias) >> shift)`.
@@ -446,6 +495,78 @@ pub fn add_idct4x4_8x8_scalar(dst: &mut [u8], ds: usize, blocks: &[[i16; 16]; 4]
             }
         }
     }
+}
+
+/// The 1-D transform of [`hadamard4x4_16x4`] of `x`, times 4: the non-zero row (column) of the
+/// transform of a $4\times4$ block whose rows (columns) all equal `x`.
+#[inline(always)]
+fn hadamard_edge(x: &[u8]) -> [i16; 4] {
+    let x = [x[0] as i16, x[1] as i16, x[2] as i16, x[3] as i16];
+    let (s01, d01, s23, d23) = (x[0] + x[1], x[0] - x[1], x[2] + x[3], x[2] - x[3]);
+    [s01 + s23, s01 - s23, d01 + d23, d01 - d23].map(|c| 4 * c)
+}
+
+/// SATDs, as [`pixel_satd_16x16`], of the $16\times16$ block `src` against its vertical,
+/// horizontal and DC intra predictions from the `top` and `left` edge samples and the DC value
+/// `dc`, in that order (`x264_intra_satd_x3_16x16`). One Hadamard transform of the source serves
+/// all three: a prediction with equal rows (columns) transforms to a single non-zero row
+/// (column), and the DC prediction to a single coefficient.
+#[inline]
+pub fn intra_satd_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    let tv: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&top[b * 4..]));
+    let th: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&left[b * 4..]));
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { intra_satd_x3_avx2(src, &tv, &th, 16 * dc as i16) };
+    }
+    let mut out = [[[0i16; 16]; 4]; 4];
+    for (strip, o) in out.iter_mut().enumerate() {
+        hadamard4x4_16x4(&src[strip * 64..], 16, o);
+    }
+    intra_satd_x3_from(&out, &tv, &th, 16 * dc as i16)
+}
+
+/// Scalar reference for [`intra_satd_x3_16x16`].
+pub fn intra_satd_x3_16x16_scalar(
+    src: &[u8; 256],
+    top: &[u8; 16],
+    left: &[u8; 16],
+    dc: u8,
+) -> [u32; 3] {
+    let tv: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&top[b * 4..]));
+    let th: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&left[b * 4..]));
+    let mut out = [[[0i16; 16]; 4]; 4];
+    for (strip, o) in out.iter_mut().enumerate() {
+        hadamard4x4_16x4_scalar(&src[strip * 64..], 16, o);
+    }
+    intra_satd_x3_from(&out, &tv, &th, 16 * dc as i16)
+}
+
+/// [`intra_satd_x3_16x16`] from the source's transforms (`out[strip][block]`), the transformed
+/// edges per block column (`tv`) and row (`th`) and the transformed DC prediction.
+fn intra_satd_x3_from(
+    out: &[[[i16; 16]; 4]; 4],
+    tv: &[[i16; 4]; 4],
+    th: &[[i16; 4]; 4],
+    dc16: i16,
+) -> [u32; 3] {
+    let mut sum = [0u32; 3];
+    for (by, strip) in out.iter().enumerate() {
+        for (bx, blk) in strip.iter().enumerate() {
+            for (k, &c) in blk.iter().enumerate() {
+                let (v, h) = (k / 4, k % 4);
+                let c = c as i32;
+                let pv = if v == 0 { tv[bx][h] as i32 } else { 0 };
+                let ph = if h == 0 { th[by][v] as i32 } else { 0 };
+                let pd = if k == 0 { dc16 as i32 } else { 0 };
+                sum[0] += (c - pv).unsigned_abs();
+                sum[1] += (c - ph).unsigned_abs();
+                sum[2] += (c - pd).unsigned_abs();
+            }
+        }
+    }
+    sum.map(|s| s >> 1)
 }
 
 /// Row stride and width of the planes of a [`HpelWindow`].
@@ -927,9 +1048,90 @@ fn dct4_butterfly_avx2(d: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_64
     ]
 }
 
+/// [`intra_satd_x3_16x16`]: the transform of each strip stays in registers holding one column
+/// of coefficients per block (`o[h]` lane `4 b + v`), so each prediction only replaces a few
+/// lanes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dct_strip_avx2(
+unsafe fn intra_satd_x3_avx2(
+    src: &[u8; 256],
+    tv: &[[i16; 4]; 4],
+    th: &[[i16; 4]; 4],
+    dc16: i16,
+) -> [u32; 3] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        // Vertical prediction of column h: lane 4 b holds block b's transformed top edge.
+        let pv: [__m256i; 4] = std::array::from_fn(|h| {
+            _mm256_setr_epi16(
+                tv[0][h], 0, 0, 0, tv[1][h], 0, 0, 0, tv[2][h], 0, 0, 0, tv[3][h], 0, 0, 0,
+            )
+        });
+        let pd = _mm256_setr_epi16(dc16, 0, 0, 0, dc16, 0, 0, 0, dc16, 0, 0, 0, dc16, 0, 0, 0);
+        let (mut acc_v, mut acc_h, mut acc_d) = (
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+        );
+        for (strip, t) in th.iter().enumerate() {
+            let row = |k: usize| {
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                    src.as_ptr().add((strip * 4 + k) * 16) as *const __m128i
+                ))
+            };
+            let v = hadamard4_butterfly_avx2([row(0), row(1), row(2), row(3)]);
+            let o = hadamard4_butterfly_avx2(transpose_4x4_epi16_avx2(v));
+            // Column 0 under the horizontal prediction: every block holds the transformed left
+            // edge of this block row.
+            let ph = _mm256_set1_epi64x(
+                (t[0] as u16 as i64)
+                    | (t[1] as u16 as i64) << 16
+                    | (t[2] as u16 as i64) << 32
+                    | (t[3] as u16 as i64) << 48,
+            );
+            let abs_sum = |x: __m256i| _mm256_madd_epi16(_mm256_abs_epi16(x), ones);
+            let rest = _mm256_add_epi32(
+                _mm256_add_epi32(abs_sum(o[1]), abs_sum(o[2])),
+                abs_sum(o[3]),
+            );
+            acc_h = _mm256_add_epi32(acc_h, rest);
+            acc_d = _mm256_add_epi32(acc_d, rest);
+            acc_h = _mm256_add_epi32(acc_h, abs_sum(_mm256_sub_epi16(o[0], ph)));
+            acc_d = _mm256_add_epi32(acc_d, abs_sum(_mm256_sub_epi16(o[0], pd)));
+            for h in 0..4 {
+                acc_v = _mm256_add_epi32(acc_v, abs_sum(_mm256_sub_epi16(o[h], pv[h])));
+            }
+        }
+        let hsum = |a: __m256i| {
+            let s = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256::<1>(a));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
+            _mm_cvtsi128_si32(s) as u32
+        };
+        [hsum(acc_v) >> 1, hsum(acc_h) >> 1, hsum(acc_d) >> 1]
+    }
+}
+
+/// The $4\times4$ Hadamard butterfly of [`hadamard4x4_16x4`] applied element-wise across four
+/// registers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn hadamard4_butterfly_avx2(d: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+    let (s01, d01) = (_mm256_add_epi16(d[0], d[1]), _mm256_sub_epi16(d[0], d[1]));
+    let (s23, d23) = (_mm256_add_epi16(d[2], d[3]), _mm256_sub_epi16(d[2], d[3]));
+    [
+        _mm256_add_epi16(s01, s23),
+        _mm256_sub_epi16(s01, s23),
+        _mm256_add_epi16(d01, d23),
+        _mm256_sub_epi16(d01, d23),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dct_strip_avx2<const HAD: bool>(
     src: *const u8,
     ss: usize,
     pred: *const u8,
@@ -963,8 +1165,15 @@ unsafe fn dct_strip_avx2(
         };
         // Vertical pass on rows, then the horizontal pass on columns; the transform is exact
         // integer arithmetic within 16 bits, so the order of the passes does not matter.
-        let v = dct4_butterfly_avx2([row(0), row(1), row(2), row(3)]);
-        let o = dct4_butterfly_avx2(transpose_4x4_epi16_avx2(v));
+        let butterfly = |d| {
+            if HAD {
+                hadamard4_butterfly_avx2(d)
+            } else {
+                dct4_butterfly_avx2(d)
+            }
+        };
+        let v = butterfly([row(0), row(1), row(2), row(3)]);
+        let o = butterfly(transpose_4x4_epi16_avx2(v));
         // o[m] holds column m of each coefficient block; interleave back to raster rows.
         let t0 = _mm256_unpacklo_epi16(o[0], o[1]);
         let t1 = _mm256_unpackhi_epi16(o[0], o[1]);
@@ -1353,7 +1562,7 @@ unsafe fn zigzag_neon(blocks: &[[i16; 16]; 4]) -> [[i16; 16]; 4] {
 /// `row_off` rows below `src` / `pred`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn dct_strip_neon(
+unsafe fn dct_strip_neon<const HAD: bool>(
     src: *const u8,
     ss: usize,
     pred: *const u8,
@@ -1362,9 +1571,19 @@ unsafe fn dct_strip_neon(
     out: &mut [[i16; 16]],
 ) {
     use std::arch::aarch64::*;
-    fn butterfly(d: [int16x8_t; 4]) -> [int16x8_t; 4] {
+    fn butterfly<const HAD: bool>(d: [int16x8_t; 4]) -> [int16x8_t; 4] {
         // Safety: NEON is baseline on aarch64.
         unsafe {
+            if HAD {
+                let (s01, d01) = (vaddq_s16(d[0], d[1]), vsubq_s16(d[0], d[1]));
+                let (s23, d23) = (vaddq_s16(d[2], d[3]), vsubq_s16(d[2], d[3]));
+                return [
+                    vaddq_s16(s01, s23),
+                    vsubq_s16(s01, s23),
+                    vaddq_s16(d01, d23),
+                    vsubq_s16(d01, d23),
+                ];
+            }
             let (s03, s12) = (vaddq_s16(d[0], d[3]), vaddq_s16(d[1], d[2]));
             let (d03, d12) = (vsubq_s16(d[0], d[3]), vsubq_s16(d[1], d[2]));
             [
@@ -1398,8 +1617,8 @@ unsafe fn dct_strip_neon(
                 vld1_u8(pred.add(r * ps)),
             ))
         };
-        let v = butterfly([row(0), row(1), row(2), row(3)]);
-        let r = transpose(butterfly(transpose(v)));
+        let v = butterfly::<HAD>([row(0), row(1), row(2), row(3)]);
+        let r = transpose(butterfly::<HAD>(transpose(v)));
         for (h, blk) in out.iter_mut().enumerate().take(2) {
             for (k, rv) in r.iter().enumerate() {
                 let half = if h == 0 {
@@ -1585,6 +1804,48 @@ mod tests {
     }
 
     #[test]
+    fn intra_satd_x3_matches_explicit_predictions() {
+        let a = plane(16, 16, 31);
+        let e = plane(40, 1, 32);
+        let src: [u8; 256] = a.try_into().unwrap();
+        let cases: [([u8; 16], [u8; 16], u8); 4] = [
+            (
+                e[..16].try_into().unwrap(),
+                e[20..36].try_into().unwrap(),
+                77,
+            ),
+            ([255; 16], [0; 16], 255),
+            ([0; 16], [255; 16], 0),
+            (
+                e[3..19].try_into().unwrap(),
+                e[1..17].try_into().unwrap(),
+                128,
+            ),
+        ];
+        for (top, left, dc) in cases {
+            let preds: [[u8; 256]; 3] = [
+                std::array::from_fn(|i| top[i % 16]),
+                std::array::from_fn(|i| left[i / 16]),
+                [dc; 256],
+            ];
+            let want = preds.map(|p| pixel_satd_16x16_scalar(&src, 16, &p, 16));
+            assert_eq!(intra_satd_x3_16x16_scalar(&src, &top, &left, dc), want);
+            assert_eq!(intra_satd_x3_16x16(&src, &top, &left, dc), want);
+            for (flat, other) in [([255u8; 256], 0u8), ([0; 256], 255)] {
+                let want = [
+                    pixel_satd_16x16_scalar(&flat, 16, &[other; 256], 16),
+                    pixel_satd_16x16_scalar(&flat, 16, &[other; 256], 16),
+                    pixel_satd_16x16_scalar(&flat, 16, &[other; 256], 16),
+                ];
+                assert_eq!(
+                    intra_satd_x3_16x16(&flat, &[other; 16], &[other; 16], other),
+                    want
+                );
+            }
+        }
+    }
+
+    #[test]
     fn residual_transforms_match_scalar() {
         let (pw, ph) = (45usize, 29usize);
         let a = plane(pw, ph, 21);
@@ -1606,7 +1867,27 @@ mod tests {
                     d[k] = p[o + (k / 4) * pw + k % 4] as i16 - q[o + (k / 4) * pw + k % 4] as i16;
                 }
                 assert_eq!(r[0], crate::forward_dct4x4_scalar(&d));
+                hadamard4x4_16x4(&p[o..], pw, &mut s);
+                hadamard4x4_16x4_scalar(&p[o..], pw, &mut r);
+                assert_eq!(s, r, "Hadamard at ({x}, {y})");
             }
+        }
+        // The transforms are linear: SATD is half the sum of the coefficient differences.
+        for (p, q) in [(&a, &b), (&white, &black)] {
+            let mut sum = 0u32;
+            for strip in 0..4 {
+                let (mut hp, mut hq) = ([[0i16; 16]; 4], [[0i16; 16]; 4]);
+                hadamard4x4_16x4(&p[strip * 4 * pw..], pw, &mut hp);
+                hadamard4x4_16x4(&q[strip * 4 * pw + 2..], pw, &mut hq);
+                for (bp, bq) in hp.iter().zip(&hq) {
+                    sum += bp
+                        .iter()
+                        .zip(bq)
+                        .map(|(&u, &v)| (u as i32 - v as i32).unsigned_abs())
+                        .sum::<u32>();
+                }
+            }
+            assert_eq!(sum >> 1, pixel_satd_16x16_scalar(p, pw, &q[2..], pw));
         }
     }
 

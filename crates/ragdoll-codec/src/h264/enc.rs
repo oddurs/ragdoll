@@ -12,9 +12,9 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hpel_window, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8,
-    pixel_sad_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4,
-    sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    h264_luma_mc, hpel_window, intra_satd_x3_16x16, nonzero_mask_4x4_x4, pixel_avg_16x16,
+    pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
+    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -175,7 +175,9 @@ pub(super) struct EncState {
 }
 
 impl EncState {
-    fn prepare(&mut self, mb_w: usize, mb_h: usize, slice_qp: u8) {
+    /// Sizes the pictures and grids and clears the per-frame state. `ref_grid` and `mv_grid` are
+    /// left alone: every macroblock writes its own entries before a later one reads them.
+    fn prepare(&mut self, mb_w: usize, mb_h: usize, slice_qp: u8, cabac: bool) {
         let (n4, n2, n) = (mb_w * mb_h * 16, mb_w * mb_h * 4, mb_w * mb_h);
         if self.mb_w != mb_w || self.mb_h != mb_h {
             *self = Self {
@@ -183,6 +185,8 @@ impl EncState {
                 mb_h,
                 cur: Pic::alloc(mb_w * 16, mb_h * 16),
                 refp: Pic::alloc(mb_w * 16, mb_h * 16),
+                ref_grid: vec![-2; n4],
+                mv_grid: vec![[0; 2]; n4],
                 prev_mb_mv: vec![[0; 2]; n],
                 ..Self::default()
             };
@@ -210,12 +214,26 @@ impl EncState {
         reset_b(&mut self.mb_chroma_dc_cbf[0]);
         reset_b(&mut self.mb_chroma_dc_cbf[1]);
         reset_b(&mut self.mb_8x8_flag);
-        self.ref_grid.clear();
-        self.ref_grid.resize(n4, -2);
-        self.mv_grid.clear();
-        self.mv_grid.resize(n4, [0; 2]);
-        self.mvd_grid.clear();
-        self.mvd_grid.resize(n4, [0; 2]);
+        // Only CABAC reads the neighbours' motion vector differences.
+        if cabac {
+            self.mvd_grid.clear();
+            self.mvd_grid.resize(n4, [0; 2]);
+        }
+    }
+
+    /// Marks macroblock `(mb_x, mb_y)` intra in the motion grids: no reference, zero vectors.
+    fn set_intra_motion(&mut self, mb_x: usize, mb_y: usize) {
+        let g_stride = self.mb_w * 4;
+        fill_grid_4x4(&mut self.ref_grid, g_stride, mb_x * 4, mb_y * 4, 4, 4, -1);
+        fill_grid_4x4(
+            &mut self.mv_grid,
+            g_stride,
+            mb_x * 4,
+            mb_y * 4,
+            4,
+            4,
+            [0; 2],
+        );
     }
 
     /// The latest reconstructed (deblocked) picture at coded size.
@@ -340,6 +358,24 @@ fn decimate_score(scanned: &[i16]) -> u32 {
     score
 }
 
+/// [`decimate_score`] of a scanned $4\times4$ block (16 or 15 levels) given the mask of its
+/// non-zero levels (bit `i` for `scanned[i]`).
+#[inline]
+fn decimate_masked(scanned: &[i16], mask: u32) -> u32 {
+    let mut score = 0u32;
+    let mut m = mask;
+    while m != 0 {
+        let p = 31 - m.leading_zeros() as i32;
+        if scanned[p as usize].unsigned_abs() > 1 {
+            return 9;
+        }
+        m ^= 1 << p;
+        let below = 31 - m.leading_zeros() as i32; // -1 once `m` is empty
+        score += DECIMATE4[(p - below - 1) as usize] as u32;
+    }
+    score
+}
+
 #[inline(always)]
 fn zigzag16(q: &[i16; 16]) -> [i16; 16] {
     ZIGZAG_4X4.map(|i| q[i])
@@ -391,19 +427,59 @@ static LEVEL_VLC: [[u32; 64]; 7] = {
     t
 };
 
+/// `suffixLength` after coding a level of magnitude `abs` at `suffix_len` (ITU-T H.264 9.2.2.1).
+#[inline(always)]
+const fn next_suffix_len(suffix_len: u32, abs: u32) -> u32 {
+    let s = if suffix_len == 0 { 1 } else { suffix_len };
+    if abs > (3 << (s - 1)) && s < 6 {
+        s + 1
+    } else {
+        s
+    }
+}
+
+/// Largest level magnitude [`LEVEL_TAB`] covers.
+const LEVEL_TAB_MAX: i32 = 32;
+
+/// Level codes by `suffixLength` and `level + LEVEL_TAB_MAX` for the levels that need no
+/// `levelCode` adjustment, packed as `bits << 16 | next suffixLength << 8 | length`
+/// (`x264_level_token`).
+static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
+    let mut t = [[0u32; 2 * LEVEL_TAB_MAX as usize]; 7];
+    let mut s = 0;
+    while s < 7 {
+        let mut i = 0;
+        while i < 2 * LEVEL_TAB_MAX {
+            let lv = i - LEVEL_TAB_MAX;
+            if lv != 0 {
+                let code = if lv > 0 { 2 * lv - 2 } else { -2 * lv - 1 } as u32;
+                let (bits, len) = level_vlc(code, s as u32);
+                let next = next_suffix_len(s as u32, lv.unsigned_abs());
+                t[s][i as usize] = bits << 16 | next << 8 | len;
+            }
+            i += 1;
+        }
+        s += 1;
+    }
+    t
+};
+
 /// CAVLC `residual_block` of a zig-zag scanned block of `N` = 16 or 15 coefficients (`nc` selects
 /// the `coeff_token` table), or of the 4 chroma DC coefficients (`N` = 4); the bits equal
-/// [`encode_cavlc_block`]'s. Levels are visited through a bit mask of the non-zero positions.
+/// [`encode_cavlc_block`]'s.
 fn write_cavlc_block<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8) {
     let mut mask = 0u32;
     for (i, &c) in coeffs.iter().enumerate() {
         mask |= u32::from(c != 0) << i;
     }
-    write_cavlc_masked(w, coeffs, nc, mask);
+    write_cavlc_masked::<N>(w, coeffs, nc, mask);
 }
 
-/// [`write_cavlc_block`] given the mask of the non-zero coefficients (bit `i` for `coeffs[i]`).
-fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8, mask: u32) {
+/// [`write_cavlc_block`] of the first `N` levels of `coeffs` given the mask of the non-zero ones
+/// (bit `i` for `coeffs[i]`). Levels and runs are visited from the highest frequency down through
+/// the mask, so the cost follows the number of coded levels.
+#[inline]
+fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask: u32) {
     let (token_len, token_bits): (&[u8], &[u8]) = if N == 4 {
         (&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS)
     } else {
@@ -415,44 +491,38 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8, m
         return;
     }
     let n = mask.count_ones() as usize;
-    let total_zeros = 32 - mask.leading_zeros() as usize - n;
-    // Levels from the highest frequency down, each with the zero run below it.
-    let mut levels = [0i16; 16];
-    let mut runs = [0usize; 16];
+    let top = 31 - mask.leading_zeros();
+    let total_zeros = top as usize + 1 - n;
+
+    // Up to three trailing +-1 levels, coded as sign bits after the token.
     let mut m = mask;
-    let mut pos = 31 - m.leading_zeros() as usize;
-    for k in 0..n {
-        levels[k] = coeffs[pos];
-        m ^= 1 << pos;
-        let below = if m != 0 {
-            31 - m.leading_zeros() as usize
-        } else {
-            usize::MAX
-        };
-        runs[k] = pos.wrapping_sub(below).wrapping_sub(1);
-        pos = below;
+    let mut trailing_ones = 0usize;
+    let mut signs = 0u32;
+    while trailing_ones < 3 && m != 0 {
+        let p = 31 - m.leading_zeros();
+        let c = coeffs[p as usize];
+        if c.unsigned_abs() != 1 {
+            break;
+        }
+        signs = (signs << 1) | u32::from(c < 0);
+        trailing_ones += 1;
+        m ^= 1 << p;
     }
-    let trailing_ones = levels[..n.min(3)]
-        .iter()
-        .take_while(|l| l.unsigned_abs() == 1)
-        .count();
     let tok = n * 4 + trailing_ones;
-    let signs = levels[..trailing_ones]
-        .iter()
-        .fold(0u32, |acc, &l| (acc << 1) | u32::from(l < 0));
     w.put32(
         ((token_bits[tok] as u32) << trailing_ones) | signs,
         token_len[tok] as u32 + trailing_ones as u32,
     );
 
-    let mut suffix_len = u32::from(n > 10 && trailing_ones < 3);
-    for (i, &lv) in levels[..n].iter().enumerate().skip(trailing_ones) {
-        let mut code = if lv > 0 {
-            ((lv as i32) << 1) - 2
-        } else {
-            (-(lv as i32) << 1) - 1
-        } as u32;
-        if i == trailing_ones && trailing_ones < 3 {
+    if m != 0 {
+        let mut suffix_len = u32::from(n > 10 && trailing_ones < 3);
+        // The first remaining level cannot be +-1 when fewer than three trailing ones were
+        // taken, so its `levelCode` is lowered by 2.
+        let p = 31 - m.leading_zeros();
+        m ^= 1 << p;
+        let lv = coeffs[p as usize] as i32;
+        let mut code = if lv > 0 { 2 * lv - 2 } else { -2 * lv - 1 } as u32;
+        if trailing_ones < 3 {
             code -= 2;
         }
         let (bits, len) = if code < 64 {
@@ -462,11 +532,22 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8, m
             level_vlc(code, suffix_len)
         };
         w.put32(bits, len);
-        if suffix_len == 0 {
-            suffix_len = 1;
-        }
-        if lv.unsigned_abs() as u32 > (3 << (suffix_len - 1)) && suffix_len < 6 {
-            suffix_len += 1;
+        suffix_len = next_suffix_len(suffix_len, lv.unsigned_abs());
+        while m != 0 {
+            let p = 31 - m.leading_zeros();
+            m ^= 1 << p;
+            let lv = coeffs[p as usize] as i32;
+            let i = lv + LEVEL_TAB_MAX;
+            if (i as u32) < 2 * LEVEL_TAB_MAX as u32 {
+                let e = LEVEL_TAB[suffix_len as usize][i as usize];
+                w.put32(e >> 16, e & 0xFF);
+                suffix_len = (e >> 8) & 0xFF;
+            } else {
+                let code = if lv > 0 { 2 * lv - 2 } else { -2 * lv - 1 } as u32;
+                let (bits, len) = level_vlc(code, suffix_len);
+                w.put32(bits, len);
+                suffix_len = next_suffix_len(suffix_len, lv.unsigned_abs());
+            }
         }
     }
 
@@ -484,14 +565,18 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8, m
         };
         w.put32(b as u32, l as u32);
     }
-    let mut zeros_left = total_zeros;
-    for &r in &runs[..n - 1] {
-        if zeros_left == 0 {
-            break;
-        }
-        let k = (zeros_left - 1).min(6);
-        w.put32(RUN_BITS[k][r] as u32, RUN_LEN[k][r] as u32);
-        zeros_left -= r;
+    // run_before of each level from the highest down while zeros remain, except the last.
+    let mut zeros_left = total_zeros as u32;
+    let mut m = mask ^ (1 << top);
+    let mut p = top;
+    while zeros_left != 0 && m != 0 {
+        let below = 31 - m.leading_zeros();
+        m ^= 1 << below;
+        let run = (p - below - 1) as usize;
+        let k = (zeros_left - 1).min(6) as usize;
+        w.put32(RUN_BITS[k][run] as u32, RUN_LEN[k][run] as u32);
+        zeros_left -= run as u32;
+        p = below;
     }
 }
 
@@ -527,7 +612,7 @@ fn write_cavlc_residuals(
             let g = (mb_y * 4 + by) * g_stride + mb_x * 4 + bx;
             if coded {
                 let nc = predict_luma_nc(luma_nnz, g_stride, mb_x * 4 + bx, mb_y * 4 + by);
-                write_cavlc_masked(w, zz, nc, mask);
+                write_cavlc_masked::<16>(w, zz, nc, mask);
             }
             luma_nnz[g] = mask.count_ones() as u8;
         }
@@ -557,11 +642,17 @@ fn write_cavlc_chroma(
     if cbp_chroma >= 2 {
         let cg_stride = mb_w * 2;
         for (plane, nnz) in chroma_ac.iter().zip(chroma_nnz.iter_mut()) {
-            for (b, ac) in plane.iter().enumerate() {
+            // Levels at 1..16 behind a zero DC slot, so the masks come from the SIMD kernel.
+            let mut padded = [[0i16; 16]; 4];
+            for (p, ac) in padded.iter_mut().zip(plane) {
+                p[1..].copy_from_slice(ac);
+            }
+            let masks = nonzero_mask_4x4_x4(&padded);
+            for (b, (p, &mask)) in padded.iter().zip(&masks).enumerate() {
                 let (cgx, cgy) = (mb_x * 2 + (b & 1), mb_y * 2 + (b >> 1));
                 let nc = predict_chroma_nc(nnz, cg_stride, cgx, cgy);
-                write_cavlc_block(w, ac, nc);
-                nnz[cgy * cg_stride + cgx] = ac.iter().filter(|&&c| c != 0).count() as u8;
+                write_cavlc_masked::<15>(w, &p[1..], nc, mask >> 1);
+                nnz[cgy * cg_stride + cgx] = mask.count_ones() as u8;
             }
         }
     }
@@ -1003,25 +1094,36 @@ fn pred_chroma(
     plane_pred::<8>(a, (17 * h + 16) >> 5, (17 * v + 16) >> 5, dst);
 }
 
-/// Picks the intra $16\times16$ mode with the least SATD; returns its cost, mode and prediction.
-fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8, [u8; 256]) {
+/// Picks the intra $16\times16$ mode with the least SATD; returns that SATD and the mode. The
+/// vertical, horizontal and DC costs come from one transform of the source
+/// ([`intra_satd_x3_16x16`]); ties keep DC, then vertical, then horizontal, then plane.
+fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
     let (top, left, tl) = i16_edges(&pic.y, mb_x, mb_y);
-    let mut best = (u32::MAX, 2u8, [0u8; 256]);
-    let mut pred = [0u8; 256];
-    for mode in [2u8, 0, 1, 3] {
-        let ok = match mode {
-            0 => top.is_some(),
-            1 => left.is_some(),
-            3 => top.is_some() && left.is_some(),
-            _ => true,
-        };
-        if !ok {
-            continue;
-        }
-        pred16(mode, top.as_ref(), left.as_ref(), tl, &mut pred);
+    let sum = |e: &[u8; 16]| e.iter().map(|&v| v as u32).sum::<u32>();
+    let dc = match (&top, &left) {
+        (Some(t), Some(l)) => ((sum(t) + sum(l) + 16) >> 5) as u8,
+        (Some(e), None) | (None, Some(e)) => ((sum(e) + 8) >> 4) as u8,
+        (None, None) => 128,
+    };
+    let [v, h, d] = intra_satd_x3_16x16(
+        &src.y,
+        top.as_ref().unwrap_or(&[0; 16]),
+        left.as_ref().unwrap_or(&[0; 16]),
+        dc,
+    );
+    let mut best = (d, 2u8);
+    if top.is_some() && v < best.0 {
+        best = (v, 0);
+    }
+    if left.is_some() && h < best.0 {
+        best = (h, 1);
+    }
+    if top.is_some() && left.is_some() {
+        let mut pred = [0u8; 256];
+        pred16(3, top.as_ref(), left.as_ref(), tl, &mut pred);
         let cost = pixel_satd_16x16(&src.y, 16, &pred, 16);
         if cost < best.0 {
-            best = (cost, mode, pred);
+            best = (cost, 3);
         }
     }
     best
@@ -1137,10 +1239,8 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16
             continue;
         }
         let zz = zigzag_4x4_x4(group);
-        let score: u32 = (0..4)
-            .filter(|b| nz & (1 << b) != 0)
-            .map(|b| decimate_score(&zz[b]))
-            .sum();
+        let masks = nonzero_mask_4x4_x4(&zz);
+        let score: u32 = (0..4).map(|b| decimate_masked(&zz[b], masks[b])).sum();
         if score < 4 {
             *group = [[0; 16]; 4];
         } else {
@@ -1155,31 +1255,59 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16
     (q4, cbp)
 }
 
-/// Transforms and quantizes the chroma residual: the $2\times2$ DC levels and the zig-zag scanned
-/// AC levels of both planes.
-#[allow(clippy::type_complexity)]
-fn quant_chroma(
-    src: &MbSrc,
-    pu: &[u8; 64],
-    pv: &[u8; 64],
-    qpc: u8,
-    intra: bool,
-) -> ([[i16; 4]; 2], [[[i16; 15]; 4]; 2]) {
+/// Transformed and quantized chroma residual of a macroblock.
+struct ChromaLevels {
+    /// The $2\times2$ DC levels of each plane.
+    dc: [[i16; 4]; 2],
+    /// The zig-zag scanned AC levels of each $4\times4$ block.
+    ac: [[[i16; 15]; 4]; 2],
+    /// Masks of the non-zero AC levels (bit `i` for `ac[..][..][i]`).
+    ac_masks: [[u32; 4]; 2],
+}
+
+impl ChromaLevels {
+    /// `coded_block_pattern` chroma: 2 with AC levels, 1 with DC levels only, else 0.
+    fn cbp(&self) -> u8 {
+        if self.ac_masks.iter().flatten().any(|&m| m != 0) {
+            2
+        } else if self.dc.iter().flatten().any(|&c| c != 0) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The decimation score of plane `p`'s AC levels.
+    fn ac_score(&self, p: usize) -> u32 {
+        (0..4)
+            .map(|b| decimate_masked(&self.ac[p][b], self.ac_masks[p][b]))
+            .sum()
+    }
+}
+
+/// Transforms and quantizes the chroma residual of both planes.
+fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool) -> ChromaLevels {
     let q = quant4(qpc, intra);
-    let mut dc = [[0i16; 4]; 2];
-    let mut ac = [[[0i16; 15]; 4]; 2];
+    let mut out = ChromaLevels {
+        dc: [[0; 4]; 2],
+        ac: [[[0; 15]; 4]; 2],
+        ac_masks: [[0; 4]; 2],
+    };
     for (p, (s, pred)) in [(&src.u, pu), (&src.v, pv)].into_iter().enumerate() {
         let mut c = [[0i16; 16]; 4];
         sub_dct4x4_8x8(s, 8, pred, 8, &mut c);
         let dc_raw = [c[0][0], c[1][0], c[2][0], c[3][0]];
         if quant_4x4_x4(&mut c, q) != 0 {
-            for (a, zz) in ac[p].iter_mut().zip(zigzag_4x4_x4(&c)) {
-                a.copy_from_slice(&zz[1..]);
+            let zz = zigzag_4x4_x4(&c);
+            // Bit 0 is the block's DC slot, which the 2x2 DC transform codes instead.
+            out.ac_masks[p] = nonzero_mask_4x4_x4(&zz).map(|m| m >> 1);
+            for (a, z) in out.ac[p].iter_mut().zip(&zz) {
+                a.copy_from_slice(&z[1..]);
             }
         }
-        dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
+        out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
     }
-    (dc, ac)
+    out
 }
 
 #[inline(always)]
@@ -1231,16 +1359,6 @@ fn recon_chroma(
     }
 }
 
-fn chroma_cbp(dc: &[[i16; 4]; 2], ac: &[[[i16; 15]; 4]; 2]) -> u8 {
-    if ac.iter().flatten().flatten().any(|&c| c != 0) {
-        2
-    } else if dc.iter().flatten().any(|&c| c != 0) {
-        1
-    } else {
-        0
-    }
-}
-
 /// $8\times8$-transform counterpart of [`quant_luma_4x4_inter`].
 fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64]; 4], u8, u32) {
     let mut q8 = [[0i16; 64]; 4];
@@ -1268,22 +1386,15 @@ fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64
 
 /// Quantizes the chroma residual of an inter macroblock, dropping a plane's AC levels when they
 /// are nearly empty.
-#[allow(clippy::type_complexity)]
-fn quant_chroma_inter(
-    src: &MbSrc,
-    pu: &[u8; 64],
-    pv: &[u8; 64],
-    qpc: u8,
-) -> ([[i16; 4]; 2], [[[i16; 15]; 4]; 2], u8) {
-    let (dc, mut ac) = quant_chroma(src, pu, pv, qpc, false);
-    for plane in ac.iter_mut() {
-        let score: u32 = plane.iter().map(|b| decimate_score(b)).sum();
-        if score < 7 {
-            *plane = [[0; 15]; 4];
+fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> ChromaLevels {
+    let mut c = quant_chroma(src, pu, pv, qpc, false);
+    for p in 0..2 {
+        if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
+            c.ac[p] = [[0; 15]; 4];
+            c.ac_masks[p] = [0; 4];
         }
     }
-    let cbp = chroma_cbp(&dc, &ac);
-    (dc, ac, cbp)
+    c
 }
 
 /// SAD thresholds of the skip decision at one QP.
@@ -1356,12 +1467,11 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
         if nz == 0 {
             continue;
         }
-        for (b, zz) in zigzag_4x4_x4(group).iter().enumerate() {
-            if nz & (1 << b) != 0 {
-                total += decimate_score(zz);
-                if total >= 6 {
-                    return false;
-                }
+        let zz = zigzag_4x4_x4(group);
+        for (z, &mask) in zz.iter().zip(&nonzero_mask_4x4_x4(&zz)) {
+            total += decimate_masked(z, mask);
+            if total >= 6 {
+                return false;
             }
         }
     }
@@ -1370,12 +1480,11 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
 
 /// `x264_macroblock_probe_pskip`, chroma part: no DC level, and AC levels decimated per plane.
 fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool {
-    let (dc, ac) = quant_chroma(src, pu, pv, qpc, false);
-    if dc.iter().flatten().any(|&c| c != 0) {
+    let c = quant_chroma(src, pu, pv, qpc, false);
+    if c.dc.iter().flatten().any(|&l| l != 0) {
         return false;
     }
-    ac.iter()
-        .all(|plane| plane.iter().map(|b| decimate_score(b)).sum::<u32>() < 7)
+    (0..2).all(|p| c.ac_score(p) < 7)
 }
 
 impl H264Encoder {
@@ -1472,7 +1581,7 @@ impl H264Encoder {
             None
         };
 
-        self.state.prepare(mb_w, mb_h, slice_qp);
+        self.state.prepare(mb_w, mb_h, slice_qp, use_cabac);
         let mut sl = SliceState {
             is_idr,
             use_cabac,
@@ -1575,11 +1684,43 @@ impl H264Encoder {
         } else {
             Vec::new()
         };
-        out.extend_from_slice(&encode_annex_b_nal(3, nal_type, &slice_rbsp));
+        append_annex_b_nal(&mut out, nal_header, &slice_rbsp);
         self.state.bits_buf = slice_rbsp;
         self.finish_frame_rate_control(&mut out, fps);
         Ok(out)
     }
+}
+
+/// Appends the Annex-B NAL unit of `rbsp` to `out`, inserting emulation prevention bytes exactly
+/// as [`encode_annex_b_nal`] does. Eight bytes at a time are skipped while no zero byte can
+/// start an escape.
+fn append_annex_b_nal(out: &mut Vec<u8>, header: NalHeader, rbsp: &[u8]) {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    out.reserve(rbsp.len() + rbsp.len() / 64 + 8);
+    out.extend_from_slice(&[0, 0, 0, 1, header.to_byte()]);
+    let (mut zeros, mut copied, mut i) = (0u32, 0usize, 0usize);
+    while i < rbsp.len() {
+        if zeros == 0
+            && let Some(word) = rbsp.get(i..i + 8)
+        {
+            let x = u64::from_le_bytes(word.try_into().unwrap());
+            if x.wrapping_sub(ONES) & !x & HIGHS == 0 {
+                i += 8;
+                continue;
+            }
+        }
+        let b = rbsp[i];
+        if zeros == 2 && b <= 3 {
+            out.extend_from_slice(&rbsp[copied..i]);
+            out.push(3);
+            copied = i;
+            zeros = 0;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        i += 1;
+    }
+    out.extend_from_slice(&rbsp[copied..]);
 }
 
 /// MSB-first bit writer for slice data (`x264` `bs_t`): bits gather in a 64-bit word that is
@@ -1750,7 +1891,7 @@ impl EncState {
         }
         let g_stride = mb_w * 4;
         fill_grid_4x4(&mut self.luma_nnz, g_stride, mb_x * 4, mb_y * 4, 4, 4, 16);
-        fill_grid_4x4(&mut self.ref_grid, g_stride, mb_x * 4, mb_y * 4, 4, 4, -1);
+        self.set_intra_motion(mb_x, mb_y);
         for c in 0..2 {
             fill_grid_4x4(
                 &mut self.chroma_nnz[c],
@@ -1953,10 +2094,10 @@ impl EncState {
 
         // 3. Intra 16x16 when inter prediction is poor.
         if inter_satd > 24 * lambda {
-            let (i16_satd, i16_mode, i16_pred) = analyse_i16(&self.cur, mb_x, mb_y, src);
+            let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
             if i16_satd + lambda * 8 < inter_cost {
                 self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
-                self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode, i16_pred);
+                self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
                 return;
             }
         }
@@ -1983,10 +2124,10 @@ impl EncState {
                 res.cbp_luma = cbp8;
             }
         }
-        let (dc, ac, cbp_c) = quant_chroma_inter(src, &pu, &pv, qpc);
-        res.chroma_dc = dc;
-        res.chroma_ac = ac;
-        res.cbp_chroma = cbp_c;
+        let c = quant_chroma_inter(src, &pu, &pv, qpc);
+        res.cbp_chroma = c.cbp();
+        res.chroma_dc = c.dc;
+        res.chroma_ac = c.ac;
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);
             self.cur.store_mb(mb_x, mb_y, &py, &pu, &pv);
@@ -2111,7 +2252,9 @@ impl EncState {
         recon_chroma(pu, pv, &res.chroma_dc, &res.chroma_ac, cbp_chroma, eff_qpc);
         fill_grid_4x4(&mut self.ref_grid, g_stride, gx0, gy0, 4, 4, 0);
         fill_grid_4x4(&mut self.mv_grid, g_stride, gx0, gy0, 4, 4, mv);
-        fill_grid_4x4(&mut self.mvd_grid, g_stride, gx0, gy0, 4, 4, mvd);
+        if cabac.is_some() {
+            fill_grid_4x4(&mut self.mvd_grid, g_stride, gx0, gy0, 4, 4, mvd);
+        }
         self.cur.store_mb(mb_x, mb_y, py, pu, pv);
     }
 
@@ -2128,14 +2271,14 @@ impl EncState {
         src: &MbSrc,
     ) {
         let lambda = LAMBDA[qp as usize] as u32;
-        let (i16_satd, i16_mode, i16_pred) = analyse_i16(&self.cur, mb_x, mb_y, src);
+        let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
         if i16_satd > 40 * lambda
             && let Some(i4) = self.analyse_i4(mb_x, mb_y, qp, src, i16_satd + lambda * 4)
         {
             self.code_i4(sl, w, cabac, mb_x, mb_y, qp, src, i4);
             return;
         }
-        self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode, i16_pred);
+        self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
     }
 
     /// Chooses, codes and reconstructs the sixteen $4\times4$ blocks of an `I_4x4` candidate in
@@ -2227,15 +2370,16 @@ impl EncState {
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
         let (chroma_mode, mut pu, mut pv) = analyse_chroma_intra(&self.cur, mb_x, mb_y, src);
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
-        let (chroma_dc, chroma_ac) = quant_chroma(src, &pu, &pv, qpc, true);
-        let cbp_chroma = chroma_cbp(&chroma_dc, &chroma_ac);
+        let c = quant_chroma(src, &pu, &pv, qpc, true);
+        let cbp_chroma = c.cbp();
+        let (chroma_dc, chroma_ac) = (c.dc, c.ac);
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
         let qp_delta = if cbp != 0 { qp as i32 - sl.cur_qp } else { 0 };
         let eff_qp = (sl.cur_qp + qp_delta).clamp(0, 51) as u8;
         let eff_qpc = chroma_qp(eff_qp as i32, sl.chroma_qp_offset);
         self.mb_is_intra[mb_idx] = true;
         self.mb_chroma_mode[mb_idx] = chroma_mode;
-        fill_grid_4x4(&mut self.ref_grid, g_stride, mb_x * 4, mb_y * 4, 4, 4, -1);
+        self.set_intra_motion(mb_x, mb_y);
         // Mode prediction while writing must see the neighbours' modes, not this MB's choices.
         for b in 0..16 {
             let (bx, by) = blk_xy(b);
@@ -2350,7 +2494,7 @@ impl EncState {
         self.cur.store_mb(mb_x, mb_y, &i4.recon, &pu, &pv);
     }
 
-    /// Writes and reconstructs an `I_16x16` macroblock with prediction `pred` of mode `mode`.
+    /// Writes and reconstructs an `I_16x16` macroblock predicted with `mode`.
     #[allow(clippy::too_many_arguments)]
     fn code_i16(
         &mut self,
@@ -2362,8 +2506,10 @@ impl EncState {
         qp: u8,
         src: &MbSrc,
         mode: u8,
-        mut pred: [u8; 256],
     ) {
+        let mut pred = [0u8; 256];
+        let (top, left, tl) = i16_edges(&self.cur.y, mb_x, mb_y);
+        pred16(mode, top.as_ref(), left.as_ref(), tl, &mut pred);
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
@@ -2371,7 +2517,7 @@ impl EncState {
         self.mb_is_intra[mb_idx] = true;
         self.mb_is_i16x16[mb_idx] = true;
         self.mb_chroma_mode[mb_idx] = chroma_mode;
-        fill_grid_4x4(&mut self.ref_grid, g_stride, mb_x * 4, mb_y * 4, 4, 4, -1);
+        self.set_intra_motion(mb_x, mb_y);
         let qp_delta = qp as i32 - sl.cur_qp;
         let eff_qp = (sl.cur_qp + qp_delta).clamp(0, 51) as u8;
         let eff_qpc = chroma_qp(eff_qp as i32, sl.chroma_qp_offset);
@@ -2396,8 +2542,9 @@ impl EncState {
         let dc_q = quantize_luma_dc4x4(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
-        let (chroma_dc, chroma_ac) = quant_chroma(src, &pu, &pv, eff_qpc, true);
-        let cbp_chroma = chroma_cbp(&chroma_dc, &chroma_ac);
+        let c = quant_chroma(src, &pu, &pv, eff_qpc, true);
+        let cbp_chroma = c.cbp();
+        let (chroma_dc, chroma_ac) = (c.dc, c.ac);
         let mb_type = 1 + mode as u32 + 4 * cbp_chroma as u32 + if cbp_luma != 0 { 12 } else { 0 };
         self.mb_cbp_luma[mb_idx] = cbp_luma;
         self.mb_cbp_chroma[mb_idx] = cbp_chroma;
@@ -2679,6 +2826,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nal_escaping_matches_the_reference() {
+        let mut x = 0x2545_f491_u32;
+        for len in 0..300usize {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    // Mostly zeros and small values, so escapes and long zero runs occur.
+                    match x % 8 {
+                        0..=3 => 0,
+                        4 | 5 => (x >> 8) as u8 & 3,
+                        _ => (x >> 8) as u8,
+                    }
+                })
+                .collect();
+            let header = NalHeader {
+                nal_ref_idc: 3,
+                nal_unit_type: NalUnitType::NonIdrSlice,
+            };
+            let mut out = vec![9];
+            append_annex_b_nal(&mut out, header, &data);
+            assert_eq!(
+                out[1..],
+                encode_annex_b_nal(3, NalUnitType::NonIdrSlice, &data)[..]
+            );
+        }
+    }
+
+    #[test]
     fn cavlc_writer_matches_reference_block_coder() {
         let mut x = 0x9e37_79b9_u32;
         let mut next = || {
@@ -2690,17 +2867,17 @@ mod tests {
         for _ in 0..20_000 {
             let len = [16usize, 15, 4][(next() % 3) as usize];
             let density = next() % 17;
-            let big = next() % 4 == 0;
+            let range = [4u32, 4, 40, 3000][(next() % 4) as usize];
             let mut c = [0i16; 16];
             for v in c.iter_mut().take(len) {
                 if next() % 16 < density {
-                    let mag = if big {
-                        (next() % 3000) as i16 + 1
-                    } else {
-                        (next() % 4) as i16 + 1
-                    };
+                    let mag = (next() % range) as i16 + 1;
                     *v = if next() & 1 == 0 { mag } else { -mag };
                 }
+            }
+            if len != 4 {
+                let mask = (0..len).fold(0u32, |m, i| m | u32::from(c[i] != 0) << i);
+                assert_eq!(decimate_masked(&c[..len], mask), decimate_score(&c[..len]));
             }
             let nc = (next() % 17) as u8;
             let chroma_dc = len == 4;
