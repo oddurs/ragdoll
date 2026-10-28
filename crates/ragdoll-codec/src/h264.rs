@@ -2347,7 +2347,7 @@ fn cavlc_block(
     };
     let sym = token
         .symbol(r, count)
-        .ok_or(bad("CAVLC invalid coeff_token"))??;
+        .ok_or_else(|| bad("CAVLC invalid coeff_token"))??;
     let (total_coeff, trailing_ones) = (sym / 4, sym % 4);
 
     if total_coeff == 0 {
@@ -2444,7 +2444,7 @@ fn cavlc_block(
             &tables.total_zeros[total_coeff - 1]
         };
         t.symbol(r, count)
-            .ok_or(bad("CAVLC invalid total_zeros"))??
+            .ok_or_else(|| bad("CAVLC invalid total_zeros"))??
     };
 
     let mut pos = total_coeff + zeros_left - 1;
@@ -2456,7 +2456,7 @@ fn cavlc_block(
         let run_before = if zeros_left > 0 {
             let t = &tables.run[(zeros_left - 1).min(6)];
             t.symbol(r, zeros_left + 1)
-                .ok_or(bad("CAVLC invalid run_before"))??
+                .ok_or_else(|| bad("CAVLC invalid run_before"))??
         } else {
             0
         };
