@@ -6,8 +6,10 @@
 //!   `celt`/`bands`/`vq`/`rate`/`energy`/`mdct`/`plc` (CELT), `silk`/`silk_dsp` (SILK and its
 //!   resampler), `math` (fixed-point helpers), `*_tables` (tables generated from libopus).
 //!   Being a port, it carries libopus's BSD-3-Clause notice: see `COPYING.libopus`.
-//! - **Encoder** ([`OpusEncoder`], `OpusRangeEncoder`, PVQ helpers): writes packets no other
-//!   decoder can read; being replaced (cairn `BUG-0078`).
+//! - **Encoder** ([`encoder::OpusPacketEncoder`], wrapped by [`OpusEncoder`]): a port of the
+//!   fixed-point libopus 1.3.1 CELT encoder (`celt_enc`) and the CELT-only paths of its Opus
+//!   layer, byte-identical with libopus in the restricted low-delay application at complexity
+//!   0 to 9 (cairn `BUG-0078`).
 //! - **`OpusHead` and `OpusTags`**: header parser and serializer for Ogg Opus and Matroska/WebM
 //!   `CodecPrivate`.
 
@@ -15,8 +17,10 @@
 
 mod bands;
 mod celt;
+mod celt_enc;
 mod celt_tables;
 pub mod decoder;
+pub mod encoder;
 mod energy;
 mod math;
 mod mdct;
@@ -31,15 +35,8 @@ mod vq;
 use ragdoll_core::{
     AudioFrame, ChannelLayout, RagdollError, Rational64, Result, SampleFormat, Timestamp,
 };
-use ragdoll_simd::{MdctPlan, sine_window_f32};
 
 use crate::pcm::convert_audio_frame;
-
-/// RFC 6716 CELT 21 Bark-scale band boundaries for a 120-bin (2.5 ms) base block;
-/// multiply by `4` for a 480-bin (10 ms, `N = 960` MDCT) CELT block.
-pub const CELT_EBAND_BASE: [u16; 22] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 78, 120,
-];
 
 /// RFC 7845 Section 5.1 `OpusHead` identification header (19 bytes for `mapping_family = 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,200 +197,46 @@ impl OpusToc {
             frame_samples_48k,
         }
     }
-
-    /// Encodes a TOC byte for CELT Fullband 20 ms (`config = 31`, `960` samples at 48 kHz).
-    #[inline]
-    pub const fn celt_fb_20ms(stereo: bool) -> u8 {
-        (31 << 3) | (if stereo { 1 << 2 } else { 0 })
-    }
 }
 
-// ============================================================================
-// RFC 6716 Section 4.1 Range Coder (OpusRangeEncoder / OpusRangeDecoder)
-// ============================================================================
-
-const EC_SYM_BITS: u32 = 8;
-const EC_CODE_BITS: u32 = 32;
-const EC_SYM_MAX: u32 = (1 << EC_SYM_BITS) - 1;
-const EC_CODE_SHIFT: u32 = EC_CODE_BITS - EC_SYM_BITS - 1;
-const EC_CODE_TOP: u32 = 1 << (EC_CODE_BITS - 1);
-const EC_CODE_BOT: u32 = EC_CODE_TOP >> EC_SYM_BITS;
-
-/// RFC 6716 Section 4.1 Arithmetic Range Encoder (`ec_enc`).
-#[derive(Clone, Debug)]
-pub struct OpusRangeEncoder {
-    buf: Vec<u8>,
-    val: u32,
-    rng: u32,
-    rem: i32,
-    ext: usize,
-}
-
-impl OpusRangeEncoder {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(cap),
-            val: 0,
-            rng: EC_CODE_TOP,
-            rem: -1,
-            ext: 0,
-        }
-    }
-
-    #[inline]
-    fn carry_out(&mut self, c: i32) {
-        if c != EC_SYM_MAX as i32 {
-            let carry = c >> EC_SYM_BITS;
-            if self.rem >= 0 {
-                self.buf.push((self.rem + carry) as u8);
-            }
-            while self.ext > 0 {
-                self.buf.push(((EC_SYM_MAX as i32 + carry) & 0xFF) as u8);
-                self.ext -= 1;
-            }
-            self.rem = c & (EC_SYM_MAX as i32);
-        } else {
-            self.ext += 1;
-        }
-    }
-
-    #[inline]
-    fn normalize(&mut self) {
-        while self.rng <= EC_CODE_BOT {
-            self.carry_out((self.val >> EC_CODE_SHIFT) as i32);
-            self.val = (self.val << EC_SYM_BITS) & (EC_CODE_TOP - 1);
-            self.rng <<= EC_SYM_BITS;
-        }
-    }
-
-    /// Encodes a symbol with cumulative frequency interval `[fl, fh)` out of total `ft`.
-    pub fn encode(&mut self, fl: u32, fh: u32, ft: u32) {
-        let r = self.rng / ft;
-        if fl > 0 {
-            self.val += self.rng - r * (ft - fl);
-            self.rng = r * (fh - fl);
-        } else {
-            self.rng -= r * (ft - fh);
-        }
-        self.normalize();
-    }
-
-    /// Encodes a uniformly distributed integer `val` in `0..ft` (`ft <= 65536`).
-    pub fn encode_uint(&mut self, val: u32, ft: u32) {
-        assert!(val < ft && ft > 0);
-        if ft > 1 {
-            self.encode(val, val + 1, ft);
-        }
-    }
-
-    /// Encodes a binary symbol `bit` where $P(\text{bit} = 1) = 2^{-\text{logp}}$.
-    pub fn encode_bit_logp(&mut self, bit: bool, logp: u32) {
-        let r = self.rng >> logp;
-        if bit {
-            self.val += self.rng - r;
-            self.rng = r;
-        } else {
-            self.rng -= r;
-        }
-        self.normalize();
-    }
-
-    /// Finalizes the RFC 6716 range coder stream into bytes.
-    pub fn finish(mut self) -> Vec<u8> {
-        let mut l = EC_CODE_BITS - (32 - self.rng.leading_zeros());
-        let mut msk = (EC_CODE_TOP - 1) >> l;
-        let mut end = (self.val + msk) & !msk;
-        if (end | msk) >= self.val + self.rng {
-            l += 1;
-            msk >>= 1;
-            end = (self.val + msk) & !msk;
-        }
-        while l > 0 {
-            self.carry_out((end >> EC_CODE_SHIFT) as i32);
-            end = (end << EC_SYM_BITS) & (EC_CODE_TOP - 1);
-            l = l.saturating_sub(EC_SYM_BITS);
-        }
-        if self.rem >= 0 || self.ext > 0 {
-            self.carry_out(0);
-        }
-        self.buf
-    }
-}
-
-/// Greedily projects unit-norm band vector `x` onto the integer $L_1$ pyramid $\sum_i |y_i| = k_pulses$,
-/// maximizing $\frac{x \cdot y}{\sqrt{y \cdot y}}$ per RFC 6716 Section 4.3.4 (`alg_quant`).
-pub fn pvq_search_pulses(x: &[f32], k_pulses: usize, y_out: &mut [i16]) {
-    let n = x.len().min(y_out.len());
-    y_out[..n].fill(0);
-    if n == 0 || k_pulses == 0 {
-        return;
-    }
-    let mut rxy = 0.0f32;
-    let mut ryy = 0.0f32;
-    for _ in 0..k_pulses {
-        let mut best_idx = 0usize;
-        let mut best_score = -1.0e30f32;
-        let mut best_sign = 1i16;
-        for i in 0..n {
-            let s = if x[i] >= 0.0 { 1.0f32 } else { -1.0f32 };
-            let si = if x[i] >= 0.0 { 1i16 } else { -1i16 };
-            let new_rxy = rxy + s * x[i];
-            let new_ryy = ryy + 2.0 * (s * (y_out[i] as f32)) + 1.0;
-            // Maximize new_rxy / sqrt(new_ryy) <-> sign(new_rxy) * new_rxy^2 / new_ryy
-            let score = if new_rxy >= 0.0 {
-                (new_rxy * new_rxy) / new_ryy.max(1.0)
-            } else {
-                -(new_rxy * new_rxy) / new_ryy.max(1.0)
-            };
-            if score > best_score {
-                best_score = score;
-                best_idx = i;
-                best_sign = si;
-            }
-        }
-        rxy += (best_sign as f32) * x[best_idx];
-        ryy += 2.0 * ((best_sign as f32) * (y_out[best_idx] as f32)) + 1.0;
-        y_out[best_idx] += best_sign;
-    }
-}
-
-/// Normalizes integer PVQ pulse vector `y` onto the $L_2$ sphere and scales by `band_gain`.
-pub fn pvq_reconstruct_band(y: &[i16], band_gain: f32, x_out: &mut [f32]) {
-    let n = y.len().min(x_out.len());
-    let mut sum_sq = 0.0f32;
-    for i in 0..n {
-        let v = y[i] as f32;
-        sum_sq += v * v;
-    }
-    if sum_sq <= 1e-12 {
-        x_out[..n].fill(0.0);
-        return;
-    }
-    let scale = band_gain / sum_sq.sqrt();
-    for i in 0..n {
-        x_out[i] = (y[i] as f32) * scale;
-    }
-}
-
-/// Pure-Rust Opus Encoder (`48 kHz`, 20 ms = `960` samples per frame, CELT MDCT + Range Coder + PVQ).
-#[derive(Clone, Debug)]
+/// Opus encoder producing one Ogg/Matroska stream: 20 ms CELT packets at 48 kHz, byte-identical
+/// with fixed-point libopus 1.3.1 in the restricted low-delay application at complexity 9
+/// (constrained VBR by default). See [`encoder::OpusPacketEncoder`] for the full control set.
+#[derive(Clone)]
 pub struct OpusEncoder {
     pub head: OpusHead,
     pub bitrate_bps: u32,
-    mdct_960: MdctPlan,
-    win_960: Vec<f32>,
-    history: [[f32; 480]; 2],
+    inner: encoder::OpusPacketEncoder,
+    packet: Vec<u8>,
 }
 
+impl std::fmt::Debug for OpusEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpusEncoder")
+            .field("head", &self.head)
+            .field("bitrate_bps", &self.bitrate_bps)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Samples per channel of the 20 ms frames the encoder codes.
+const ENC_FRAME: usize = 960;
+
 impl OpusEncoder {
-    /// Creates a new `OpusEncoder` for `sample_rate` (resampled/mapped to 48 kHz Opus clock), `channels` (`1` or `2`), and `bitrate_bps`.
+    /// Creates an encoder for 48 kHz input with `channels` (1 or 2) at `bitrate_bps`;
+    /// `sample_rate` is recorded in the `OpusHead` as the original input rate.
     pub fn new(sample_rate: u32, channels: u8, bitrate_bps: u32) -> Self {
+        let channels = channels.clamp(1, 2);
+        let mut inner = encoder::OpusPacketEncoder::new(channels as usize)
+            .expect("one or two channels are always valid");
+        inner.set_bitrate(bitrate_bps.min(i32::MAX as u32) as i32);
+        let mut head = OpusHead::new(channels, sample_rate);
+        head.pre_skip = inner.lookahead() as u16;
         Self {
-            head: OpusHead::new(channels, sample_rate),
-            bitrate_bps: bitrate_bps.max(32_000),
-            mdct_960: MdctPlan::new(960),
-            win_960: sine_window_f32(960),
-            history: [[0.0; 480]; 2],
+            head,
+            bitrate_bps,
+            inner,
+            packet: vec![0; 1500],
         }
     }
 
@@ -402,131 +245,88 @@ impl OpusEncoder {
         self.head.to_bytes()
     }
 
-    #[inline]
-    fn pulses_for_band(band: usize, bitrate_bps: u32) -> usize {
-        let base = match band {
-            0..=7 => 10,
-            8..=12 => 18,
-            13..=16 => 24,
-            17..=19 => 20,
-            _ => 12,
-        };
-        if bitrate_bps >= 128_000 {
-            base * 2
-        } else {
-            base
-        }
+    /// The underlying packet encoder, for VBR, complexity and other controls.
+    pub fn packet_encoder(&mut self) -> &mut encoder::OpusPacketEncoder {
+        &mut self.inner
     }
 
-    /// Encodes a 20 ms (`960`-sample at 48 kHz) [`AudioFrame`] into an RFC 6716 CELT Opus packet.
+    /// Final range coder state of the last packet (`OPUS_GET_FINAL_RANGE`); a decoder that
+    /// reads the packet correctly ends in the same state.
+    pub fn final_range(&self) -> u32 {
+        self.inner.final_range()
+    }
+
+    /// Encodes 20 ms (960 samples per channel at 48 kHz) of interleaved 16-bit samples.
+    pub fn encode_i16(&mut self, pcm: &[i16]) -> Result<Vec<u8>> {
+        let n = self
+            .inner
+            .encode(pcm, ENC_FRAME, &mut self.packet)
+            .map_err(|e| RagdollError::InvalidData(format!("Opus encode: {e}")))?;
+        Ok(self.packet[..n].to_vec())
+    }
+
+    /// Encodes a 20 ms (960-sample at 48 kHz) [`AudioFrame`] into one Opus packet. Shorter frames
+    /// are padded with silence; floating-point samples are converted as `opus_encode_float` does.
     pub fn encode_frame(&mut self, frame: &AudioFrame) -> Result<Vec<u8>> {
-        let f32_frame = if frame.format == SampleFormat::F32le {
-            frame.clone()
-        } else {
-            convert_audio_frame(frame, SampleFormat::F32le)?
-        };
-        let ch_count = (self.head.channels as usize).clamp(1, 2);
-        let src = f32_frame.as_f32_slice();
-        let src_ch = (f32_frame.channels as usize).max(1);
-        let in_samples = f32_frame.num_samples.min(960);
-
-        let mut re = OpusRangeEncoder::with_capacity(256);
-        // Header flags: silence = 0 (logp 15), postfilter = 0 (logp 1), transient = 0 (logp 3), intra = 1 (logp 3)
-        re.encode_bit_logp(false, 15);
-        re.encode_bit_logp(false, 1);
-        re.encode_bit_logp(false, 3);
-        re.encode_bit_logp(true, 3);
-
-        // Two 10 ms (480-sample) MDCT sub-frames per 20 ms (960-sample) Opus frame
-        for sub in 0..2 {
-            let sub_base = sub * 480;
-            for c in 0..ch_count {
-                let mut cur_480 = [0.0f32; 480];
-                for i in 0..480 {
-                    let idx = sub_base + i;
-                    if idx < in_samples {
-                        cur_480[i] = src[idx * src_ch + c.min(src_ch - 1)];
-                    }
-                }
-                let mut win_in = [0.0f32; 960];
-                for i in 0..480 {
-                    win_in[i] = self.history[c][i] * self.win_960[i];
-                    win_in[480 + i] = cur_480[i] * self.win_960[480 + i];
-                }
-                self.history[c] = cur_480;
-
-                let mut coeffs = [0.0f32; 480];
-                self.mdct_960.mdct(&win_in, &mut coeffs);
-
-                for b in 0..21 {
-                    let start = (CELT_EBAND_BASE[b] as usize) * 4;
-                    let end = (CELT_EBAND_BASE[b + 1] as usize) * 4;
-                    let band_slice = &coeffs[start..end];
-                    let norm = band_slice.iter().map(|&x| x * x).sum::<f32>().sqrt();
-                    if norm < 1e-5 {
-                        re.encode_bit_logp(false, 2); // band silent
-                    } else {
-                        re.encode_bit_logp(true, 2); // band active
-                        // Quantize log2(norm) in [-16.0, +16.0] to 11-bit unsigned [0..2047]
-                        let q_e =
-                            (((norm.log2() + 16.0) * 64.0).round() as i32).clamp(0, 2047) as u32;
-                        re.encode_uint(q_e, 2048);
-
-                        let k_pulses = Self::pulses_for_band(b, self.bitrate_bps);
-                        let mut pulses = vec![0i16; end - start];
-                        pvq_search_pulses(band_slice, k_pulses, &mut pulses);
-                        for &p in &pulses {
-                            if p == 0 {
-                                re.encode_bit_logp(false, 2);
-                            } else {
-                                re.encode_bit_logp(true, 2);
-                                re.encode_bit_logp(p < 0, 1);
-                                let mag = (p.unsigned_abs() as u32).min(63);
-                                re.encode_uint(mag - 1, 63);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let range_bytes = re.finish();
-        let toc = OpusToc::celt_fb_20ms(ch_count == 2);
-        let mut pkt = Vec::with_capacity(1 + range_bytes.len());
-        pkt.push(toc);
-        pkt.extend_from_slice(&range_bytes);
-        Ok(pkt)
+        let ch = self.head.channels as usize;
+        let pcm = frame_to_i16(frame, ch, ENC_FRAME)?;
+        self.encode_i16(&pcm)
     }
 
-    /// Encodes an arbitrary-length `AudioFrame` into 20 ms (`960`-sample) Opus packets.
+    /// Encodes a whole [`AudioFrame`] into 20 ms packets, adding enough silence at the end that
+    /// every input sample comes out of a decoder after the `OpusHead` pre-skip.
     pub fn encode_stream_frames(
         &mut self,
         frame: &AudioFrame,
     ) -> Result<Vec<(Vec<u8>, Timestamp, i64)>> {
-        let f32_frame = if frame.format == SampleFormat::F32le {
-            frame.clone()
-        } else {
-            convert_audio_frame(frame, SampleFormat::F32le)?
-        };
-        let ch = f32_frame.channels as usize;
-        let total = f32_frame.num_samples;
-        let src = f32_frame.as_f32_slice();
+        let ch = self.head.channels as usize;
+        let total = frame.num_samples;
+        let padded = (total + self.head.pre_skip as usize).div_ceil(ENC_FRAME) * ENC_FRAME;
+        let pcm = frame_to_i16(frame, ch, padded)?;
         let tb = Rational64::new(1, 48_000);
         let base_pts = frame.pts.rescale_to(tb).ticks;
-
-        let mut out = Vec::new();
-        let mut off = 0usize;
-        while off < total {
-            let take = (total - off).min(960);
-            let mut sub = AudioFrame::new(48_000, f32_frame.channels, SampleFormat::F32le, 960);
-            sub.as_f32_mut_slice()[..take * ch].copy_from_slice(&src[off * ch..(off + take) * ch]);
-            let pkt = self.encode_frame(&sub)?;
-            let pts = Timestamp::new(base_pts + (off as i64), tb);
-            out.push((pkt, pts, 960));
-            off += 960;
+        let mut out = Vec::with_capacity(padded / ENC_FRAME);
+        for (k, chunk) in pcm.chunks_exact(ENC_FRAME * ch).enumerate() {
+            let pkt = self.encode_i16(chunk)?;
+            let pts = Timestamp::new(base_pts + (k * ENC_FRAME) as i64, tb);
+            out.push((pkt, pts, ENC_FRAME as i64));
         }
         Ok(out)
     }
+}
+
+/// Interleaved 16-bit samples of `frame` mapped to `ch` channels and zero-padded to `len`
+/// samples per channel. Float input is scaled by 32768, clamped and rounded to nearest-even,
+/// like libopus's `FLOAT2INT16`.
+fn frame_to_i16(frame: &AudioFrame, ch: usize, len: usize) -> Result<Vec<i16>> {
+    let src_ch = (frame.channels as usize).max(1);
+    let n = frame.num_samples.min(len);
+    let mut out = vec![0i16; len * ch];
+    let get: Box<dyn Fn(usize) -> i16> = match frame.format {
+        SampleFormat::S16le => {
+            let s = frame.as_i16_slice();
+            Box::new(move |i| s[i])
+        }
+        SampleFormat::F32le => {
+            let s = frame.as_f32_slice();
+            Box::new(move |i| (s[i] * 32768.0).clamp(-32768.0, 32767.0).round_ties_even() as i16)
+        }
+        _ => {
+            let f = convert_audio_frame(frame, SampleFormat::F32le)?;
+            let v: Vec<i16> = f
+                .as_f32_slice()
+                .iter()
+                .map(|&x| (x * 32768.0).clamp(-32768.0, 32767.0).round_ties_even() as i16)
+                .collect();
+            Box::new(move |i| v[i])
+        }
+    };
+    for i in 0..n {
+        for c in 0..ch {
+            out[i * ch + c] = get(i * src_ch + c.min(src_ch - 1));
+        }
+    }
+    Ok(out)
 }
 
 /// Opus decoder for one Ogg/Matroska stream (RFC 7845 channel mapping family 0): wraps the

@@ -39,10 +39,7 @@ pub use h264::{
     quantize_block4x4, quantize_block8x8, roundtrip_block4x4_dct,
 };
 pub use loudness::{EbuR128Meter, KWeightingFilterBank, LoudnessReport, normalize_audio_frame};
-pub use opus::{
-    CELT_EBAND_BASE, OpusDecoder, OpusEncoder, OpusHead, OpusRangeEncoder, OpusToc,
-    build_opus_tags, parse_opus_tags, pvq_reconstruct_band, pvq_search_pulses,
-};
+pub use opus::{OpusDecoder, OpusEncoder, OpusHead, OpusToc, build_opus_tags, parse_opus_tags};
 pub use pcm::{
     audio_frame_to_planar_i32, convert_audio_frame, decorrelate_mid_side_i32,
     decorrelate_mid_side_i32_scalar, deinterleave_stereo_i32, deinterleave_stereo_i32_scalar,
@@ -1452,13 +1449,17 @@ mod tests {
             let _ = std::fs::remove_file(&ff_aac);
         }
 
-        // 2. Opus 48 kHz Stereo Roundtrip (OpusEncoder -> OpusDecoder) + Range Coder verification
+        // 2. Opus 48 kHz stereo roundtrip: the decoder must read every packet exactly (final
+        // range equal to the encoder's) and reproduce the input after the OpusHead pre-skip.
         let mut opus_enc = OpusEncoder::new(48_000, 2, 128_000);
         let mut opus_dec = OpusDecoder::new(2)
             .with_extra_data(&opus_enc.extra_data())
             .unwrap();
-        let mut opus_energy = 0.0f64;
-        for f_idx in 0..6usize {
+        let skip = opus_dec.pre_skip();
+        assert_eq!(skip, 120);
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        for f_idx in 0..25usize {
             let mut frame = AudioFrame::new(48_000, 2, SampleFormat::F32le, 960);
             let dst = frame.as_f32_mut_slice();
             for i in 0..960 {
@@ -1466,19 +1467,24 @@ mod tests {
                 dst[i * 2] = ((2.0 * std::f64::consts::PI * 500.0 * t).sin() * 0.6) as f32;
                 dst[i * 2 + 1] = ((2.0 * std::f64::consts::PI * 750.0 * t).cos() * 0.5) as f32;
             }
+            input.extend_from_slice(frame.as_f32_slice());
             let pkt = opus_enc.encode_frame(&frame).unwrap();
             let df = opus_dec.decode_packet(&pkt).unwrap();
+            assert_eq!(opus_dec.final_range(), opus_enc.final_range());
             assert_eq!(df.num_samples, 960);
             assert_eq!(df.channels, 2);
-            if f_idx >= 1 {
-                for &s in df.as_f32_slice() {
-                    opus_energy += (s as f64) * (s as f64);
-                }
-            }
+            output.extend_from_slice(df.as_f32_slice());
         }
-        assert!(
-            opus_energy > 100.0,
-            "expected non-trivial reconstructed Opus audio energy, got {opus_energy}"
-        );
+        // Skip the first 20 ms while the codec settles; compare input with output delayed by the
+        // pre-skip.
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for i in 2 * 960..input.len() - 2 * skip {
+            let x = input[i] as f64;
+            let d = x - output[i + 2 * skip] as f64;
+            sig += x * x;
+            err += d * d;
+        }
+        let snr = 10.0 * (sig / err).log10();
+        assert!(snr > 25.0, "Opus 128 kbit/s roundtrip SNR {snr:.1} dB");
     }
 }

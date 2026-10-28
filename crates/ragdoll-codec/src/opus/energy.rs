@@ -118,7 +118,6 @@ pub fn unquant_finalise(
 }
 
 /// `loss_distortion`.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 fn loss_distortion(e: &[i16], old: &[i16], start: usize, end: usize, c: usize) -> i32 {
     let mut dist = 0i32;
     for ch in 0..c {
@@ -132,7 +131,6 @@ fn loss_distortion(e: &[i16], old: &[i16], start: usize, end: usize, c: usize) -
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 fn quant_coarse_impl(
     start: usize,
     end: usize,
@@ -220,9 +218,8 @@ fn quant_coarse_impl(
     badness
 }
 
-/// `quant_coarse_energy` (two-pass intra/inter decision without loss-rate bias).
+/// `quant_coarse_energy`: codes the coarse energies, choosing intra or inter prediction.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn quant_coarse(
     start: usize,
     end: usize,
@@ -238,7 +235,12 @@ pub fn quant_coarse(
     force_intra: bool,
     delayed_intra: &mut i32,
     two_pass: bool,
+    loss_rate: i32,
 ) {
+    let intra_bias = (budget
+        .wrapping_mul(*delayed_intra as u32)
+        .wrapping_mul(loss_rate as u32)
+        / (c as u32 * 512)) as i32;
     let budget = budget as i32;
     let mut intra = force_intra
         || (!two_pass
@@ -282,7 +284,7 @@ pub fn quant_coarse(
         );
         if two_pass
             && (badness1 < badness2
-                || (badness1 == badness2 && enc.tell_frac() as i32 > tell_intra))
+                || (badness1 == badness2 && enc.tell_frac() as i32 + intra_bias > tell_intra))
         {
             *enc = intra_state;
             old.copy_from_slice(&old_intra);
@@ -302,7 +304,6 @@ pub fn quant_coarse(
 }
 
 /// `quant_fine_energy`.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn quant_fine(
     start: usize,
     end: usize,
@@ -331,7 +332,6 @@ pub fn quant_fine(
 
 /// `quant_energy_finalise`.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn quant_finalise(
     start: usize,
     end: usize,
@@ -365,7 +365,6 @@ pub fn quant_finalise(
 }
 
 /// `amp2Log2`: band amplitudes to Q10 log energies relative to the band means.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn amp2log2(eff_end: usize, end: usize, band_e: &[i32], log_e: &mut [i16], c: usize) {
     for ch in 0..c {
         for i in 0..eff_end {

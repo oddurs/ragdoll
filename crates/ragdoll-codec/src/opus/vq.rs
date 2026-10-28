@@ -10,7 +10,6 @@ use super::math::{
 use super::range::Ec;
 
 pub const SPREAD_NONE: i32 = 0;
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub const SPREAD_LIGHT: i32 = 1;
 pub const SPREAD_NORMAL: i32 = 2;
 pub const SPREAD_AGGRESSIVE: i32 = 3;
