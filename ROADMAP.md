@@ -158,7 +158,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`··········` 0% · 0 of 12 done
+`··········` 0% · 0 of 13 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -179,4 +179,14 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
 - [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 - [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
+- [ ] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
+
+## Unscheduled
+
+`··········` 0% · 0 of 2 done
+
+### backlog
+
+- [ ] `0073` Python bindings with zero-copy tensor export (DLPack) for ML frame ingestion <sup>feature · p2 · pipeline</sup>
+- [ ] `ADR-0074` Hardware acceleration and the zero-C-FFI boundary <sup>decision · p3 · arch</sup>
 
