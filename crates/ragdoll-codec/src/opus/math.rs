@@ -9,7 +9,7 @@
 
 /// `MULT16_16`: product of the low 16 bits of `a` and `b`.
 #[inline(always)]
-pub fn mul16(a: i32, b: i32) -> i32 {
+pub const fn mul16(a: i32, b: i32) -> i32 {
     (a as i16 as i32) * (b as i16 as i32)
 }
 
@@ -20,7 +20,7 @@ pub fn mul16su(a: i32, b: i32) -> i32 {
 }
 
 #[inline(always)]
-pub fn mul16_q15(a: i32, b: i32) -> i32 {
+pub const fn mul16_q15(a: i32, b: i32) -> i32 {
     mul16(a, b) >> 15
 }
 
@@ -98,13 +98,13 @@ pub fn mac16_32_q16(c: i32, a: i32, b: i32) -> i32 {
 
 /// `SHL32`: shift through `u32` so bits shifted out are discarded.
 #[inline(always)]
-pub fn shl32(a: i32, s: i32) -> i32 {
+pub const fn shl32(a: i32, s: i32) -> i32 {
     ((a as u32) << s) as i32
 }
 
 /// `VSHR32`: right shift, or left shift for a negative count.
 #[inline(always)]
-pub fn vshr32(a: i32, s: i32) -> i32 {
+pub const fn vshr32(a: i32, s: i32) -> i32 {
     if s > 0 { a >> s } else { shl32(a, -s) }
 }
 
@@ -158,19 +158,19 @@ pub fn celt_udiv(n: u32, d: u32) -> u32 {
 
 /// `ADD16`: 16-bit wrapping addition.
 #[inline(always)]
-pub fn add16(a: i32, b: i32) -> i32 {
+pub const fn add16(a: i32, b: i32) -> i32 {
     (a as i16).wrapping_add(b as i16) as i32
 }
 
 /// `SUB16`: difference of the 16-bit operands (not truncated).
 #[inline(always)]
-pub fn sub16(a: i32, b: i32) -> i32 {
+pub const fn sub16(a: i32, b: i32) -> i32 {
     (a as i16 as i32) - (b as i16 as i32)
 }
 
 /// `SHL16`.
 #[inline(always)]
-pub fn shl16(a: i32, s: i32) -> i32 {
+pub const fn shl16(a: i32, s: i32) -> i32 {
     ((a as u16) << s) as i16 as i32
 }
 
@@ -188,7 +188,7 @@ pub fn sig2word16(x: i32) -> i16 {
 
 /// `celt_ilog2`: floor(log2(x)) for x > 0.
 #[inline(always)]
-pub fn ilog2(x: i32) -> i32 {
+pub const fn ilog2(x: i32) -> i32 {
     31 - (x as u32).leading_zeros() as i32
 }
 
@@ -286,7 +286,7 @@ pub fn frac_div32(a: i32, b: i32) -> i32 {
 }
 
 /// `celt_rsqrt_norm`.
-pub fn rsqrt_norm(x: i32) -> i32 {
+pub const fn rsqrt_norm(x: i32) -> i32 {
     let n = (x - 32768) as i16 as i32;
     let r = add16(23557, mul16_q15(n, add16(-13490, mul16_q15(n, 6713))));
     let r2 = mul16_q15(r, r) as i16 as i32;

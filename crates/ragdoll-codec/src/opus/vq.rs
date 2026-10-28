@@ -386,11 +386,9 @@ pub fn exp_rotation(x: &mut [i16], len: usize, dir: i32, stride: usize, k: usize
 }
 
 fn normalise_residual(iy: &[i32], x: &mut [i16], n: usize, ryy: i32, gain: i32) {
-    let k = ilog2(ryy) >> 1;
-    let t = vshr32(ryy, 2 * (k - 7));
-    let g = mul16_p15(rsqrt_norm(t), gain);
+    let (g, sh) = pulses_gain(ryy, gain);
     for (o, &v) in x[..n].iter_mut().zip(&iy[..n]) {
-        *o = pshr32(mul16(g, v), k + 1) as i16;
+        *o = pshr32(mul16(g, v), sh) as i16;
     }
 }
 
@@ -518,12 +516,38 @@ pub fn alg_unquant(
     let x = &mut x[..n];
     let ryy = decode_pulses(x, n, k, dec);
     let cm = extract_collapse_mask(x, n, b);
-    let kk = ilog2(ryy) >> 1;
-    let t = vshr32(ryy, 2 * (kk - 7));
-    let g = mul16_p15(rsqrt_norm(t), gain);
-    scale_shr(x, g, kk + 1);
+    let (g, sh) = pulses_gain(ryy, gain);
+    scale_shr(x, g, sh);
     exp_rotation(x, n, -1, b, k, spread);
     cm
+}
+
+/// The reciprocal square root `normalise_residual` takes of the squared norm `ryy` of a
+/// pulse vector.
+const fn pulses_rsqrt(ryy: i32) -> i32 {
+    let k = ilog2(ryy) >> 1;
+    rsqrt_norm(vshr32(ryy, 2 * (k - 7)))
+}
+
+/// [`pulses_rsqrt`] for the small squared norms nearly every pulse vector has: its polynomial
+/// is a serial chain of seven multiplies between a vector's decoding and its scaling.
+static RSQRT_PULSES: [i16; 4096] = {
+    let mut t = [0i16; 4096];
+    let mut r = 1;
+    while r < t.len() {
+        t[r] = pulses_rsqrt(r as i32) as i16;
+        r += 1;
+    }
+    t
+};
+
+/// The gain and shift of `normalise_residual` for pulses of squared norm `ryy`.
+fn pulses_gain(ryy: i32, gain: i32) -> (i32, i32) {
+    let r = match RSQRT_PULSES.get(ryy as usize) {
+        Some(&r) => r as i32,
+        None => pulses_rsqrt(ryy),
+    };
+    (mul16_p15(r, gain), (ilog2(ryy) >> 1) + 1)
 }
 
 /// `renormalise_vector`.
