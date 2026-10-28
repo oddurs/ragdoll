@@ -3,10 +3,12 @@ id: 80
 uid: d4c2e0cf-5635-4191-8d1d-127aa4e7c028
 title: Ogg Opus decode keeps the encoder padding after the final granule position
 type: bug
-status: backlog
+status: done
 milestone: m11-validation
+assignee: Claude
 created: 2026-10-28
 updated: 2026-10-28
+closed_at: 2026-10-28
 priority: p2
 effort: s
 area: format
@@ -26,6 +28,14 @@ RFC 7845 section 4.4: the granule position of the last page gives the end of the
 
 ## Acceptance criteria
 
-- [ ] `OggDemuxer` exposes the final granule position, and `decode_audio_bytes` trims Ogg Opus output to `final_granule - pre_skip` samples.
-- [ ] The `opus_ogg` test expects 72000 and 48000 samples, still sample-exact with libopus over the kept range.
-- [ ] A regression test reproduces the failure and passes with the fix.
+- [x] `OggDemuxer` exposes the final granule position, and `decode_audio_bytes` trims Ogg Opus output to `final_granule - pre_skip` samples.
+- [x] The `opus_ogg` test expects 72000 and 48000 samples, still sample-exact with libopus over the kept range.
+- [x] A regression test reproduces the failure and passes with the fix.
+
+## 2026-10-28
+
+OggDemuxer records the last page granule position (final_granule()); for Opus the track duration is final_granule - pre_skip. decode_audio_bytes drops the pre-skip and truncates at that end. OggMuxer writes the final page with granule min(sum of packet durations, pre_skip + track.duration_ticks) for Opus, and the pipeline's Opus track duration is now the input length instead of packets x 960, so Ragdoll's own files carry the trim. Evidence: the FFmpeg-libopus test files decode to 72000 and 48000 samples (1.5 s and 1.0 s), still sample-exact with libopus over the kept range; a 3.7 s Ragdoll transcode decodes in FFmpeg to exactly 177600 samples (the input), 34.5 dB SNR; ogg->ogg remux keeps granule 72312 and FFmpeg's decode identical.
+
+## Result
+
+Ogg Opus decode honours the final granule position: decode_audio_bytes output is exactly the encoded length after pre-skip, and OggMuxer writes the trimmed end granule from the track duration.

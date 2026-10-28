@@ -59,6 +59,7 @@ pub struct OggDemuxer<'a> {
     pub samples: Vec<SampleEntry>,
     packets: Vec<IndexedOggPacket>,
     cursor: usize,
+    final_granule: Option<i64>,
 }
 
 impl<'a> OggDemuxer<'a> {
@@ -76,6 +77,7 @@ impl<'a> OggDemuxer<'a> {
         let mut cur_pkt = Vec::new();
         let mut cur_contig: Option<(usize, usize)> = None;
         let mut cur_file_off = 0u64;
+        let mut final_granule = None;
 
         while pos + 27 <= data.len() {
             if &data[pos..pos + 4] != b"OggS" {
@@ -106,6 +108,9 @@ impl<'a> OggDemuxer<'a> {
                 )));
             }
 
+            if granule_pos >= 0 {
+                final_granule = Some(granule_pos);
+            }
             let mut seg_off = hdr_end;
             for &lacing in seg_table {
                 let slen = lacing as usize;
@@ -259,12 +264,21 @@ impl<'a> OggDemuxer<'a> {
             cur_pts += dur;
         }
 
+        // RFC 7845 section 4.4: an Opus stream ends at its final granule position, which counts
+        // the pre-skip; the last packet usually decodes past it.
+        let duration = match final_granule {
+            Some(g) if codec_id == CodecId::Opus && extra_data.len() >= 12 => {
+                let pre_skip = u16::from_le_bytes([extra_data[10], extra_data[11]]) as i64;
+                (g - pre_skip).clamp(0, cur_pts)
+            }
+            _ => cur_pts,
+        };
         let track = TrackInfo {
             index: 0,
             track_type: TrackType::Audio,
             codec_id,
             timebase: Rational64::new(1, sample_rate.max(1) as i64),
-            duration_ticks: Some(cur_pts),
+            duration_ticks: Some(duration),
             extra_data,
             video: None,
             audio: Some(AudioTrackParams {
@@ -285,7 +299,15 @@ impl<'a> OggDemuxer<'a> {
             samples,
             packets,
             cursor: 0,
+            final_granule,
         })
+    }
+
+    /// Granule position of the last page that has one: for Opus, the end of the audio counted
+    /// from the start of decoding (pre-skip included); for FLAC, the total sample count.
+    #[inline]
+    pub fn final_granule(&self) -> Option<i64> {
+        self.final_granule
     }
 
     #[inline]
@@ -338,6 +360,46 @@ impl<'a> OggDemuxer<'a> {
             pkt.file_offset = item.entry.offset;
             Ok(Some(pkt))
         }
+    }
+}
+
+/// Pages are flushed once they hold this many payload bytes (or one second of audio).
+const OGG_PAGE_TARGET_BYTES: usize = 4096;
+
+/// Accumulates lacing segments into pages for [`OggMuxer`].
+struct Pager {
+    serial: u32,
+    seq: u32,
+    segs: Vec<u8>,
+    data: Vec<u8>,
+    /// Granule position of the last packet completed on this page, or -1.
+    granule: i64,
+    continued: bool,
+    written: u64,
+}
+
+impl Pager {
+    fn flush<W: Write>(&mut self, writer: &mut W, extra_flags: u8) -> Result<()> {
+        if self.segs.is_empty() && extra_flags == 0 {
+            return Ok(());
+        }
+        let htype = if self.continued { 0x01 } else { 0x00 } | extra_flags;
+        let page = build_ogg_page(
+            htype,
+            self.granule,
+            self.serial,
+            self.seq,
+            &self.segs,
+            &self.data,
+        );
+        writer.write_all(&page)?;
+        self.written += page.len() as u64;
+        self.seq += 1;
+        self.segs.clear();
+        self.data.clear();
+        self.granule = -1;
+        self.continued = false;
+        Ok(())
     }
 }
 
@@ -540,22 +602,70 @@ impl OggMuxer {
             )?;
         }
 
-        // 3. Audio packets (EOS flag 0x04 on the last packet's final page)
+        // 3. Audio packets, several per page. The stream's final granule position is the real
+        // end of the audio when the track duration says the packets run past it (Opus end
+        // padding, RFC 7845 section 4.4).
+        let rate = if track.codec_id == CodecId::Opus {
+            48_000
+        } else {
+            audio.sample_rate.max(1) as i64
+        };
+        let total: i64 = self.packets.iter().map(|(_, d)| *d).sum();
+        let pre_skip = if track.codec_id == CodecId::Opus
+            && track.extra_data.len() >= 12
+            && &track.extra_data[0..8] == b"OpusHead"
+        {
+            u16::from_le_bytes([track.extra_data[10], track.extra_data[11]]) as i64
+        } else {
+            0
+        };
+        let end_granule = match track.duration_ticks {
+            Some(d) if d > 0 && track.codec_id == CodecId::Opus => total.min(pre_skip + d),
+            _ => total,
+        };
+        let mut pager = Pager {
+            serial: self.serial_number,
+            seq: page_seq,
+            segs: Vec::new(),
+            data: Vec::new(),
+            granule: -1,
+            continued: false,
+            written: 0,
+        };
         let num_pkts = self.packets.len();
         let mut granule = 0i64;
+        let mut page_start = 0i64;
         for (idx, (pkt_bytes, dur)) in self.packets.into_iter().enumerate() {
             granule += dur;
-            let eos = if idx + 1 == num_pkts { 0x04 } else { 0x00 };
-            written += Self::write_packet_pages(
-                &mut writer,
-                0x00,
-                eos,
-                granule,
-                self.serial_number,
-                &mut page_seq,
-                &pkt_bytes,
-            )?;
+            let last = idx + 1 == num_pkts;
+            let pkt_granule = if last { end_granule } else { granule };
+            let mut rem = pkt_bytes.len();
+            let mut off = 0usize;
+            loop {
+                if pager.segs.len() == 255 {
+                    pager.flush(&mut writer, 0)?;
+                    // The next page continues this packet unless it starts here.
+                    pager.continued = off > 0;
+                    page_start = granule - dur;
+                }
+                let seg = rem.min(255);
+                pager.segs.push(seg as u8);
+                pager.data.extend_from_slice(&pkt_bytes[off..off + seg]);
+                off += seg;
+                rem -= seg;
+                if seg < 255 {
+                    break;
+                }
+            }
+            pager.granule = pkt_granule;
+            if last {
+                pager.flush(&mut writer, 0x04)?;
+            } else if pager.data.len() >= OGG_PAGE_TARGET_BYTES || granule - page_start >= rate {
+                pager.flush(&mut writer, 0)?;
+                page_start = granule;
+            }
         }
+        written += pager.written;
         writer.flush()?;
         Ok(written)
     }

@@ -1629,6 +1629,7 @@ pub fn decode_audio_bytes(data: &[u8]) -> Result<(AudioFrame, VorbisComments)> {
     }
     if data.starts_with(b"OggS") {
         let mut demux = OggDemuxer::open(data)?;
+        let final_granule = demux.final_granule();
         let comments = demux.comments().clone();
         let track = demux.track().clone();
         let mut raw_pkts = Vec::new();
@@ -1659,9 +1660,14 @@ pub fn decode_audio_bytes(data: &[u8]) -> Result<(AudioFrame, VorbisComments)> {
                 let f = dec.decode_packet(p)?;
                 all_samples.extend_from_slice(f.as_f32_slice());
             }
-            // RFC 7845 section 4.2: the first `pre_skip` samples are encoder delay.
+            // RFC 7845 section 4.2: the first `pre_skip` samples are encoder delay, and the
+            // final granule position marks the end of the audio (section 4.4).
             let skip = (dec.pre_skip() * ch_usize).min(all_samples.len());
             all_samples.drain(..skip);
+            if let Some(g) = final_granule {
+                let end = (g - dec.pre_skip() as i64).max(0) as usize * ch_usize;
+                all_samples.truncate(end);
+            }
             let num_samples = all_samples.len() / ch_usize;
             let mut af = AudioFrame::new(48_000, ch_usize as u8, SampleFormat::F32le, num_samples);
             af.as_f32_mut_slice()
@@ -1889,7 +1895,9 @@ pub fn encode_audio_track_packets(
                 track_type: TrackType::Audio,
                 codec_id: CodecId::Opus,
                 timebase: tb,
-                duration_ticks: Some((pkts.len() as i64) * 960),
+                // The input length; the packets also cover the pre-skip and end padding, which
+                // the Ogg muxer trims through the final granule position.
+                duration_ticks: Some(frame.num_samples as i64),
                 extra_data: enc.head.to_bytes().to_vec(),
                 video: None,
                 audio: Some(AudioTrackParams {
