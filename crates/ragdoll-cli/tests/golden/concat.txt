@@ -1,1 +1,1 @@
-RAGDOLL CONCAT: 2 segments -> text_cc.mp4 | 60 video pkts, 0 audio pkts (reencoded=false, 7519 B in <n> ms)
+RAGDOLL CONCAT: 2 segments -> text_cc.mp4 | 60 video pkts, 0 audio pkts (reencoded=false, 6847 B in <n> ms)

@@ -3,8 +3,10 @@ id: 89
 uid: 2eed7656-dbba-4877-9bc2-fd321e8cb690
 title: H.264 encoder slower than x264 at equal compression (0.12x ultrafast)
 type: kernel
-status: backlog
+status: doing
 milestone: m11-validation
+assignee: Claude
+claimed: 2026-10-28
 created: 2026-10-28
 updated: 2026-10-28
 priority: p1
