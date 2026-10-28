@@ -176,9 +176,7 @@ mod tests {
             ])
             .status();
 
-        if let Ok(st) = status_dec
-            && st.success()
-        {
+        if ragdoll_core::testing::tool_succeeded(status_dec, "ffmpeg decode of Ragdoll FLAC") {
             let raw_bytes = std::fs::read(&ffmpeg_raw_path).unwrap();
             assert_eq!(raw_bytes, audio16.data.as_slice());
 
@@ -300,9 +298,7 @@ mod tests {
             ])
             .status();
 
-        if let Ok(st) = status
-            && st.success()
-        {
+        if ragdoll_core::testing::tool_succeeded(status, "ffmpeg decode of Ragdoll H.264") {
             let raw_yuv = std::fs::read(&ff_dec_y4m).unwrap();
             let frame_bytes = width * height * 3 / 2;
             assert_eq!(raw_yuv.len(), frame_bytes * 4);
@@ -324,8 +320,7 @@ mod tests {
                     x264_path.to_str().unwrap(),
                 ])
                 .status();
-            if let Ok(st2) = st_x264
-                && st2.success()
+            if ragdoll_core::testing::tool_succeeded(st_x264, "ffmpeg libx264 High profile encode")
             {
                 let x264_bytes = std::fs::read(&x264_path).unwrap();
                 let mut inspector = H264Decoder::new();
@@ -420,9 +415,7 @@ mod tests {
             ])
             .status();
 
-        if let Ok(s) = st
-            && s.success()
-        {
+        if ragdoll_core::testing::tool_succeeded(st, "ffmpeg libsvtav1 encode") {
             let ivf_data = std::fs::read(&tmp_ivf).unwrap();
             let (ivf_hdr, packets) = parse_ivf_stream(&ivf_data).unwrap();
             assert_eq!(&ivf_hdr.fourcc, b"AV01");
@@ -627,9 +620,7 @@ mod tests {
                 tmp_yuv.to_str().unwrap(),
             ])
             .status();
-        if let Ok(s) = st
-            && s.success()
-        {
+        if ragdoll_core::testing::tool_succeeded(st, "ffmpeg decode of Ragdoll P_L0_16x16 stream") {
             let yuv = std::fs::read(&tmp_yuv).unwrap();
             assert_eq!(yuv.len(), w * h * 3 / 2 * 5);
         }
@@ -701,7 +692,7 @@ mod tests {
         );
 
         // 3. Verify Ragdoll -> FFmpeg decoding bit-exactness across multi-GOP moving video (when ffmpeg is installed)
-        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+        if ragdoll_core::testing::require_tool("ffmpeg") {
             let tmp_dir = std::env::temp_dir();
             let rag_h264_path = tmp_dir.join("ragdoll_0039_out.h264");
             let rag_ff_yuv_path = tmp_dir.join("ragdoll_0039_ff_dec.yuv");
@@ -912,7 +903,7 @@ mod tests {
         }
 
         // Verify FFmpeg decodes our CABAC Main and High profile streams cleanly and Ragdoll decodes x264 High + B-frames (when ffmpeg is installed)
-        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+        if ragdoll_core::testing::require_tool("ffmpeg") {
             let tmp_dir = std::env::temp_dir();
             for (tag, bytes) in [("main", &stream_main), ("high", &stream_high)] {
                 let p_h264 = tmp_dir.join(format!("ragdoll_0040_{tag}.h264"));
@@ -1380,7 +1371,7 @@ mod tests {
         );
 
         // Verify FFmpeg decodes our ADTS AAC-LC stream AND our AacDecoder decodes `ffmpeg -c:a aac` stream
-        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+        if ragdoll_core::testing::require_tool("ffmpeg") {
             let tmp = std::env::temp_dir();
             let rag_aac = tmp.join("ragdoll_0044.aac");
             let rag_wav = tmp.join("ragdoll_0044_dec.raw");

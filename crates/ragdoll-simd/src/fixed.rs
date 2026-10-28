@@ -20,13 +20,10 @@ pub const fn clamp_u8(v: i32) -> u8 {
 #[inline(always)]
 pub fn convolve_8tap_q14_u8(samples: &[u8; 8], weights: &[i16; 8]) -> u8 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { convolve_8tap_q14_u8_neon(samples, weights) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { convolve_8tap_q14_u8_neon(samples, weights) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        convolve_8tap_q14_u8_scalar(samples, weights)
-    }
+    convolve_8tap_q14_u8_scalar(samples, weights)
 }
 
 #[inline(always)]
@@ -98,13 +95,10 @@ unsafe fn transpose_4x4_s16_neon(
 #[inline]
 pub fn forward_dct4x4(block: &[i16; 16]) -> [i16; 16] {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { forward_dct4x4_neon(block) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { forward_dct4x4_neon(block) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        forward_dct4x4_scalar(block)
-    }
+    forward_dct4x4_scalar(block)
 }
 
 pub fn forward_dct4x4_scalar(block: &[i16; 16]) -> [i16; 16] {
@@ -189,13 +183,10 @@ unsafe fn forward_dct4x4_neon(block: &[i16; 16]) -> [i16; 16] {
 #[inline]
 pub fn inverse_idct4x4(coeff: &[i16; 16]) -> [i16; 16] {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { inverse_idct4x4_neon(coeff) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { inverse_idct4x4_neon(coeff) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        inverse_idct4x4_scalar(coeff)
-    }
+    inverse_idct4x4_scalar(coeff)
 }
 
 pub fn inverse_idct4x4_scalar(coeff: &[i16; 16]) -> [i16; 16] {
@@ -322,13 +313,10 @@ pub fn add4x4_idct_u8(dst: &mut [u8], dst_stride: usize, coeff: &[i16; 16]) {
 #[inline]
 pub fn hadamard4x4(block: &[i16; 16]) -> [i16; 16] {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { hadamard4x4_neon(block) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { hadamard4x4_neon(block) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        hadamard4x4_scalar(block)
-    }
+    hadamard4x4_scalar(block)
 }
 
 pub fn hadamard4x4_scalar(block: &[i16; 16]) -> [i16; 16] {

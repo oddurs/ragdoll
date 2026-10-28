@@ -695,13 +695,7 @@ mod tests {
     fn ffprobe_and_ffmpeg_bidirectional_interop() {
         use std::process::Command;
 
-        // Check if ffprobe and ffmpeg are available on the host
-        let has_ffprobe = Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !has_ffprobe {
+        if !ragdoll_core::testing::require_tool("ffprobe") {
             return;
         }
 
@@ -804,9 +798,7 @@ mod tests {
             ])
             .status();
 
-        if let Ok(st) = enc_status
-            && st.success()
-        {
+        if ragdoll_core::testing::tool_succeeded(enc_status, "ffmpeg libx264 + aac encode") {
             let mmap = MmapSource::open(&ffmpeg_mp4_path).unwrap();
             let mut demux = Mp4Demuxer::open(&mmap).unwrap();
             assert!(demux.tracks().len() >= 2);
@@ -928,9 +920,7 @@ mod tests {
                     ffmpeg_fmp4_path.to_str().unwrap(),
                 ])
                 .status();
-            if let Ok(fst) = fmp4_status
-                && fst.success()
-            {
+            if ragdoll_core::testing::tool_succeeded(fmp4_status, "ffmpeg fragmented MP4 remux") {
                 let fmp4_mmap = MmapSource::open(&ffmpeg_fmp4_path).unwrap();
                 let mut fmp4_demux = Mp4Demuxer::open(&fmp4_mmap).unwrap();
                 assert!(fmp4_demux.is_fragmented());
@@ -1367,11 +1357,7 @@ mod tests {
         );
 
         // Optional external ffprobe validation when installed
-        if std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .is_ok()
-        {
+        if ragdoll_core::testing::require_tool("ffprobe") {
             let tmp_flac = std::env::temp_dir().join("ragdoll_test_0045.flac");
             let tmp_ogg = std::env::temp_dir().join("ragdoll_test_0045.ogg");
             std::fs::write(&tmp_flac, &flac_bytes).unwrap();
@@ -1525,11 +1511,7 @@ mod tests {
         );
 
         // 3. External ffprobe & ffmpeg interoperability when installed
-        if std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .is_ok()
-        {
+        if ragdoll_core::testing::require_tool("ffmpeg") {
             let tmp_png = std::env::temp_dir().join("ragdoll_test_0047.png");
             let tmp_jpg = std::env::temp_dir().join("ragdoll_test_0047.jpg");
             let tmp_ff_png = std::env::temp_dir().join("ragdoll_test_0047_ff.png");

@@ -267,7 +267,8 @@ impl PolyphaseResampler {
         let direct = self.direct_phase_map;
 
         #[cfg(target_arch = "aarch64")]
-        if use_simd && taps == 16 && self.channels == 2 && direct {
+        if use_simd && taps == 16 && self.channels == 2 && direct && ragdoll_core::dispatch::neon()
+        {
             unsafe {
                 use std::arch::aarch64::*;
                 let w0 = self.work_f32[0].as_ptr();

@@ -48,7 +48,10 @@ Run the local verification suite before pushing:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RAGDOLL_SIMD=scalar cargo test --workspace   # the same tests on the scalar reference paths
 ```
+
+The interop tests need `ffmpeg` and `ffprobe` (CI pins Ubuntu 24.04's FFmpeg 6.1.1) and fail without them; `RAGDOLL_ALLOW_MISSING_TOOLS=1` skips them instead. `RAGDOLL_SIMD=scalar|neon|avx2` forces a dispatch level, so a SIMD change is checked against its scalar reference end to end. CLI output is pinned by snapshots in `crates/ragdoll-cli/tests/golden/`; after an intended change, rewrite them with `RAGDOLL_BLESS=1 cargo test -p ragdoll-cli --test cli`.
 
 ### Step 4: Update Cairn & Render `ROADMAP.md`
 

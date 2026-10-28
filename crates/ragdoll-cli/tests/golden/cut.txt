@@ -1,0 +1,1 @@
+RAGDOLL CUT: v.mp4 -> text_cut.mp4 | 18 video pkts (9 zero-copy copied, 9 boundary frames re-encoded), 0 audio pkts (3046 B in <n> ms)

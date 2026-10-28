@@ -3,22 +3,16 @@
 #[inline]
 pub fn find_annex_b_start_code(data: &[u8]) -> Option<(usize, usize)> {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         // Safety: NEON is baseline on all aarch64 CPUs (including Apple Silicon M-series).
-        unsafe { find_annex_b_start_code_neon(data) }
+        return unsafe { find_annex_b_start_code_neon(data) };
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { find_annex_b_start_code_avx2(data) }
-        } else {
-            find_annex_b_start_code_scalar(data)
-        }
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { find_annex_b_start_code_avx2(data) };
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        find_annex_b_start_code_scalar(data)
-    }
+    find_annex_b_start_code_scalar(data)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -202,13 +196,10 @@ pub fn split_annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
 #[inline]
 pub fn find_mpeg_ts_sync(data: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { find_mpeg_ts_sync_neon(data) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { find_mpeg_ts_sync_neon(data) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        find_mpeg_ts_sync_scalar(data)
-    }
+    find_mpeg_ts_sync_scalar(data)
 }
 
 pub fn find_mpeg_ts_sync_scalar(data: &[u8]) -> Option<usize> {

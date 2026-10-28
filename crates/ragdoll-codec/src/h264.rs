@@ -1619,7 +1619,7 @@ pub fn predict_intra_16x16(
 ) {
     #[cfg(target_arch = "aarch64")]
     {
-        if dst.len() >= 15 * stride + 16 {
+        if ragdoll_core::dispatch::neon() && dst.len() >= 15 * stride + 16 {
             unsafe { predict_intra_16x16_neon(mode, top, left, top_left, dst, stride) };
             return;
         }
@@ -1817,7 +1817,7 @@ pub fn predict_intra_chroma_8x8(
 ) {
     #[cfg(target_arch = "aarch64")]
     {
-        if mode == 3 && dst.len() >= 7 * stride + 8 {
+        if ragdoll_core::dispatch::neon() && mode == 3 && dst.len() >= 7 * stride + 8 {
             unsafe { predict_intra_chroma_8x8_plane_neon(top, left, top_left, dst, stride) };
             return;
         }
