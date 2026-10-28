@@ -158,7 +158,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`###·······` 28% · 7 of 25 done
+`####······` 32% · 8 of 25 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -185,12 +185,9 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 - [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
 
-### in progress
-
-- [ ] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
-
 ### shipped
 
+- [x] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
 - [x] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
 - [x] `0075` H.264 decoder: bit-exact with FFmpeg on the JVT conformance suite and x264 streams <sup>feature · p0 · codec-video</sup>
 - [x] `0077` Opus decoder: RFC 6716 decoding, sample-exact with fixed-point libopus on the RFC 8251 test vectors <sup>feature · p0 · codec-audio</sup>

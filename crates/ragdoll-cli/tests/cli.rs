@@ -661,3 +661,50 @@ fn self_test_passes() {
     let out = run(&["self-test"]);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
 }
+
+/// `bench --json` runs its full workload set: a little over two minutes in a debug build, so CI
+/// runs it with `self_test_passes` (`cargo test -p ragdoll-cli -- --ignored`).
+#[test]
+#[ignore]
+fn bench_json_matches_schema() {
+    let num_or_null = || T::Nullable(Box::new(T::Num));
+    let row = T::Obj(vec![
+        ("workload", T::Str),
+        ("unit", T::Str),
+        ("ragdoll_perf_ms", T::Num),
+        ("ragdoll_perf_rate", T::Num),
+        ("ragdoll_perf_instructions", T::Int),
+        ("ragdoll_perf_cycles", T::Int),
+        ("ragdoll_perf_energy_mj", T::Num),
+        ("ragdoll_eff_ms", T::Num),
+        ("ragdoll_eff_rate", T::Num),
+        ("ragdoll_eff_instructions", T::Int),
+        ("ragdoll_eff_cycles", T::Int),
+        ("ragdoll_eff_ecore_pct", T::Num),
+        ("ragdoll_eff_energy_mj", T::Num),
+        ("ffmpeg_ms", num_or_null()),
+        ("ffmpeg_rate", num_or_null()),
+        ("ffmpeg_instructions", T::Nullable(Box::new(T::Int))),
+        ("ffmpeg_cycles", T::Nullable(Box::new(T::Int))),
+        ("ffmpeg_energy_mj", num_or_null()),
+        ("speedup_perf", num_or_null()),
+        ("speedup_eff", num_or_null()),
+    ]);
+    let schema = T::Obj(vec![
+        ("simd", T::Str),
+        (
+            "cpu_topology",
+            T::Obj(vec![
+                ("logical_cores", T::Int),
+                ("p_cores", T::Int),
+                ("e_cores", T::Int),
+            ]),
+        ),
+        ("benchmarks", T::Arr(Box::new(row))),
+    ]);
+    let out = run(&["bench", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let json = Parser::parse(&text).unwrap_or_else(|e| panic!("bench: {e}\n{text}"));
+    check(&json, &schema, "bench").unwrap_or_else(|e| panic!("{e}\n{text}"));
+}

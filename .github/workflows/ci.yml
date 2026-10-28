@@ -89,5 +89,5 @@ jobs:
         env:
           RAGDOLL_SIMD: scalar
 
-      - name: Run `ragdoll self-test` (slow)
+      - name: Run `ragdoll self-test` and `bench --json` (slow)
         run: cargo test -p ragdoll-cli --test cli -- --ignored
