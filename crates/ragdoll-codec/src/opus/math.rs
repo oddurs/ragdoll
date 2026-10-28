@@ -220,8 +220,16 @@ pub fn maxabs32(x: &[i32]) -> i32 {
     maxval.max(minval.wrapping_neg())
 }
 
-/// `isqrt32`.
-pub fn isqrt32(mut val: u32) -> u32 {
+/// `isqrt32`: `floor(sqrt(val))`, exactly. The square root of an `f64` is correctly rounded, so
+/// for integers below 2^52 its integer part is the integer square root.
+#[inline]
+pub fn isqrt32(val: u32) -> u32 {
+    (val as f64).sqrt() as u32
+}
+
+/// The bit-by-bit `isqrt32` of libopus, the reference for [`isqrt32`].
+#[cfg(test)]
+pub fn isqrt32_bitwise(mut val: u32) -> u32 {
     let mut g = 0u32;
     let mut bshift = (super::range::ilog(val) - 1) >> 1;
     let mut b = 1u32 << bshift;
@@ -426,4 +434,27 @@ pub fn inner_prod(x: &[i16], y: &[i16]) -> i32 {
 #[inline]
 pub fn lcg_rand(seed: u32) -> u32 {
     1664525u32.wrapping_mul(seed).wrapping_add(1013904223)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn isqrt32_matches_bitwise() {
+        let mut v = 1u32;
+        while v < u32::MAX / 3 {
+            for d in [0u32, 1, 2] {
+                let x = v - d.min(v - 1);
+                assert_eq!(super::isqrt32(x), super::isqrt32_bitwise(x), "{x}");
+                let s = super::isqrt32_bitwise(x) + 1;
+                for y in [s * s - 1, s * s, s * s + 1] {
+                    assert_eq!(super::isqrt32(y), super::isqrt32_bitwise(y), "{y}");
+                }
+            }
+            v = v + v / 7 + 1;
+        }
+        for x in 1..200_000u32 {
+            assert_eq!(super::isqrt32(x), super::isqrt32_bitwise(x), "{x}");
+        }
+        assert_eq!(super::isqrt32(u32::MAX), super::isqrt32_bitwise(u32::MAX));
+    }
 }

@@ -580,11 +580,22 @@ impl CeltDecoder {
             tmp
         };
         if cc == 2 && ds == 1 && !accum {
-            // The common case, both channels at once so their recurrences overlap.
+            // The common case: both channels at once so their recurrences overlap, with the
+            // conversion to 16 bits (off the recurrence) done a block at a time.
+            const BLOCK: usize = 64;
             let [mut m0, mut m1] = self.preemph_mem;
-            for ((o, &a), &b) in pcm[..2 * n].chunks_exact_mut(2).zip(x(0)).zip(x(1)) {
-                o[0] = sig2word16(step(&mut m0, a));
-                o[1] = sig2word16(step(&mut m1, b));
+            let mut tmp = [0i32; 2 * BLOCK];
+            for ((o, a), b) in pcm[..2 * n]
+                .chunks_mut(2 * BLOCK)
+                .zip(x(0).chunks(BLOCK))
+                .zip(x(1).chunks(BLOCK))
+            {
+                let t = &mut tmp[..o.len()];
+                for ((t, &a), &b) in t.chunks_exact_mut(2).zip(a).zip(b) {
+                    t[0] = step(&mut m0, a);
+                    t[1] = step(&mut m1, b);
+                }
+                sig2word16_slice(o, t);
             }
             self.preemph_mem = [m0, m1];
             return;
@@ -829,6 +840,25 @@ impl CeltDecoder {
             }
         }
         self.loss_count = loss_count + 1;
+    }
+}
+
+/// `out[i] = SIG2WORD16(x[i])`.
+fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::sig2word16_avx2(out, x) };
+        sig2word16_slice_scalar(&mut out[done..], &x[done..]);
+        return;
+    }
+    sig2word16_slice_scalar(out, x);
+}
+
+/// Scalar reference of [`sig2word16_slice`].
+pub fn sig2word16_slice_scalar(out: &mut [i16], x: &[i32]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = sig2word16(v);
     }
 }
 

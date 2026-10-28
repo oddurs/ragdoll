@@ -423,9 +423,7 @@ pub fn alg_unquant(
     let kk = ilog2(ryy) >> 1;
     let t = vshr32(ryy, 2 * (kk - 7));
     let g = mul16_p15(rsqrt_norm(t), gain);
-    for v in x.iter_mut() {
-        *v = pshr32(mul16(g, *v as i32), kk + 1) as i16;
-    }
+    scale_shr(x, g, kk + 1);
     exp_rotation(x, n, -1, b, k, spread);
     cm
 }
@@ -436,8 +434,25 @@ pub fn renormalise_vector(x: &mut [i16], n: usize, gain: i32) {
     let k = ilog2(e) >> 1;
     let t = vshr32(e, 2 * (k - 7));
     let g = mul16_p15(rsqrt_norm(t), gain);
-    for v in x[..n].iter_mut() {
-        *v = pshr32(mul16(g, *v as i32), k + 1) as i16;
+    scale_shr(&mut x[..n], g, k + 1);
+}
+
+/// `x[i] = PSHR32(MULT16_16(g, x[i]), sh)` truncated to 16 bits: the scaling of
+/// `normalise_residual` and `renormalise_vector`.
+pub fn scale_shr(x: &mut [i16], g: i32, sh: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::scale_shr_avx2(x, g, sh) };
+        return;
+    }
+    scale_shr_scalar(x, g, sh);
+}
+
+/// Scalar reference of [`scale_shr`].
+pub fn scale_shr_scalar(x: &mut [i16], g: i32, sh: i32) {
+    for v in x.iter_mut() {
+        *v = pshr32(mul16(g, *v as i32), sh) as i16;
     }
 }
 

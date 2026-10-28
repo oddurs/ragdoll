@@ -134,23 +134,41 @@ pub fn denormalise_bands(
         }
         let len = band_end - m * EBANDS[i] as usize;
         let (out, inp) = (&mut freq[f..f + len], &x[xi..xi + len]);
-        if shift < 0 {
-            if shift <= -2 {
-                g = 16384;
-                shift = -2;
-            }
-            for (o, &v) in out.iter_mut().zip(inp) {
-                *o = shl32(mul16(v as i32, g), -shift);
-            }
-        } else {
-            for (o, &v) in out.iter_mut().zip(inp) {
-                *o = mul16(v as i32, g) >> shift;
-            }
+        if shift <= -2 {
+            g = 16384;
+            shift = -2;
         }
+        denormalise_band(out, inp, g, shift);
         f += len;
         xi += len;
     }
     freq[bound..n].fill(0);
+}
+
+/// One band of [`denormalise_bands`]: `out[i] = MULT16_16(x[i], g)` shifted right by `shift`
+/// (left for a negative one).
+fn denormalise_band(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::denormalise_avx2(out, x, g, shift) };
+        denormalise_band_scalar(&mut out[done..], &x[done..], g, shift);
+        return;
+    }
+    denormalise_band_scalar(out, x, g, shift);
+}
+
+/// Scalar reference of [`denormalise_band`].
+pub fn denormalise_band_scalar(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
+    if shift < 0 {
+        for (o, &v) in out.iter_mut().zip(x) {
+            *o = shl32(mul16(v as i32, g), -shift);
+        }
+    } else {
+        for (o, &v) in out.iter_mut().zip(x) {
+            *o = mul16(v as i32, g) >> shift;
+        }
+    }
 }
 
 /// `anti_collapse`: fills collapsed short blocks with noise.
@@ -219,6 +237,24 @@ pub fn anti_collapse(
     }
 }
 
+/// `out[i] = MULT16_16_Q15(g, x[i])` truncated to 16 bits.
+fn mul_q15(out: &mut [i16], x: &[i16], g: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::mul_q15_avx2(out, x, g) };
+        return;
+    }
+    mul_q15_scalar(out, x, g);
+}
+
+/// Scalar reference of [`mul_q15`].
+pub fn mul_q15_scalar(out: &mut [i16], x: &[i16], g: i32) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = mul16_q15(g, v as i32) as i16;
+    }
+}
+
 fn compute_channel_weights(ex: i32, ey: i32) -> [i32; 2] {
     let min_e = ex.min(ey);
     let ex = ex.wrapping_add(min_e / 3);
@@ -275,11 +311,32 @@ fn stereo_merge(x: &mut [i16], y: &mut [i16], mid: i32, n: usize) {
     if kr < 7 {
         kr = 7;
     }
-    for (xv, yv) in x[..n].iter_mut().zip(&mut y[..n]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            super::simd::stereo_merge_avx2(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1)
+        };
+        return;
+    }
+    stereo_merge_scalar(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1);
+}
+
+/// Scalar reference of the final loop of `stereo_merge`.
+pub fn stereo_merge_scalar(
+    x: &mut [i16],
+    y: &mut [i16],
+    mid: i32,
+    lgain: i32,
+    lsh: i32,
+    rgain: i32,
+    rsh: i32,
+) {
+    for (xv, yv) in x.iter_mut().zip(y.iter_mut()) {
         let l = mul16_p15(mid, *xv as i32) as i16 as i32;
         let r = *yv as i32;
-        *xv = pshr32(mul16(lgain, sub16(l, r)), kl + 1) as i16;
-        *yv = pshr32(mul16(rgain, add16(l, r)), kr + 1) as i16;
+        *xv = pshr32(mul16(lgain, sub16(l, r)), lsh) as i16;
+        *yv = pshr32(mul16(rgain, add16(l, r)), rsh) as i16;
     }
 }
 
@@ -331,9 +388,21 @@ fn interleave_hadamard(x: &mut [i16], n0: usize, stride: usize, hadamard: bool) 
 
 /// `haar1`.
 pub fn haar1(x: &mut [i16], n0: usize, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::haar1_avx2(x, n0, stride) };
+        haar1_scalar(x, n0, stride, done / (2 * stride));
+        return;
+    }
+    haar1_scalar(x, n0, stride, 0);
+}
+
+/// Scalar reference of [`haar1`], from pair `j0` of every run on.
+pub fn haar1_scalar(x: &mut [i16], n0: usize, stride: usize, j0: usize) {
     let n0 = n0 >> 1;
     for i in 0..stride {
-        for j in 0..n0 {
+        for j in j0..n0 {
             let a = stride * 2 * j + i;
             let b = stride * (2 * j + 1) + i;
             let tmp1 = mul16(23170, x[a] as i32);
@@ -834,9 +903,7 @@ fn quant_band(
         b_cnt <<= recombine;
         if let Some(lo) = lowband_out {
             let nn = sqrt(shl32(n0 as i32, 22));
-            for (o, &v) in lo[..n0].iter_mut().zip(&x[..n0]) {
-                *o = mul16_q15(nn, v as i32) as i16;
-            }
+            mul_q15(&mut lo[..n0], &x[..n0], nn);
         }
         cm &= ((1u64 << b_cnt) - 1) as u32;
     }

@@ -625,7 +625,8 @@ unsafe fn fft5_neon(f: *mut i32, tw: &[i32], s: &Stage) {
 ///
 /// # Safety
 ///
-/// The CPU must support AVX2.
+/// The CPU must support AVX2, and the first `y.len() / 2` entries of `bitrev` must be below
+/// `y.len() / 2` (they are a permutation in every [`FftState`]).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn pre_rotate_avx2(x: &[i32], y: &mut [i32], t: &[i16], bitrev: &[i16], stride: usize) {
@@ -677,16 +678,391 @@ pub unsafe fn pre_rotate_avx2(x: &[i32], y: &mut [i32], t: &[i16], bitrev: &[i16
             );
             _mm256_blend_epi32::<0xAA>(yi, _mm256_slli_epi64::<32>(yr))
         };
-        let mut pairs = [[0i32; 2]; 4];
-        // Safety: `pairs` is 32 bytes.
-        unsafe { _mm256_storeu_si256(pairs.as_mut_ptr() as *mut __m256i, v) };
-        for (k, p) in pairs.iter().enumerate() {
-            let r = 2 * bitrev[i + k] as usize;
-            y[r..r + 2].copy_from_slice(p);
+        // Safety: per the function contract every pair 2 bitrev[i + k] is within `y`.
+        unsafe {
+            let yp = y.as_mut_ptr();
+            let r = |k: usize| 2 * *bitrev.get_unchecked(i + k) as usize;
+            debug_assert!((0..4).all(|k| r(k) + 2 <= n2));
+            _mm_storel_epi64(yp.add(r(0)) as *mut __m128i, _mm256_castsi256_si128(v));
+            _mm_storeh_pd(yp.add(r(1)) as *mut f64, _mm_castsi128_pd(_mm256_castsi256_si128(v)));
+            let hi = _mm256_extracti128_si256::<1>(v);
+            _mm_storel_epi64(yp.add(r(2)) as *mut __m128i, hi);
+            _mm_storeh_pd(yp.add(r(3)) as *mut f64, _mm_castsi128_pd(hi));
         }
         i += 4;
     }
     super::mdct::pre_rotate_scalar(x, y, t, bitrev, stride, i);
+}
+
+// ----- 16-bit band kernels ------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+mod avx2_i16 {
+    use std::arch::x86_64::*;
+
+    /// The 32-bit products `x * g` of 16-bit lanes, in `unpacklo`/`unpackhi` order.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn mul32(x: __m256i, g: __m256i) -> (__m256i, __m256i) {
+        let lo = _mm256_mullo_epi16(x, g);
+        let hi = _mm256_mulhi_epi16(x, g);
+        (_mm256_unpacklo_epi16(lo, hi), _mm256_unpackhi_epi16(lo, hi))
+    }
+
+    /// The low 16 bits of the 32-bit lanes of `a` and `b` (as [`mul32`] split them), in
+    /// order: a truncating pack.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn pack_trunc(a: __m256i, b: __m256i) -> __m256i {
+        let a = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(a));
+        let b = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(b));
+        _mm256_packs_epi32(a, b)
+    }
+
+    /// `PSHR32(MULT16_16(g, x), sh)` truncated to 16 bits; `round` is `1 << (sh - 1)` (or 0)
+    /// and `cnt` holds `sh`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn pshr_mul(x: __m256i, g: __m256i, round: __m256i, cnt: __m128i) -> __m256i {
+        let (p0, p1) = mul32(x, g);
+        pack_trunc(
+            _mm256_sra_epi32(_mm256_add_epi32(p0, round), cnt),
+            _mm256_sra_epi32(_mm256_add_epi32(p1, round), cnt),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn ld(p: *const i16) -> __m256i {
+        unsafe { _mm256_loadu_si256(p as *const __m256i) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn st(p: *mut i16, v: __m256i) {
+        unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
+    }
+
+    /// Applies the lane-wise `f` to all of `x` and `y` (equal lengths) in place: whole
+    /// vectors, then the last 16 lanes once more from their original values; below 16 lanes,
+    /// on a zero-padded copy.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn map2(x: &mut [i16], y: &mut [i16], f: impl Fn(__m256i, __m256i) -> (__m256i, __m256i)) {
+        let n = x.len();
+        assert!(y.len() == n);
+        if n < 16 {
+            let (mut a, mut b) = ([0i16; 16], [0i16; 16]);
+            a[..n].copy_from_slice(x);
+            b[..n].copy_from_slice(y);
+            // Safety: `a` and `b` hold 16 values.
+            unsafe {
+                let (u, v) = f(ld(a.as_ptr()), ld(b.as_ptr()));
+                st(a.as_mut_ptr(), u);
+                st(b.as_mut_ptr(), v);
+            }
+            x.copy_from_slice(&a[..n]);
+            y.copy_from_slice(&b[..n]);
+            return;
+        }
+        // Safety: every access is to 16 values at or below n - 16.
+        unsafe {
+            let (xp, yp) = (x.as_mut_ptr(), y.as_mut_ptr());
+            let last = f(ld(xp.add(n - 16)), ld(yp.add(n - 16)));
+            let mut i = 0;
+            while i + 16 < n {
+                let (u, v) = f(ld(xp.add(i)), ld(yp.add(i)));
+                st(xp.add(i), u);
+                st(yp.add(i), v);
+                i += 16;
+            }
+            st(xp.add(n - 16), last.0);
+            st(yp.add(n - 16), last.1);
+        }
+    }
+
+    /// [`map2`] for one slice.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub fn map1(x: &mut [i16], f: impl Fn(__m256i) -> __m256i) {
+        let n = x.len();
+        if n < 16 {
+            let mut a = [0i16; 16];
+            a[..n].copy_from_slice(x);
+            // Safety: `a` holds 16 values.
+            unsafe { st(a.as_mut_ptr(), f(ld(a.as_ptr()))) };
+            x.copy_from_slice(&a[..n]);
+            return;
+        }
+        // Safety: every access is to 16 values at or below n - 16.
+        unsafe {
+            let xp = x.as_mut_ptr();
+            let last = f(ld(xp.add(n - 16)));
+            let mut i = 0;
+            while i + 16 < n {
+                st(xp.add(i), f(ld(xp.add(i))));
+                i += 16;
+            }
+            st(xp.add(n - 16), last);
+        }
+    }
+}
+
+/// AVX2 [`super::vq::scale_shr_scalar`].
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn scale_shr_avx2(x: &mut [i16], g: i32, sh: i32) {
+    use avx2_i16::*;
+    use std::arch::x86_64::*;
+    let gv = _mm256_set1_epi16(g as i16);
+    let round = _mm256_set1_epi32((1i32 << sh) >> 1);
+    let cnt = _mm_cvtsi32_si128(sh);
+    map1(x, |v| pshr_mul(v, gv, round, cnt));
+}
+
+/// AVX2 [`super::bands::mul_q15_scalar`] (`out` and `x` of equal lengths).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn mul_q15_avx2(out: &mut [i16], x: &[i16], g: i32) {
+    use avx2_i16::*;
+    use std::arch::x86_64::*;
+    let gv = _mm256_set1_epi16(g as i16);
+    // (x * g) >> 15 in 16 bits: the high half doubled, plus bit 15 of the low half.
+    let f = |xv: __m256i| {
+        let hi = _mm256_slli_epi16::<1>(_mm256_mulhi_epi16(xv, gv));
+        let lo = _mm256_srli_epi16::<15>(_mm256_mullo_epi16(xv, gv));
+        _mm256_or_si256(hi, lo)
+    };
+    let n = x.len();
+    assert!(out.len() == n);
+    if n < 16 {
+        let mut a = [0i16; 16];
+        a[..n].copy_from_slice(x);
+        // Safety: `a` holds 16 values.
+        unsafe { st(a.as_mut_ptr(), f(ld(a.as_ptr()))) };
+        out.copy_from_slice(&a[..n]);
+        return;
+    }
+    // Safety: every access is to 16 values at or below n - 16; the last vector may repeat
+    // some outputs, from the unchanged input.
+    unsafe {
+        let mut i = 0;
+        while i + 16 < n {
+            st(out.as_mut_ptr().add(i), f(ld(x.as_ptr().add(i))));
+            i += 16;
+        }
+        st(out.as_mut_ptr().add(n - 16), f(ld(x.as_ptr().add(n - 16))));
+    }
+}
+
+/// AVX2 final loop of [`super::bands`] `stereo_merge` (`x` and `y` of equal lengths).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn stereo_merge_avx2(
+    x: &mut [i16],
+    y: &mut [i16],
+    mid: i32,
+    lgain: i32,
+    lsh: i32,
+    rgain: i32,
+    rsh: i32,
+) {
+    use avx2_i16::*;
+    use std::arch::x86_64::*;
+    let midv = _mm256_set1_epi16(mid as i16);
+    let (lg, rg) = (_mm256_set1_epi16(lgain as i16), _mm256_set1_epi16(rgain as i16));
+    let (lr, rr) = (
+        _mm256_set1_epi32((1i32 << lsh) >> 1),
+        _mm256_set1_epi32((1i32 << rsh) >> 1),
+    );
+    let (lc, rc) = (_mm_cvtsi32_si128(lsh), _mm_cvtsi32_si128(rsh));
+    map2(x, y, |xv, r| {
+        // MULT16_16_P15(mid, x) is pmulhrsw.
+        let l = _mm256_mulhrs_epi16(xv, midv);
+        (
+            pshr_mul(_mm256_sub_epi16(l, r), lg, lr, lc),
+            pshr_mul(_mm256_add_epi16(l, r), rg, rr, rc),
+        )
+    });
+}
+
+/// AVX2 [`super::bands::haar1_scalar`] for strides 1, 2, 4, 8 and multiples of 16 over the
+/// first values in whole vectors; returns how many values it did (0 for other strides).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn haar1_avx2(x: &mut [i16], n0: usize, stride: usize) -> usize {
+    use avx2_i16::*;
+    use std::arch::x86_64::*;
+    let total = (n0 >> 1) * 2 * stride;
+    assert!(x.len() >= total);
+    let c = _mm256_set1_epi16(23170);
+    let round = _mm256_set1_epi32(16384);
+    // tmp1 = 23170 a, tmp2 = 23170 b; a' = PSHR32(tmp1 + tmp2, 15), b' = PSHR32(tmp1 - tmp2, 15).
+    let pair = |a: __m256i, b: __m256i| -> (__m256i, __m256i) {
+        let (a0, a1) = mul32(a, c);
+        let (b0, b1) = mul32(b, c);
+        let f = |v: __m256i| _mm256_srai_epi32::<15>(_mm256_add_epi32(v, round));
+        (
+            pack_trunc(f(_mm256_add_epi32(a0, b0)), f(_mm256_add_epi32(a1, b1))),
+            pack_trunc(f(_mm256_sub_epi32(a0, b0)), f(_mm256_sub_epi32(a1, b1))),
+        )
+    };
+    if stride % 16 == 0 {
+        for blk in x[..total].chunks_exact_mut(2 * stride) {
+            let (a, b) = blk.split_at_mut(stride);
+            for (av, bv) in a.chunks_exact_mut(16).zip(b.chunks_exact_mut(16)) {
+                // Safety: `av` and `bv` hold 16 values each.
+                unsafe {
+                    let (na, nb) = pair(ld(av.as_ptr()), ld(bv.as_ptr()));
+                    st(av.as_mut_ptr(), na);
+                    st(bv.as_mut_ptr(), nb);
+                }
+            }
+        }
+        return total;
+    }
+    if !matches!(stride, 1 | 2 | 4 | 8) {
+        return 0;
+    }
+    // Within a vector, lanes alternate between runs of `stride` a values and b values: swap
+    // each run with its partner, then merge the results by lane parity.
+    let (swap, amask) = match stride {
+        1 => (
+            _mm256_setr_epi8(
+                2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 2, 3, 0, 1, 6, 7, 4, 5, 10,
+                11, 8, 9, 14, 15, 12, 13,
+            ),
+            _mm256_set1_epi32(0x0000_ffff),
+        ),
+        2 => (
+            _mm256_setr_epi8(
+                4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 12,
+                13, 14, 15, 8, 9, 10, 11,
+            ),
+            _mm256_set1_epi64x(0x0000_0000_ffff_ffff),
+        ),
+        4 => (
+            _mm256_setr_epi8(
+                8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                0, 1, 2, 3, 4, 5, 6, 7,
+            ),
+            _mm256_setr_epi64x(-1, 0, -1, 0),
+        ),
+        _ => (
+            _mm256_setr_epi8(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                10, 11, 12, 13, 14, 15,
+            ),
+            _mm256_setr_epi64x(-1, -1, 0, 0),
+        ),
+    };
+    let n = total & !15;
+    for v in x[..n].chunks_exact_mut(16) {
+        // Safety: `v` holds 16 values.
+        unsafe {
+            let w = ld(v.as_ptr());
+            let p = if stride == 8 {
+                _mm256_permute4x64_epi64::<0x4E>(w)
+            } else {
+                _mm256_shuffle_epi8(w, swap)
+            };
+            // a lanes: (w, p) are (a, b); b lanes: (p, w) are (a, b).
+            let a = _mm256_blendv_epi8(p, w, amask);
+            let b = _mm256_blendv_epi8(w, p, amask);
+            let (na, nb) = pair(a, b);
+            st(v.as_mut_ptr(), _mm256_blendv_epi8(nb, na, amask));
+        }
+    }
+    n
+}
+
+/// AVX2 [`super::bands`] denormalisation of one band: `out[i] = MULT16_16(x[i], g)` shifted
+/// right by `shift` (left for a negative one); returns how many values it did (all of them
+/// from 8 up, else none).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn denormalise_avx2(out: &mut [i32], x: &[i16], g: i32, shift: i32) -> usize {
+    use std::arch::x86_64::*;
+    let gv = _mm256_set1_epi32(g as i16 as i32);
+    let n = x.len();
+    assert!(out.len() == n);
+    if n < 8 {
+        return 0;
+    }
+    let (rc, lc) = (
+        _mm_cvtsi32_si128(shift.max(0)),
+        _mm_cvtsi32_si128((-shift).max(0)),
+    );
+    let mut f = |i: usize| {
+        // Safety: i + 8 <= n.
+        unsafe {
+            let p = _mm256_mullo_epi32(
+                _mm256_cvtepi16_epi32(_mm_loadu_si128(x.as_ptr().add(i) as *const __m128i)),
+                gv,
+            );
+            let r = _mm256_sll_epi32(_mm256_sra_epi32(p, rc), lc);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, r);
+        }
+    };
+    let mut i = 0;
+    while i + 8 < n {
+        f(i);
+        i += 8;
+    }
+    // The last vector may repeat some outputs, from the unchanged input.
+    f(n - 8);
+    n
+}
+
+/// AVX2 [`super::celt`] `sig2word16_slice_scalar` over the first `n - n % 16` values;
+/// returns how many it did.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn sig2word16_avx2(out: &mut [i16], x: &[i32]) -> usize {
+    use std::arch::x86_64::*;
+    let n = out.len().min(x.len()) & !15;
+    let r = _mm256_set1_epi32(2048);
+    for (o, v) in out[..n].chunks_exact_mut(16).zip(x[..n].chunks_exact(16)) {
+        // Safety: `o` and `v` hold 16 values each.
+        unsafe {
+            // PSHR32(x, 12) then saturation, which the pack does.
+            let a = _mm256_srai_epi32::<12>(_mm256_add_epi32(
+                _mm256_loadu_si256(v.as_ptr() as *const __m256i),
+                r,
+            ));
+            let b = _mm256_srai_epi32::<12>(_mm256_add_epi32(
+                _mm256_loadu_si256(v.as_ptr().add(8) as *const __m256i),
+                r,
+            ));
+            let p = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(a, b));
+            _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, p);
+        }
+    }
+    n
 }
 
 /// One sample of the constant-gain comb filter, as [`comb_const_avx2`] defines it.
@@ -1191,6 +1567,32 @@ mod tests {
                 fft_impl_scalar(st, &mut a);
                 fft_impl(st, &mut b);
                 assert_eq!(a, b, "nfft {} amp {amp}", n / 2);
+            }
+        }
+    }
+
+    #[test]
+    fn bitrev_tables_are_permutations() {
+        for st in &FFT_STATES {
+            let mut seen = vec![false; st.bitrev.len()];
+            for &r in st.bitrev {
+                assert!(!std::mem::replace(&mut seen[r as usize], true));
+            }
+        }
+    }
+
+    #[test]
+    fn pre_rotate_matches_scalar() {
+        use super::super::mdct::{pre_rotate, pre_rotate_scalar};
+        for (st, n2) in FFT_STATES.iter().zip([960usize, 480, 240, 120]) {
+            let t: Vec<i16> = signal(n2, 11, 32767).iter().map(|&v| v as i16).collect();
+            for stride in [1usize, 2, 4, 8] {
+                let x = signal(stride * n2, 12, i32::MAX);
+                let mut a = vec![0i32; n2];
+                let mut b = vec![0i32; n2];
+                pre_rotate_scalar(&x, &mut a, &t, st.bitrev, stride, 0);
+                pre_rotate(&x, &mut b, &t, st.bitrev, stride);
+                assert_eq!(a, b, "n2 {n2} stride {stride}");
             }
         }
     }
