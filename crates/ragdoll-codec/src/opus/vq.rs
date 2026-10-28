@@ -265,6 +265,23 @@ pub fn decode_pulses(y: &mut [i16], n: usize, k: usize, dec: &mut Ec) -> i32 {
 
 fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
     let x = &mut x[..len];
+    match stride {
+        1 if len >= 2 => exp_rotation1_serial(x, c, s),
+        1 => {}
+        2 => rotate_chains::<2>(x, c, s),
+        3 => rotate_chains::<3>(x, c, s),
+        4 => rotate_chains::<4>(x, c, s),
+        5 => rotate_chains::<5>(x, c, s),
+        6 => rotate_chains::<6>(x, c, s),
+        7 => rotate_chains::<7>(x, c, s),
+        8 => rotate_chains::<8>(x, c, s),
+        _ => rotate_strided(x, stride, c, s),
+    }
+}
+
+/// [`exp_rotation1`] with a stride above 1, as libopus writes it.
+fn rotate_strided(x: &mut [i16], stride: usize, c: i32, s: i32) {
+    let len = x.len();
     let ms = -s;
     // The rotated pair (x1, x2) -> (x1', x2').
     let rot = |x1: i32, x2: i32| {
@@ -273,12 +290,6 @@ fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
             pshr32(mac16(mul16(c, x2), s, x1), 15) as i16,
         )
     };
-    if stride == 1 {
-        if len >= 2 {
-            exp_rotation1_serial(x, c, s);
-        }
-        return;
-    }
     for i in 0..len.saturating_sub(stride) {
         let (a, b) = rot(x[i] as i32, x[i + stride] as i32);
         x[i + stride] = b;
@@ -290,6 +301,72 @@ fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
             x[i + stride] = b;
             x[i] = a;
         }
+    }
+}
+
+/// [`rotate_strided`] with stride `S`. Each pass is `S` independent chains (the coefficients
+/// `r, r + S, r + 2S, ...`), every step rotating the value the chain's previous step produced.
+/// Here each chain carries that value in a register rather than through memory, where every
+/// step waited on the previous step's store, and the `S` chains advance in lockstep.
+fn rotate_chains<const S: usize>(x: &mut [i16], c: i32, s: i32) {
+    let len = x.len();
+    if len <= S {
+        return;
+    }
+    let (c, s, ms) = (c as i16 as i32, s as i16 as i32, (-s) as i16 as i32);
+    // The rotated pair (x1, x2) -> (x1', x2').
+    let a = |x1: i32, x2: i32| ((c * x1).wrapping_add(ms * x2).wrapping_add(16384) >> 15) as i16;
+    let b = |x1: i32, x2: i32| ((c * x2).wrapping_add(s * x1).wrapping_add(16384) >> 15) as i16;
+    // Forward, steps i < len - S: (x[i], x[i + S]) with x[i] carried, x[i + S] the next one.
+    let steps = len - S;
+    let (full, rem) = (steps / S, steps % S);
+    let mut v: [i32; S] = std::array::from_fn(|r| x[r] as i32);
+    for t in 0..full {
+        let (cur, next) = x[t * S..t * S + 2 * S].split_at_mut(S);
+        for r in 0..S {
+            let x2 = next[r] as i32;
+            cur[r] = a(v[r], x2);
+            v[r] = b(v[r], x2) as i32;
+        }
+    }
+    // Chains r < rem take one more step; then each lands its value.
+    let o = full * S;
+    for r in 0..S {
+        if r < rem {
+            let x2 = x[o + S + r] as i32;
+            x[o + r] = a(v[r], x2);
+            x[o + S + r] = b(v[r], x2);
+        } else {
+            x[o + r] = v[r] as i16;
+        }
+    }
+    if len <= 2 * S {
+        return;
+    }
+    // Backward, steps i from len - 2S - 1 down: (x[i], x[i + S]) with x[i + S] carried.
+    let steps = len - 2 * S;
+    let (full, rem) = (steps / S, steps % S);
+    let o = full * S;
+    // Chains r < rem start one step higher, at i = o + r.
+    for r in 0..S {
+        v[r] = x[o + r] as i32;
+    }
+    for r in 0..rem {
+        let x1 = x[o + r] as i32;
+        let x2 = x[o + S + r] as i32;
+        x[o + S + r] = b(x1, x2);
+        v[r] = a(x1, x2) as i32;
+    }
+    for t in (0..full).rev() {
+        let (cur, next) = x[t * S..t * S + 2 * S].split_at_mut(S);
+        for r in 0..S {
+            let x1 = cur[r] as i32;
+            next[r] = b(x1, v[r]);
+            v[r] = a(x1, v[r]) as i32;
+        }
+    }
+    for r in 0..S {
+        x[r] = v[r] as i16;
     }
 }
 
@@ -602,6 +679,35 @@ pub fn stereo_itheta(x: &[i16], y: &[i16], stereo: bool, n: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotate_chains_matches_strided() {
+        let mut seed = 9u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for trial in 0..20000 {
+            let len = 1 + (rnd() % 90) as usize;
+            let stride = 2 + trial % 7;
+            let (c, s) = match trial % 5 {
+                0 => (32767, 32767),
+                1 => (-32767, 32767),
+                _ => (rnd() as i16 as i32 / 2 + 16384, rnd() as i16 as i32),
+            };
+            let x: Vec<i16> = (0..len)
+                .map(|k| match (trial + k) % 11 {
+                    0 => i16::MIN,
+                    1 => i16::MAX,
+                    _ => rnd() as i16,
+                })
+                .collect();
+            let (mut a, mut b) = (x.clone(), x.clone());
+            exp_rotation1(&mut a, len, stride, c, s);
+            rotate_strided(&mut b, stride, c, s);
+            assert_eq!(a, b, "len {len} stride {stride} c {c} s {s}");
+        }
+    }
 
     /// Every codebook whose size fits 32 bits (those libopus can code): the windowed decode
     /// matches the libopus scan, and `icwrs` inverts it.
