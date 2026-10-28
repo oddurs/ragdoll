@@ -2334,7 +2334,12 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
         for p in 0..2 {
-            let wt = self.weighting(refs, 1 + p);
+            // Implicit and default weights are the same for every component.
+            let wt = if self.cx.sh.weights.is_some() {
+                self.weighting(refs, 1 + p)
+            } else {
+                wt
+            };
             let d = co + cy * cs + cx;
             recon::predict_block(
                 &mut self.st.planes[1 + p][d..],
@@ -2364,7 +2369,6 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 }
 
-/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
 /// Where the co-located 4x4 blocks of the current macroblock lie in `RefPicList1[0]`'s motion
 /// (8.4.1.2.1, Table 8-8).
 #[derive(Clone, Copy)]
@@ -2408,6 +2412,7 @@ impl ColMb<'_> {
     }
 }
 
+/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
 fn mvp_from(
     a: Option<Mv>,
     b: Option<Mv>,

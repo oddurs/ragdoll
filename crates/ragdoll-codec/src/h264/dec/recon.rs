@@ -301,6 +301,10 @@ pub fn mc_luma(
         );
         return;
     }
+    // Whole-sample blocks at the picture edge need no interpolation margins.
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
+        return;
+    }
     let mut win = [0u8; EMU_STRIDE * 21];
     edge_window(
         &mut win,
@@ -313,6 +317,40 @@ pub fn mc_luma(
         h + 5,
     );
     h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
+}
+
+/// Whole-sample prediction: copies the `w`x`h` block at `(x, y)` of a `width`x`height` plane to
+/// `dst` when it lies inside the plane, which needs none of the interpolation margins.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn copy_inside(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    w: usize,
+    h: usize,
+    dst: &mut [u8],
+    ds: usize,
+) -> bool {
+    if x < 0 || y < 0 || x as usize + w > width || y as usize + h > height {
+        return false;
+    }
+    let o = y as usize * width + x as usize;
+    fn rows<const W: usize>(src: &[u8], o: usize, ss: usize, h: usize, dst: &mut [u8], ds: usize) {
+        for r in 0..h {
+            let s: &[u8; W] = src[o + r * ss..][..W].try_into().expect("W samples");
+            dst[r * ds..r * ds + W].copy_from_slice(s);
+        }
+    }
+    match w {
+        16 => rows::<16>(src, o, width, h, dst, ds),
+        8 => rows::<8>(src, o, width, h, dst, ds),
+        4 => rows::<4>(src, o, width, h, dst, ds),
+        _ => rows::<2>(src, o, width, h, dst, ds),
+    }
+    true
 }
 
 /// Copies the `cols`x`rows` window at `(x0, y0)` of a `width`x`height` plane into `win` (stride
@@ -374,6 +412,9 @@ pub fn mc_chroma(
             fx,
             fy,
         );
+        return;
+    }
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 9];
