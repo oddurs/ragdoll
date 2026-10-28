@@ -39,17 +39,19 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
             let t8 = st.t8x8[addr];
             let local = EdgeCtx::new(st, mb_x, mb_y);
             // An inter MB with one motion and no luma coefficients has bS 0 on every inner edge.
-            let no_inner = !local.intra[0] && st.uniform[addr] && st.cbp[addr] & 0xF == 0;
-            for dir in 0..2 {
-                let filter_mb_edge = if dir == 0 { left } else { top };
-                for edge in 0..4 {
-                    // Odd edges only exist in luma, which has none inside 8x8 transform blocks.
-                    if (edge == 0 && !filter_mb_edge)
-                        || (edge > 0 && no_inner)
-                        || (t8 && edge % 2 == 1)
-                    {
-                        continue;
-                    }
+            let no_inner = !local.intra[0] && st.motion_edges[addr] == 0 && st.cbp[addr] & 0xF == 0;
+            // Edges to visit, bit `4 * dir + edge`; odd edges only exist in luma, which has none
+            // inside 8x8 transform blocks.
+            let mut todo: u8 = if no_inner { 0x11 } else { 0xFF };
+            todo &= !(u8::from(!left) | u8::from(!top) << 4);
+            if t8 {
+                todo &= !0xAA;
+            }
+            while todo != 0 {
+                let k = todo.trailing_zeros() as usize;
+                todo &= todo - 1;
+                let (dir, edge) = (k >> 2, k & 3);
+                {
                     let bs = local.strengths(st, dir, edge);
                     if bs == [0; 4] {
                         continue;
@@ -82,7 +84,8 @@ struct EdgeCtx {
     /// Intra: this MB, the left MB, the top MB.
     intra: [bool; 3],
     field: bool,
-    uniform: bool,
+    /// [`PicState::motion_edges`] of this MB.
+    motion_edges: u8,
 }
 
 impl EdgeCtx {
@@ -98,7 +101,7 @@ impl EdgeCtx {
                 mb_y > 0 && st.mb_type[addr - st.mb_w].is_intra(),
             ],
             field: matches!(st.structure, Structure::Field(_)),
-            uniform: st.uniform[addr],
+            motion_edges: st.motion_edges[addr],
         }
     }
 
@@ -120,25 +123,27 @@ impl EdgeCtx {
         let ylim = if self.field { 2 } else { 4 };
         let (step, along) = if dir == 0 { (1, self.s) } else { (self.s, 1) };
         let q0 = self.b0 + edge * step;
+        // Inside a partition of one motion only coefficients count.
+        let check_motion = edge == 0 || self.motion_edges & (1 << (4 * dir + edge)) != 0;
         let mut bs = [0u8; 4];
         for (k, slot) in bs.iter_mut().enumerate() {
             let qi = q0 + k * along;
             let pi = qi - step;
-            *slot = if st.nz[pi] || st.nz[qi] {
-                2
-            } else if edge > 0 && self.uniform {
-                0
-            } else {
-                let rp = [st.ref_pic[0][pi], st.ref_pic[1][pi]];
-                let rq = [st.ref_pic[0][qi], st.ref_pic[1][qi]];
-                let mp = [st.mv[0][pi], st.mv[1][pi]];
-                let mq = [st.mv[0][qi], st.mv[1][qi]];
-                if rp == rq && mp == mq {
-                    0
-                } else {
-                    motion_differs(rp, mp, rq, mq, ylim) as u8
+            let nz = st.nz[pi] | st.nz[qi];
+            *slot = 2 * nz as u8;
+            if check_motion && !nz {
+                // Evaluated without short-circuits: one branch on the outcome.
+                let (rp, rq) = (
+                    [st.ref_pic[0][pi], st.ref_pic[1][pi]],
+                    [st.ref_pic[0][qi], st.ref_pic[1][qi]],
+                );
+                let (mp, mq) = ([st.mv[0][pi], st.mv[1][pi]], [st.mv[0][qi], st.mv[1][qi]]);
+                let same =
+                    (rp[0] == rq[0]) & (rp[1] == rq[1]) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
+                if !same {
+                    *slot = motion_differs(rp, mp, rq, mq, ylim) as u8;
                 }
-            };
+            }
         }
         bs
     }

@@ -6,6 +6,7 @@
 //! - [`metrics`]: NEON-accelerated block/plane SAD, SSE, and single-pass $8\times8$ SSIM window statistics.
 //! - [`dct4`]: Power-of-two DCT-IV (the AAC-LC IMDCT core) through a precomputed-twiddle complex FFT.
 //! - [`h264_deblock`]: 16-line luma and 8-line chroma H.264 deblocking edges, transposed in registers for vertical edges.
+//! - [`h264_idct`]: H.264 inverse 4x4 transform and reconstruction.
 //! - [`h264_mc`]: Partition-sized H.264 quarter-pel luma and eighth-pel chroma inter prediction.
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
@@ -14,6 +15,7 @@ pub mod dct4;
 pub mod fixed;
 pub mod h264_deblock;
 pub mod h264_dsp;
+pub mod h264_idct;
 pub mod h264_mc;
 pub mod metrics;
 pub mod scan;
@@ -48,6 +50,7 @@ pub use h264_dsp::{
     predict_intra_4x4_u8_scalar, put_h264_chroma_mc8_u8, put_h264_chroma_mc8_u8_scalar,
     put_h264_qpel8_mc_u8, put_h264_qpel16_mc_u8, put_h264_qpel16_mc_u8_scalar,
 };
+pub use h264_idct::{h264_idct4_add, h264_idct4_add_scalar};
 pub use h264_mc::{
     chroma_mc_cols, h264_avg, h264_avg_scalar, h264_chroma_mc, h264_chroma_mc_scalar, h264_luma_mc,
     h264_luma_mc_scalar, h264_weight_bi, h264_weight_bi_scalar, h264_weight_uni,
