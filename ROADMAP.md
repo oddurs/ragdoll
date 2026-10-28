@@ -182,8 +182,11 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 ### up next
 
 - [ ] `BUG-0060` H.264 decoder disagrees with FFmpeg on Ragdoll-encoded streams (17.3 dB vs 35.1 dB) <sup>bug · p0 · codec-video</sup>
-- [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 - [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
+
+### in progress
+
+- [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 
 ### shipped
 

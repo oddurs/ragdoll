@@ -53,6 +53,19 @@ RAGDOLL_SIMD=scalar cargo test --workspace   # the same tests on the scalar refe
 
 The interop tests need `ffmpeg` and `ffprobe` (CI pins Ubuntu 24.04's FFmpeg 6.1.1) and fail without them; `RAGDOLL_ALLOW_MISSING_TOOLS=1` skips them instead. `RAGDOLL_SIMD=scalar|neon|avx2` forces a dispatch level, so a SIMD change is checked against its scalar reference end to end. CLI output is pinned by snapshots in `crates/ragdoll-cli/tests/golden/`; after an intended change, rewrite them with `RAGDOLL_BLESS=1 cargo test -p ragdoll-cli --test cli`.
 
+#### The QA corpus (`qa/`)
+
+Validation tooling lives in its own Cargo workspace under `qa/`, so nothing it needs reaches the library's `Cargo.lock`. `qa/corpus/manifest.toml` pins every corpus file by SHA-256 and size, in four tiers: synthesized clips kept in git (tier 1), conformance suites (tier 2) and real-world files (tier 3) downloaded into `qa/corpus/cache/`, and regression files kept in git (tier 4).
+
+```sh
+cd qa
+cargo run --release -- corpus fetch    # download tiers 2 and 3, verifying each file
+cargo run --release -- corpus verify   # fail on any missing file or hash mismatch
+cargo run --release -- corpus synth    # regenerate tier 1 and check it is byte-identical
+```
+
+To add a file, append a `[[file]]` entry with its `url` (or its path, for tier 4), `size` and `sha256`. When a bug or fuzz crash is fixed, commit its minimized input and list it as tier 4.
+
 ### Step 4: Update Cairn & Render `ROADMAP.md`
 
 Record architectural findings, tick verified acceptance criteria, close the item (if complete), and regenerate `ROADMAP.md`:

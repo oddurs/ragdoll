@@ -1,0 +1,20 @@
+[package]
+name = "ragdoll-qa"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ragdoll validation tooling: media corpus manager (and, later, conformance, interop, fuzz, RD and perf runners)."
+license = "MIT"
+
+[[bin]]
+name = "qa"
+path = "src/main.rs"
+
+[dependencies]
+ragdoll-pipeline = { path = "../crates/ragdoll-pipeline" }
+
+# Its own workspace: nothing qa needs ever enters the library's Cargo.lock.
+[workspace]
+
+[profile.release]
+opt-level = 3

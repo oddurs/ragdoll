@@ -3,10 +3,12 @@ id: 62
 uid: 7976ce3f-d062-405d-bb60-7ab2c3d73cef
 title: qa/ workspace and tiered media corpus manager
 type: feature
-status: planned
+status: doing
 milestone: m11-validation
+assignee: Claude
+claimed: 2026-10-28
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-10-28
 priority: p1
 effort: m
 area: arch
@@ -22,6 +24,10 @@ A separate `qa/` Cargo workspace with a `ragdoll-qa` binary (`qa corpus`, `qa co
 
 ## Acceptance criteria
 
-- [ ] `qa/` builds independently; the root `Cargo.lock` still lists only the seven `ragdoll-*` packages.
-- [ ] `qa corpus fetch` downloads and verifies every manifest entry, and `qa corpus verify` fails on any hash mismatch.
+- [x] `qa/` builds independently; the root `Cargo.lock` still lists only the seven `ragdoll-*` packages.
+- [x] `qa corpus fetch` downloads and verifies every manifest entry, and `qa corpus verify` fails on any hash mismatch.
 - [ ] CI caches tier 2 and 3 by manifest hash.
+
+## 2026-10-28
+
+qa/ is its own Cargo workspace (package ragdoll-qa, binary qa; root Cargo.toml excludes it) using only std plus path dependencies on the ragdoll crates: SHA-256 is implemented in qa/src/sha256.rs (FIPS 180 vectors tested, including 1,000,000 'a' in uneven chunks) and downloads use curl, so neither lock file gains a third-party crate; the root Cargo.lock still lists exactly the seven ragdoll-* packages (checked in CI). Only 'qa corpus' exists so far; conformance, interop, fuzz, rd, perf and report are items 0063-0069. Manifest qa/corpus/manifest.toml (a [[file]] TOML subset parsed by hand, unknown keys and duplicate names rejected): tier 1, five clips made by ragdoll synth (MP4, MKV, Y4M, WAV, FLAC; 100 KB) in git under qa/corpus/synth, which 'qa corpus synth' regenerates and verifies; tier 2, the RFC 8251 Opus vectors, five JVT H.264 conformance streams and three ISO AAC conformance streams with their reference PCM (FATE suite); tier 3, seven FATE real-world files (TS, MKV with Opus codec delay, MOV/M4A with AAC priming, MP4 edit lists, 7.1 Opus in TS); tier 4, the 43 regression fixtures already in git under crates/*/tests/data. Tiers 2 and 3 total 85 MB. Evidence: a cold 'qa corpus fetch' took 39 s and 'verify' passed 67/67; flipping one byte of BA1_Sony_D.jsv made verify fail (exit 1, reporting the hash); fetch replaced it and verify passed again. CI (.github/workflows/qa.yml) caches qa/corpus/cache with key qa-corpus-${hashFiles(manifest)}, runs fmt/clippy/tests for qa, fetch, verify and synth, and asserts the root lock file's package list.
