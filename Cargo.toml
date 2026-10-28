@@ -9,6 +9,8 @@ members = [
     "crates/ragdoll-pipeline",
     "crates/ragdoll-cli",
 ]
+# Validation tooling is its own workspace, so its needs never enter this Cargo.lock (0062).
+exclude = ["qa"]
 
 [workspace.package]
 version = "0.1.0"

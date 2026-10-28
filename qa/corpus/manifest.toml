@@ -1,0 +1,439 @@
+# Ragdoll media corpus (0062): every file pinned by SHA-256 and size.
+#   tier 1: synthesized by `ragdoll synth`, kept in git under qa/corpus/synth/ (`qa corpus synth` regenerates them)
+#   tier 2: conformance suites, downloaded into the cache
+#   tier 3: real-world files from other encoders and muxers, downloaded into the cache
+#   tier 4: regression files kept in git forever (paths from the repository root)
+
+# --- tier 1 ---
+
+[[file]]
+name = "clip_160x90_30fps.mp4"
+tier = 1
+synth = "160x90 30fps 1.0s"
+size = 4115
+sha256 = "e7b76ee9bb34a5529f96a7d27202ad3c77916cc456496236be57f3aae094395f"
+
+[[file]]
+name = "clip_320x180_25fps.mkv"
+tier = 1
+synth = "320x180 25fps 0.6s"
+size = 3908
+sha256 = "2b7f9aa4844e5ae120b32866cb8fd37396b69ed15fdcd88ffc7beffe475c4aa8"
+
+[[file]]
+name = "clip_64x36_30fps.y4m"
+tier = 1
+synth = "64x36 30fps 0.2s"
+size = 20834
+sha256 = "f3725781f178a93dc53fcc3f0780a271efbcb67347bbb7b43bd4eab50ee9a433"
+
+[[file]]
+name = "tone_48k_stereo.wav"
+tier = 1
+synth = "0x0 30fps 0.25s"
+size = 48044
+sha256 = "0f6947ba80b36fb81b9dd14a562abb47d094933e0f9ddbf1c83646b91ff81ba1"
+
+[[file]]
+name = "tone_48k_stereo.flac"
+tier = 1
+synth = "0x0 30fps 0.5s"
+size = 23010
+sha256 = "133b9a0d1b0f248358c2cc952907f4f8bedf35bb46e1196b7deca095dcc10567"
+
+# --- tier 2: conformance ---
+
+[[file]]
+name = "opus/opus_testvectors-rfc8251.tar.gz"
+tier = 2
+url = "https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz"
+size = 74624664
+sha256 = "6b26a22f9ba87b2b836906a9bb7afec5f8e54d49553b1200382520ee6fedfa55"
+
+[[file]]
+name = "h264/BA1_Sony_D.jsv"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/h264-conformance/BA1_Sony_D.jsv"
+size = 55537
+sha256 = "90c84dee7e57151b80918e4b81910d33885fba2ce131fa119e1753c1892086fc"
+
+[[file]]
+name = "h264/BA2_Sony_F.jsv"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/h264-conformance/BA2_Sony_F.jsv"
+size = 183140
+sha256 = "ea4d6cc823bb931b22fb4f5947745d0d0829cd79eca72209bb990b890afded0a"
+
+[[file]]
+name = "h264/CABA1_SVA_B.264"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/h264-conformance/CABA1_SVA_B.264"
+size = 30920
+sha256 = "2c1319be664863d68bf22c26ccfff417b7eeca1d8d6360f1862b5b3aa4c24c0a"
+
+[[file]]
+name = "h264/BAMQ1_JVC_C.264"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/h264-conformance/BAMQ1_JVC_C.264"
+size = 411660
+sha256 = "3cb7ccaf39846b1e6a5de48580461427f7e96ad563918d4f9c85c8133da5d1f9"
+
+[[file]]
+name = "h264/AUD_MW_E.264"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/h264-conformance/AUD_MW_E.264"
+size = 54828
+sha256 = "173b75a2883f3208894877549362f118721f45633bf08007396703ef2c358987"
+
+[[file]]
+name = "aac/al04_44.mp4"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/al04_44.mp4"
+size = 69537
+sha256 = "e98388671459a44e499e3ddbfb93ffb9bc027bb4a434dbba9ee9a918600dfebf"
+
+[[file]]
+name = "aac/al04_44.s16"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/al04_44.s16"
+size = 727040
+sha256 = "1c4a9035d5863e0be61aea7fdb3171d2820274e21aac37225cb5dfc5555f3758"
+
+[[file]]
+name = "aac/al04sf_48.mp4"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/al04sf_48.mp4"
+size = 69601
+sha256 = "7dc63a8bbf3818af6e771ff359220ab9e0fe63fb0fad8550f55ccadb2df1a40b"
+
+[[file]]
+name = "aac/al04sf_48.s16"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/al04sf_48.s16"
+size = 741120
+sha256 = "0c52376b0ae7b9078dc6fb21fdffef9ef703ce098ded4e26dd7bef0a53f8db65"
+
+[[file]]
+name = "aac/Fd_2_c1_Ms_0x01.mp4"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/Fd_2_c1_Ms_0x01.mp4"
+size = 372462
+sha256 = "8a5869362d2c2548d9fe4ed7b1d6e6601f8d6ac1d177a90144991b6938a63ed2"
+
+[[file]]
+name = "aac/Fd_2_c1_Ms_0x01.s16"
+tier = 2
+url = "https://fate-suite.ffmpeg.org/aac/Fd_2_c1_Ms_0x01.s16"
+size = 10587060
+sha256 = "9a7c405e95480c1181e46284abad97e756357b1fd545ce6d0306c812e5118bc5"
+
+# --- tier 3: real-world zoo ---
+
+[[file]]
+name = "zoo/h264small.ts"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mpegts/h264small.ts"
+size = 16544
+sha256 = "5e999d972e3d53e5780851933dd0a8428697e14a4d6ba83034960b82e39a920c"
+
+[[file]]
+name = "zoo/1242-small.mkv"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mkv/1242-small.mkv"
+size = 102400
+sha256 = "40892f34d39ff6db3ae9dd281ed4aba22a34fea126291ec855a59dded5e7e155"
+
+[[file]]
+name = "zoo/440hz-10ms.m4a"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mov/440hz-10ms.m4a"
+size = 4553
+sha256 = "4ee70d7adae3bdab5ad90050f0b8b5cf4505c80dce0ce84b9d67a946396059e5"
+
+[[file]]
+name = "zoo/aac-2048-priming.mov"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mov/aac-2048-priming.mov"
+size = 45226
+sha256 = "b163ddd5ea05b0986fe01723308bd296077f0548ad6b29db676d23ea8f4e4b35"
+
+[[file]]
+name = "zoo/codec_delay_opus.mkv"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mkv/codec_delay_opus.mkv"
+size = 9585
+sha256 = "19a9e97d1c8628ddfa34b01aee965e85c335176543096de0ea184edbabc58352"
+
+[[file]]
+name = "zoo/test-8-7.1.opus-small.ts"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/opus/test-8-7.1.opus-small.ts"
+size = 512000
+sha256 = "46b0c9ff33bd24daa11ff2ab2f9df01678190c0e062b77c5e611babe6e481fc1"
+
+[[file]]
+name = "zoo/elst_ends_betn_b_and_i.mp4"
+tier = 3
+url = "https://fate-suite.ffmpeg.org/mov/elst_ends_betn_b_and_i.mp4"
+size = 87059
+sha256 = "cc9bbd4ea05e2cd432088e482c94742108422789b4b838acf329c7876f47a215"
+
+# --- tier 4: regression fixtures ---
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/mono_22k_short.aac"
+tier = 4
+size = 2381
+sha256 = "80b9b2903e2f06e0881fc56e2411d7666c8f3c3440b9b8b9beba57fe53533718"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/mono_22k_short.s16"
+tier = 4
+size = 16384
+sha256 = "3d993d636f98bb0931feb2ce0f8886d3b42cd036cb7bb28a33615542318095a7"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/mono_8k.aac"
+tier = 4
+size = 1470
+sha256 = "7295f06c5ef96460da3ec9fe2569828f2ba0e090a908b55564e5f5bc0d4be8de"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/mono_8k.s16"
+tier = 4
+size = 10240
+sha256 = "fcd9326fd6085134a41ebe35aaac6c8860fdef0cc23dbca802bed6f17bc6eefa"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_32k_320k.aac"
+tier = 4
+size = 7823
+sha256 = "da0c05851d5a871ae4259929bf6b95649176620e0604a7e526f5a16390d474ec"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_32k_320k.s16"
+tier = 4
+size = 32768
+sha256 = "b94aaf848cdd826202568f8265c0bd4c5fcf67e0e326e272e53e47b92442d7f1"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_44k_ms.aac"
+tier = 4
+size = 2450
+sha256 = "b37a0cda0145a6719974a73e7d4420b0d534bc9654d77fcaf77390a6a642c312"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_44k_ms.s16"
+tier = 4
+size = 40960
+sha256 = "4f978a4747b8cca851765e8dd2dcea85fb14eb8e70652d965a78494e99f23a5d"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_48k_tools.aac"
+tier = 4
+size = 4354
+sha256 = "5e57b10f9cd8bbfcedce971c0f830d4740d998120b1842c3b796c48a5bae5622"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_48k_tools.s16"
+tier = 4
+size = 53248
+sha256 = "32af303baf568e421066aade89b649f34eaa62b970f43848a15cf89c241d435e"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_96k.aac"
+tier = 4
+size = 1934
+sha256 = "c3ef37a101028b389952b2bda149d7c44390894220f45bbbe62e335051564a62"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/stereo_96k.s16"
+tier = 4
+size = 24576
+sha256 = "bbb5a9ddb94a4bf5ef7a50959d1c9c1d7a83a5a835d8306e861038de23cccf18"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/surround51_48k.aac"
+tier = 4
+size = 3000
+sha256 = "1cb9aa8bc685bb3543c81b71ef48fee082ce99064812ea1c738d568f528a7b41"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/aac/surround51_48k.s16"
+tier = 4
+size = 49152
+sha256 = "2d7f0733170f13dde557ff7471891105791346f3b4ee6e53bb80b20c08da07c0"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cabac_bpyramid_weighted.264"
+tier = 4
+size = 11434
+sha256 = "891a2741340c5479422d3192251b97beb6dd50bc4d33c34b38069df4611df145"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cabac_mbaff_temporal_weighted.264"
+tier = 4
+size = 14759
+sha256 = "207d81baf5ed88f7d34bf70fb84928a9636b84e3102b90d8c2202c457b654bee"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cabac_temporal_direct_8x8_cqm.264"
+tier = 4
+size = 10908
+sha256 = "1a6c16168842d51b5cf8462894c9adaa2df138f5557c1d500f3c625d1e368e43"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cavlc_baseline_multiref_slices.264"
+tier = 4
+size = 14924
+sha256 = "d7934ac74dc103518ebc0103076c4da9ff7bc2f7d3ff54eaf88aa571c3fa0e32"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cavlc_high_cropped_90x58.264"
+tier = 4
+size = 3179
+sha256 = "c7f8e2a4d0f01f6b193e4f40ddfaa36e5c8ca83a56bde9fd5c40d21e831b79c6"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/h264/cavlc_mbaff_spatial.264"
+tier = 4
+size = 16078
+sha256 = "f3bfa87fd26faeedadfbe4857f95cf395d006fb4f6cb0b747898c6d7a5e2aac4"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_audio_hybrid_100ms.bit"
+tier = 4
+size = 6275
+sha256 = "595667545e293be2dd5ade3ad5d2c7719c1eb5665a56129874a3eba39d0449ab"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_celt_120ms.bit"
+tier = 4
+size = 10857
+sha256 = "28d21cbf3c108377d22beb18eedd8e41e63a9472f6be2ef98092cfe156328b08"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_celt_2_5ms.bit"
+tier = 4
+size = 12431
+sha256 = "6eb4e6a43717ca9a3103ab59846677295698cad65d01dca2084d9fb4be01d8aa"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_hybrid_fb_stereo_fec_40ms.bit"
+tier = 4
+size = 9813
+sha256 = "9f9be57411a526d68daccb5fefaa6067da4f2a2481267de039a3eaddb1763091"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_lowdelay_10ms.bit"
+tier = 4
+size = 8186
+sha256 = "8ee95a9bd88a8f996aab45dafac297096c53202bf84ed528abd578e6c6601cf7"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_silk_mb_fec_40ms.bit"
+tier = 4
+size = 4283
+sha256 = "ee6673d981d8509f24615bd4cfc2d8d90072a9e008bc33b478c23fb3c21187a8"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_silk_nb_fec_60ms.bit"
+tier = 4
+size = 2918
+sha256 = "d8eea97880eb060512f7d58428c9ab2985b8fbdcdb6db9fd4569d967d093314a"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_silk_wb_dtx.bit"
+tier = 4
+size = 4177
+sha256 = "68a874204d06528c4cf7db8763ed7c86c34e96578465ef1a0a88482e49682a3b"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/enc_silk_wb_stereo_fec.bit"
+tier = 4
+size = 7051
+sha256 = "a4f9737c4be64290489d82c4e7ffe10ce690f91401ec69e10d4e80757b7e0d1e"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv01.bit"
+tier = 4
+size = 11777
+sha256 = "85415fa08983ae8b5e90ac50f5a609b74ec4452513a92305e7ba0ec4b72a3880"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv02.bit"
+tier = 4
+size = 11995
+sha256 = "cab85207a13a004b1a0f64bc141cafdd87f47b50261a0aede5c2cf0e31a31079"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv03.bit"
+tier = 4
+size = 11987
+sha256 = "a6f81bb899736d0d45705ea7a2aa8b2b43db216d3b5a100f75cd08c91286a9ce"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv04.bit"
+tier = 4
+size = 11992
+sha256 = "2575bd1827d8152fc1b870a93e5b05de8899cc6db8ef5b7394141698a0f64905"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv05.bit"
+tier = 4
+size = 11986
+sha256 = "877759d14f23220f181f048175e1352cfc21861c438d4cea0b2fe76247e69789"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv06.bit"
+tier = 4
+size = 11981
+sha256 = "07f5eb94ed468bea71601dfe224310e78c7291da0389748a6fcb1e013539199b"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv07.bit"
+tier = 4
+size = 11994
+sha256 = "b27fcf854b32ff907dc0910356b9f2212664d9425ba5912576b6be75f160a090"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv08.bit"
+tier = 4
+size = 11771
+sha256 = "a82b70223e5ff589e570ab1abc37dae570adb777ae5b08ef2c69095976e4d089"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv09.bit"
+tier = 4
+size = 11265
+sha256 = "b63914f2b10cb386855ee78d56537b2359e83ae26065e1ec1dab8684fa75c59a"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv10.bit"
+tier = 4
+size = 11512
+sha256 = "f26badd877c32aacd52514aac46791f1e39a2f6f5855addc40be8729ff889fc5"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv11.bit"
+tier = 4
+size = 11972
+sha256 = "29f819fb4992f59b18d329e5bf9865375d3e21080773e377514466c428561f90"
+
+[[file]]
+name = "crates/ragdoll-codec/tests/data/opus/tv12.bit"
+tier = 4
+size = 12000
+sha256 = "110e1fd901cb01d5edb2aa8efce41c8fb880b5759ba3d5098e6c31d6d09e5181"
+
+[[file]]
+name = "crates/ragdoll-pipeline/tests/data/opus/audio_stereo_10ms.opus"
+tier = 4
+size = 7282
+sha256 = "34abd66715e2314eb99604e52cb0b2c1f39fc523beddb83870917064804e0ff8"
+
+[[file]]
+name = "crates/ragdoll-pipeline/tests/data/opus/voip_mono_60ms.opus"
+tier = 4
+size = 2701
+sha256 = "6d6e589bc9680c1aa28e2edc3fef812faceb669751a14d76556e2f60813e4d1f"
