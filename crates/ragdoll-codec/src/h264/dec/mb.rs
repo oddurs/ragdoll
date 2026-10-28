@@ -1951,10 +1951,40 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
 
+        // Spatial motion of an 8x8 from its co-located block.
+        let spatial_mvs = |col_ref: i8, col_mv: [i16; 2]| {
+            let col_zero = col_short
+                && col_ref == 0
+                && (-1..=1).contains(&col_mv[0])
+                && (-1..=1).contains(&col_mv[1]);
+            let mut mvs = [[0i16; 2]; 2];
+            for list in 0..2 {
+                if !(direct_zero || sp_ref[list] < 0 || (sp_ref[list] == 0 && col_zero)) {
+                    mvs[list] = sp_mv[list];
+                }
+            }
+            mvs
+        };
+        // Spatial prediction only looks at the co-located block for a reference index 0.
+        let need_col = !spatial || !(direct_zero || (sp_ref[0] != 0 && sp_ref[1] != 0));
+        let mut col_mb = None;
+        // A whole spatial-direct MB with 8x8 inference has one motion when the co-located MB is
+        // not consulted or has one motion itself: derive and store it once.
+        if spatial && inference && mask == 0xF {
+            let col = if need_col {
+                let c = col_mb.get_or_insert_with(|| self.colocated_mb());
+                c.uniform().then(|| c.block(0, 0))
+            } else {
+                Some((-1, [0, 0], NO_PIC, 0))
+            };
+            if let Some((col_ref, col_mv, _, _)) = col {
+                return self.store_direct(0, 0, 4, sp_ref, spatial_mvs(col_ref, col_mv));
+            }
+        }
+
         // With 8x8 inference, motion of each 8x8 is collected first so that a macroblock whose
         // 8x8s agree is stored once.
         let mut per8: [Option<DirectMotion>; 4] = [None; 4];
-        let mut col_mb = None;
         for b8 in 0..4 {
             if mask & (1 << b8) == 0 {
                 continue;
@@ -1970,29 +2000,15 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     (bx, by)
                 };
-                // Spatial prediction only looks at the co-located block for a reference index 0.
-                let (col_ref, col_mv, col_pic, vscale) =
-                    if spatial && (direct_zero || (sp_ref[0] != 0 && sp_ref[1] != 0)) {
-                        (-1, [0, 0], NO_PIC, 0)
-                    } else {
-                        col_mb
-                            .get_or_insert_with(|| self.colocated_mb())
-                            .block(cbx, cby)
-                    };
+                let (col_ref, col_mv, col_pic, vscale) = if need_col {
+                    col_mb
+                        .get_or_insert_with(|| self.colocated_mb())
+                        .block(cbx, cby)
+                } else {
+                    (-1, [0, 0], NO_PIC, 0)
+                };
                 let (refs, mvs) = if spatial {
-                    let col_zero = col_short
-                        && col_ref == 0
-                        && (-1..=1).contains(&col_mv[0])
-                        && (-1..=1).contains(&col_mv[1]);
-                    let mut mvs = [[0i16; 2]; 2];
-                    for list in 0..2 {
-                        if direct_zero || sp_ref[list] < 0 || (sp_ref[list] == 0 && col_zero) {
-                            mvs[list] = [0, 0];
-                        } else {
-                            mvs[list] = sp_mv[list];
-                        }
-                    }
-                    (sp_ref, mvs)
+                    (sp_ref, spatial_mvs(col_ref, col_mv))
                 } else {
                     // Temporal (8.4.1.2.3): map the co-located reference into RefPicList0 and
                     // convert its vertical vector between frame and field units.
@@ -2463,6 +2479,19 @@ struct ColMb<'r> {
 }
 
 impl ColMb<'_> {
+    /// Every 4x4 block of the co-located MB gives the same [`Self::block`] result.
+    fn uniform(&self) -> bool {
+        let Some(m) = self.m else {
+            return true;
+        };
+        let ColLayout::Same(row) = self.layout else {
+            return false;
+        };
+        let mb = row * self.mb_w + self.mbx;
+        m.mb_intra.get(mb).copied().unwrap_or(true)
+            || m.mb_uniform.get(mb).copied().unwrap_or(false)
+    }
+
     /// `(refIdxCol, mvCol, referenced picture id, vertical scale)` of MB-relative 4x4 block
     /// `(cbx, cby)`; the scale is `1` for field-to-frame, `-1` for frame-to-field, else `0`.
     fn block(&self, cbx: usize, cby: usize) -> (i8, [i16; 2], u32, i32) {

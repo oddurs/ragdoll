@@ -49,6 +49,8 @@ pub struct Motion {
     pub ref_pic: [Vec<u32>; 2],
     /// Per macroblock.
     pub mb_intra: Vec<bool>,
+    /// Per macroblock: one motion for all 16 blocks (see [`PicState::motion_edges`]).
+    pub mb_uniform: Vec<bool>,
     /// Per macroblock: decoded as a field macroblock (field picture or field MB pair).
     pub mb_field: Vec<bool>,
     /// Decoded as an MBAFF frame (rather than as a frame or two field pictures).
@@ -63,6 +65,7 @@ impl Motion {
             ref_idx: [vec![-1; b4], vec![-1; b4]],
             ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
             mb_intra: vec![true; mb_w * mb_h],
+            mb_uniform: vec![false; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
             mbaff: false,
         }
@@ -155,6 +158,7 @@ impl FrameStore {
                 m.ref_pic[l].fill(NO_PIC);
             }
             m.mb_intra.fill(true);
+            m.mb_uniform.fill(false);
             m.mb_field.fill(false);
             debug_assert_eq!(m.mb_intra.len(), n);
         }
@@ -441,6 +445,7 @@ impl PicState {
             }
             for (i, t) in self.mb_type.iter().enumerate() {
                 m.mb_intra[i] = t.is_intra();
+                m.mb_uniform[i] = self.motion_edges[i] == 0;
             }
             m.mb_field.copy_from_slice(&self.mb_field);
             return;
@@ -454,6 +459,7 @@ impl PicState {
                 let src_mb = mby * self.mb_w + mbx;
                 let dst_mb = fy * self.mb_w + mbx;
                 m.mb_intra[dst_mb] = self.mb_type[src_mb].is_intra();
+                m.mb_uniform[dst_mb] = self.motion_edges[src_mb] == 0;
                 m.mb_field[dst_mb] = self.mb_field[src_mb];
                 for r in 0..4 {
                     let s = (mby * 4 + r) * stride + mbx * 4;
