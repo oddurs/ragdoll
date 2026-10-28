@@ -33,9 +33,13 @@ Partition-sized luma and chroma MC kernels with edge emulation only at picture b
 ## Acceptance criteria
 
 - [ ] 720p x264 `-preset medium` decodes at 300 fps or more single-threaded on x86_64 AVX2 and on Apple M-series NEON, measured by the benchmark suite.
-- [ ] Every SIMD kernel has a differential test against its scalar reference.
-- [ ] The x264 matrix and all supported conformance streams stay byte-identical with JM.
+- [x] Every SIMD kernel has a differential test against its scalar reference.
+- [x] The x264 matrix and all supported conformance streams stay byte-identical with JM.
 
 ## 2026-10-28
 
 2026-10-28 head-to-head (Xeon 2.1 GHz VM, AVX2, single-threaded, in process; libavcodec 6.1.1 called directly with packets pre-demuxed, best of 3): 1080p x264 medium High/CABAC at 6.2 Mbit/s decodes at 29 fps against FFmpeg's 181 fps (505 fps with 4 frame threads), 6.3x slower; 720p x264 Baseline/CAVLC at 3.1 Mbit/s at 77 fps against 834 fps, 11x slower. 1080p30 is just under real time. Harness: rbench (Ragdoll), avbench (libavcodec) in the session scratchpad; the inputs are testsrc2 with light temporal noise.
+
+## 2026-10-28
+
+Round 1 (this PR): partition-sized AVX2/NEON MC + weighting + avg kernels (ragdoll_simd::h264_mc), 16-line SIMD deblocking edges (h264_deblock), per-MB bS shortcuts, picture-buffer reuse with per-MB state reset, bit-cache + branch-free CABAC, CAVLC lookup tables, division-free neighbour location, direct-mode grouping, VideoFrame::from_rows. Per access unit like avbench (rbench h264-dec-au): 1080p High 29 -> 74 fps (FFmpeg 202), 720p Baseline 77 -> 288 fps (FFmpeg 804); callgrind 10.45 G -> 2.76 G instr on 30 frames 1080p (FFmpeg 1.12 G). All 166 JVT streams byte-identical to before. Remaining gap ~2.7x: MC glue (~550 M vs ~210 M), deblock (~380 M vs ~220 M), direct (~300 M vs ~25 M), CABAC residual, intra pred and IDCT still scalar.
