@@ -40,8 +40,8 @@ pub use h264::{
 };
 pub use loudness::{EbuR128Meter, KWeightingFilterBank, LoudnessReport, normalize_audio_frame};
 pub use opus::{
-    CELT_EBAND_BASE, OpusDecoder, OpusEncoder, OpusHead, OpusRangeDecoder, OpusRangeEncoder,
-    OpusToc, build_opus_tags, parse_opus_tags, pvq_reconstruct_band, pvq_search_pulses,
+    CELT_EBAND_BASE, OpusDecoder, OpusEncoder, OpusHead, OpusRangeEncoder, OpusToc,
+    build_opus_tags, parse_opus_tags, pvq_reconstruct_band, pvq_search_pulses,
 };
 pub use pcm::{
     audio_frame_to_planar_i32, convert_audio_frame, decorrelate_mid_side_i32,

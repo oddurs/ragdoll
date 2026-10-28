@@ -1659,6 +1659,9 @@ pub fn decode_audio_bytes(data: &[u8]) -> Result<(AudioFrame, VorbisComments)> {
                 let f = dec.decode_packet(p)?;
                 all_samples.extend_from_slice(f.as_f32_slice());
             }
+            // RFC 7845 section 4.2: the first `pre_skip` samples are encoder delay.
+            let skip = (dec.pre_skip() * ch_usize).min(all_samples.len());
+            all_samples.drain(..skip);
             let num_samples = all_samples.len() / ch_usize;
             let mut af = AudioFrame::new(48_000, ch_usize as u8, SampleFormat::F32le, num_samples);
             af.as_f32_mut_slice()
@@ -1765,6 +1768,9 @@ pub fn decode_audio_track_packets(
                 let f = dec.decode_packet(p)?;
                 all_samples.extend_from_slice(f.as_f32_slice());
             }
+            // RFC 7845 section 4.2: the first `pre_skip` samples are encoder delay.
+            let skip = (dec.pre_skip() * ch_usize).min(all_samples.len());
+            all_samples.drain(..skip);
             let num_samples = all_samples.len() / ch_usize;
             let mut out = AudioFrame::new(48_000, ch_usize as u8, SampleFormat::F32le, num_samples);
             out.as_f32_mut_slice()

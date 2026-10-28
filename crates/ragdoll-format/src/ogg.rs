@@ -204,28 +204,36 @@ impl<'a> OggDemuxer<'a> {
                 continue;
             }
             let dur = if codec_id == CodecId::Opus {
+                // RFC 6716 section 3.1: frame duration from the TOC config, times the frame
+                // count from the TOC code (code 3 carries the count in the second byte).
                 let cfg = pkt_bytes[0] >> 3;
-                match cfg {
-                    0..=11 => match cfg & 3 {
-                        0 => 480i64,
-                        1 => 960,
-                        2 => 1920,
-                        _ => 2880,
-                    },
-                    12..=15 => {
-                        if (cfg & 1) == 0 {
-                            480
-                        } else {
-                            960
+                let frames = match pkt_bytes[0] & 3 {
+                    0 => 1,
+                    1 | 2 => 2,
+                    _ => pkt_bytes.get(1).map_or(0, |b| (b & 0x3f) as i64),
+                };
+                frames
+                    * match cfg {
+                        0..=11 => match cfg & 3 {
+                            0 => 480i64,
+                            1 => 960,
+                            2 => 1920,
+                            _ => 2880,
+                        },
+                        12..=15 => {
+                            if (cfg & 1) == 0 {
+                                480
+                            } else {
+                                960
+                            }
                         }
+                        _ => match cfg & 3 {
+                            0 => 120,
+                            1 => 240,
+                            2 => 480,
+                            _ => 960,
+                        },
                     }
-                    _ => match cfg & 3 {
-                        0 => 120,
-                        1 => 240,
-                        2 => 480,
-                        _ => 960,
-                    },
-                }
             } else if let Some((_, bs)) =
                 parse_flac_frame_header_len_and_samples(&pkt_bytes, 16, 65535)
             {
