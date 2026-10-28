@@ -47,7 +47,13 @@ fn ogg_opus_roundtrip_keeps_length_and_pages_packets() {
 
     let n = 50_000;
     let mut frame = AudioFrame::new(48_000, 2, SampleFormat::F32le, n);
-    for (i, s) in frame.as_f32_mut_slice().chunks_exact_mut(2).enumerate() {
+    for (i, s) in frame
+        .as_f32_mut_slice()
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         let t = i as f64 / 48_000.0;
         s[0] = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.5) as f32;
         s[1] = ((2.0 * std::f64::consts::PI * (300.0 + 2000.0 * t) * t).sin() * 0.4) as f32;
