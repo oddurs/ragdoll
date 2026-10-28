@@ -7,7 +7,7 @@ status: done
 milestone: m10-production-v1
 assignee: Oddur Sigurdsson
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-10-28
 closed_at: 2026-10-25
 priority: p1
 effort: l
@@ -28,3 +28,7 @@ Decode per GOP inside each wave: partition the demuxed `SampleEntry` index into 
 - [x] `extract --at` decodes only the GOP containing the target frame.
 - [x] `metrics` processes reference and distorted inputs in bounded waves.
 - [x] Memory-limit callouts removed from the transcode and memory-model docs pages.
+
+## 2026-10-28
+
+Reopened in substance as BUG-0072 on 2026-10-28: peak RSS of transcode grows with input length (113 MB for 2 s, 405 MB for 8 s of 720p) because decode_video_bytes decodes the whole input before GopRingPipeline runs. The first and third criteria were ticked without a test that measures RSS across two lengths. metrics also decodes both inputs in full. extract --at on MP4 is genuinely bounded.

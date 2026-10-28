@@ -95,6 +95,13 @@ pub const SIG_COEFF_OFFSET_8X8: [u8; 63] = [
     13, 11, 14, 10, 12,
 ];
 
+/// ITU-T H.264 Table 9-43 `significant_coeff_flag` context offset for field-coded $8\times8$ blocks.
+pub const SIG_COEFF_OFFSET_8X8_FIELD: [u8; 63] = [
+    0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5, 6, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8,
+    11, 12, 11, 9, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 13, 13, 9, 9, 10, 10, 8, 13, 13, 9,
+    9, 10, 10, 14, 14, 14, 14, 14,
+];
+
 /// ITU-T H.264 Table 9-43 `last_significant_coeff_flag` context offset for $8\times8$ blocks (`cat = 5`).
 pub const LAST_COEFF_OFFSET_8X8: [u8; 63] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -992,7 +999,10 @@ impl<'a> CabacDecoder<'a> {
     /// Reads `dst.len()` raw `I_PCM` sample bytes from the byte-aligned slice payload after `decode_terminate() == 1`
     /// and re-initializes the CABAC arithmetic decoding engine (ITU-T H.264 9.3.1.2).
     pub fn align_for_pcm(&mut self, dst: &mut [u8]) -> Result<()> {
-        let pcm_start = (self.bit_pos + 1).div_ceil(8);
+        // The encoder's flush after the terminating bin writes exactly as many bits as the
+        // decoder has read (its 9-bit initial window plus one per renormalisation shift), so the
+        // PCM alignment bits start at the next unread bit.
+        let pcm_start = self.bit_pos.div_ceil(8);
         let pcm_end = pcm_start + dst.len();
         if pcm_end > self.data.len() {
             return Err(RagdollError::BitstreamEndOfData);
@@ -1303,10 +1313,34 @@ impl<'a> CabacDecoder<'a> {
         cbf_cond: u8,
         dst: &mut [i16],
     ) -> (u8, usize) {
+        self.decode_residual_block(ctxs, cat, cbf_cond, dst, false)
+    }
+
+    /// [`Self::decode_residual_block_cat`] for frame (`field = false`) or field-coded macroblocks,
+    /// which use their own significance-map contexts (ctxIdxOffset 277/338, 436/451).
+    pub fn decode_residual_block(
+        &mut self,
+        ctxs: &mut [CabacContext],
+        cat: usize,
+        cbf_cond: u8,
+        dst: &mut [i16],
+        field: bool,
+    ) -> (u8, usize) {
         const CBF_BASE: [usize; 5] = [85, 89, 93, 97, 101];
-        const SIG_BASE: [usize; 6] = [105, 120, 134, 149, 152, 402];
-        const LAST_BASE: [usize; 6] = [166, 181, 195, 210, 213, 417];
+        const SIG_BASE: [[usize; 6]; 2] = [
+            [105, 120, 134, 149, 152, 402],
+            [277, 292, 306, 321, 324, 436],
+        ];
+        const LAST_BASE: [[usize; 6]; 2] = [
+            [166, 181, 195, 210, 213, 417],
+            [338, 353, 367, 382, 385, 451],
+        ];
         const LVL_BASE: [usize; 6] = [227, 237, 247, 257, 266, 426];
+        let sig_8x8 = if field {
+            &SIG_COEFF_OFFSET_8X8_FIELD
+        } else {
+            &SIG_COEFF_OFFSET_8X8
+        };
 
         dst.fill(0);
         let max_coeff = dst.len();
@@ -1317,8 +1351,8 @@ impl<'a> CabacDecoder<'a> {
             }
         }
 
-        let sig_base = SIG_BASE[cat];
-        let last_base = LAST_BASE[cat];
+        let sig_base = SIG_BASE[field as usize][cat];
+        let last_base = LAST_BASE[field as usize][cat];
         let lvl_base = LVL_BASE[cat];
 
         let mut sig_positions = [0usize; 64];
@@ -1326,11 +1360,7 @@ impl<'a> CabacDecoder<'a> {
         let mut ended = false;
 
         for i in 0..max_coeff.saturating_sub(1) {
-            let sig_off = if cat == 5 {
-                SIG_COEFF_OFFSET_8X8[i] as usize
-            } else {
-                i
-            };
+            let sig_off = if cat == 5 { sig_8x8[i] as usize } else { i };
             if self.decode_decision(&mut ctxs[sig_base + sig_off]) != 0 {
                 sig_positions[sig_count] = i;
                 sig_count += 1;
