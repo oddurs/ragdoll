@@ -17,12 +17,17 @@ pub const SPREAD_AGGRESSIVE: i32 = 3;
 
 /// Columns of the `U(n, k)` table; rows are indexed by `min(n, k) <= 14`.
 const U_COLS: usize = 210;
+/// Zero rows and columns ahead of the table: U(n, j) reads as 0 for `-U_PAD <= j < 0`, so the
+/// pulse-count windows of [`cwrsi`] need no tests at the low end.
+const U_PAD: usize = 8;
+/// Row length of the padded table.
+const U_STRIDE: usize = U_PAD + U_COLS;
 
 /// `CELT_PVQ_U_ROW`: U(n, k), the number of n-dimensional codewords with k pulses and a positive
-/// first element, by `[min(n, k)][max(n, k)]`. Built from the recurrence
+/// first element, at `[U_PAD + min(n, k)][U_PAD + max(n, k)]`. Built from the recurrence
 /// U(n, k) = U(n-1, k) + U(n, k-1) + U(n-1, k-1); entries libopus uses fit 32 bits.
-fn u_table() -> &'static [[u32; U_COLS]; 15] {
-    static T: OnceLock<Box<[[u32; U_COLS]; 15]>> = OnceLock::new();
+fn u_table() -> &'static [[u32; U_STRIDE]; U_PAD + 15] {
+    static T: OnceLock<Box<[[u32; U_STRIDE]; U_PAD + 15]>> = OnceLock::new();
     T.get_or_init(|| {
         // Full symmetric table u[n][k] for n < 15, k < U_COLS, in 64 bits (overflowing entries
         // are never read by valid codebooks).
@@ -35,9 +40,9 @@ fn u_table() -> &'static [[u32; U_COLS]; 15] {
                     .wrapping_add(u[n - 1][k - 1]);
             }
         }
-        let mut t = Box::new([[0u32; U_COLS]; 15]);
-        for (row, src) in t.iter_mut().zip(&u) {
-            for (d, s) in row.iter_mut().zip(src) {
+        let mut t = Box::new([[0u32; U_STRIDE]; U_PAD + 15]);
+        for (row, src) in t[U_PAD..].iter_mut().zip(&u) {
+            for (d, s) in row[U_PAD..].iter_mut().zip(src) {
                 *d = *s as u32;
             }
         }
@@ -47,7 +52,7 @@ fn u_table() -> &'static [[u32; U_COLS]; 15] {
 
 #[inline]
 fn pvq_u(n: usize, k: usize) -> u32 {
-    u_table()[n.min(k)][n.max(k)]
+    u_table()[U_PAD + n.min(k)][U_PAD + n.max(k)]
 }
 
 /// `CELT_PVQ_V`: number of codewords with `k` pulses in `n` dimensions.
@@ -79,14 +84,107 @@ pub fn encode_pulses(y: &[i32], n: usize, k: usize, enc: &mut Ec) {
     enc.enc_uint(icwrs(n, y), pvq_v(n, k));
 }
 
+/// The pulse count left after a dimension of `cwrsi`: the largest `j <= k` with
+/// `U(n, j) <= i`, where U(n, j) is at `u + j * S`. The `W` thresholds below `k` are compared
+/// without branches (U grows with j); only a count past them takes the loop.
+///
+/// # Safety
+///
+/// `u + j * S` must be readable for `-W < j <= k`, and must hold U(n, j) (0 for `j < 0`), with
+/// U(n, 0) = 0, for `j <= k`.
+#[inline(always)]
+unsafe fn pulse_count<const W: usize, const S: usize>(u: *const u32, k: usize, i: u32) -> usize {
+    // Safety: the caller's contract; `kk` stays within `0..=k` because U(n, 0) = 0 <= i.
+    unsafe {
+        let at = |j: usize| *u.add(j * S);
+        let top = u.add(k * S);
+        let mut d = 0usize;
+        for w in 0..W {
+            d += (*top.sub(w * S) > i) as usize;
+        }
+        if d < W {
+            return k - d;
+        }
+        // All W thresholds exceed `i`, so `k - W + 1 >= 1` (U(n, j) <= 0 below that).
+        let mut kk = k - W;
+        while at(kk) > i {
+            kk -= 1;
+        }
+        kk
+    }
+}
+
 /// `cwrsi`: codeword of index `i`; returns its squared norm.
+///
+/// Each dimension takes the sign, then the pulse count as the largest `k' <= k` with
+/// U(n, k') <= i, which [`pulse_count`] finds from a window of thresholds rather than the
+/// one-step-at-a-time scan of libopus: the scan's exits are data-dependent branches the CPU
+/// mostly mispredicts. The result is the same codeword (`cwrsi_reference` is the libopus scan).
 fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
-    let rows = u_table();
+    // Every table read is of U(n', j) with n' <= n and j <= k + 1, so these bound them all.
+    assert!(n >= 2 && n.min(k + 1) < 15 && n.max(k + 1) < U_COLS && y.len() >= n);
+    let t = u_table().as_flattened().as_ptr();
+    let mut yy = 0i32;
+    let mut yi = 0usize;
+    while n > 2 {
+        let s;
+        let kn;
+        let p;
+        // Safety: by the assert, U(n, j) for j <= k + 1 lies in the table: in row n when
+        // k >= n (then n < 15), in column n otherwise (then j <= k + 1 < 15); the U_PAD zero
+        // rows and columns ahead cover the windows' j > -U_PAD.
+        unsafe {
+            if k >= n {
+                let u = t.add((U_PAD + n) * U_STRIDE + U_PAD);
+                let q = *u.add(k + 1);
+                s = -((i >= q) as i32);
+                i -= q & s as u32;
+                kn = pulse_count::<8, 1>(u, k, i);
+                p = *u.add(kn);
+            } else {
+                let u = t.add(U_PAD * U_STRIDE + U_PAD + n);
+                let q = *u.add((k + 1) * U_STRIDE);
+                s = -((i >= q) as i32);
+                i -= q & s as u32;
+                kn = pulse_count::<3, U_STRIDE>(u, k, i);
+                p = *u.add(kn * U_STRIDE);
+            }
+        }
+        i -= p;
+        let val = ((k as i32 - kn as i32 + s) ^ s) as i16;
+        y[yi] = val;
+        yi += 1;
+        yy = mac16(yy, val as i32, val as i32);
+        k = kn;
+        n -= 1;
+    }
+    // n == 2
+    let p = 2 * k as u32 + 1;
+    let s = -((i >= p) as i32);
+    i -= p & s as u32;
+    let k0 = k;
+    k = ((i + 1) >> 1) as usize;
+    if k != 0 {
+        i -= 2 * k as u32 - 1;
+    }
+    let val = ((k0 as i32 - k as i32 + s) ^ s) as i16;
+    y[yi] = val;
+    yy = mac16(yy, val as i32, val as i32);
+    let s = -(i as i32);
+    let val = ((k as i32 + s) ^ s) as i16;
+    y[yi + 1] = val;
+    mac16(yy, val as i32, val as i32)
+}
+
+/// `cwrsi` as libopus writes it, the reference of [`cwrsi`].
+#[cfg(test)]
+fn cwrsi_reference(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
+    let rows = |a: usize| &u_table()[U_PAD + a][U_PAD..];
     let mut yy = 0i32;
     let mut yi = 0usize;
     while n > 2 {
         if k >= n {
-            let row = &rows[n];
+            let row = rows(n);
             let mut p = row[k + 1];
             let s = -((i >= p) as i32);
             i -= p & s as u32;
@@ -96,7 +194,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
                 k = n;
                 loop {
                     k -= 1;
-                    p = rows[k][n];
+                    p = rows(k)[n];
                     if p <= i {
                         break;
                     }
@@ -114,8 +212,8 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
             yi += 1;
             yy = mac16(yy, val as i32, val as i32);
         } else {
-            let p = rows[k][n];
-            let q = rows[k + 1][n];
+            let p = rows(k)[n];
+            let q = rows(k + 1)[n];
             if p <= i && i < q {
                 i -= p;
                 y[yi] = 0;
@@ -127,7 +225,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
                 let mut p;
                 loop {
                     k -= 1;
-                    p = rows[k][n];
+                    p = rows(k)[n];
                     if p <= i {
                         break;
                     }
@@ -475,4 +573,56 @@ pub fn stereo_itheta(x: &[i16], y: &[i16], stereo: bool, n: usize) -> i32 {
     let mid = sqrt(emid);
     let side = sqrt(eside);
     mul16_q15(20861, atan2p(side, mid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every codebook whose size fits 32 bits (those libopus can code): the windowed decode
+    /// matches the libopus scan, and `icwrs` inverts it.
+    #[test]
+    fn cwrsi_matches_reference() {
+        let mut u = vec![[0u128; U_COLS + 1]; 200];
+        u[0][0] = 1;
+        for n in 1..200 {
+            for k in 1..=U_COLS {
+                u[n][k] = (u[n - 1][k] + u[n][k - 1] + u[n - 1][k - 1]).min(1 << 64);
+            }
+        }
+        let (mut ya, mut yb) = ([0i16; 200], [0i16; 200]);
+        let mut seed = 1u32;
+        let mut pairs = 0;
+        for n in 2..=176usize {
+            for k in 1..U_COLS - 1 {
+                let v = u[n][k] + u[n][k + 1];
+                if n.min(k + 1) >= 15 || v >= 1 << 32 {
+                    continue;
+                }
+                pairs += 1;
+                assert_eq!(pvq_v(n, k) as u128, v);
+                let v = v as u32;
+                let up = u[n][k + 1] as u32;
+                let mut check = |i: u32| {
+                    let a = cwrsi(n, k, i, &mut ya);
+                    let b = cwrsi_reference(n, k, i, &mut yb);
+                    assert_eq!((a, &ya[..n]), (b, &yb[..n]), "n {n} k {k} i {i}");
+                    let y: Vec<i32> = ya[..n].iter().map(|&x| x as i32).collect();
+                    assert_eq!(icwrs(n, &y), i, "n {n} k {k}");
+                };
+                if v <= 2048 {
+                    (0..v).for_each(&mut check);
+                } else {
+                    for i in [0, 1, up - 1, up, up + 1, v - 2, v - 1] {
+                        check(i);
+                    }
+                    for _ in 0..48 {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        check(((seed as u64 * v as u64) >> 32) as u32);
+                    }
+                }
+            }
+        }
+        assert_eq!(pairs, 1979);
+    }
 }
