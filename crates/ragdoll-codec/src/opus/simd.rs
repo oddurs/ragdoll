@@ -1253,6 +1253,80 @@ pub unsafe fn bits2pulses_neon(c: &[u8], bits: i32) -> i32 {
     super::rate::bits2pulses_pick(c, bits, lo)
 }
 
+/// AVX2 [`super::rate::alloc_psum_scalar`]: the 21 bands in three vectors, the band where
+/// the scan turns `done` found from a mask instead of a branch per band.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn alloc_psum_avx2(
+    tmp: &[i32; 21],
+    thresh: &[i32],
+    cap: &[i32],
+    start: usize,
+    end: usize,
+    floor: i32,
+) -> i32 {
+    use std::arch::x86_64::*;
+    assert!(start <= end && end <= 21 && thresh.len() >= end && cap.len() >= end);
+    let pad = |s: &[i32]| -> [i32; 24] {
+        let mut a = [0i32; 24];
+        a[start..end].copy_from_slice(&s[start..end]);
+        a
+    };
+    let (t, th, cp) = (pad(tmp), pad(thresh), pad(cap));
+    let fl = _mm256_set1_epi32(floor);
+    let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let (s, e) = (
+        _mm256_set1_epi32(start as i32),
+        _mm256_set1_epi32(end as i32),
+    );
+    let mut tv = [_mm256_setzero_si256(); 3];
+    let mut valid = [_mm256_setzero_si256(); 3];
+    let mut reach = 0u32;
+    for v in 0..3 {
+        // Safety: the arrays hold 24 values.
+        unsafe {
+            let idx = _mm256_add_epi32(lanes, _mm256_set1_epi32(8 * v as i32));
+            valid[v] = _mm256_andnot_si256(_mm256_cmpgt_epi32(s, idx), _mm256_cmpgt_epi32(e, idx));
+            tv[v] = _mm256_loadu_si256(t.as_ptr().add(8 * v) as *const __m256i);
+            let thv = _mm256_loadu_si256(th.as_ptr().add(8 * v) as *const __m256i);
+            // tmp >= thresh is !(thresh > tmp).
+            let ge = _mm256_andnot_si256(_mm256_cmpgt_epi32(thv, tv[v]), valid[v]);
+            reach |= (_mm256_movemask_ps(_mm256_castsi256_ps(ge)) as u32) << (8 * v);
+        }
+    }
+    // Bands up to the highest one reaching its threshold are `done`.
+    let top = if reach == 0 {
+        -1
+    } else {
+        31 - reach.leading_zeros() as i32
+    };
+    let topv = _mm256_set1_epi32(top);
+    let mut sum = _mm256_setzero_si256();
+    for v in 0..3 {
+        // Safety: the arrays hold 24 values.
+        unsafe {
+            let idx = _mm256_add_epi32(lanes, _mm256_set1_epi32(8 * v as i32));
+            let done = _mm256_cmpgt_epi32(_mm256_add_epi32(topv, _mm256_set1_epi32(1)), idx);
+            let cpv = _mm256_loadu_si256(cp.as_ptr().add(8 * v) as *const __m256i);
+            let capped = _mm256_min_epi32(tv[v], cpv);
+            let floored = _mm256_andnot_si256(_mm256_cmpgt_epi32(fl, tv[v]), fl);
+            let c = _mm256_blendv_epi8(floored, capped, done);
+            sum = _mm256_add_epi32(sum, _mm256_and_si256(c, valid[v]));
+        }
+    }
+    let h = _mm_add_epi32(
+        _mm256_castsi256_si128(sum),
+        _mm256_extracti128_si256::<1>(sum),
+    );
+    let h = _mm_add_epi32(h, _mm_shuffle_epi32::<0x4E>(h));
+    let h = _mm_add_epi32(h, _mm_shuffle_epi32::<0xB1>(h));
+    _mm_cvtsi128_si32(h)
+}
+
 /// One sample of the constant-gain comb filter, as [`comb_const_avx2`] defines it.
 ///
 /// # Safety
@@ -1961,6 +2035,31 @@ mod tests {
                 lpc_synthesis::<10>(&mut sa, &a_q12, &r, &mut xa, -4321);
                 lpc_synthesis_scalar::<10>(&mut sb, &a_q12, &r, &mut xb, -4321, 0);
                 assert_eq!((&sa, &xa), (&sb, &xb), "lpc_synthesis 10 sub {sub}");
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_psum_matches_scalar() {
+        use super::super::rate::alloc_psum_scalar;
+        for seed in 0..400u32 {
+            let r: Vec<i32> = signal(63, seed, 4000).iter().map(|v| v % 4000).collect();
+            let tmp: [i32; 21] = std::array::from_fn(|j| r[j]);
+            let thresh: Vec<i32> = r[21..42].iter().map(|v| v.abs() % 300).collect();
+            let cap: Vec<i32> = r[42..63].iter().map(|v| v.abs()).collect();
+            for (start, end) in [(0usize, 21usize), (17, 21), (0, 13), (5, 6), (3, 3)] {
+                for floor in [8, 16] {
+                    let want = alloc_psum_scalar(&tmp, &thresh, &cap, start, end, floor);
+                    #[cfg(target_arch = "x86_64")]
+                    if ragdoll_core::dispatch::avx2() {
+                        // Safety: AVX2 is available.
+                        let got = unsafe {
+                            super::alloc_psum_avx2(&tmp, &thresh, &cap, start, end, floor)
+                        };
+                        assert_eq!(got, want, "seed {seed} {start}..{end}");
+                    }
+                    let _ = want;
+                }
             }
         }
     }
