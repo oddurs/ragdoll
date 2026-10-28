@@ -1145,6 +1145,25 @@ impl<'a, 'c> Dec<'a, 'c> {
     #[allow(clippy::type_complexity)]
     fn nb_blocks(&self, c: usize, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
         let chroma = c > 0;
+        if !self.st.mbaff {
+            // Without MBAFF the left and top blocks follow from block coordinates directly.
+            // Blocks per MB side: 1 << sh.
+            let sh = if chroma { 1 } else { 2 };
+            let w4 = self.st.mb_w << sh;
+            let (x4, y4) = ((self.mb.x << sh) + bx, (self.mb.y << sh) + by);
+            let at = |x4: usize, y4: usize, inside: bool| {
+                let a = if inside {
+                    self.mb.addr
+                } else {
+                    (y4 >> sh) * self.st.mb_w + (x4 >> sh)
+                };
+                (inside || self.mb_avail(a)).then_some((a, y4 * w4 + x4))
+            };
+            return [
+                (x4 > 0).then(|| at(x4 - 1, y4, bx > 0)).flatten(),
+                (y4 > 0).then(|| at(x4, y4 - 1, by > 0)).flatten(),
+            ];
+        }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         [(x - 1, y), (x, y - 1)].map(|(xn, yn)| {
             let (a, xw, yw) = self.locate(xn, yn, chroma)?;
@@ -1460,7 +1479,11 @@ impl<'a, 'c> Dec<'a, 'c> {
             put::<_, N>(&mut st.ref_idx[list], i, m.0);
             put::<_, N>(&mut st.mv[list], i, m.1);
             put::<_, N>(&mut st.ref_pic[list], i, pic);
-            put::<_, N>(&mut st.mvd[list], i, mvd);
+            // A macroblock's mvd entries start at zero and each partition is written once, so
+            // zero (every skipped and direct block) needs no store.
+            if mvd != [0, 0] {
+                put::<_, N>(&mut st.mvd[list], i, mvd);
+            }
         }
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
         for y in by..by + h {
