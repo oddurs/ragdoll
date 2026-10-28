@@ -5,12 +5,14 @@
 //! - [`scan`]: Vectorized Annex-B NAL start-code (`0x000001` / `0x00000001`) and MPEG-TS `0x47` sync-byte scanners.
 //! - [`metrics`]: NEON-accelerated block/plane SAD, SSE, and single-pass $8\times8$ SSIM window statistics.
 //! - [`dct4`]: Power-of-two DCT-IV (the AAC-LC IMDCT core) through a precomputed-twiddle complex FFT.
+//! - [`h264_deblock`]: 16-line luma and 8-line chroma H.264 deblocking edges, transposed in registers for vertical edges.
 //! - [`h264_mc`]: Partition-sized H.264 quarter-pel luma and eighth-pel chroma inter prediction.
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
 pub mod audio_dsp;
 pub mod dct4;
 pub mod fixed;
+pub mod h264_deblock;
 pub mod h264_dsp;
 pub mod h264_mc;
 pub mod metrics;
@@ -35,6 +37,9 @@ pub use fixed::{
     Q14_HALF, Q14_ONE, add4x4_idct_u8, clamp_u8, convolve_8tap_q14_u8, convolve_8tap_q14_u8_scalar,
     forward_dct4x4, forward_dct4x4_scalar, forward_dct8x8, hadamard4x4, hadamard4x4_scalar,
     inverse_idct4x4, inverse_idct4x4_scalar, inverse_idct8x8, sub4x4_dct_u8,
+};
+pub use h264_deblock::{
+    h264_chroma_deblock, h264_chroma_deblock_scalar, h264_luma_deblock, h264_luma_deblock_scalar,
 };
 pub use h264_dsp::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, h264_deblock_chroma_line,
