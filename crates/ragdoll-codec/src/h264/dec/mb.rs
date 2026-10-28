@@ -13,7 +13,7 @@ use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
 use super::intra::{self, Edges};
-use super::picture::{MbType, Motion, NO_PIC, PicState, Structure, fill_rect};
+use super::picture::{MbType, Motion, NO_MOTION, NO_PIC, PicState, Structure, fill_rect};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
@@ -1528,13 +1528,14 @@ impl<'a, 'c> Dec<'a, 'c> {
             mvd: [u8; 2],
         ) {
             let s = st.mb_w * 4;
-            fill_rect::<_, N>(&mut st.ref_idx[list], i, s, h, m.0);
-            fill_rect::<_, N>(&mut st.mv[list], i, s, h, m.1);
-            fill_rect::<_, N>(&mut st.ref_pic[list], i, s, h, pic);
-            // A macroblock's mvd entries start at zero and each partition is written once, so
-            // zero (every skipped and direct block) needs no store.
-            if mvd != [0, 0] {
-                fill_rect::<_, N>(&mut st.mvd[list], i, s, h, mvd);
+            let rows = &mut st.blocks[i..i + (h - 1) * s + N];
+            for r in 0..h {
+                for b in &mut rows[r * s..r * s + N] {
+                    b.ref_idx[list] = m.0;
+                    b.mv[list] = m.1;
+                    b.ref_pic[list] = pic;
+                    b.mvd[list] = mvd;
+                }
             }
         }
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
@@ -1556,7 +1557,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             return [None, None];
         };
         [0, 1].map(|list| {
-            let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
+            let (r, mv) = (self.st.blocks[i].ref_idx[list], self.st.blocks[i].mv[list]);
             if r < 0 || !self.st.mbaff {
                 return Some((r, mv));
             }
@@ -1570,7 +1571,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Option<Mv> {
         let (a, i) = self.blk(xn, yn, done)?;
-        let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
+        let (r, mv) = (self.st.blocks[i].ref_idx[list], self.st.blocks[i].mv[list]);
         if r < 0 || !self.st.mbaff {
             return Some((r, mv));
         }
@@ -1631,7 +1632,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         let i = self.st.b4(x * 4, y * 4);
         let s = w * 4;
         let st = &*self.st;
-        let at = |i: usize| [0, 1].map(|l| Some((st.ref_idx[l][i], st.mv[l][i])));
+        let at = |i: usize| {
+            let b = st.blocks[i];
+            [0, 1].map(|l| Some((b.ref_idx[l], b.mv[l])))
+        };
         let none = [None, None];
         let a = if x > 0 && self.mb_avail(addr - 1) {
             at(i - 1)
@@ -1682,7 +1686,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 0
             };
-            (self.st.ref_idx[list][i] > thresh) as u8
+            (self.st.blocks[i].ref_idx[list] > thresh) as u8
         };
         let (ca, cb) = (cond(x - 1, y), cond(x, y - 1));
         let (cd, ctxs) = self.cabac();
@@ -1708,7 +1712,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
                 return 0;
             };
-            let v = self.st.mvd[list][i][comp] as u32;
+            let v = self.st.blocks[i].mvd[list][comp] as u32;
             // Vertical components between frame and field MBs are rescaled (9.3.3.1.1.7).
             match (comp, self.st.mbaff, self.field, self.st.mb_field[addr]) {
                 (1, true, false, true) => v * 2,
@@ -1832,7 +1836,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 for y in by..by + h {
                     for x in bx..bx + w {
                         let i = self.st.b4(self.mb.x * 4 + x, self.mb.y * 4 + y);
-                        self.st.ref_idx[list][i] = r;
+                        self.st.blocks[i].ref_idx[list] = r;
                     }
                 }
             }
@@ -1879,7 +1883,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 for y in by..by + 2 {
                     for x in bx..bx + 2 {
                         let j = self.st.b4(self.mb.x * 4 + x, self.mb.y * 4 + y);
-                        self.st.ref_idx[list][j] = r;
+                        self.st.blocks[j].ref_idx[list] = r;
                     }
                 }
             }
@@ -2082,18 +2086,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         refs: [i8; 2],
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
+        let mut b = NO_MOTION;
         for list in 0..2 {
-            let r = refs[list];
-            let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
-            let id = self.ref_id(list, r)?;
-            self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
+            if refs[list] >= 0 {
+                b.ref_idx[list] = refs[list];
+                b.mv[list] = mvs[list];
+            }
+            b.ref_pic[list] = self.ref_id(list, b.ref_idx[list])?;
         }
+        self.partial_motion |= n != 4;
         let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
         let s = self.st.mb_w * 4;
         match n {
-            4 => fill_rect::<_, 4>(&mut self.st.direct, i, s, 4, true),
-            2 => fill_rect::<_, 2>(&mut self.st.direct, i, s, 2, true),
-            _ => fill_rect::<_, 1>(&mut self.st.direct, i, s, 1, true),
+            4 => {
+                fill_rect::<_, 4>(&mut self.st.blocks, i, s, 4, b);
+                fill_rect::<_, 4>(&mut self.st.direct, i, s, 4, true);
+            }
+            2 => {
+                fill_rect::<_, 2>(&mut self.st.blocks, i, s, 2, b);
+                fill_rect::<_, 2>(&mut self.st.direct, i, s, 2, true);
+            }
+            _ => {
+                fill_rect::<_, 1>(&mut self.st.blocks, i, s, 1, b);
+                fill_rect::<_, 1>(&mut self.st.direct, i, s, 1, true);
+            }
         }
         Ok(())
     }
@@ -2246,7 +2262,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let key = |s: &PicState, bx: usize, by: usize| {
             let j = s.b4(mx4 + bx, my4 + by);
-            (s.ref_idx[0][j], s.mv[0][j], s.ref_idx[1][j], s.mv[1][j])
+            let b = &s.blocks[j];
+            (b.ref_idx[0], b.mv[0], b.ref_idx[1], b.mv[1])
         };
         let same = |s: &PicState, bx: usize, by: usize, n: usize| {
             let k = key(s, bx, by);
@@ -2508,8 +2525,9 @@ impl ColMb<'_> {
             return (-1, [0, 0], NO_PIC, vscale);
         }
         let i = (row * 4 + by) * self.mb_w * 4 + self.mbx * 4 + cbx;
-        let l = if m.ref_idx[0][i] >= 0 { 0 } else { 1 };
-        (m.ref_idx[l][i], m.mv[l][i], m.ref_pic[l][i], vscale)
+        let b = &m.blocks[i];
+        let l = if b.ref_idx[0] >= 0 { 0 } else { 1 };
+        (b.ref_idx[l], b.mv[l], b.ref_pic[l], vscale)
     }
 }
 
