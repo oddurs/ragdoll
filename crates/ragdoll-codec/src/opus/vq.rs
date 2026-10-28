@@ -176,26 +176,8 @@ fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
         )
     };
     if stride == 1 {
-        // Each step rotates the previous step's output, so carry it in a register rather
-        // than through memory.
-        if len < 2 {
-            return;
-        }
-        let mut x1 = x[0] as i32;
-        for i in 0..len - 1 {
-            let (a, b) = rot(x1, x[i + 1] as i32);
-            x[i] = a;
-            x1 = b as i32;
-        }
-        x[len - 1] = x1 as i16;
-        if len > 2 {
-            let mut x2 = x[len - 2] as i32;
-            for i in (0..len - 2).rev() {
-                let (a, b) = rot(x[i] as i32, x2);
-                x[i + 1] = b;
-                x2 = a as i32;
-            }
-            x[0] = x2 as i16;
+        if len >= 2 {
+            exp_rotation1_serial(x, c, s);
         }
         return;
     }
@@ -211,6 +193,63 @@ fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
             x[i] = a;
         }
     }
+}
+
+/// [`exp_rotation1`] with stride 1, where every step rotates the previous step's output: a
+/// serial chain, so it is kept short. The carried value stays in a register and skips the
+/// 16-bit truncation while it is in range (then the truncation changes nothing); the first
+/// value out of range, which a normalised band never produces, leaves for the exact loop.
+/// The `black_box` keeps the rounding constant and the other product off the chain.
+fn exp_rotation1_serial(x: &mut [i16], c: i32, s: i32) {
+    use std::hint::black_box;
+    let len = x.len();
+    let ms = -s;
+    let in_range = |v: i32| (v + 32768) as u32 <= 65535;
+    // Forward: (x[i], x[i + 1]) -> (a, b), with b carried as the next x[i].
+    let mut x1 = x[0] as i32;
+    let mut i = 0;
+    while i < len - 1 {
+        let x2 = x[i + 1] as i32;
+        let u = black_box(c * x2 + 16384);
+        x[i] = ((c * x1 + ms * x2 + 16384) >> 15) as i16;
+        x1 = (s * x1 + u) >> 15;
+        i += 1;
+        if !in_range(x1) {
+            break;
+        }
+    }
+    x1 = x1 as i16 as i32;
+    while i < len - 1 {
+        let x2 = x[i + 1] as i32;
+        x[i] = ((c * x1 + ms * x2 + 16384) >> 15) as i16;
+        x1 = ((s * x1 + c * x2 + 16384) >> 15) as i16 as i32;
+        i += 1;
+    }
+    x[len - 1] = x1 as i16;
+    if len <= 2 {
+        return;
+    }
+    // Backward: (x[i], x[i + 1]) -> (a, b), with a carried as the next x[i + 1].
+    let mut x2 = x[len - 2] as i32;
+    let mut i = len - 2;
+    while i > 0 {
+        i -= 1;
+        let x1 = x[i] as i32;
+        let u = black_box(c * x1 + 16384);
+        x[i + 1] = ((c * x2 + s * x1 + 16384) >> 15) as i16;
+        x2 = (ms * x2 + u) >> 15;
+        if !in_range(x2) {
+            break;
+        }
+    }
+    x2 = x2 as i16 as i32;
+    while i > 0 {
+        i -= 1;
+        let x1 = x[i] as i32;
+        x[i + 1] = ((c * x2 + s * x1 + 16384) >> 15) as i16;
+        x2 = ((ms * x2 + c * x1 + 16384) >> 15) as i16 as i32;
+    }
+    x[0] = x2 as i16;
 }
 
 /// `exp_rotation`: spreading rotation (`dir` 1 before quantisation, -1 after).
