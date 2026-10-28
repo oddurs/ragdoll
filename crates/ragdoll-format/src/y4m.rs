@@ -17,6 +17,17 @@ pub struct Y4mDemuxer<'a> {
 
 impl<'a> Y4mDemuxer<'a> {
     pub fn open(data: &'a [u8]) -> Result<Self> {
+        Self::open_impl(data, None)
+    }
+
+    /// [`Self::open`] on a mapped file, releasing the pages the frame index touched after every
+    /// MiB of the scan, so indexing a long raw file does not make it resident (BUG-0072).
+    pub fn open_mapped(source: &'a crate::MmapSource) -> Result<Self> {
+        Self::open_impl(source.as_slice(), Some(source))
+    }
+
+    fn open_impl(data: &'a [u8], mapping: Option<&crate::MmapSource>) -> Result<Self> {
+        const RELEASE_STEP: usize = 1 << 20;
         const MAGIC: &[u8] = b"YUV4MPEG2 ";
         if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
             return Err(RagdollError::InvalidHeader(
@@ -139,6 +150,7 @@ impl<'a> Y4mDemuxer<'a> {
         let frame_bytes = pixel_format.packed_frame_bytes(width as usize, height as usize);
         let mut frames = Vec::new();
         let mut pos = hdr_end + 1;
+        let mut released = 0usize;
 
         while pos < data.len() {
             if data[pos..].len() < 6 || &data[pos..pos + 5] != b"FRAME" {
@@ -166,7 +178,16 @@ impl<'a> Y4mDemuxer<'a> {
                 0,
                 true,
             ));
+            if let Some(m) = mapping
+                && payload_end - released >= RELEASE_STEP
+            {
+                m.release_range(released, payload_end - released);
+                released = payload_end;
+            }
             pos = payload_end;
+        }
+        if let Some(m) = mapping {
+            m.release_range(released, data.len() - released);
         }
 
         // Timebase is 1 / frame_rate = (den / num) seconds per frame

@@ -158,7 +158,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`###·······` 29% · 6 of 21 done
+`###·······` 28% · 7 of 25 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -174,6 +174,10 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0070` Formal checks on unsafe code: Miri, Kani proofs and mutation testing <sup>chore · p3 · arch</sup>
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
 - [ ] `BUG-0082` AAC encoder ignores its target bitrate (no rate control; 35 kbit/s at 128k) <sup>bug · p2 · codec-audio</sup>
+- [ ] `SIMD-0083` AAC-LC decoder is 13x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
+- [ ] `SIMD-0084` FLAC decoder is 2.5x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
+- [ ] `BUG-0085` ragdoll bench --compare-ffmpeg prints made-up hardware telemetry and compares in-process calls with whole FFmpeg processes <sup>bug · p1 · bench</sup>
+- [ ] `BUG-0086` Audio transcode decodes the whole track into one AudioFrame, so peak RSS grows with duration <sup>bug · p2 · pipeline</sup>
 
 ### up next
 
@@ -181,10 +185,10 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0061` Stop false passes in CI: fail-loud tool checks, pinned FFmpeg, forced-scalar dispatch, determinism and CLI snapshots <sup>chore · p0 · arch</sup>
 - [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 - [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
-- [ ] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
 
 ### shipped
 
+- [x] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
 - [x] `0075` H.264 decoder: bit-exact with FFmpeg on the JVT conformance suite and x264 streams <sup>feature · p0 · codec-video</sup>
 - [x] `0077` Opus decoder: RFC 6716 decoding, sample-exact with fixed-point libopus on the RFC 8251 test vectors <sup>feature · p0 · codec-audio</sup>
 - [x] `BUG-0078` Opus encoder writes streams that no other decoder can read <sup>bug · p0 · codec-audio</sup>

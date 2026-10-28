@@ -54,6 +54,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+mod stream;
+pub use stream::{VideoFilterChain, VideoFrameStream};
+
 /// Telemetry report emitted after executing a remux, transcode, or recipe pipeline.
 #[derive(Clone, Debug, Default)]
 pub struct PipelineTelemetry {
@@ -197,6 +200,15 @@ pub const DEFAULT_PIPELINE_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 /// Battery-saver memory budget (`64 MiB`) for [`GopRingPipeline`] in `PowerMode::Efficiency`.
 pub const EFFICIENCY_PIPELINE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// The memory budget for the active [`PowerMode`]: `256 MiB`, or `64 MiB` in
+/// `PowerMode::Efficiency`.
+pub fn default_pipeline_memory_budget() -> usize {
+    match global_power_mode() {
+        PowerMode::Efficiency => EFFICIENCY_PIPELINE_MEMORY_BUDGET,
+        _ => DEFAULT_PIPELINE_MEMORY_BUDGET,
+    }
+}
+
 /// Bounded-memory GOP window streaming executor (`0036` / `ADR-0035`).
 ///
 /// Instead of materializing an entire feature film's scaled/filtered `Vec<VideoFrame>` in RAM,
@@ -227,11 +239,7 @@ pub struct GopRingStats {
 impl GopRingPipeline {
     /// Creates a [`GopRingPipeline`] sized for the active [`PowerMode`] (`256 MiB` default, `64 MiB` in `PowerMode::Efficiency`).
     pub fn new(threads: usize) -> Self {
-        let budget = match global_power_mode() {
-            PowerMode::Efficiency => EFFICIENCY_PIPELINE_MEMORY_BUDGET,
-            _ => DEFAULT_PIPELINE_MEMORY_BUDGET,
-        };
-        Self::with_budget_bytes(threads, budget)
+        Self::with_budget_bytes(threads, default_pipeline_memory_budget())
     }
 
     /// Creates a [`GopRingPipeline`] with an explicit memory cap in bytes.
@@ -302,12 +310,49 @@ impl GopRingPipeline {
         if raw_frames.is_empty() {
             return Ok((Vec::new(), GopRingStats::default()));
         }
-        let src_w = raw_frames[0].width;
-        let src_h = raw_frames[0].height;
-        let fmt = raw_frames[0].format;
+        let mut enc = self.streaming_encoder(
+            &raw_frames[0],
+            raw_frames.len(),
+            scale_dims,
+            scale_filter,
+            video_codec,
+            fps,
+            qp,
+            h264_profile,
+            rate_control,
+        );
+        let chunks: Vec<&[VideoFrame]> = raw_frames.chunks(enc.plan.gop_size).collect();
+        if enc.plan.is_abr {
+            enc.encode_abr(raw_frames)?;
+        } else {
+            for wave in chunks.chunks(enc.plan.max_gops_wave) {
+                enc.encode_wave(wave)?;
+            }
+        }
+        enc.finish()
+    }
+
+    /// Starts a [`GopRingEncoder`] for a stream of `total_frames` frames shaped like `first`,
+    /// encoding exactly what [`Self::encode_gops_bounded_with_h264`] would for the same frames
+    /// while holding at most one wave of them (BUG-0072).
+    #[allow(clippy::too_many_arguments)]
+    pub fn streaming_encoder(
+        &self,
+        first: &VideoFrame,
+        total_frames: usize,
+        scale_dims: Option<(usize, usize)>,
+        scale_filter: ScaleFilter,
+        video_codec: &str,
+        fps: Rational64,
+        qp: u8,
+        h264_profile: H264Profile,
+        rate_control: RateControlMode,
+    ) -> GopRingEncoder<'_> {
+        let src_w = first.width;
+        let src_h = first.height;
+        let fmt = first.format;
         let (dst_w, dst_h) = scale_dims.unwrap_or((src_w, src_h));
         let needs_scale = dst_w != src_w || dst_h != src_h;
-
         let banks = if needs_scale {
             let h_bank_y = PolyphaseFilterBank::new(src_w, dst_w, scale_filter);
             let v_bank_y = PolyphaseFilterBank::new(src_h, dst_h, scale_filter);
@@ -319,98 +364,229 @@ impl GopRingPipeline {
         } else {
             None
         };
-
         let is_abr = matches!(rate_control, RateControlMode::Abr { .. });
         let eff_workers = if is_abr {
             1
         } else {
             self.worker_threads.max(1)
         };
-        let max_gop_for_threads = raw_frames.len().div_ceil(eff_workers).max(1);
+        let max_gop_for_threads = total_frames.div_ceil(eff_workers).max(1);
         let gop_size = if is_abr {
-            raw_frames.len().max(1)
+            total_frames.max(1)
         } else {
             15usize.min(max_gop_for_threads)
         };
-        let gop_chunks: Vec<&[VideoFrame]> = raw_frames.chunks(gop_size).collect();
         let max_gops_wave = self.max_gops_per_wave(src_w, src_h, dst_w, dst_h, gop_size);
-        let use_rgdi = video_codec.eq_ignore_ascii_case("rgdi");
-
-        let mut all_encoded_gops = Vec::with_capacity(gop_chunks.len());
-        let mut waves_processed = 0usize;
-        let mut peak_wave_memory_bytes = 0usize;
         let frame_bytes = (src_w * src_h * 3 / 2)
             + if needs_scale {
                 dst_w * dst_h * 3 / 2
             } else {
                 0
             };
-
-        for wave in gop_chunks.chunks(max_gops_wave) {
-            waves_processed += 1;
-            let wave_frames: usize = wave.iter().map(|c| c.len()).sum();
-            peak_wave_memory_bytes = peak_wave_memory_bytes
-                .max(wave_frames.saturating_mul(frame_bytes))
-                .min(self.memory_budget_bytes);
-
-            let wave_encoded: Vec<Vec<(Vec<u8>, bool)>> =
-                parallel_gop_map(wave, eff_workers, |_idx, chunk| {
-                    let mut out_pkts = Vec::with_capacity(chunk.len());
-                    if use_rgdi {
-                        let enc = RagdollIntraEncoder::new(1);
-                        for src in *chunk {
-                            if let Some((ref hy, ref vy, ref hc, ref vc)) = banks {
-                                let mut dst = self.pool.acquire_scoped(dst_w, dst_h, src.format);
-                                dst.colorimetry = src.colorimetry;
-                                dst.pts = src.pts;
-                                scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
-                                if src.planes.len() >= 3 {
-                                    scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
-                                    scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
-                                }
-                                out_pkts.push((enc.encode_frame(&dst).unwrap(), true));
-                            } else {
-                                out_pkts.push((enc.encode_frame(src).unwrap(), true));
-                            }
-                        }
-                    } else {
-                        let mut enc = H264Encoder::new(dst_w as u32, dst_h as u32, fps, qp)
-                            .with_profile(h264_profile)
-                            .with_rate_control(rate_control);
-                        enc.keyint = if is_abr { 15 } else { chunk.len() as u32 + 1 };
-                        for (i, src) in chunk.iter().enumerate() {
-                            let is_kf = (i as u32).is_multiple_of(enc.keyint.max(1));
-                            if let Some((ref hy, ref vy, ref hc, ref vc)) = banks {
-                                let mut dst = self.pool.acquire_scoped(dst_w, dst_h, src.format);
-                                dst.colorimetry = src.colorimetry;
-                                dst.pts = src.pts;
-                                scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
-                                if src.planes.len() >= 3 {
-                                    scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
-                                    scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
-                                }
-                                out_pkts.push((enc.encode_frame(&dst).unwrap(), is_kf));
-                            } else {
-                                out_pkts.push((enc.encode_frame(src).unwrap(), is_kf));
-                            }
-                        }
-                    }
-                    out_pkts
-                });
-
-            all_encoded_gops.extend(wave_encoded);
+        GopRingEncoder {
+            ring: self,
+            plan: GopEncodePlan {
+                dst_w,
+                dst_h,
+                banks,
+                is_abr,
+                eff_workers,
+                gop_size,
+                max_gops_wave,
+                use_rgdi: video_codec.eq_ignore_ascii_case("rgdi"),
+                frame_bytes,
+                fps,
+                qp,
+                h264_profile,
+                rate_control,
+            },
+            pending: Vec::new(),
+            abr: None,
+            encoded: Vec::new(),
+            waves: 0,
+            gops: 0,
+            frames: 0,
+            peak_wave_bytes: 0,
         }
+    }
+}
 
+type FilterBanks = (
+    PolyphaseFilterBank,
+    PolyphaseFilterBank,
+    PolyphaseFilterBank,
+    PolyphaseFilterBank,
+);
+
+struct GopEncodePlan {
+    dst_w: usize,
+    dst_h: usize,
+    banks: Option<FilterBanks>,
+    is_abr: bool,
+    eff_workers: usize,
+    gop_size: usize,
+    max_gops_wave: usize,
+    use_rgdi: bool,
+    frame_bytes: usize,
+    fps: Rational64,
+    qp: u8,
+    h264_profile: H264Profile,
+    rate_control: RateControlMode,
+}
+
+/// Bounded-memory GOP-ring encoder fed frames a batch at a time (BUG-0072): frames wait only
+/// until a wave of `max_gops_per_wave` GOPs is complete, then encode in parallel and are dropped.
+/// ABR encodes one rate-controlled GOP chain, so its frames are encoded as they arrive.
+pub struct GopRingEncoder<'p> {
+    ring: &'p GopRingPipeline,
+    plan: GopEncodePlan,
+    pending: Vec<VideoFrame>,
+    abr: Option<(H264Encoder, usize, EncodedGop)>,
+    encoded: Vec<EncodedGop>,
+    waves: usize,
+    gops: usize,
+    frames: usize,
+    peak_wave_bytes: usize,
+}
+
+impl GopRingEncoder<'_> {
+    /// Output frame dimensions.
+    pub fn output_dims(&self) -> (usize, usize) {
+        (self.plan.dst_w, self.plan.dst_h)
+    }
+
+    /// Encodes `frames` (the next frames of the stream, in order) as far as complete waves allow.
+    pub fn push(&mut self, frames: Vec<VideoFrame>) -> Result<()> {
+        if self.plan.is_abr {
+            return self.encode_abr(&frames);
+        }
+        self.pending.extend(frames);
+        let wave_frames = self.plan.gop_size * self.plan.max_gops_wave;
+        while self.pending.len() >= wave_frames {
+            let rest = self.pending.split_off(wave_frames);
+            let wave = std::mem::replace(&mut self.pending, rest);
+            let chunks: Vec<&[VideoFrame]> = wave.chunks(self.plan.gop_size).collect();
+            self.encode_wave(&chunks)?;
+        }
+        Ok(())
+    }
+
+    /// Encodes what is left and returns every GOP in order.
+    pub fn finish(mut self) -> Result<(Vec<EncodedGop>, GopRingStats)> {
+        if !self.pending.is_empty() {
+            let wave = std::mem::take(&mut self.pending);
+            let chunks: Vec<&[VideoFrame]> = wave.chunks(self.plan.gop_size).collect();
+            self.encode_wave(&chunks)?;
+        }
+        if let Some((_, _, pkts)) = self.abr.take() {
+            self.encoded.push(pkts);
+            self.waves += 1;
+            self.gops += 1;
+            self.peak_wave_bytes = self
+                .peak_wave_bytes
+                .max(self.frames.saturating_mul(self.plan.frame_bytes))
+                .min(self.ring.memory_budget_bytes);
+        }
         let stats = GopRingStats {
-            waves_processed,
-            gops_processed: gop_chunks.len(),
-            frames_processed: raw_frames.len(),
-            max_gops_per_wave: max_gops_wave,
-            peak_wave_memory_bytes,
-            pool_allocations: self.pool.allocations(),
-            pool_recycled_hits: self.pool.recycled_hits(),
+            waves_processed: self.waves,
+            gops_processed: self.gops,
+            frames_processed: self.frames,
+            max_gops_per_wave: self.plan.max_gops_wave,
+            peak_wave_memory_bytes: self.peak_wave_bytes,
+            pool_allocations: self.ring.pool.allocations(),
+            pool_recycled_hits: self.ring.pool.recycled_hits(),
         };
-        Ok((all_encoded_gops, stats))
+        Ok((self.encoded, stats))
+    }
+
+    fn encode_abr(&mut self, frames: &[VideoFrame]) -> Result<()> {
+        let plan = &self.plan;
+        let pool = &self.ring.pool;
+        let (enc, idx, pkts) = self.abr.get_or_insert_with(|| {
+            let mut enc = H264Encoder::new(plan.dst_w as u32, plan.dst_h as u32, plan.fps, plan.qp)
+                .with_profile(plan.h264_profile)
+                .with_rate_control(plan.rate_control);
+            enc.keyint = 15;
+            (enc, 0, Vec::new())
+        });
+        for src in frames {
+            let is_kf = (*idx as u32).is_multiple_of(enc.keyint.max(1));
+            if let Some((ref hy, ref vy, ref hc, ref vc)) = plan.banks {
+                let mut dst = pool.acquire_scoped(plan.dst_w, plan.dst_h, src.format);
+                dst.colorimetry = src.colorimetry;
+                dst.pts = src.pts;
+                scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
+                if src.planes.len() >= 3 {
+                    scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
+                    scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
+                }
+                pkts.push((enc.encode_frame(&dst)?, is_kf));
+            } else {
+                pkts.push((enc.encode_frame(src)?, is_kf));
+            }
+            *idx += 1;
+        }
+        self.frames += frames.len();
+        Ok(())
+    }
+
+    fn encode_wave(&mut self, wave: &[&[VideoFrame]]) -> Result<()> {
+        let plan = &self.plan;
+        let pool = &self.ring.pool;
+        let wave_frames: usize = wave.iter().map(|c| c.len()).sum();
+        self.waves += 1;
+        self.gops += wave.len();
+        self.frames += wave_frames;
+        self.peak_wave_bytes = self
+            .peak_wave_bytes
+            .max(wave_frames.saturating_mul(plan.frame_bytes))
+            .min(self.ring.memory_budget_bytes);
+        let wave_encoded: Vec<Result<EncodedGop>> =
+            parallel_gop_map(wave, plan.eff_workers, |_idx, chunk| {
+                let mut out_pkts = Vec::with_capacity(chunk.len());
+                let scale = |src: &VideoFrame| {
+                    plan.banks.as_ref().map(|(hy, vy, hc, vc)| {
+                        let mut dst = pool.acquire_scoped(plan.dst_w, plan.dst_h, src.format);
+                        dst.colorimetry = src.colorimetry;
+                        dst.pts = src.pts;
+                        scale_plane_with_banks(src.plane(0), dst.plane_mut(0), hy, vy);
+                        if src.planes.len() >= 3 {
+                            scale_plane_with_banks(src.plane(1), dst.plane_mut(1), hc, vc);
+                            scale_plane_with_banks(src.plane(2), dst.plane_mut(2), hc, vc);
+                        }
+                        dst
+                    })
+                };
+                if plan.use_rgdi {
+                    let enc = RagdollIntraEncoder::new(1);
+                    for src in *chunk {
+                        let pkt = match scale(src) {
+                            Some(dst) => enc.encode_frame(&dst)?,
+                            None => enc.encode_frame(src)?,
+                        };
+                        out_pkts.push((pkt, true));
+                    }
+                } else {
+                    let mut enc =
+                        H264Encoder::new(plan.dst_w as u32, plan.dst_h as u32, plan.fps, plan.qp)
+                            .with_profile(plan.h264_profile)
+                            .with_rate_control(plan.rate_control);
+                    enc.keyint = chunk.len() as u32 + 1;
+                    for (i, src) in chunk.iter().enumerate() {
+                        let is_kf = (i as u32).is_multiple_of(enc.keyint.max(1));
+                        let pkt = match scale(src) {
+                            Some(dst) => enc.encode_frame(&dst)?,
+                            None => enc.encode_frame(src)?,
+                        };
+                        out_pkts.push((pkt, is_kf));
+                    }
+                }
+                Ok(out_pkts)
+            });
+        for g in wave_encoded {
+            self.encoded.push(g?);
+        }
+        Ok(())
     }
 }
 
@@ -1030,250 +1206,46 @@ pub fn decode_image_file(path: impl AsRef<Path>) -> Result<VideoFrame> {
 pub fn decode_video_file(path: impl AsRef<Path>) -> Result<(Vec<VideoFrame>, Rational64)> {
     let p_str = path.as_ref().to_string_lossy();
     if is_image_sequence_pattern(&p_str) {
-        let files = expand_image_sequence_inputs(&p_str)?;
-        let fps = Rational64::FPS_30;
-        let frames = parallel_gop_map(&files, 0, |idx, fpath| {
-            let img = decode_image_file(fpath).expect("valid image sequence frame");
-            let mut yuv = if img.format == PixelFormat::Yuv420p {
-                img
-            } else {
-                convert_frame(&img, PixelFormat::Yuv420p, img.colorimetry)
-            };
-            yuv.pts = Timestamp::new(idx as i64, fps.recip());
-            yuv
-        });
-        return Ok((frames, fps));
+        let stream = VideoFrameStream::open_image_sequence(&p_str, usize::MAX, 0)?;
+        let fps = stream.frame_rate();
+        return Ok((stream.collect_all()?, fps));
     }
     let mmap = MmapSource::open(path.as_ref())?;
     decode_video_bytes(mmap.as_slice())
 }
 
-/// Decodes all video frames from an in-memory or memory-mapped container byte slice.
+/// Decodes all video frames from an in-memory or memory-mapped container byte slice. Use
+/// [`VideoFrameStream`] to hold only a batch of frames at a time.
 pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> {
-    if data.starts_with(b"RGDI") {
-        let dec = RagdollIntraDecoder::new();
-        let f = dec.decode_frame(data)?;
-        return Ok((vec![f], Rational64::FPS_30));
+    let stream = VideoFrameStream::open(data, usize::MAX, 0)?;
+    let fps = stream.frame_rate();
+    let mut frames = stream.collect_all()?;
+    if detect_container_format(data) == Some(ContainerFormat::Mp4)
+        && !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks)
+    {
+        frames.sort_by_key(|f| f.pts.ticks);
     }
+    Ok((frames, fps))
+}
 
-    let fmt = detect_container_format(data)
-        .ok_or_else(|| RagdollError::InvalidHeader("unrecognized video container".into()))?;
-
-    match fmt {
-        ContainerFormat::Y4m => {
-            let mut demux = Y4mDemuxer::open(data)?;
-            let vp = demux
-                .track()
-                .video
-                .clone()
-                .ok_or_else(|| RagdollError::InvalidData("Y4M missing video params".into()))?;
-            let fps = vp.frame_rate;
-            let mut packets = Vec::with_capacity(demux.frame_count());
-            while let Some(pkt) = demux.next_packet()? {
-                packets.push(pkt);
-            }
-            let frames = parallel_gop_map(&packets, 0, |_, pkt| {
-                let mut dst =
-                    VideoFrame::new(vp.width as usize, vp.height as usize, vp.pixel_format);
-                dst.pts = pkt.pts;
-                dst.colorimetry = vp.colorimetry;
-                let raw = pkt.data();
-                let mut src_off = 0usize;
-                for plane in &mut dst.planes {
-                    let row_bytes = plane.row_bytes();
-                    let h = plane.height();
-                    if plane.stride() == row_bytes {
-                        let total = row_bytes * h;
-                        plane.data_mut()[..total].copy_from_slice(&raw[src_off..src_off + total]);
-                        src_off += total;
-                    } else {
-                        for y in 0..h {
-                            plane
-                                .row_mut(y)
-                                .copy_from_slice(&raw[src_off..src_off + row_bytes]);
-                            src_off += row_bytes;
-                        }
-                    }
-                }
-                dst
-            });
-            Ok((frames, fps))
-        }
-        ContainerFormat::Ppm | ContainerFormat::Pgm => {
-            let f = read_pnm_image(data)?;
-            let yuv = if f.format == PixelFormat::Yuv420p {
-                f
-            } else {
-                convert_frame(&f, PixelFormat::Yuv420p, f.colorimetry)
-            };
-            Ok((vec![yuv], Rational64::FPS_30))
-        }
-        ContainerFormat::Png => {
-            let f = read_png_image(data)?;
-            let yuv = if f.format == PixelFormat::Yuv420p {
-                f
-            } else {
-                convert_frame(&f, PixelFormat::Yuv420p, f.colorimetry)
-            };
-            Ok((vec![yuv], Rational64::FPS_30))
-        }
-        ContainerFormat::Jpeg => {
-            let f = read_jpeg_image(data)?;
-            let yuv = if f.format == PixelFormat::Yuv420p {
-                f
-            } else {
-                convert_frame(&f, PixelFormat::Yuv420p, f.colorimetry)
-            };
-            Ok((vec![yuv], Rational64::FPS_30))
-        }
-        ContainerFormat::Mp4 => {
-            let mut demux = Mp4Demuxer::open(data)?;
-            let v_track = demux
-                .tracks()
-                .iter()
-                .find(|t| t.info.track_type == TrackType::Video)
-                .ok_or_else(|| RagdollError::InvalidData("MP4 has no video track".into()))?
-                .info
-                .clone();
-            let fps = v_track
-                .video
-                .as_ref()
-                .map_or(Rational64::FPS_30, |v| v.frame_rate);
-
-            let rgdi_dec = RagdollIntraDecoder::new();
-            let annex_b_hdr = if v_track.codec_id == CodecId::H264 && v_track.extra_data.len() >= 8
-            {
-                Some(avcc_config_to_annex_b(&v_track.extra_data))
-            } else {
-                None
-            };
-
-            let mut pkts = Vec::new();
-            while let Some(pkt) = demux.next_packet()? {
-                if pkt.track_index == v_track.index {
-                    pkts.push(pkt);
-                }
-            }
-
-            let mut frames = if pkts.first().is_some_and(|p| p.data().starts_with(b"RGDI")) {
-                let mut out = Vec::with_capacity(pkts.len());
-                for pkt in &pkts {
-                    out.push(rgdi_dec.decode_frame(pkt.data())?);
-                }
-                out
-            } else if v_track.codec_id == CodecId::H264 {
-                let mut gops: Vec<Vec<&PacketSlice<'_>>> = Vec::new();
-                for pkt in &pkts {
-                    // Each GOP gets its own decoder, so only split where the decoder can start:
-                    // container sync flags on non-IDR pictures would leave it without references.
-                    let starts_gop =
-                        pkt.is_keyframe() && avcc_has_idr(&v_track.extra_data, pkt.data());
-                    if starts_gop || gops.is_empty() {
-                        gops.push(vec![pkt]);
-                    } else if let Some(last) = gops.last_mut() {
-                        last.push(pkt);
-                    }
-                }
-                if gops.len() > 1 {
-                    let gop_results: Vec<Result<Vec<VideoFrame>>> =
-                        parallel_gop_map(&gops, 0, |_, gop_pkts| {
-                            let mut dec = H264Decoder::new();
-                            if let Some(ref hdr) = annex_b_hdr {
-                                let _ = dec.set_extradata(hdr);
-                            }
-                            let mut gf = Vec::with_capacity(gop_pkts.len());
-                            for pkt in gop_pkts {
-                                let annex_b = h264_avcc_to_annex_b_au(
-                                    &v_track.extra_data,
-                                    pkt.data(),
-                                    pkt.is_keyframe(),
-                                );
-                                if let Some(f) = dec.decode_annex_b_packet(&annex_b)? {
-                                    gf.push(f);
-                                }
-                            }
-                            Ok(gf)
-                        });
-                    let mut out = Vec::with_capacity(pkts.len());
-                    for gr in gop_results {
-                        out.extend(gr?);
-                    }
-                    order_h264_frames(out)
-                } else {
-                    let mut h264_dec = H264Decoder::new();
-                    if let Some(ref hdr) = annex_b_hdr {
-                        let _ = h264_dec.set_extradata(hdr);
-                    }
-                    let mut out = Vec::with_capacity(pkts.len());
-                    for pkt in &pkts {
-                        let annex_b = h264_avcc_to_annex_b_au(
-                            &v_track.extra_data,
-                            pkt.data(),
-                            pkt.is_keyframe(),
-                        );
-                        if let Some(f) = h264_dec.decode_annex_b_packet(&annex_b)? {
-                            out.push(f);
-                        }
-                    }
-                    order_h264_frames(out)
-                }
-            } else {
-                Vec::new()
-            };
-            if !frames.windows(2).all(|w| w[0].pts.ticks <= w[1].pts.ticks) {
-                frames.sort_by_key(|f| f.pts.ticks);
-            }
-            Ok((frames, fps))
-        }
-        ContainerFormat::Matroska | ContainerFormat::WebM => {
-            let mut demux = MkvDemuxer::open(data)?;
-            let v_track = demux
-                .tracks()
-                .iter()
-                .find(|t| t.track_type == TrackType::Video)
-                .ok_or_else(|| RagdollError::InvalidData("MKV has no video track".into()))?
-                .clone();
-            let fps = v_track
-                .video
-                .as_ref()
-                .map_or(Rational64::FPS_30, |v| v.frame_rate);
-            let mut h264_dec = H264Decoder::new();
-            if v_track.codec_id == CodecId::H264 && v_track.extra_data.len() >= 8 {
-                let annex_b_hdr = avcc_config_to_annex_b(&v_track.extra_data);
-                let _ = h264_dec.set_extradata(&annex_b_hdr);
-            }
-            let mut frames = Vec::new();
-            while let Some(pkt) = demux.next_packet()? {
-                if pkt.track_index != v_track.index {
-                    continue;
-                }
-                let annex_b =
-                    h264_avcc_to_annex_b_au(&v_track.extra_data, pkt.data(), pkt.is_keyframe());
-                if let Some(f) = h264_dec.decode_annex_b_packet(&annex_b)? {
-                    frames.push(f);
-                }
-            }
-            Ok((order_h264_frames(frames), fps))
-        }
-        ContainerFormat::MpegTs => {
-            let mut demux = MpegTsDemuxer::open(data)?;
-            let mut h264_dec = H264Decoder::new();
-            let mut frames = Vec::new();
-            while let Some(pkt) = demux.next_packet()? {
-                if let Some(f) = h264_dec.decode_annex_b_packet(pkt.data())? {
-                    frames.push(f);
-                }
-            }
-            Ok((order_h264_frames(frames), Rational64::FPS_30))
-        }
-        ContainerFormat::Wav
-        | ContainerFormat::Flac
-        | ContainerFormat::Ogg
-        | ContainerFormat::WebVtt
-        | ContainerFormat::SubRip => Err(RagdollError::Unsupported(
-            "audio/subtitle container has no video stream".into(),
-        )),
+/// Opens `path` (a container file or an image-sequence pattern) as a [`VideoFrameStream`] whose
+/// batches stay within `batch_bytes`, and runs `f` on it while the file stays mapped.
+pub fn with_video_stream<R>(
+    path: impl AsRef<Path>,
+    batch_bytes: usize,
+    threads: usize,
+    f: impl FnOnce(VideoFrameStream<'_>) -> Result<R>,
+) -> Result<R> {
+    let p_str = path.as_ref().to_string_lossy();
+    if is_image_sequence_pattern(&p_str) {
+        return f(VideoFrameStream::open_image_sequence(
+            &p_str,
+            batch_bytes,
+            threads,
+        )?);
     }
+    let mmap = MmapSource::open(path.as_ref())?;
+    f(VideoFrameStream::open_mapped(&mmap, batch_bytes, threads)?)
 }
 
 /// Whether a length-prefixed (`avcC`) H.264 access unit contains an IDR slice.
@@ -1294,23 +1266,6 @@ fn avcc_has_idr(avcc_extra: &[u8], au: &[u8]) -> bool {
         pos += len;
     }
     false
-}
-
-/// Puts decode-order `H264Decoder` frames into presentation order. The decoder stamps PTS from
-/// `pic_order_cnt`, which restarts at every IDR, so it only orders frames within one GOP: sorting
-/// across GOPs interleaves them. Sorts each GOP by POC, then renumbers PTS across the whole stream.
-fn order_h264_frames(mut frames: Vec<VideoFrame>) -> Vec<VideoFrame> {
-    let mut gop_start = 0;
-    for i in 1..=frames.len() {
-        if i == frames.len() || frames[i].keyframe {
-            frames[gop_start..i].sort_by_key(|f| f.pts.ticks);
-            gop_start = i;
-        }
-    }
-    for (idx, f) in frames.iter_mut().enumerate() {
-        f.pts = Timestamp::new(idx as i64, f.pts.timebase);
-    }
-    frames
 }
 
 /// Extracts non-video (Audio and Subtitle) tracks and their packets from a container byte slice
@@ -2184,74 +2139,92 @@ pub fn transcode_file_with_options(
         });
     }
 
-    // Video (+ Multi-Track Audio/Subtitle) transcode path:
-    // 1. Open input once (supports both zero-copy `mmap`, `-` / `stdin` pipes, and image sequences)
+    // Video (+ Multi-Track Audio/Subtitle) transcode path. Frames are decoded, filtered and
+    // encoded a batch at a time, so resident frame memory follows the memory budget, not the
+    // input length (BUG-0072).
+    let budget = opts
+        .memory_budget_bytes
+        .unwrap_or_else(default_pipeline_memory_budget);
     let in_str = in_p.to_string_lossy();
-    let (decoded_frames, decoded_fps, bytes_in, aux_tracks) = if is_image_sequence_pattern(&in_str)
-    {
-        let files = expand_image_sequence_inputs(&in_str)?;
-        let total_b: u64 = files
-            .iter()
-            .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
-            .sum();
-        let (frames, fps) = decode_video_file(in_p)?;
-        (frames, fps, total_b, Vec::new())
+    let mmap = if is_image_sequence_pattern(&in_str) {
+        None
     } else {
-        let mmap = MmapSource::open(in_p)?;
-        let data = mmap.as_slice();
-        let bytes_in = data.len() as u64;
-        let (frames, fps) = decode_video_bytes(data)?;
-        let aux = extract_auxiliary_tracks(data).unwrap_or_default();
-        (frames, fps, bytes_in, aux)
+        Some(MmapSource::open(in_p)?)
     };
-    if decoded_frames.is_empty() {
+    let (stream, bytes_in, aux_tracks) = match &mmap {
+        None => {
+            let files = expand_image_sequence_inputs(&in_str)?;
+            let total_b: u64 = files
+                .iter()
+                .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+                .sum();
+            let stream =
+                VideoFrameStream::open_image_sequence(&in_str, budget / 4, worker_threads)?;
+            (stream, total_b, Vec::new())
+        }
+        Some(m) => {
+            let data = m.as_slice();
+            let stream = VideoFrameStream::open_mapped(m, budget / 4, worker_threads)?;
+            let aux = extract_auxiliary_tracks(data).unwrap_or_default();
+            (stream, data.len() as u64, aux)
+        }
+    };
+    let Some(mut frames) = stream::FilteredFrames::new(stream, opts, worker_threads)? else {
         return Err(RagdollError::InvalidData("input video has 0 frames".into()));
-    }
+    };
+    let fps = frames.filters.frame_rate();
+    let planned_frames = frames.filters.output_count();
+    let Some(first) = frames.next()? else {
+        return Err(RagdollError::InvalidData("input video has 0 frames".into()));
+    };
 
-    let (raw_frames, fps) = apply_video_filters(decoded_frames, decoded_fps, opts, worker_threads)?;
-
-    let num_frames = raw_frames.len();
-    let (dst_w, dst_h) = opts
-        .scale_dims
-        .unwrap_or((raw_frames[0].width, raw_frames[0].height));
+    let mut num_frames = planned_frames;
+    let (dst_w, dst_h) = opts.scale_dims.unwrap_or((first[0].width, first[0].height));
     let width = dst_w as u32;
     let height = dst_h as u32;
+    let scaled = |batch: Vec<VideoFrame>| -> Result<Vec<VideoFrame>> {
+        match opts.scale_dims {
+            Some((dw, dh)) => {
+                parallel_scale_frames(&batch, dw, dh, opts.scale_filter, worker_threads)
+            }
+            None => Ok(batch),
+        }
+    };
 
     // 2. Bounded-memory GOP-Ring scaling + encoding (`GopRingPipeline`)
-    let gop_ring = match opts.memory_budget_bytes {
-        Some(budget) => GopRingPipeline::with_budget_bytes(worker_threads, budget),
-        None => GopRingPipeline::new(worker_threads),
-    };
+    let gop_ring = GopRingPipeline::with_budget_bytes(worker_threads, budget);
 
     let mut gops_processed = 1usize;
     let mut audio_samples_processed = 0usize;
 
     let out_str = out_p.to_string_lossy();
     if is_image_sequence_pattern(&out_str) {
-        let frames = if let Some((dw, dh)) = opts.scale_dims {
-            parallel_scale_frames(&raw_frames, dw, dh, opts.scale_filter, worker_threads)?
-        } else {
-            raw_frames
-        };
         let mut total_bytes_out = 0u64;
-        for (idx, frame) in frames.iter().enumerate() {
-            let fpath = format_image_sequence_path(&out_str, idx + 1);
-            let rgb = convert_frame(frame, PixelFormat::Rgb24, frame.colorimetry);
-            let mut buf = Vec::new();
-            match out_ext.as_str() {
-                "png" => {
-                    write_png_image(&mut buf, &rgb)?;
+        let mut idx = 0usize;
+        let mut batch = Some(first);
+        while let Some(b) = batch {
+            for frame in &scaled(b)? {
+                idx += 1;
+                let fpath = format_image_sequence_path(&out_str, idx);
+                let rgb = convert_frame(frame, PixelFormat::Rgb24, frame.colorimetry);
+                let mut buf = Vec::new();
+                match out_ext.as_str() {
+                    "png" => {
+                        write_png_image(&mut buf, &rgb)?;
+                    }
+                    "jpg" | "jpeg" => {
+                        write_jpeg_image(&mut buf, &rgb, 90)?;
+                    }
+                    _ => {
+                        write_pnm_image(&mut buf, &rgb)?;
+                    }
                 }
-                "jpg" | "jpeg" => {
-                    write_jpeg_image(&mut buf, &rgb, 90)?;
-                }
-                _ => {
-                    write_pnm_image(&mut buf, &rgb)?;
-                }
+                std::fs::write(&fpath, &buf)?;
+                total_bytes_out += buf.len() as u64;
             }
-            std::fs::write(&fpath, &buf)?;
-            total_bytes_out += buf.len() as u64;
+            batch = frames.next()?;
         }
+        let num_frames = idx;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let elapsed_s = (elapsed_ms / 1000.0).max(1e-9);
         return Ok(PipelineTelemetry {
@@ -2273,11 +2246,7 @@ pub fn transcode_file_with_options(
 
     let bytes_out = match out_ext.as_str() {
         "y4m" => {
-            let frames = if let Some((dw, dh)) = opts.scale_dims {
-                parallel_scale_frames(&raw_frames, dw, dh, opts.scale_filter, worker_threads)?
-            } else {
-                raw_frames
-            };
+            let first = scaled(first)?;
             let writer = OutputSink::create(out_p)?;
             let mut mux = Y4mMuxer::new(
                 writer,
@@ -2285,22 +2254,23 @@ pub fn transcode_file_with_options(
                 height as usize,
                 PixelFormat::Yuv420p,
                 fps,
-                frames[0].colorimetry,
+                first[0].colorimetry,
             )?;
-            for f in &frames {
-                mux.write_frame(f)?;
+            let mut written = 0usize;
+            let mut batch = Some(first);
+            while let Some(b) = batch {
+                for f in &b {
+                    mux.write_frame(f)?;
+                }
+                written += b.len();
+                batch = frames.next()?.map(scaled).transpose()?;
             }
+            num_frames = written;
             mux.finish()?
         }
         "ppm" | "png" | "jpg" | "jpeg" => {
-            let first = if let Some((dw, dh)) = opts.scale_dims {
-                parallel_scale_frames(&raw_frames[..1], dw, dh, opts.scale_filter, worker_threads)?
-                    .into_iter()
-                    .next()
-                    .unwrap()
-            } else {
-                raw_frames[0].clone()
-            };
+            // Only the first frame is written.
+            let first = scaled(first.into_iter().take(1).collect())?.remove(0);
             let rgb = convert_frame(&first, PixelFormat::Rgb24, first.colorimetry);
             let mut writer = OutputSink::create(out_p)?;
             let mut buf = Vec::new();
@@ -2320,14 +2290,7 @@ pub fn transcode_file_with_options(
             buf.len() as u64
         }
         "rgdi" => {
-            let first = if let Some((dw, dh)) = opts.scale_dims {
-                parallel_scale_frames(&raw_frames[..1], dw, dh, opts.scale_filter, worker_threads)?
-                    .into_iter()
-                    .next()
-                    .unwrap()
-            } else {
-                raw_frames[0].clone()
-            };
+            let first = scaled(first.into_iter().take(1).collect())?.remove(0);
             let enc = RagdollIntraEncoder::new(1);
             let pkt = enc.encode_frame(&first)?;
             let mut writer = OutputSink::create(out_p)?;
@@ -2346,8 +2309,9 @@ pub fn transcode_file_with_options(
             let avcc_extra =
                 build_avcc_from_sps_pps(&hdr_enc.sps.to_nal_unit(), &hdr_enc.pps.to_nal_unit());
 
-            let (encoded_gops, ring_stats) = gop_ring.encode_gops_bounded_with_h264(
-                &raw_frames,
+            let mut encoder = gop_ring.streaming_encoder(
+                &first[0],
+                planned_frames,
                 opts.scale_dims,
                 opts.scale_filter,
                 &opts.video_codec,
@@ -2355,8 +2319,15 @@ pub fn transcode_file_with_options(
                 opts.qp,
                 opts.h264_profile,
                 rc,
-            )?;
+            );
+            let mut batch = Some(first);
+            while let Some(b) = batch {
+                encoder.push(b)?;
+                batch = frames.next()?;
+            }
+            let (encoded_gops, ring_stats) = encoder.finish()?;
             gops_processed = ring_stats.gops_processed;
+            num_frames = ring_stats.frames_processed;
 
             let timebase = Rational64::new(1, 90_000);
             let frame_dur = ((90_000 * fps.den) / fps.num.max(1)).max(1);
@@ -2709,21 +2680,56 @@ pub fn extract_media(
         };
         (out_frame, 1, mp4_fps)
     } else {
-        let (frames, fps) = decode_video_file(in_p)?;
-        if frames.is_empty() {
-            return Err(RagdollError::InvalidData(
-                "no video frames to extract".into(),
-            ));
-        }
+        // Decode a batch at a time, keeping only the frames that are extracted (BUG-0072).
+        let batch_bytes = default_pipeline_memory_budget() / 4;
+        let (selected, fps) = with_video_stream(in_p, batch_bytes, 0, |mut stream| {
+            let fps = stream.frame_rate();
+            let n = stream.frame_count().max(1);
+            let wanted: Vec<usize> = match thumbnails {
+                Some((count, _, _)) => {
+                    let count = count.max(1);
+                    (0..count).map(|i| (i * n / count).min(n - 1)).collect()
+                }
+                None => vec![
+                    at_sec
+                        .map(|s| ((s * fps.as_f64()).round() as usize).min(n - 1))
+                        .unwrap_or(0),
+                ],
+            };
+            let last_wanted = wanted.iter().copied().max().unwrap_or(0);
+            let mut picked: Vec<Option<VideoFrame>> = vec![None; wanted.len()];
+            let mut last: Option<VideoFrame> = None;
+            let mut idx = 0usize;
+            'decode: while let Some(batch) = stream.next_batch()? {
+                for f in batch {
+                    for (slot, &w) in picked.iter_mut().zip(&wanted) {
+                        if w == idx {
+                            *slot = Some(f.clone());
+                        }
+                    }
+                    idx += 1;
+                    last = Some(f);
+                    if idx > last_wanted {
+                        break 'decode;
+                    }
+                }
+            }
+            let Some(last) = last else {
+                return Err(RagdollError::InvalidData(
+                    "no video frames to extract".into(),
+                ));
+            };
+            // A stream shorter than its index ends at its last frame.
+            let selected: Vec<VideoFrame> = picked
+                .into_iter()
+                .map(|p| p.unwrap_or_else(|| last.clone()))
+                .collect();
+            Ok((selected, fps))
+        })?;
         if let Some((count, cols, rows)) = thumbnails {
             let count = count.max(1);
-            let thumb_w = (frames[0].width / cols.max(1)).max(64) & !1;
-            let thumb_h = (frames[0].height / rows.max(1)).max(36) & !1;
-            let mut selected = Vec::with_capacity(count);
-            for i in 0..count {
-                let idx = (i * frames.len() / count).min(frames.len() - 1);
-                selected.push(frames[idx].clone());
-            }
+            let thumb_w = (selected[0].width / cols.max(1)).max(64) & !1;
+            let thumb_h = (selected[0].height / rows.max(1)).max(36) & !1;
             let scaled =
                 parallel_scale_frames(&selected, thumb_w, thumb_h, ScaleFilter::Lanczos3, 0)?;
             let rgb_thumbs: Vec<VideoFrame> = scaled
@@ -2734,11 +2740,7 @@ pub fn extract_media(
             let sheet = compose_contact_sheet_rgb24(&thumb_refs, cols.max(1), 4, [18, 18, 22])?;
             (sheet, count, fps)
         } else {
-            let fps_val = fps.as_f64();
-            let target_idx = at_sec
-                .map(|s| ((s * fps_val).round() as usize).min(frames.len() - 1))
-                .unwrap_or(0);
-            let chosen = &frames[target_idx];
+            let chosen = &selected[0];
             let out_frame = if out_ext == "y4m" {
                 chosen.clone()
             } else {
@@ -2819,32 +2821,67 @@ pub fn evaluate_media_metrics(
     ref_path: impl AsRef<Path>,
     dist_path: impl AsRef<Path>,
 ) -> Result<(QualityReport, usize, f64)> {
+    evaluate_media_metrics_with_budget(ref_path, dist_path, default_pipeline_memory_budget())
+}
+
+/// [`evaluate_media_metrics`] holding at most `memory_budget_bytes` of decoded frames: both
+/// inputs are decoded a batch at a time and compared in waves (BUG-0072).
+pub fn evaluate_media_metrics_with_budget(
+    ref_path: impl AsRef<Path>,
+    dist_path: impl AsRef<Path>,
+    memory_budget_bytes: usize,
+) -> Result<(QualityReport, usize, f64)> {
     let t0 = Instant::now();
-    let (ref_frames, _) = decode_video_file(ref_path)?;
-    let (dist_frames, _) = decode_video_file(dist_path)?;
-    let count = ref_frames.len().min(dist_frames.len());
+    const METRICS_WAVE: usize = 30;
+    let batch_bytes = memory_budget_bytes / 4;
+    let reports = with_video_stream(ref_path, batch_bytes, 0, |mut refs| {
+        with_video_stream(dist_path, batch_bytes, 0, |mut dists| {
+            let mut reports = Vec::new();
+            let (mut rq, mut dq) = (
+                std::collections::VecDeque::new(),
+                std::collections::VecDeque::new(),
+            );
+            let (mut r_end, mut d_end) = (false, false);
+            let mut prev: Option<VideoFrame> = None;
+            loop {
+                while !r_end && rq.len() < METRICS_WAVE {
+                    match refs.next_batch()? {
+                        Some(b) => rq.extend(b),
+                        None => r_end = true,
+                    }
+                }
+                while !d_end && dq.len() < METRICS_WAVE {
+                    match dists.next_batch()? {
+                        Some(b) => dq.extend(b),
+                        None => d_end = true,
+                    }
+                }
+                let n = rq.len().min(dq.len()).min(METRICS_WAVE);
+                if n == 0 {
+                    break;
+                }
+                let ref_wave: Vec<VideoFrame> = rq.drain(..n).collect();
+                let dist_wave: Vec<VideoFrame> = dq.drain(..n).collect();
+                let indices: Vec<usize> = (0..n).collect();
+                let wave_reports: Vec<QualityReport> = parallel_gop_map(&indices, 0, |_, &i| {
+                    let p = if i > 0 {
+                        Some(&ref_wave[i - 1])
+                    } else {
+                        prev.as_ref()
+                    };
+                    evaluate_frame_quality(&ref_wave[i], &dist_wave[i], p)
+                });
+                reports.extend(wave_reports);
+                prev = ref_wave.into_iter().last();
+            }
+            Ok(reports)
+        })
+    })?;
+    let count = reports.len();
     if count == 0 {
         return Err(RagdollError::InvalidData(
             "cannot compute metrics on 0 frames".into(),
         ));
-    }
-
-    const METRICS_WAVE: usize = 30;
-    let mut reports = Vec::with_capacity(count);
-    let mut wave_start = 0usize;
-    while wave_start < count {
-        let wave_end = (wave_start + METRICS_WAVE).min(count);
-        let indices: Vec<usize> = (wave_start..wave_end).collect();
-        let wave_reports: Vec<QualityReport> = parallel_gop_map(&indices, 0, |_, &i| {
-            let prev = if i > 0 {
-                Some(&ref_frames[i - 1])
-            } else {
-                None
-            };
-            evaluate_frame_quality(&ref_frames[i], &dist_frames[i], prev)
-        });
-        reports.extend(wave_reports);
-        wave_start = wave_end;
     }
 
     let inv = 1.0 / (count as f64);
@@ -2971,10 +3008,33 @@ pub fn synth_media(
 
     let num_frames = ((fps_num as f64) * duration_sec).round().max(1.0) as usize;
     let fps = Rational64::new(fps_num.max(1), 1);
-    let indices: Vec<usize> = (0..num_frames).collect();
-    let frames = parallel_gop_map(&indices, 0, |_i, &f_idx| {
-        synth_video_frame(width, height, f_idx)
-    });
+    // Frames are generated and written a batch at a time (BUG-0072).
+    let write_y4m = |path: &Path| -> Result<()> {
+        let f = File::create(path)?;
+        let mut mux = Y4mMuxer::new(
+            BufWriter::with_capacity(256 * 1024, f),
+            width,
+            height,
+            PixelFormat::Yuv420p,
+            fps,
+            Colorimetry::bt709_limited(),
+        )?;
+        let frame_bytes = (width * height * 3 / 2).max(1);
+        let batch = (resolve_thread_count(0) * 8)
+            .min(default_pipeline_memory_budget() / 4 / frame_bytes)
+            .max(1);
+        let indices: Vec<usize> = (0..num_frames).collect();
+        for chunk in indices.chunks(batch) {
+            let frames = parallel_gop_map(chunk, 0, |_i, &f_idx| {
+                synth_video_frame(width, height, f_idx)
+            });
+            for frame in &frames {
+                mux.write_frame(frame)?;
+            }
+        }
+        mux.finish()?;
+        Ok(())
+    };
 
     let bytes_in = (num_frames * width * height * 3 / 2) as u64;
     let tmp_y4m = std::env::temp_dir().join(format!(
@@ -2984,21 +3044,10 @@ pub fn synth_media(
     ));
 
     if ext == "y4m" {
-        let f = File::create(out_p)?;
-        let mut mux = Y4mMuxer::new(
-            BufWriter::with_capacity(256 * 1024, f),
-            width,
-            height,
-            PixelFormat::Yuv420p,
-            fps,
-            Colorimetry::bt709_limited(),
-        )?;
-        for frame in &frames {
-            mux.write_frame(frame)?;
-        }
-        mux.finish()?;
+        write_y4m(out_p)?;
     } else if matches!(ext.as_str(), "ppm" | "png" | "jpg" | "jpeg") {
-        let rgb = convert_frame(&frames[0], PixelFormat::Rgb24, frames[0].colorimetry);
+        let first = synth_video_frame(width, height, 0);
+        let rgb = convert_frame(&first, PixelFormat::Rgb24, first.colorimetry);
         let mut buf = Vec::new();
         match ext.as_str() {
             "png" => {
@@ -3013,19 +3062,7 @@ pub fn synth_media(
         }
         std::fs::write(out_p, &buf)?;
     } else {
-        let f = File::create(&tmp_y4m)?;
-        let mut mux = Y4mMuxer::new(
-            BufWriter::with_capacity(256 * 1024, f),
-            width,
-            height,
-            PixelFormat::Yuv420p,
-            fps,
-            Colorimetry::bt709_limited(),
-        )?;
-        for frame in &frames {
-            mux.write_frame(frame)?;
-        }
-        mux.finish()?;
+        write_y4m(&tmp_y4m)?;
         let _ = transcode_file(&tmp_y4m, out_p, None, ScaleFilter::Lanczos3, "h264", 20, 0)?;
         let _ = std::fs::remove_file(&tmp_y4m);
     }
@@ -3622,52 +3659,64 @@ pub fn concat_media<P: AsRef<Path>>(
         });
     }
 
-    // Fallback when resolution/codec differs across inputs: decode & normalize all frames to first input's dimensions
-    let mut all_frames = Vec::new();
-    let mut target_w = 0usize;
-    let mut target_h = 0usize;
-    let mut target_fps = Rational64::FPS_30;
-    for (idx, (path, _, _)) in opened.iter().enumerate() {
-        let (frames, fps) = decode_video_file(path)?;
-        if frames.is_empty() {
-            continue;
-        }
-        if idx == 0 {
-            target_w = frames[0].width;
-            target_h = frames[0].height;
-            target_fps = fps;
-        }
-        let scaled = if frames[0].width != target_w || frames[0].height != target_h {
-            parallel_scale_frames(&frames, target_w, target_h, ScaleFilter::Lanczos3, 0)?
-        } else {
-            frames
-        };
-        all_frames.extend(scaled);
-    }
-
+    // Fallback when resolution/codec differs across inputs: decode & normalize all frames to the
+    // first input's dimensions, streaming them into a temporary Y4M a batch at a time (BUG-0072).
     let tmp_y4m = std::env::temp_dir().join(format!("ragdoll_concat_{}.y4m", std::process::id()));
-    {
-        let f = File::create(&tmp_y4m)?;
-        let mut mux = Y4mMuxer::new(
-            BufWriter::new(f),
-            target_w,
-            target_h,
-            PixelFormat::Yuv420p,
-            target_fps,
-            Colorimetry::bt709_limited(),
-        )?;
-        for frame in &all_frames {
-            mux.write_frame(frame)?;
-        }
-        mux.finish()?;
+    let batch_bytes = default_pipeline_memory_budget() / 4;
+    let mut mux: Option<Y4mMuxer<BufWriter<File>>> = None;
+    let mut target: Option<(usize, usize)> = None;
+    let mut frames_written = 0usize;
+    for (idx, (path, _, _)) in opened.iter().enumerate() {
+        with_video_stream(path, batch_bytes, 0, |mut stream| {
+            let mut first = true;
+            let mut rescale = false;
+            while let Some(batch) = stream.next_batch()? {
+                if first {
+                    first = false;
+                    if idx == 0 {
+                        target = Some((batch[0].width, batch[0].height));
+                        let f = File::create(&tmp_y4m)?;
+                        mux = Some(Y4mMuxer::new(
+                            BufWriter::new(f),
+                            batch[0].width,
+                            batch[0].height,
+                            PixelFormat::Yuv420p,
+                            stream.frame_rate(),
+                            Colorimetry::bt709_limited(),
+                        )?);
+                    }
+                    let (tw, th) = target.unwrap_or((0, 0));
+                    rescale = batch[0].width != tw || batch[0].height != th;
+                }
+                let batch = if rescale {
+                    let (tw, th) = target.unwrap_or((0, 0));
+                    parallel_scale_frames(&batch, tw, th, ScaleFilter::Lanczos3, 0)?
+                } else {
+                    batch
+                };
+                if let Some(m) = mux.as_mut() {
+                    for frame in &batch {
+                        m.write_frame(frame)?;
+                    }
+                }
+                frames_written += batch.len();
+            }
+            Ok(())
+        })?;
     }
+    let Some(mux) = mux else {
+        return Err(RagdollError::InvalidData(
+            "concat_media: the first input has no video frames".into(),
+        ));
+    };
+    mux.finish()?;
     let tel = transcode_file(&tmp_y4m, out_p, None, ScaleFilter::Lanczos3, "h264", 20, 0)?;
     let _ = std::fs::remove_file(&tmp_y4m);
 
     Ok(ConcatReport {
         output_bytes: tel.bytes_out,
         segments_merged: inputs.len(),
-        video_packets: all_frames.len(),
+        video_packets: frames_written,
         audio_packets: 0,
         reencoded: true,
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -3784,67 +3833,60 @@ pub fn package_abr(
     let out_dir = output_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let (raw_frames, fps) = decode_video_file(in_p)?;
-    if raw_frames.is_empty() {
-        return Err(RagdollError::InvalidData(
-            "package_abr input has 0 video frames".into(),
-        ));
-    }
+    // The input is decoded a wave of segments at a time; every rendition encodes its segments
+    // of the wave, writes them, and drops the frames (BUG-0072).
+    let budget = default_pipeline_memory_budget();
+    let threads = resolve_thread_count(0);
+    with_video_stream(in_p, budget / 4, 0, |mut stream| {
+        let Some(first) = stream.next_batch()? else {
+            return Err(RagdollError::InvalidData(
+                "package_abr input has 0 video frames".into(),
+            ));
+        };
+        let fps = stream.frame_rate();
+        let src_w = first[0].width;
+        let src_h = first[0].height;
+        let planned_frames = stream.frame_count().max(1);
+        let ladder = if let Some(ref spec) = opts.ladder_spec {
+            AbrRenditionSpec::parse_ladder(spec, src_w, src_h)?
+        } else {
+            let half_w = ((src_w / 2) & !1).max(32);
+            let half_h = ((src_h / 2) & !1).max(32);
+            vec![
+                AbrRenditionSpec {
+                    width: src_w & !1,
+                    height: src_h & !1,
+                    bitrate_kbps: 2400,
+                },
+                AbrRenditionSpec {
+                    width: half_w,
+                    height: half_h,
+                    bitrate_kbps: 800,
+                },
+            ]
+        };
 
-    let src_w = raw_frames[0].width;
-    let src_h = raw_frames[0].height;
-    let ladder = if let Some(ref spec) = opts.ladder_spec {
-        AbrRenditionSpec::parse_ladder(spec, src_w, src_h)?
-    } else {
-        let half_w = ((src_w / 2) & !1).max(32);
-        let half_h = ((src_h / 2) & !1).max(32);
-        vec![
-            AbrRenditionSpec {
-                width: src_w & !1,
-                height: src_h & !1,
-                bitrate_kbps: 2400,
-            },
-            AbrRenditionSpec {
-                width: half_w,
-                height: half_h,
-                bitrate_kbps: 800,
-            },
-        ]
-    };
+        let seg_dur_s = opts.segment_duration_sec.max(0.2);
+        let fps_f = fps.as_f64().max(1.0);
+        let frames_per_seg = ((seg_dur_s * fps_f).round() as usize).max(1);
+        let timebase = Rational64::new(1, 90_000);
+        let frame_dur_ticks = ((90_000 * fps.den) / fps.num.max(1)).max(1);
+        let target_dur_ceil = seg_dur_s.ceil().max(1.0) as u32;
 
-    let seg_dur_s = opts.segment_duration_sec.max(0.2);
-    let fps_f = fps.as_f64().max(1.0);
-    let frames_per_seg = ((seg_dur_s * fps_f).round() as usize).max(1);
-    let num_segments = raw_frames.len().div_ceil(frames_per_seg);
-    let total_duration_s = (raw_frames.len() as f64) / fps_f;
-
-    let timebase = Rational64::new(1, 90_000);
-    let frame_dur_ticks = ((90_000 * fps.den) / fps.num.max(1)).max(1);
-
-    let mut total_bytes = 0u64;
-    let mut rendition_codecs = Vec::with_capacity(ladder.len());
-
-    let target_dur_ceil = seg_dur_s.ceil().max(1.0) as u32;
-    let rend_indices: Vec<usize> = (0..ladder.len()).collect();
-    let rend_results: Vec<Result<(String, u64)>> =
-        parallel_gop_map(&rend_indices, 0, |_, &r_idx| {
-            let rend = &ladder[r_idx];
+        // 1. `stream_N/init.mp4` and the playlist header for every rendition.
+        struct Rendition {
+            spec: AbrRenditionSpec,
+            dir: std::path::PathBuf,
+            mux: Mp4Muxer<'static>,
+            m3u8: String,
+            bytes: u64,
+            codecs_tag: String,
+            rc: RateControlMode,
+        }
+        let mut rends = Vec::with_capacity(ladder.len());
+        for (r_idx, rend) in ladder.iter().enumerate() {
             let r_dir = out_dir.join(format!("stream_{r_idx}"));
             std::fs::create_dir_all(&r_dir)?;
-            let mut r_bytes = 0u64;
-
-            let scaled = if rend.width == src_w && rend.height == src_h {
-                raw_frames.clone()
-            } else {
-                parallel_scale_frames(
-                    &raw_frames,
-                    rend.width,
-                    rend.height,
-                    ScaleFilter::Lanczos3,
-                    0,
-                )?
-            };
-
             let rc = RateControlMode::Abr {
                 bitrate_kbps: rend.bitrate_kbps,
                 maxrate_kbps: Some(rend.bitrate_kbps * 2),
@@ -3853,20 +3895,19 @@ pub fn package_abr(
             let hdr_enc = H264Encoder::new(rend.width as u32, rend.height as u32, fps, 22)
                 .with_profile(H264Profile::Main)
                 .with_rate_control(rc);
-            let sps_nal = hdr_enc.sps.to_nal_unit();
-            let pps_nal = hdr_enc.pps.to_nal_unit();
-            let avcc_extra = build_avcc_from_sps_pps(&sps_nal, &pps_nal);
+            let avcc_extra =
+                build_avcc_from_sps_pps(&hdr_enc.sps.to_nal_unit(), &hdr_enc.pps.to_nal_unit());
             let codecs_tag = format!(
                 "avc1.{:02X}{:02X}{:02X}",
                 hdr_enc.sps.profile_idc, hdr_enc.sps.constraint_set_flags, hdr_enc.sps.level_idc
             );
-
-            let track_info = TrackInfo {
+            let mut mux = Mp4Muxer::new();
+            mux.add_track(TrackInfo {
                 index: 0,
                 track_type: TrackType::Video,
                 codec_id: CodecId::H264,
                 timebase,
-                duration_ticks: Some((scaled.len() as i64) * frame_dur_ticks),
+                duration_ticks: Some((planned_frames as i64) * frame_dur_ticks),
                 extra_data: avcc_extra,
                 video: Some(VideoTrackParams {
                     width: rend.width as u32,
@@ -3879,19 +3920,11 @@ pub fn package_abr(
                     level: None,
                 }),
                 audio: None,
-                sample_count: scaled.len(),
+                sample_count: planned_frames,
                 total_bytes: 0,
-            };
-
-            let mut mux = Mp4Muxer::new();
-            mux.add_track(track_info);
-
-            // 1. Write `stream_N/init.mp4`
-            let init_path = r_dir.join("init.mp4");
-            let init_file = File::create(&init_path)?;
-            r_bytes += mux.write_cmaf_init_segment(BufWriter::new(init_file))?;
-
-            // 2. Encode each GOP-aligned segment and write `stream_N/seg_NNNN.m4s` + `stream_N/index.m3u8`
+            });
+            let init_file = File::create(r_dir.join("init.mp4"))?;
+            let bytes = mux.write_cmaf_init_segment(BufWriter::new(init_file))?;
             let mut m3u8 = String::new();
             m3u8.push_str("#EXTM3U\n");
             m3u8.push_str("#EXT-X-VERSION:7\n");
@@ -3900,22 +3933,70 @@ pub fn package_abr(
             m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
             m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
             m3u8.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+            rends.push(Rendition {
+                spec: *rend,
+                dir: r_dir,
+                mux,
+                m3u8,
+                bytes,
+                codecs_tag,
+                rc,
+            });
+        }
 
-            let seg_indices: Vec<usize> = (0..num_segments).collect();
-            let encoded_segs: Vec<Result<(usize, Vec<PacketSlice<'static>>, usize)>> =
-                parallel_gop_map(&seg_indices, 0, |_, &seg_idx| {
-                    let f_start = seg_idx * frames_per_seg;
-                    let f_end = ((seg_idx + 1) * frames_per_seg).min(scaled.len());
-                    let seg_frames = &scaled[f_start..f_end];
-
-                    // Fresh encoder per segment guarantees every segment starts with an IDR keyframe (`SAP=1`)
+        // 2. GOP-aligned segments, a wave at a time. Each segment has a fresh encoder, so it
+        // starts with an IDR keyframe (`SAP=1`).
+        let seg_bytes = frames_per_seg.saturating_mul(src_w * src_h * 3 / 2).max(1);
+        let segs_per_wave = ((budget / 2) / seg_bytes).clamp(1, threads.max(1) * 2);
+        let wave_frames = segs_per_wave * frames_per_seg;
+        let thumb_w = 160usize;
+        let thumb_h = 90usize;
+        let mut thumbs: Vec<VideoFrame> = Vec::new();
+        let mut pending: Vec<VideoFrame> = first;
+        let mut stream_done = false;
+        let mut total_frames = 0usize;
+        let mut seg_base = 0usize;
+        loop {
+            while !stream_done && pending.len() < wave_frames {
+                match stream.next_batch()? {
+                    Some(b) => pending.extend(b),
+                    None => stream_done = true,
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let take = pending.len().min(wave_frames);
+            let rest = pending.split_off(take);
+            let wave = std::mem::replace(&mut pending, rest);
+            let segs: Vec<&[VideoFrame]> = wave.chunks(frames_per_seg).collect();
+            let jobs: Vec<(usize, usize)> = (0..rends.len())
+                .flat_map(|r| (0..segs.len()).map(move |sg| (r, sg)))
+                .collect();
+            let rends_ref = &rends;
+            let encoded: Vec<Result<Vec<PacketSlice<'static>>>> =
+                parallel_gop_map(&jobs, 0, |_, &(r, sg)| {
+                    let rend = &rends_ref[r];
+                    let seg_frames = segs[sg];
+                    let scaled = if rend.spec.width == src_w && rend.spec.height == src_h {
+                        None
+                    } else {
+                        Some(parallel_scale_frames(
+                            seg_frames,
+                            rend.spec.width,
+                            rend.spec.height,
+                            ScaleFilter::Lanczos3,
+                            1,
+                        )?)
+                    };
+                    let frames = scaled.as_deref().unwrap_or(seg_frames);
                     let mut seg_enc =
-                        H264Encoder::new(rend.width as u32, rend.height as u32, fps, 22)
+                        H264Encoder::new(rend.spec.width as u32, rend.spec.height as u32, fps, 22)
                             .with_profile(H264Profile::Main)
-                            .with_rate_control(rc);
-
-                    let mut seg_pkts = Vec::with_capacity(seg_frames.len());
-                    for (local_i, frame) in seg_frames.iter().enumerate() {
+                            .with_rate_control(rend.rc);
+                    let f_start = (seg_base + sg) * frames_per_seg;
+                    let mut seg_pkts = Vec::with_capacity(frames.len());
+                    for (local_i, frame) in frames.iter().enumerate() {
                         let global_i = (f_start + local_i) as i64;
                         let annex_b = seg_enc.encode_frame(frame)?;
                         let avcc_au = h264_annex_b_to_avcc_au(&annex_b);
@@ -3933,133 +4014,142 @@ pub fn package_abr(
                             },
                         ));
                     }
-                    Ok((seg_idx, seg_pkts, seg_frames.len()))
+                    Ok(seg_pkts)
                 });
-
-            for seg_res in encoded_segs {
-                let (seg_idx, seg_pkts, seg_frame_count) = seg_res?;
-                let seg_num = (seg_idx + 1) as u32;
+            for (&(r, sg), seg_res) in jobs.iter().zip(encoded) {
+                let seg_pkts = seg_res?;
+                let rend = &mut rends[r];
+                let seg_num = (seg_base + sg + 1) as u32;
                 let seg_name = format!("seg_{seg_num:04}.m4s");
-                let seg_path = r_dir.join(&seg_name);
-                let seg_file = File::create(&seg_path)?;
-                r_bytes +=
-                    mux.write_cmaf_media_segment(BufWriter::new(seg_file), seg_num, 1, &seg_pkts)?;
-
-                let actual_seg_dur = (seg_frame_count as f64) / fps_f;
-                m3u8.push_str(&format!("#EXTINF:{actual_seg_dur:.6},\n{seg_name}\n"));
+                let seg_file = File::create(rend.dir.join(&seg_name))?;
+                rend.bytes += rend.mux.write_cmaf_media_segment(
+                    BufWriter::new(seg_file),
+                    seg_num,
+                    1,
+                    &seg_pkts,
+                )?;
+                let actual_seg_dur = (segs[sg].len() as f64) / fps_f;
+                rend.m3u8
+                    .push_str(&format!("#EXTINF:{actual_seg_dur:.6},\n{seg_name}\n"));
             }
+            if opts.generate_thumbnails {
+                let starts: Vec<VideoFrame> = segs.iter().map(|sg| sg[0].clone()).collect();
+                thumbs.extend(parallel_scale_frames(
+                    &starts,
+                    thumb_w,
+                    thumb_h,
+                    ScaleFilter::Lanczos3,
+                    0,
+                )?);
+            }
+            seg_base += segs.len();
+            total_frames += wave.len();
+        }
+
+        let num_segments = seg_base;
+        let total_duration_s = (total_frames as f64) / fps_f;
+        let mut total_bytes = 0u64;
+        let mut rendition_codecs = Vec::with_capacity(rends.len());
+        for rend in rends {
+            let mut m3u8 = rend.m3u8;
             m3u8.push_str("#EXT-X-ENDLIST\n");
-            let playlist_path = r_dir.join("index.m3u8");
-            std::fs::write(&playlist_path, m3u8.as_bytes())?;
-            r_bytes += m3u8.len() as u64;
-            Ok((codecs_tag, r_bytes))
-        });
+            std::fs::write(rend.dir.join("index.m3u8"), m3u8.as_bytes())?;
+            total_bytes += rend.bytes + m3u8.len() as u64;
+            rendition_codecs.push(rend.codecs_tag);
+        }
 
-    for res in rend_results {
-        let (codecs_tag, r_bytes) = res?;
-        rendition_codecs.push(codecs_tag);
-        total_bytes += r_bytes;
-    }
-
-    // 3. Write RFC 8216 HLS `master.m3u8`
-    let mut master_m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    for (r_idx, rend) in ladder.iter().enumerate() {
-        let bw = rend.bitrate_kbps * 1000;
-        let avg_bw = (bw * 9) / 10;
-        let codecs = &rendition_codecs[r_idx];
-        master_m3u8.push_str(&format!(
+        // 3. Write RFC 8216 HLS `master.m3u8`
+        let mut master_m3u8 =
+            String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+        for (r_idx, rend) in ladder.iter().enumerate() {
+            let bw = rend.bitrate_kbps * 1000;
+            let avg_bw = (bw * 9) / 10;
+            let codecs = &rendition_codecs[r_idx];
+            master_m3u8.push_str(&format!(
             "#EXT-X-STREAM-INF:BANDWIDTH={bw},AVERAGE-BANDWIDTH={avg_bw},RESOLUTION={}x{},FRAME-RATE={fps_f:.3},CODECS=\"{codecs}\"\nstream_{r_idx}/index.m3u8\n",
             rend.width, rend.height
         ));
-    }
-    let master_m3u8_path = out_dir.join("master.m3u8");
-    std::fs::write(&master_m3u8_path, master_m3u8.as_bytes())?;
-    total_bytes += master_m3u8.len() as u64;
+        }
+        let master_m3u8_path = out_dir.join("master.m3u8");
+        std::fs::write(&master_m3u8_path, master_m3u8.as_bytes())?;
+        total_bytes += master_m3u8.len() as u64;
 
-    // 4. Write ISO/IEC 23009-1 DASH `manifest.mpd` referencing the exact same CMAF segments
-    let seg_dur_ticks = (frames_per_seg as i64) * frame_dur_ticks;
-    let mut mpd = String::new();
-    mpd.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-    mpd.push_str(&format!(
+        // 4. Write ISO/IEC 23009-1 DASH `manifest.mpd` referencing the exact same CMAF segments
+        let seg_dur_ticks = (frames_per_seg as i64) * frame_dur_ticks;
+        let mut mpd = String::new();
+        mpd.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        mpd.push_str(&format!(
         "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" profiles=\"urn:mpeg:dash:profile:isoff-live:2011,http://dashif.org/guidelines/dash264\" type=\"static\" mediaPresentationDuration=\"PT{total_duration_s:.3}S\" minBufferTime=\"PT{seg_dur_s:.3}S\">\n"
     ));
-    mpd.push_str(&format!(
-        "  <Period id=\"0\" duration=\"PT{total_duration_s:.3}S\">\n"
-    ));
-    mpd.push_str("    <AdaptationSet id=\"0\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\">\n");
-    for (r_idx, rend) in ladder.iter().enumerate() {
-        let bw = rend.bitrate_kbps * 1000;
-        let codecs = &rendition_codecs[r_idx];
         mpd.push_str(&format!(
+            "  <Period id=\"0\" duration=\"PT{total_duration_s:.3}S\">\n"
+        ));
+        mpd.push_str("    <AdaptationSet id=\"0\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\">\n");
+        for (r_idx, rend) in ladder.iter().enumerate() {
+            let bw = rend.bitrate_kbps * 1000;
+            let codecs = &rendition_codecs[r_idx];
+            mpd.push_str(&format!(
             "      <Representation id=\"{r_idx}\" bandwidth=\"{bw}\" width=\"{}\" height=\"{}\" codecs=\"{codecs}\">\n",
             rend.width, rend.height
         ));
-        mpd.push_str(&format!(
+            mpd.push_str(&format!(
             "        <SegmentTemplate timescale=\"90000\" duration=\"{seg_dur_ticks}\" initialization=\"stream_{r_idx}/init.mp4\" media=\"stream_{r_idx}/seg_$Number%04d$.m4s\" startNumber=\"1\"/>\n"
         ));
-        mpd.push_str("      </Representation>\n");
-    }
-    mpd.push_str("    </AdaptationSet>\n  </Period>\n</MPD>\n");
-    let mpd_path = out_dir.join("manifest.mpd");
-    std::fs::write(&mpd_path, mpd.as_bytes())?;
-    total_bytes += mpd.len() as u64;
-
-    // 5. Generate WebVTT trick-play thumbnail track (`thumbnails.vtt` + `sprites.jpg`)
-    let thumbnails_vtt_path = if opts.generate_thumbnails {
-        let thumb_w = 160usize;
-        let thumb_h = 90usize;
-        let cols = 5usize;
-        let mut selected = Vec::with_capacity(num_segments);
-        for seg_idx in 0..num_segments {
-            let f_idx = (seg_idx * frames_per_seg).min(raw_frames.len() - 1);
-            selected.push(raw_frames[f_idx].clone());
+            mpd.push_str("      </Representation>\n");
         }
-        let scaled_thumbs =
-            parallel_scale_frames(&selected, thumb_w, thumb_h, ScaleFilter::Lanczos3, 0)?;
-        let rgb_thumbs: Vec<VideoFrame> = scaled_thumbs
-            .iter()
-            .map(|f| convert_frame(f, PixelFormat::Rgb24, f.colorimetry))
-            .collect();
-        let refs: Vec<&VideoFrame> = rgb_thumbs.iter().collect();
-        let sheet = compose_contact_sheet_rgb24(&refs, cols, 0, [0, 0, 0])?;
-        let sprite_path = out_dir.join("sprites.jpg");
-        let mut jpg_buf = Vec::new();
-        write_jpeg_image(&mut jpg_buf, &sheet, 85)?;
-        std::fs::write(&sprite_path, &jpg_buf)?;
-        total_bytes += jpg_buf.len() as u64;
+        mpd.push_str("    </AdaptationSet>\n  </Period>\n</MPD>\n");
+        let mpd_path = out_dir.join("manifest.mpd");
+        std::fs::write(&mpd_path, mpd.as_bytes())?;
+        total_bytes += mpd.len() as u64;
 
-        let mut vtt = String::from("WEBVTT\n\n");
-        for seg_idx in 0..num_segments {
-            let start_ms = ((seg_idx * frames_per_seg) as f64 * 1000.0 / fps_f).round() as u64;
-            let end_ms = ((((seg_idx + 1) * frames_per_seg).min(raw_frames.len())) as f64 * 1000.0
-                / fps_f)
-                .round() as u64;
-            let r = seg_idx / cols;
-            let c = seg_idx % cols;
-            let x = c * thumb_w;
-            let y = r * thumb_h;
-            let t0_str = ragdoll_format::format_subtitle_timestamp_ms(start_ms as i64, '.');
-            let t1_str = ragdoll_format::format_subtitle_timestamp_ms(end_ms as i64, '.');
-            vtt.push_str(&format!(
-                "{t0_str} --> {t1_str}\nsprites.jpg#xywh={x},{y},{thumb_w},{thumb_h}\n\n"
-            ));
-        }
-        let vtt_path = out_dir.join("thumbnails.vtt");
-        std::fs::write(&vtt_path, vtt.as_bytes())?;
-        total_bytes += vtt.len() as u64;
-        Some(vtt_path)
-    } else {
-        None
-    };
+        // 5. Generate WebVTT trick-play thumbnail track (`thumbnails.vtt` + `sprites.jpg`)
+        let thumbnails_vtt_path = if opts.generate_thumbnails {
+            let cols = 5usize;
+            let rgb_thumbs: Vec<VideoFrame> = thumbs
+                .iter()
+                .map(|f| convert_frame(f, PixelFormat::Rgb24, f.colorimetry))
+                .collect();
+            let refs: Vec<&VideoFrame> = rgb_thumbs.iter().collect();
+            let sheet = compose_contact_sheet_rgb24(&refs, cols, 0, [0, 0, 0])?;
+            let sprite_path = out_dir.join("sprites.jpg");
+            let mut jpg_buf = Vec::new();
+            write_jpeg_image(&mut jpg_buf, &sheet, 85)?;
+            std::fs::write(&sprite_path, &jpg_buf)?;
+            total_bytes += jpg_buf.len() as u64;
 
-    Ok(PackageReport {
-        renditions: ladder.len(),
-        segments_per_rendition: num_segments,
-        master_m3u8_path,
-        mpd_path,
-        thumbnails_vtt_path,
-        total_bytes,
-        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            let mut vtt = String::from("WEBVTT\n\n");
+            for seg_idx in 0..num_segments {
+                let start_ms = ((seg_idx * frames_per_seg) as f64 * 1000.0 / fps_f).round() as u64;
+                let end_ms = ((((seg_idx + 1) * frames_per_seg).min(total_frames)) as f64 * 1000.0
+                    / fps_f)
+                    .round() as u64;
+                let r = seg_idx / cols;
+                let c = seg_idx % cols;
+                let x = c * thumb_w;
+                let y = r * thumb_h;
+                let t0_str = ragdoll_format::format_subtitle_timestamp_ms(start_ms as i64, '.');
+                let t1_str = ragdoll_format::format_subtitle_timestamp_ms(end_ms as i64, '.');
+                vtt.push_str(&format!(
+                    "{t0_str} --> {t1_str}\nsprites.jpg#xywh={x},{y},{thumb_w},{thumb_h}\n\n"
+                ));
+            }
+            let vtt_path = out_dir.join("thumbnails.vtt");
+            std::fs::write(&vtt_path, vtt.as_bytes())?;
+            total_bytes += vtt.len() as u64;
+            Some(vtt_path)
+        } else {
+            None
+        };
+
+        Ok(PackageReport {
+            renditions: ladder.len(),
+            segments_per_rendition: num_segments,
+            master_m3u8_path,
+            mpd_path,
+            thumbnails_vtt_path,
+            total_bytes,
+            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        })
     })
 }
 
