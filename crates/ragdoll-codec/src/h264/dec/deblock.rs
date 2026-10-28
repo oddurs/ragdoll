@@ -70,11 +70,12 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
 
 /// The motion, transform coefficients and intra flags bS derivation (8.7.2.1) reads for one
 /// macroblock and the blocks left of and above it, as `[row + 1][column + 1]` over the 5x5
-/// 4x4 blocks from `(-1, -1)`.
+/// 4x4 blocks from `(-1, -1)`. Motion is only loaded for an inter macroblock.
 struct MbMotion {
     nz: [[bool; 5]; 5],
-    pic: [[[u32; 2]; 5]; 5],
-    mv: [[[[i16; 2]; 2]; 5]; 5],
+    /// `[list][row][column]`.
+    pic: [[[u32; 5]; 5]; 2],
+    mv: [[[[i16; 2]; 5]; 5]; 2],
     /// Intra: this MB, the left MB, the top MB.
     intra: [bool; 3],
     field: bool,
@@ -87,8 +88,8 @@ impl MbMotion {
         let addr = mb_y * st.mb_w + mb_x;
         let mut m = Self {
             nz: [[false; 5]; 5],
-            pic: [[[NO_PIC; 2]; 5]; 5],
-            mv: [[[[0; 2]; 2]; 5]; 5],
+            pic: [[[NO_PIC; 5]; 5]; 2],
+            mv: [[[[0; 2]; 5]; 5]; 2],
             intra: [
                 st.mb_type[addr].is_intra(),
                 mb_x > 0 && st.mb_type[addr - 1].is_intra(),
@@ -97,29 +98,43 @@ impl MbMotion {
             field: matches!(st.structure, Structure::Field(_)),
             uniform: false,
         };
+        if m.intra[0] {
+            return m;
+        }
         let s = st.mb_w * 4;
         let (qx, qy) = (mb_x * 4, mb_y * 4);
-        let put = |m: &mut Self, r: usize, c: usize, i: usize| {
-            m.nz[r][c] = st.nz[i];
-            m.pic[r][c] = [st.ref_pic[0][i], st.ref_pic[1][i]];
-            m.mv[r][c] = [st.mv[0][i], st.mv[1][i]];
+        // Columns 0..5 of a row start one block left of the MB (column 0 unused at the left
+        // edge). Fixed-size copies, so they compile to moves rather than memcpy calls.
+        fn copy<T: Copy, const N: usize>(dst: &mut [T; 5], src: &[T], i: usize) {
+            dst[5 - N..].copy_from_slice(&src[i + 4 - N..i + 4]);
+        }
+        let row = |m: &mut Self, r: usize, i: usize| {
+            if mb_x > 0 {
+                copy::<_, 5>(&mut m.nz[r], &st.nz, i);
+                for l in 0..2 {
+                    copy::<_, 5>(&mut m.pic[l][r], &st.ref_pic[l], i);
+                    copy::<_, 5>(&mut m.mv[l][r], &st.mv[l], i);
+                }
+            } else {
+                copy::<_, 4>(&mut m.nz[r], &st.nz, i);
+                for l in 0..2 {
+                    copy::<_, 4>(&mut m.pic[l][r], &st.ref_pic[l], i);
+                    copy::<_, 4>(&mut m.mv[l][r], &st.mv[l], i);
+                }
+            }
         };
         for r in 0..4 {
-            let row = (qy + r) * s + qx;
-            for c in 0..4 {
-                put(&mut m, r + 1, c + 1, row + c);
-            }
-            if mb_x > 0 {
-                put(&mut m, r + 1, 0, row - 1);
-            }
+            row(&mut m, r + 1, (qy + r) * s + qx);
         }
         if mb_y > 0 {
-            for c in 0..4 {
-                put(&mut m, 0, c + 1, (qy - 1) * s + qx + c);
+            let i = (qy - 1) * s + qx;
+            copy::<_, 4>(&mut m.nz[0], &st.nz, i);
+            for l in 0..2 {
+                copy::<_, 4>(&mut m.pic[l][0], &st.ref_pic[l], i);
+                copy::<_, 4>(&mut m.mv[l][0], &st.mv[l], i);
             }
         }
-        let (p0, v0) = (m.pic[1][1], m.mv[1][1]);
-        m.uniform = (1..5).all(|r| (1..5).all(|c| m.pic[r][c] == p0 && m.mv[r][c] == v0));
+        m.uniform = st.uniform[addr];
         m
     }
 
@@ -150,13 +165,11 @@ impl MbMotion {
             } else if edge > 0 && self.uniform {
                 0
             } else {
-                motion_differs(
-                    self.pic[pr][pc],
-                    self.mv[pr][pc],
-                    self.pic[qr][qc],
-                    self.mv[qr][qc],
-                    ylim,
-                ) as u8
+                let rp = [self.pic[0][pr][pc], self.pic[1][pr][pc]];
+                let rq = [self.pic[0][qr][qc], self.pic[1][qr][qc]];
+                let mp = [self.mv[0][pr][pc], self.mv[1][pr][pc]];
+                let mq = [self.mv[0][qr][qc], self.mv[1][qr][qc]];
+                motion_differs(rp, mp, rq, mq, ylim) as u8
             };
         }
         bs
@@ -177,7 +190,7 @@ fn motion_differs(
     ylim: i32,
 ) -> bool {
     // Identical motion on both sides (the common case inside a partition) never differs.
-    if rp == rq && mp == mq {
+    if rp[0] == rq[0] && rp[1] == rq[1] && mp[0] == mq[0] && mp[1] == mq[1] {
         return false;
     }
     let np = rp.iter().filter(|&&r| r != NO_PIC).count();

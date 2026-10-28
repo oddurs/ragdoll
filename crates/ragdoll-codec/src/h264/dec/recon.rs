@@ -229,15 +229,45 @@ pub fn mc_luma(
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 21];
-    for r in 0..h + 5 {
-        let sy = (iy + r as isize - 2).clamp(0, height as isize - 1) as usize;
+    edge_window(
+        &mut win,
+        src,
+        width,
+        height,
+        ix - 2,
+        iy - 2,
+        cols + 2,
+        h + 5,
+    );
+    h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
+}
+
+/// Copies the `cols`x`rows` window at `(x0, y0)` of a `width`x`height` plane into `win` (stride
+/// [`EMU_STRIDE`]), clamping coordinates to the plane (FFmpeg's `emulated_edge_mc`).
+#[allow(clippy::too_many_arguments)]
+fn edge_window(
+    win: &mut [u8],
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x0: isize,
+    y0: isize,
+    cols: usize,
+    rows: usize,
+) {
+    let inside = x0 >= 0 && x0 as usize + cols <= width;
+    for r in 0..rows {
+        let sy = (y0 + r as isize).clamp(0, height as isize - 1) as usize;
         let row = &src[sy * width..sy * width + width];
-        for c in 0..cols + 2 {
-            let sx = (ix + c as isize - 2).clamp(0, width as isize - 1) as usize;
-            win[r * EMU_STRIDE + c] = row[sx];
+        let out = &mut win[r * EMU_STRIDE..r * EMU_STRIDE + cols];
+        if inside {
+            out.copy_from_slice(&row[x0 as usize..x0 as usize + cols]);
+        } else {
+            for (c, o) in out.iter_mut().enumerate() {
+                *o = row[(x0 + c as isize).clamp(0, width as isize - 1) as usize];
+            }
         }
     }
-    h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
 }
 
 /// Chroma (4:2:0) prediction samples for a `w`x`h` chroma block at chroma pixel `(x, y)`,
@@ -274,14 +304,7 @@ pub fn mc_chroma(
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 9];
-    for r in 0..h + 1 {
-        let sy = (iy + r as isize).clamp(0, height as isize - 1) as usize;
-        let row = &src[sy * width..sy * width + width];
-        for c in 0..cols {
-            let sx = (ix + c as isize).clamp(0, width as isize - 1) as usize;
-            win[r * EMU_STRIDE + c] = row[sx];
-        }
-    }
+    edge_window(&mut win, src, width, height, ix, iy, cols, h + 1);
     h264_chroma_mc(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
 }
 
@@ -295,15 +318,27 @@ pub fn predict_block(
     h: usize,
     used: [bool; 2],
     wt: Weighting,
+    scratch: &mut [[u8; 256]; 2],
     mut predict: impl FnMut(usize, &mut [u8], usize),
 ) {
+    // Weights equal to 2^logWD with zero offsets reduce exactly to default prediction:
+    // ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
+    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
+    let wt = match (used, wt) {
+        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
+            Weighting::Default
+        }
+        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
+        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
+        _ => wt,
+    };
     match (used, wt) {
         ([true, false], Weighting::Default) => predict(0, dst, ds),
         ([false, true], Weighting::Default) => predict(1, dst, ds),
         ([true, true], Weighting::Default) => {
             predict(0, dst, ds);
-            let mut t = [0u8; 256];
-            predict(1, &mut t, 16);
+            let t = &mut scratch[0];
+            predict(1, t, 16);
             for r in 0..h {
                 let d = &mut dst[r * ds..r * ds + w];
                 for (d, &b) in d.iter_mut().zip(&t[r * 16..r * 16 + w]) {
@@ -312,7 +347,7 @@ pub fn predict_block(
             }
         }
         (_, Weighting::Weighted(log_wd, [(w0, o0), (w1, o1)])) => {
-            let mut t = [[0u8; 256]; 2];
+            let t = scratch;
             for list in 0..2 {
                 if used[list] {
                     predict(list, &mut t[list], 16);

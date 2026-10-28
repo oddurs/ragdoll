@@ -102,6 +102,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         field: cx.sh.field_pic,
         implicit,
         implicit_field,
+        scratch: [[0; 256]; 2],
     };
     d.run(first, total)
 }
@@ -182,6 +183,8 @@ struct Dec<'a, 'c> {
     field: bool,
     implicit: Vec<[i32; 2]>,
     implicit_field: [Vec<[i32; 2]>; 2],
+    /// Prediction samples of the second list, or of both for weighted prediction.
+    scratch: [[u8; 256]; 2],
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -527,6 +530,28 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
     /// current MB are available when their bit is set in `done` (by `luma4x4BlkIdx`).
     fn blk(&self, xn: isize, yn: isize, done: u16) -> Option<(usize, usize)> {
+        if !self.st.mbaff {
+            // Without MBAFF the 4x4 block follows from absolute luma coordinates directly.
+            let px = (self.mb.x * 16) as isize + xn;
+            let py = (self.mb.y * 16) as isize + yn;
+            if px < 0
+                || py < 0
+                || px >= (self.st.mb_w * 16) as isize
+                || py >= (self.st.mb_h * 16) as isize
+            {
+                return None;
+            }
+            let (px, py) = (px as usize, py as usize);
+            let a = (py >> 4) * self.st.mb_w + (px >> 4);
+            if a == self.mb.addr {
+                if done & (1 << BLK4_AT[(py & 15) >> 2][(px & 15) >> 2]) == 0 {
+                    return None;
+                }
+            } else if !self.mb_avail(a) {
+                return None;
+            }
+            return Some((a, self.st.b4(px >> 2, py >> 2)));
+        }
         let (a, xw, yw) = self.locate(xn, yn, false)?;
         if a == self.mb.addr {
             if done & (1 << BLK4_AT[yw / 4][xw / 4]) == 0 {
@@ -1447,6 +1472,24 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Motion of the available block covering luma `(xn, yn)` relative to the current MB, in the
     /// current MB's frame/field units (8.4.1.3.2): an MBAFF neighbour of the other kind has its
     /// reference index and vertical vector rescaled.
+    /// [`Self::neighbour`] for both lists, locating the block once.
+    fn neighbour_pair(&self, xn: isize, yn: isize, done: u16) -> [Option<Mv>; 2] {
+        let Some((a, i)) = self.blk(xn, yn, done) else {
+            return [None, None];
+        };
+        [0, 1].map(|list| {
+            let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
+            if r < 0 || !self.st.mbaff {
+                return Some((r, mv));
+            }
+            Some(match (self.field, self.st.mb_field[a]) {
+                (true, false) => (r * 2, [mv[0], mv[1] / 2]),
+                (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
+                _ => (r, mv),
+            })
+        })
+    }
+
     fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Option<Mv> {
         let (a, i) = self.blk(xn, yn, done)?;
         let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
@@ -1478,34 +1521,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let c = self
             .neighbour(list, x + (w * 4) as isize, y - 1, done)
             .or_else(|| self.neighbour(list, x - 1, y - 1, done));
-        match part {
-            Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
-            Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-            Some((Part::P8x16, 0)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-            Some((Part::P8x16, 1)) if c.is_some_and(|n| n.0 == refidx) => return c.unwrap().1,
-            _ => {}
-        }
-        let (a, b, c) = if b.is_none() && c.is_none() && a.is_some() {
-            (a, a, a)
-        } else {
-            (a, b, c)
-        };
-        let un = (-1i8, [0i16; 2]);
-        let (a, b, c) = (a.unwrap_or(un), b.unwrap_or(un), c.unwrap_or(un));
-        let matches = [a.0 == refidx, b.0 == refidx, c.0 == refidx];
-        if matches.iter().filter(|&&m| m).count() == 1 {
-            return if matches[0] {
-                a.1
-            } else if matches[1] {
-                b.1
-            } else {
-                c.1
-            };
-        }
-        [
-            median(a.1[0], b.1[0], c.1[0]),
-            median(a.1[1], b.1[1], c.1[1]),
-        ]
+        mvp_from(a, b, c, refidx, part)
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
@@ -1786,21 +1802,27 @@ impl<'a, 'c> Dec<'a, 'c> {
         let col_short = !self.refs(1)[0].long;
         let inference = self.cx.sps.direct_8x8_inference;
         let spatial = self.cx.sh.direct_spatial;
-        let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
 
         // Spatial: reference indices and predictors from the MB neighbours (8.4.1.2.2).
         let mut sp_ref = [-1i8; 2];
         let mut sp_mv = [[0i16; 2]; 2];
         let mut direct_zero = false;
         if spatial {
-            for list in 0..2 {
-                let a = self.neighbour(list, -1, 0, 0);
-                let b = self.neighbour(list, 0, -1, 0);
-                let c = self
-                    .neighbour(list, 16, -1, 0)
-                    .or_else(|| self.neighbour(list, -1, -1, 0));
+            // Neighbours A, B and C (or D) of the whole MB, as for a 16x16 partition's predictor.
+            let mut nb = [[None; 3]; 2];
+            let a = self.neighbour_pair(-1, 0, 0);
+            let b = self.neighbour_pair(0, -1, 0);
+            let c = self.neighbour_pair(16, -1, 0);
+            // C falls back to D when unavailable; availability is the same for both lists.
+            let c = if c[0].is_none() {
+                self.neighbour_pair(-1, -1, 0)
+            } else {
+                c
+            };
+            for (list, n) in nb.iter_mut().enumerate() {
                 let rr = |n: Option<Mv>| n.map_or(-1, |n| n.0);
-                sp_ref[list] = min_positive(rr(a), min_positive(rr(b), rr(c)));
+                sp_ref[list] = min_positive(rr(a[list]), min_positive(rr(b[list]), rr(c[list])));
+                *n = [a[list], b[list], c[list]];
             }
             if sp_ref[0] < 0 && sp_ref[1] < 0 {
                 sp_ref = [0, 0];
@@ -1808,12 +1830,16 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 for list in 0..2 {
                     if sp_ref[list] >= 0 {
-                        sp_mv[list] = self.mvp(list, 0, 0, 4, sp_ref[list], None, 0);
+                        let [a, b, c] = nb[list];
+                        sp_mv[list] = mvp_from(a, b, c, sp_ref[list], None);
                     }
                 }
             }
         }
 
+        // With 8x8 inference, motion of each 8x8 is collected first so that a macroblock whose
+        // 8x8s agree is stored once.
+        let mut per8: [Option<DirectMotion>; 4] = [None; 4];
         for b8 in 0..4 {
             if mask & (1 << b8) == 0 {
                 continue;
@@ -1823,7 +1849,6 @@ impl<'a, 'c> Dec<'a, 'c> {
             // so the 8x8 is derived once.
             for sub in 0..if inference { 1 } else { 4 } {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
-                let n = if inference { 2 } else { 1 };
                 // Co-located 4x4 block (corner of the 8x8 with direct_8x8_inference).
                 let (cbx, cby) = if inference {
                     ((b8 & 1) * 3, (b8 >> 1) * 3)
@@ -1887,19 +1912,47 @@ impl<'a, 'c> Dec<'a, 'c> {
                     };
                     ([ref0, 0], [mv0, mv1])
                 };
-                for list in 0..2 {
-                    let r = refs[list];
-                    let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
-                    let id = self.ref_id(list, r)?;
-                    self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
-                }
-                for y in by..by + n {
-                    for x in bx..bx + n {
-                        let i = self.st.b4(mx4 + x, my4 + y);
-                        self.st.direct[i] = true;
-                    }
+                if inference {
+                    per8[b8] = Some((refs, mvs));
+                } else {
+                    self.store_direct(bx, by, 1, refs, mvs)?;
                 }
             }
+        }
+        if inference {
+            let first = per8[0];
+            if mask == 0xF && per8.iter().all(|p| *p == first) {
+                let (refs, mvs) = first.expect("all four 8x8s");
+                return self.store_direct(0, 0, 4, refs, mvs);
+            }
+            for (b8, p) in per8.iter().enumerate() {
+                if let Some((refs, mvs)) = *p {
+                    self.store_direct((b8 & 1) * 2, (b8 >> 1) * 2, 2, refs, mvs)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores direct-mode motion for the MB-relative `n`x`n` 4x4 blocks at `(bx, by)`.
+    fn store_direct(
+        &mut self,
+        bx: usize,
+        by: usize,
+        n: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        for list in 0..2 {
+            let r = refs[list];
+            let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
+            let id = self.ref_id(list, r)?;
+            self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
+        }
+        let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
+        for y in by..by + n {
+            let i = self.st.b4(mx4 + bx, my4 + y);
+            self.st.direct[i..i + n].fill(true);
         }
         Ok(())
     }
@@ -2052,6 +2105,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             (by..by + n).all(|y| (bx..bx + n).all(|x| key(s, x, y) == k))
         };
         if same(self.st, 0, 0, 4) {
+            self.st.uniform[self.mb.addr] = true;
             let k = key(self.st, 0, 0);
             return self.mc_rect(0, 0, 4, 4, [k.0, k.2], [k.1, k.3]);
         }
@@ -2112,6 +2166,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             h,
             used,
             wt,
+            &mut self.scratch,
             |list, out, os| {
                 recon::mc_luma(&planes(list)[0], pw, ph, x, y, w, h, mvs[list], out, os)
             },
@@ -2141,6 +2196,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 ch,
                 used,
                 wt,
+                &mut self.scratch,
                 |list, out, os| {
                     recon::mc_chroma(
                         &planes(list)[1 + p],
@@ -2160,6 +2216,47 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 }
+
+/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
+fn mvp_from(
+    a: Option<Mv>,
+    b: Option<Mv>,
+    c: Option<Mv>,
+    refidx: i8,
+    part: Option<(Part, usize)>,
+) -> [i16; 2] {
+    match part {
+        Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
+        Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
+        Some((Part::P8x16, 0)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
+        Some((Part::P8x16, 1)) if c.is_some_and(|n| n.0 == refidx) => return c.unwrap().1,
+        _ => {}
+    }
+    let (a, b, c) = if b.is_none() && c.is_none() && a.is_some() {
+        (a, a, a)
+    } else {
+        (a, b, c)
+    };
+    let un = (-1i8, [0i16; 2]);
+    let (a, b, c) = (a.unwrap_or(un), b.unwrap_or(un), c.unwrap_or(un));
+    let matches = [a.0 == refidx, b.0 == refidx, c.0 == refidx];
+    if matches.iter().filter(|&&m| m).count() == 1 {
+        return if matches[0] {
+            a.1
+        } else if matches[1] {
+            b.1
+        } else {
+            c.1
+        };
+    }
+    [
+        median(a.1[0], b.1[0], c.1[0]),
+        median(a.1[1], b.1[1], c.1[1]),
+    ]
+}
+
+/// Reference indices and vectors of both lists for one direct-mode block.
+type DirectMotion = ([i8; 2], [[i16; 2]; 2]);
 
 fn combine_nc(a: Option<u8>, b: Option<u8>) -> u8 {
     match (a, b) {

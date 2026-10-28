@@ -443,9 +443,10 @@ mod x86 {
 }
 
 /// Horizontal half-sample filter `b` (8.4.2.2.1) for `rows` rows from `s` into `t` (stride 16).
+/// `t` must hold `rows * 16` bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn h_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: usize, rows: usize) {
+unsafe fn h_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
     use std::arch::x86_64::*;
     use x86::*;
     let r16 = _mm256_set1_epi16(16);
@@ -461,7 +462,7 @@ unsafe fn h_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: us
                 load_w16::<W>(p.add(3)),
             );
             let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(v, r16));
-            store::<W>(t.as_mut_ptr().add(r * 16), pack16(v));
+            store::<W>(t.add(r * 16), pack16(v));
         }
     }
 }
@@ -469,7 +470,7 @@ unsafe fn h_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: us
 /// Vertical half-sample filter `h` for `rows` rows from `s` into `t` (stride 16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn v_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: usize, rows: usize) {
+unsafe fn v_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
     use std::arch::x86_64::*;
     use x86::*;
     let r16 = _mm256_set1_epi16(16);
@@ -482,7 +483,7 @@ unsafe fn v_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: us
         for r in 0..rows {
             let f = load_w16::<W>(s.add((r + 3) * ss));
             let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(tap6(a, b, c, d, e, f), r16));
-            store::<W>(t.as_mut_ptr().add(r * 16), pack16(v));
+            store::<W>(t.add(r * 16), pack16(v));
             (a, b, c, d, e) = (b, c, d, e, f);
         }
     }
@@ -491,7 +492,7 @@ unsafe fn v_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: us
 /// Centre half-sample filter `j`: horizontal `i16` intermediates, then the vertical filter in `i32`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn hv_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: usize, rows: usize) {
+unsafe fn hv_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
     use std::arch::x86_64::*;
     use x86::*;
     let mut mid = [_mm256_setzero_si256(); 21];
@@ -528,22 +529,17 @@ unsafe fn hv_lowpass_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: u
         );
         let lo = _mm256_srai_epi32::<10>(_mm256_add_epi32(lo, r512));
         let hi = _mm256_srai_epi32::<10>(_mm256_add_epi32(hi, r512));
-        unsafe {
-            store::<W>(
-                t.as_mut_ptr().add(r * 16),
-                pack16(_mm256_packs_epi32(lo, hi)),
-            )
-        };
+        unsafe { store::<W>(t.add(r * 16), pack16(_mm256_packs_epi32(lo, hi))) };
     }
 }
 
 /// Copies `rows` rows of `W` samples from `s` into `t` (stride 16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn copy_avx2<const W: usize>(t: &mut [u8; 256], s: *const u8, ss: usize, rows: usize) {
+unsafe fn copy_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
     use x86::*;
     for r in 0..rows {
-        unsafe { store::<W>(t.as_mut_ptr().add(r * 16), load::<W>(s.add(r * ss))) };
+        unsafe { store::<W>(t.add(r * 16), load::<W>(s.add(r * ss))) };
     }
 }
 
@@ -564,55 +560,58 @@ unsafe fn luma_avx2_w<const W: usize>(
     use std::arch::x86_64::*;
     use x86::*;
     let s = unsafe { src.as_ptr().add(off) };
-    let mut t0 = [0u8; 256];
-    let mut t1 = [0u8; 256];
+    // Scratch rows are only read after being written, through raw pointers, so they need no
+    // initialisation.
+    let mut b0 = std::mem::MaybeUninit::<[u8; 256]>::uninit();
+    let mut b1 = std::mem::MaybeUninit::<[u8; 256]>::uninit();
+    let (t0, t1) = (b0.as_mut_ptr() as *mut u8, b1.as_mut_ptr() as *mut u8);
     // t0 (and t1 when two samples are averaged) per Table 8-12's sample positions.
     let two = unsafe {
         match (mx, my) {
             (0, 0) => {
-                copy_avx2::<W>(&mut t0, s, ss, h);
+                copy_avx2::<W>(t0, s, ss, h);
                 false
             }
             (_, 0) => {
-                h_lowpass_avx2::<W>(&mut t0, s, ss, h);
+                h_lowpass_avx2::<W>(t0, s, ss, h);
                 if mx != 2 {
-                    copy_avx2::<W>(&mut t1, s.add((mx == 3) as usize), ss, h);
+                    copy_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
                 }
                 mx != 2
             }
             (0, _) => {
-                v_lowpass_avx2::<W>(&mut t0, s, ss, h);
+                v_lowpass_avx2::<W>(t0, s, ss, h);
                 if my != 2 {
-                    copy_avx2::<W>(&mut t1, s.add((my == 3) as usize * ss), ss, h);
+                    copy_avx2::<W>(t1, s.add((my == 3) as usize * ss), ss, h);
                 }
                 my != 2
             }
             (2, 2) => {
-                hv_lowpass_avx2::<W>(&mut t0, s, ss, h);
+                hv_lowpass_avx2::<W>(t0, s, ss, h);
                 false
             }
             (2, _) => {
-                hv_lowpass_avx2::<W>(&mut t0, s, ss, h);
-                h_lowpass_avx2::<W>(&mut t1, s.add((my == 3) as usize * ss), ss, h);
+                hv_lowpass_avx2::<W>(t0, s, ss, h);
+                h_lowpass_avx2::<W>(t1, s.add((my == 3) as usize * ss), ss, h);
                 true
             }
             (_, 2) => {
-                hv_lowpass_avx2::<W>(&mut t0, s, ss, h);
-                v_lowpass_avx2::<W>(&mut t1, s.add((mx == 3) as usize), ss, h);
+                hv_lowpass_avx2::<W>(t0, s, ss, h);
+                v_lowpass_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
                 true
             }
             _ => {
-                h_lowpass_avx2::<W>(&mut t0, s.add((my == 3) as usize * ss), ss, h);
-                v_lowpass_avx2::<W>(&mut t1, s.add((mx == 3) as usize), ss, h);
+                h_lowpass_avx2::<W>(t0, s.add((my == 3) as usize * ss), ss, h);
+                v_lowpass_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
                 true
             }
         }
     };
     for r in 0..h {
         unsafe {
-            let mut v = load::<W>(t0.as_ptr().add(r * 16));
+            let mut v = load::<W>(t0.add(r * 16));
             if two {
-                v = _mm_avg_epu8(v, load::<W>(t1.as_ptr().add(r * 16)));
+                v = _mm_avg_epu8(v, load::<W>(t1.add(r * 16)));
             }
             let d = dst.as_mut_ptr().add(r * ds);
             match w {
@@ -688,36 +687,84 @@ unsafe fn weight_avx2(
     round: i32,
 ) {
     use std::arch::x86_64::*;
-    // madd pairs (a, b) with (w0, w1); for uni-prediction (a, 0).
-    let weights = _mm_set1_epi32((wt[1] << 16) | (wt[0] & 0xffff));
-    let rnd = _mm_set1_epi32(round);
+    // madd pairs (a, b) with (w0, w1); for uni-prediction (a, 0). 16 samples per step: whole
+    // rows of 16, two rows of 8, or four rows of 4 (or 2).
+    let weights = _mm256_set1_epi32((wt[1] << 16) | (wt[0] & 0xffff));
+    let rnd = _mm256_set1_epi32(round);
     let sh = _mm_cvtsi32_si128(shift as i32);
-    let zero = _mm_setzero_si128();
-    for r in 0..h {
-        let mut c = 0;
-        while c < w {
-            unsafe {
-                let pa = _mm_loadl_epi64(a.as_ptr().add(r * s + c) as *const __m128i);
-                let pb = match b {
-                    Some(b) => _mm_loadl_epi64(b.as_ptr().add(r * s + c) as *const __m128i),
-                    None => zero,
-                };
-                let ab = _mm_unpacklo_epi8(pa, pb);
-                let lo = _mm_madd_epi16(_mm_unpacklo_epi8(ab, zero), weights);
-                let hi = _mm_madd_epi16(_mm_unpackhi_epi8(ab, zero), weights);
-                let lo = _mm_sra_epi32(_mm_add_epi32(lo, rnd), sh);
-                let hi = _mm_sra_epi32(_mm_add_epi32(hi, rnd), sh);
-                let v = _mm_packs_epi32(lo, hi);
-                let v = _mm_packus_epi16(v, v);
-                let d = dst.as_mut_ptr().add(r * ds + c);
-                match w - c {
-                    8.. => _mm_storel_epi64(d as *mut __m128i, v),
-                    4 => (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
-                    _ => (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16),
+    let weigh = |pa: __m128i, pb: __m128i| -> __m128i {
+        let (a, b) = (_mm256_cvtepu8_epi16(pa), _mm256_cvtepu8_epi16(pb));
+        let lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), weights);
+        let hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), weights);
+        let lo = _mm256_sra_epi32(_mm256_add_epi32(lo, rnd), sh);
+        let hi = _mm256_sra_epi32(_mm256_add_epi32(hi, rnd), sh);
+        let v = _mm256_packs_epi32(lo, hi);
+        let v = _mm256_packus_epi16(v, v);
+        _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(v))
+    };
+    let pa = a.as_ptr();
+    let pb = b.map(|b| b.as_ptr());
+    let d = dst.as_mut_ptr();
+    let rows = match w {
+        16 => 1,
+        8 => 2,
+        _ => 4,
+    };
+    // Loads 16 samples of `p` from rows `r..r + n` (`n <= rows`), `16 / rows` from each.
+    let gather = |p: *const u8, r: usize, n: usize| -> __m128i {
+        unsafe {
+            match rows {
+                1 => _mm_loadu_si128(p.add(r * s) as *const __m128i),
+                2 => _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(p.add(r * s) as *const __m128i),
+                    _mm_loadl_epi64(p.add((r + 1) * s) as *const __m128i),
+                ),
+                _ => {
+                    let row = |k: usize| {
+                        if k < n {
+                            (p.add((r + k) * s) as *const i32).read_unaligned()
+                        } else {
+                            0
+                        }
+                    };
+                    _mm_setr_epi32(row(0), row(1), row(2), row(3))
                 }
             }
-            c += 8;
         }
+    };
+    let mut r = 0;
+    while r < h {
+        let n = rows.min(h - r);
+        let va = gather(pa, r, n);
+        let vb = match pb {
+            Some(pb) => gather(pb, r, n),
+            None => _mm_setzero_si128(),
+        };
+        let v = weigh(va, vb);
+        unsafe {
+            match (w, n) {
+                (16, _) => _mm_storeu_si128(d.add(r * ds) as *mut __m128i, v),
+                (8, _) => {
+                    _mm_storel_epi64(d.add(r * ds) as *mut __m128i, v);
+                    _mm_storel_epi64(
+                        d.add((r + 1) * ds) as *mut __m128i,
+                        _mm_unpackhi_epi64(v, v),
+                    );
+                }
+                _ => {
+                    let lanes: [i32; 4] = std::mem::transmute(v);
+                    for (k, &l) in lanes.iter().enumerate().take(n) {
+                        let p = d.add((r + k) * ds);
+                        if w == 4 {
+                            (p as *mut i32).write_unaligned(l);
+                        } else {
+                            (p as *mut u16).write_unaligned(l as u16);
+                        }
+                    }
+                }
+            }
+        }
+        r += n;
     }
 }
 
@@ -1049,7 +1096,19 @@ mod tests {
             (1, 3, 5, -7),
         ];
         for &(log_wd, w0, w1, off) in &cases {
-            for &(w, h) in &[(16, 16), (8, 4), (4, 8), (2, 2), (16, 8)] {
+            for &(w, h) in &[
+                (16, 16),
+                (8, 4),
+                (4, 8),
+                (2, 2),
+                (16, 8),
+                (8, 16),
+                (8, 2),
+                (4, 2),
+                (2, 4),
+                (4, 4),
+                (2, 8),
+            ] {
                 let mut x = vec![0x11u8; 21 * 16];
                 let mut y = x.clone();
                 h264_weight_bi(&mut x, 21, &a, &b, 16, w, h, log_wd, w0, w1, off);

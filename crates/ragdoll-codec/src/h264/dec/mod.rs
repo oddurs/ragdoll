@@ -623,24 +623,20 @@ fn make_output(
 ) -> VideoFrame {
     let (x0, y0, w, h) = sps.crop_rect();
     let (x0, y0, w, h) = (x0 as usize, y0 as usize, w as usize, h as usize);
-    let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
     let pw = store.width;
-    for y in 0..h {
-        let src = &store.planes[0][(y0 + y) * pw + x0..(y0 + y) * pw + x0 + w];
-        f.plane_mut(0).row_mut(y)[..w].copy_from_slice(src);
-    }
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    for c in 0..2 {
-        for y in 0..ch {
-            let row = f.plane_mut(1 + c).row_mut(y);
-            if sps.chroma_array_type() == 0 {
-                row[..cw].fill(128);
-            } else {
-                let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
-                row[..cw].copy_from_slice(&store.planes[1 + c][o..o + cw]);
-            }
+    let cw = w.div_ceil(2);
+    let grey = vec![128u8; if sps.chroma_array_type() == 0 { cw } else { 0 }];
+    let mut f = VideoFrame::from_rows(w, h, PixelFormat::Yuv420p, |p, y| {
+        if p == 0 {
+            let o = (y0 + y) * pw + x0;
+            &store.planes[0][o..o + w]
+        } else if sps.chroma_array_type() == 0 {
+            &grey
+        } else {
+            let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
+            &store.planes[p][o..o + cw]
         }
-    }
+    });
     f.colorimetry = sps.colorimetry;
     f.keyframe = idr;
     f.pict_type = pict_type;

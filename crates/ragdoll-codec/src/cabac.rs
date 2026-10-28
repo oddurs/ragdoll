@@ -891,10 +891,14 @@ impl Default for CabacEncoder {
 /// ITU-T H.264 9.3.1.2 & 9.3.3.2 CABAC Binary Arithmetic Decoder (`M`-Coder).
 #[derive(Clone, Debug)]
 pub struct CabacDecoder<'a> {
-    pub data: &'a [u8],
-    pub bit_pos: usize,
-    pub range: u32,
-    pub offset: u32,
+    data: &'a [u8],
+    /// Next byte of `data` not yet in `cache`.
+    pos: usize,
+    /// The stream's next bits, most significant first; the top `bits` of them are valid.
+    cache: u64,
+    bits: u32,
+    range: u32,
+    offset: u32,
 }
 
 impl<'a> CabacDecoder<'a> {
@@ -903,37 +907,67 @@ impl<'a> CabacDecoder<'a> {
         if data.len() < 2 {
             return Err(RagdollError::BitstreamEndOfData);
         }
-        let offset = ((data[0] as u32) << 1) | ((data[1] as u32) >> 7);
-        Ok(Self {
+        let mut d = Self {
             data,
-            bit_pos: 9,
+            pos: 0,
+            cache: 0,
+            bits: 0,
             range: 510,
-            offset,
-        })
+            offset: 0,
+        };
+        d.offset = d.take(9);
+        Ok(d)
     }
 
+    /// Tops `cache` up to at least 57 valid bits; past the end of `data` the stream reads as zeros.
     #[inline(always)]
-    fn read_bit(&mut self) -> u32 {
-        let byte_idx = self.bit_pos >> 3;
-        let shift = 7 - (self.bit_pos & 7);
-        self.bit_pos += 1;
-        if byte_idx < self.data.len() {
-            ((self.data[byte_idx] >> shift) & 1) as u32
+    fn refill(&mut self) {
+        if let Some(b) = self.data.get(self.pos..self.pos + 8) {
+            // Bits below the valid ones are the stream's own, so OR-ing them again later is harmless.
+            let v = u64::from_be_bytes(b.try_into().expect("8 bytes"));
+            self.cache |= v >> self.bits;
+            let n = (63 - self.bits) >> 3;
+            self.pos += n as usize;
+            self.bits += n * 8;
         } else {
-            0
+            while self.bits <= 56 {
+                let b = self.data.get(self.pos).copied().unwrap_or(0) as u64;
+                self.cache |= b << (56 - self.bits);
+                self.bits += 8;
+                self.pos += 1;
+            }
         }
+    }
+
+    /// The next `n` (`1..=32`) bits of the stream.
+    #[inline(always)]
+    fn take(&mut self, n: u32) -> u32 {
+        if self.bits < n {
+            self.refill();
+        }
+        let v = (self.cache >> (64 - n)) as u32;
+        self.cache <<= n;
+        self.bits -= n;
+        v
+    }
+
+    /// Bit position in `data` of the next unread bit.
+    fn bit_pos(&self) -> usize {
+        self.pos * 8 - self.bits as usize
     }
 
     #[inline(always)]
     fn renormalize(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.read_bit();
+        if self.range < 256 {
+            // One shift brings range back to 256..=511 (it is at least 2 here).
+            let n = self.range.leading_zeros() - 23;
+            self.range <<= n;
+            self.offset = (self.offset << n) | self.take(n);
         }
     }
 
     /// Decodes a single binary decision (`0` or `1`) using `ctx` (ITU-T H.264 9.3.3.2.1).
-    #[inline]
+    #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut CabacContext) -> u8 {
         let q_idx = ((self.range >> 6) & 3) as usize;
         let st = (ctx.state & 63) as usize;
@@ -959,9 +993,9 @@ impl<'a> CabacDecoder<'a> {
     }
 
     /// Decodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
-    #[inline]
+    #[inline(always)]
     pub fn decode_bypass(&mut self) -> u8 {
-        self.offset = (self.offset << 1) | self.read_bit();
+        self.offset = (self.offset << 1) | self.take(1);
         if self.offset >= self.range {
             self.offset -= self.range;
             1
@@ -1002,17 +1036,17 @@ impl<'a> CabacDecoder<'a> {
         // The encoder's flush after the terminating bin writes exactly as many bits as the
         // decoder has read (its 9-bit initial window plus one per renormalisation shift), so the
         // PCM alignment bits start at the next unread bit.
-        let pcm_start = self.bit_pos.div_ceil(8);
+        let pcm_start = self.bit_pos().div_ceil(8);
         let pcm_end = pcm_start + dst.len();
         if pcm_end > self.data.len() {
             return Err(RagdollError::BitstreamEndOfData);
         }
         dst.copy_from_slice(&self.data[pcm_start..pcm_end]);
-        let b0 = self.data.get(pcm_end).copied().unwrap_or(0) as u32;
-        let b1 = self.data.get(pcm_end + 1).copied().unwrap_or(0) as u32;
+        self.pos = pcm_end;
+        self.cache = 0;
+        self.bits = 0;
         self.range = 510;
-        self.offset = (b0 << 1) | (b1 >> 7);
-        self.bit_pos = pcm_end * 8 + 9;
+        self.offset = self.take(9);
         Ok(())
     }
 

@@ -240,6 +240,8 @@ pub struct PicState {
     pub ref_idx: [Vec<i8>; 2],
     pub ref_pic: [Vec<u32>; 2],
     pub direct: Vec<bool>,
+    /// Per macroblock: inter prediction used one motion for all 16 blocks.
+    pub uniform: Vec<bool>,
     /// Per 4x4 chroma block of each plane: total_coeff of the AC block.
     pub nnz_c: [Vec<u8>; 2],
     /// The buffers were reused from an earlier picture: each macroblock's state is restored by
@@ -279,6 +281,7 @@ impl PicState {
             ref_idx: [vec![-1; b4], vec![-1; b4]],
             ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
             direct: vec![false; b4],
+            uniform: vec![false; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
         }
@@ -315,6 +318,7 @@ impl PicState {
         self.t8x8[addr] = false;
         self.chroma_pred_mode[addr] = 0;
         self.cbf_dc[addr] = 0;
+        self.uniform[addr] = false;
         let (x, y) = (addr % self.mb_w, addr / self.mb_w);
         for r in 0..4 {
             let i = self.b4(x * 4, y * 4 + r);
