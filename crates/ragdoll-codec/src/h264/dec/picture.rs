@@ -69,6 +69,19 @@ impl Motion {
     }
 }
 
+/// Sets the `W`x`h` rectangle of `v` whose rows start at `i`, `i + stride`, ... to `val`, with
+/// one bounds check (`h >= 1`).
+#[inline(always)]
+pub fn fill_rect<T: Copy, const W: usize>(v: &mut [T], i: usize, stride: usize, h: usize, val: T) {
+    let s = &mut v[i..i + (h - 1) * stride + W];
+    for r in 0..h {
+        s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+    }
+}
+
+/// [`PicState::motion_edges`] of a macroblock with unknown motion: every inner edge.
+pub const ANY_INNER_EDGE: u8 = 0xEE;
+
 pub const NO_PIC: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,8 +253,9 @@ pub struct PicState {
     pub ref_idx: [Vec<i8>; 2],
     pub ref_pic: [Vec<u32>; 2],
     pub direct: Vec<bool>,
-    /// Per macroblock: inter prediction used one motion for all 16 blocks.
-    pub uniform: Vec<bool>,
+    /// Per macroblock: the inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which
+    /// motion may differ; `0` when inter prediction used one motion for all 16 blocks.
+    pub motion_edges: Vec<u8>,
     /// Per 4x4 chroma block of each plane: total_coeff of the AC block.
     pub nnz_c: [Vec<u8>; 2],
     /// The buffers were reused from an earlier picture: each macroblock's state is restored by
@@ -281,7 +295,7 @@ impl PicState {
             ref_idx: [vec![-1; b4], vec![-1; b4]],
             ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
             direct: vec![false; b4],
-            uniform: vec![false; mbs],
+            motion_edges: vec![ANY_INNER_EDGE; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
         }
@@ -318,29 +332,22 @@ impl PicState {
         self.t8x8[addr] = false;
         self.chroma_pred_mode[addr] = 0;
         self.cbf_dc[addr] = 0;
-        self.uniform[addr] = false;
+        self.motion_edges[addr] = ANY_INNER_EDGE;
         let (x, y) = (addr % self.mb_w, addr / self.mb_w);
-        // One bounds check per array: the macroblock's rows lie in `[i, i + 3w + 4)`.
-        fn rows<T: Copy, const N: usize>(v: &mut [T], i: usize, w: usize, val: T) {
-            let s = &mut v[i..i + (N - 1) * w + N];
-            for r in 0..N {
-                s[r * w..r * w + N].copy_from_slice(&[val; N]);
-            }
-        }
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
-        rows::<_, 4>(&mut self.nnz, i, w, 0);
-        rows::<_, 4>(&mut self.nz, i, w, false);
-        rows::<_, 4>(&mut self.intra_mode, i, w, -1);
-        rows::<_, 4>(&mut self.direct, i, w, false);
+        fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
+        fill_rect::<_, 4>(&mut self.nz, i, w, 4, false);
+        fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
+        fill_rect::<_, 4>(&mut self.direct, i, w, 4, false);
         for l in 0..2 {
-            rows::<_, 4>(&mut self.mv[l], i, w, [0; 2]);
-            rows::<_, 4>(&mut self.mvd[l], i, w, [0; 2]);
-            rows::<_, 4>(&mut self.ref_idx[l], i, w, -1);
-            rows::<_, 4>(&mut self.ref_pic[l], i, w, NO_PIC);
+            fill_rect::<_, 4>(&mut self.mv[l], i, w, 4, [0; 2]);
+            fill_rect::<_, 4>(&mut self.mvd[l], i, w, 4, [0; 2]);
+            fill_rect::<_, 4>(&mut self.ref_idx[l], i, w, 4, -1);
+            fill_rect::<_, 4>(&mut self.ref_pic[l], i, w, 4, NO_PIC);
         }
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
-            rows::<_, 2>(c, i, self.mb_w * 2, 0);
+            fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);
         }
     }
 

@@ -13,7 +13,7 @@ use crate::h264::decode_cavlc_block;
 
 use super::cabac_se;
 use super::intra::{self, Edges};
-use super::picture::{MbType, Motion, NO_PIC, PicState, Structure};
+use super::picture::{MbType, Motion, NO_PIC, PicState, Structure, fill_rect};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
@@ -1512,35 +1512,33 @@ impl<'a, 'c> Dec<'a, 'c> {
         mvd: [u8; 2],
     ) {
         // Fixed-size stores per width: a slice fill of a few elements becomes a memset call.
-        fn put<T: Copy, const N: usize>(dst: &mut [T], i: usize, v: T) {
-            dst[i..i + N].copy_from_slice(&[v; N]);
-        }
-        fn row<const N: usize>(
+        #[allow(clippy::too_many_arguments)]
+        fn rect<const N: usize>(
             st: &mut PicState,
             list: usize,
             i: usize,
+            h: usize,
             m: Mv,
             pic: u32,
             mvd: [u8; 2],
         ) {
-            put::<_, N>(&mut st.ref_idx[list], i, m.0);
-            put::<_, N>(&mut st.mv[list], i, m.1);
-            put::<_, N>(&mut st.ref_pic[list], i, pic);
+            let s = st.mb_w * 4;
+            fill_rect::<_, N>(&mut st.ref_idx[list], i, s, h, m.0);
+            fill_rect::<_, N>(&mut st.mv[list], i, s, h, m.1);
+            fill_rect::<_, N>(&mut st.ref_pic[list], i, s, h, pic);
             // A macroblock's mvd entries start at zero and each partition is written once, so
             // zero (every skipped and direct block) needs no store.
             if mvd != [0, 0] {
-                put::<_, N>(&mut st.mvd[list], i, mvd);
+                fill_rect::<_, N>(&mut st.mvd[list], i, s, h, mvd);
             }
         }
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
-        for y in by..by + h {
-            let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + y);
-            match w {
-                1 => row::<1>(self.st, list, i, m, pic, mvd),
-                2 => row::<2>(self.st, list, i, m, pic, mvd),
-                3 => row::<3>(self.st, list, i, m, pic, mvd),
-                _ => row::<4>(self.st, list, i, m, pic, mvd),
-            }
+        let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+        match w {
+            1 => rect::<1>(self.st, list, i, h, m, pic, mvd),
+            2 => rect::<2>(self.st, list, i, h, m, pic, mvd),
+            3 => rect::<3>(self.st, list, i, h, m, pic, mvd),
+            _ => rect::<4>(self.st, list, i, h, m, pic, mvd),
         }
     }
 
@@ -1600,13 +1598,59 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
-        let a = self.neighbour(0, -1, 0, 0);
-        let b = self.neighbour(0, 0, -1, 0);
+        let [a, b, c] = self.mb_neighbours()[0];
         match (a, b) {
             (None, _) | (_, None) => [0, 0],
             (Some((0, [0, 0])), _) | (_, Some((0, [0, 0]))) => [0, 0],
-            _ => self.mvp(0, 0, 0, 4, 0, None, 0),
+            _ => mvp_from(a, b, c, 0, None),
         }
+    }
+
+    /// Neighbours A, B and C (D where C is unavailable) of the whole macroblock in both lists,
+    /// as for a 16x16 partition's predictor (8.4.1.3.2).
+    fn mb_neighbours(&self) -> [[Option<Mv>; 3]; 2] {
+        if self.st.mbaff {
+            let a = self.neighbour_pair(-1, 0, 0);
+            let b = self.neighbour_pair(0, -1, 0);
+            let c = self.neighbour_pair(16, -1, 0);
+            // C falls back to D when unavailable; availability is the same for both lists.
+            let c = if c[0].is_none() {
+                self.neighbour_pair(-1, -1, 0)
+            } else {
+                c
+            };
+            return [[a[0], b[0], c[0]], [a[1], b[1], c[1]]];
+        }
+        // Without MBAFF the neighbours are the adjacent macroblocks' corner blocks.
+        let (x, y, w, addr) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
+        let i = self.st.b4(x * 4, y * 4);
+        let s = w * 4;
+        let st = &*self.st;
+        let at = |i: usize| [0, 1].map(|l| Some((st.ref_idx[l][i], st.mv[l][i])));
+        let none = [None, None];
+        let a = if x > 0 && self.mb_avail(addr - 1) {
+            at(i - 1)
+        } else {
+            none
+        };
+        let (b, c) = if y > 0 {
+            let b = if self.mb_avail(addr - w) {
+                at(i - s)
+            } else {
+                none
+            };
+            let c = if x + 1 < w && self.mb_avail(addr - w + 1) {
+                at(i - s + 4)
+            } else if x > 0 && self.mb_avail(addr - w - 1) {
+                at(i - s - 1)
+            } else {
+                none
+            };
+            (b, c)
+        } else {
+            (none, none)
+        };
+        [[a[0], b[0], c[0]], [a[1], b[1], c[1]]]
     }
 
     fn read_ref_idx(&mut self, list: usize, bx: usize, by: usize) -> Result<i8> {
@@ -1884,20 +1928,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         let mut direct_zero = false;
         if spatial {
             // Neighbours A, B and C (or D) of the whole MB, as for a 16x16 partition's predictor.
-            let mut nb = [[None; 3]; 2];
-            let a = self.neighbour_pair(-1, 0, 0);
-            let b = self.neighbour_pair(0, -1, 0);
-            let c = self.neighbour_pair(16, -1, 0);
-            // C falls back to D when unavailable; availability is the same for both lists.
-            let c = if c[0].is_none() {
-                self.neighbour_pair(-1, -1, 0)
-            } else {
-                c
-            };
-            for (list, n) in nb.iter_mut().enumerate() {
+            let nb = self.mb_neighbours();
+            for (list, &[a, b, c]) in nb.iter().enumerate() {
                 let rr = |n: Option<Mv>| n.map_or(-1, |n| n.0);
-                sp_ref[list] = min_positive(rr(a[list]), min_positive(rr(b[list]), rr(c[list])));
-                *n = [a[list], b[list], c[list]];
+                sp_ref[list] = min_positive(rr(a), min_positive(rr(b), rr(c)));
             }
             if sp_ref[0] < 0 && sp_ref[1] < 0 {
                 sp_ref = [0, 0];
@@ -1915,6 +1949,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         // With 8x8 inference, motion of each 8x8 is collected first so that a macroblock whose
         // 8x8s agree is stored once.
         let mut per8: [Option<DirectMotion>; 4] = [None; 4];
+        let mut col_mb = None;
         for b8 in 0..4 {
             if mask & (1 << b8) == 0 {
                 continue;
@@ -1935,7 +1970,9 @@ impl<'a, 'c> Dec<'a, 'c> {
                     if spatial && (direct_zero || (sp_ref[0] != 0 && sp_ref[1] != 0)) {
                         (-1, [0, 0], NO_PIC, 0)
                     } else {
-                        self.colocated(cbx, cby)
+                        col_mb
+                            .get_or_insert_with(|| self.colocated_mb())
+                            .block(cbx, cby)
                     };
                 let (refs, mvs) = if spatial {
                     let col_zero = col_short
@@ -2030,21 +2067,26 @@ impl<'a, 'c> Dec<'a, 'c> {
             let id = self.ref_id(list, r)?;
             self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
         }
-        let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
-        for y in by..by + n {
-            let i = self.st.b4(mx4 + bx, my4 + y);
-            self.st.direct[i..i + n].fill(true);
+        let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+        let s = self.st.mb_w * 4;
+        match n {
+            4 => fill_rect::<_, 4>(&mut self.st.direct, i, s, 4, true),
+            2 => fill_rect::<_, 2>(&mut self.st.direct, i, s, 2, true),
+            _ => fill_rect::<_, 1>(&mut self.st.direct, i, s, 1, true),
         }
         Ok(())
     }
 
-    /// Co-located block for direct prediction (8.4.1.2.1): `(refIdxCol, mvCol, referenced picture id,
-    /// vertical scale)` where the scale is `1` for field-to-frame, `-1` for frame-to-field, else `0`.
-    /// `(cbx, cby)` is the MB-relative 4x4 block, after the 8x8-inference corner selection.
-    fn colocated(&self, cbx: usize, cby: usize) -> (i8, [i16; 2], u32, i32) {
+    /// The co-located macroblock of direct prediction (8.4.1.2.1), for [`ColMb::block`].
+    fn colocated_mb(&self) -> ColMb<'c> {
         let col = &self.refs(1)[0];
-        let Some(m) = &col.motion else {
-            return (-1, [0, 0], NO_PIC, 0);
+        let Some(m) = col.motion.as_deref() else {
+            return ColMb {
+                m: None,
+                mb_w: 0,
+                mbx: 0,
+                layout: ColLayout::Same(0),
+            };
         };
         let mb_w = self.st.mb_w;
         let mbx = self.mb.x;
@@ -2055,17 +2097,17 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             (self.st.structure, self.mb.y)
         };
-        let (row, by, vscale) = match structure {
+        let layout = match structure {
             Structure::Frame => {
                 let row = cur_row;
-                if m.mb_field[row * mb_w + mbx] {
+                if m.mb_field.get(row * mb_w + mbx).copied().unwrap_or(false) {
                     let cur = self.cx.cur_poc;
                     let cp = usize::from(
                         (col.field_poc[0] - cur).abs() >= (col.field_poc[1] - cur).abs(),
                     );
-                    ((row & !1) + cp, 2 * (row % 2) + cby / 2, 1)
+                    ColLayout::FrameFromField((row & !1) + cp, 2 * (row % 2))
                 } else {
-                    (row, cby, 0)
+                    ColLayout::Same(row)
                 }
             }
             Structure::Field(cur_parity) => {
@@ -2076,20 +2118,23 @@ impl<'a, 'c> Dec<'a, 'c> {
                     col.parity.unwrap_or(0) as usize
                 };
                 let r = cur_row;
-                if m.mb_field[(2 * r + cp) * mb_w + mbx] {
-                    (2 * r + cp, cby, 0)
+                if m.mb_field
+                    .get((2 * r + cp) * mb_w + mbx)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    ColLayout::Same(2 * r + cp)
                 } else {
-                    (2 * r + cby / 2, 2 * (cby % 2), -1)
+                    ColLayout::FieldFromFrame(2 * r)
                 }
             }
         };
-        let mb = row * mb_w + mbx;
-        if mb >= m.mb_intra.len() || m.mb_intra[mb] {
-            return (-1, [0, 0], NO_PIC, vscale);
+        ColMb {
+            m: Some(m),
+            mb_w,
+            mbx,
+            layout,
         }
-        let i = (row * 4 + by) * mb_w * 4 + mbx * 4 + cbx;
-        let l = if m.ref_idx[0][i] >= 0 { 0 } else { 1 };
-        (m.ref_idx[l][i], m.mv[l][i], m.ref_pic[l][i], vscale)
     }
 
     /// Coded block pattern, optional transform_size_8x8_flag, residual and reconstruction of an inter MB.
@@ -2189,13 +2234,31 @@ impl<'a, 'c> Dec<'a, 'c> {
         // Motion stored only for the whole MB (the other list left at its reset value) is one
         // motion without comparing.
         if !self.partial_motion || same(self.st, 0, 0, 4) {
-            self.st.uniform[self.mb.addr] = true;
+            self.st.motion_edges[self.mb.addr] = 0;
             let k = key(self.st, 0, 0);
             return self.mc_rect(0, 0, 4, 4, [k.0, k.2], [k.1, k.3]);
         }
-        for b8 in 0..4 {
+        let uni: [bool; 4] =
+            std::array::from_fn(|b8| same(self.st, (b8 & 1) * 2, (b8 >> 1) * 2, 2));
+        let k8 = |b8: usize| key(self.st, (b8 & 1) * 2, (b8 >> 1) * 2);
+        // Inner edges of each 8x8, then the edges between 8x8s that are uniform and agree.
+        let mut m = 0u8;
+        for (bit, a, b) in [(1, 0, 2), (3, 1, 3), (5, 0, 1), (7, 2, 3)] {
+            if !uni[a] || !uni[b] {
+                m |= 1 << bit;
+            }
+        }
+        let all = uni.iter().all(|&u| u);
+        if !(all && k8(0) == k8(1) && k8(2) == k8(3)) {
+            m |= 1 << 2;
+        }
+        if !(all && k8(0) == k8(2) && k8(1) == k8(3)) {
+            m |= 1 << 6;
+        }
+        self.st.motion_edges[self.mb.addr] = m;
+        for (b8, &uniform) in uni.iter().enumerate() {
             let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-            if same(self.st, bx, by, 2) {
+            if uniform {
                 let k = key(self.st, bx, by);
                 self.mc_rect(bx, by, 2, 2, [k.0, k.2], [k.1, k.3])?;
             } else {
@@ -2302,6 +2365,49 @@ impl<'a, 'c> Dec<'a, 'c> {
 }
 
 /// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
+/// Where the co-located 4x4 blocks of the current macroblock lie in `RefPicList1[0]`'s motion
+/// (8.4.1.2.1, Table 8-8).
+#[derive(Clone, Copy)]
+enum ColLayout {
+    /// Frame from frame, or field from field: MB row `.0`, block rows as they are.
+    Same(usize),
+    /// A frame MB from a field MB pair: MB row `.0`, block rows `.1 + cby / 2`.
+    FrameFromField(usize, usize),
+    /// A field MB from frame MBs: MB rows `.0 + cby / 2`, block rows `2 * (cby % 2)`.
+    FieldFromFrame(usize),
+}
+
+/// The co-located macroblock of the current one; `m` is `None` without stored motion.
+#[derive(Clone, Copy)]
+struct ColMb<'r> {
+    m: Option<&'r Motion>,
+    mb_w: usize,
+    mbx: usize,
+    layout: ColLayout,
+}
+
+impl ColMb<'_> {
+    /// `(refIdxCol, mvCol, referenced picture id, vertical scale)` of MB-relative 4x4 block
+    /// `(cbx, cby)`; the scale is `1` for field-to-frame, `-1` for frame-to-field, else `0`.
+    fn block(&self, cbx: usize, cby: usize) -> (i8, [i16; 2], u32, i32) {
+        let Some(m) = self.m else {
+            return (-1, [0, 0], NO_PIC, 0);
+        };
+        let (row, by, vscale) = match self.layout {
+            ColLayout::Same(row) => (row, cby, 0),
+            ColLayout::FrameFromField(row, half) => (row, half + cby / 2, 1),
+            ColLayout::FieldFromFrame(r2) => (r2 + cby / 2, 2 * (cby % 2), -1),
+        };
+        let mb = row * self.mb_w + self.mbx;
+        if mb >= m.mb_intra.len() || m.mb_intra[mb] {
+            return (-1, [0, 0], NO_PIC, vscale);
+        }
+        let i = (row * 4 + by) * self.mb_w * 4 + self.mbx * 4 + cbx;
+        let l = if m.ref_idx[0][i] >= 0 { 0 } else { 1 };
+        (m.ref_idx[l][i], m.mv[l][i], m.ref_pic[l][i], vscale)
+    }
+}
+
 fn mvp_from(
     a: Option<Mv>,
     b: Option<Mv>,

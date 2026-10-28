@@ -39,7 +39,7 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
             let t8 = st.t8x8[addr];
             let local = EdgeCtx::new(st, mb_x, mb_y);
             // An inter MB with one motion and no luma coefficients has bS 0 on every inner edge.
-            let no_inner = !local.intra[0] && st.uniform[addr] && st.cbp[addr] & 0xF == 0;
+            let no_inner = !local.intra[0] && st.motion_edges[addr] == 0 && st.cbp[addr] & 0xF == 0;
             for dir in 0..2 {
                 let filter_mb_edge = if dir == 0 { left } else { top };
                 for edge in 0..4 {
@@ -82,7 +82,8 @@ struct EdgeCtx {
     /// Intra: this MB, the left MB, the top MB.
     intra: [bool; 3],
     field: bool,
-    uniform: bool,
+    /// [`PicState::motion_edges`] of this MB.
+    motion_edges: u8,
 }
 
 impl EdgeCtx {
@@ -98,7 +99,7 @@ impl EdgeCtx {
                 mb_y > 0 && st.mb_type[addr - st.mb_w].is_intra(),
             ],
             field: matches!(st.structure, Structure::Field(_)),
-            uniform: st.uniform[addr],
+            motion_edges: st.motion_edges[addr],
         }
     }
 
@@ -126,7 +127,7 @@ impl EdgeCtx {
             let pi = qi - step;
             *slot = if st.nz[pi] || st.nz[qi] {
                 2
-            } else if edge > 0 && self.uniform {
+            } else if edge > 0 && self.motion_edges & (1 << (4 * dir + edge)) == 0 {
                 0
             } else {
                 let rp = [st.ref_pic[0][pi], st.ref_pic[1][pi]];
