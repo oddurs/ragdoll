@@ -3,7 +3,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_chroma_mc, h264_luma_mc, h264_weight_bi, h264_weight_uni, luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_luma_mc, h264_weight_bi, h264_weight_uni,
+    luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -339,12 +340,7 @@ pub fn predict_block(
             predict(0, dst, ds);
             let t = &mut scratch[0];
             predict(1, t, 16);
-            for r in 0..h {
-                let d = &mut dst[r * ds..r * ds + w];
-                for (d, &b) in d.iter_mut().zip(&t[r * 16..r * 16 + w]) {
-                    *d = ((*d as u16 + b as u16 + 1) >> 1) as u8;
-                }
-            }
+            h264_avg(dst, ds, t, 16, w, h);
         }
         (_, Weighting::Weighted(log_wd, [(w0, o0), (w1, o1)])) => {
             let t = scratch;

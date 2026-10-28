@@ -220,6 +220,99 @@ pub fn h264_chroma_mc_scalar(
     }
 }
 
+/// Default bi-prediction (8.4.2.3.1): `dst = (dst + src + 1) >> 1` over `w`x`h` samples.
+///
+/// # Panics
+/// If a buffer is too short for `h` rows of `w` samples.
+#[inline]
+pub fn h264_avg(dst: &mut [u8], ds: usize, src: &[u8], ss: usize, w: usize, h: usize) {
+    assert!(matches!(w, 2 | 4 | 8 | 16) && h > 0);
+    assert!((h - 1) * ds + w <= dst.len() && (h - 1) * ss + w <= src.len());
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe { avg_avx2(dst, ds, src, ss, w, h) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe { avg_neon(dst, ds, src, ss, w, h) };
+        return;
+    }
+    h264_avg_scalar(dst, ds, src, ss, w, h);
+}
+
+/// Scalar reference for [`h264_avg`].
+pub fn h264_avg_scalar(dst: &mut [u8], ds: usize, src: &[u8], ss: usize, w: usize, h: usize) {
+    for r in 0..h {
+        for c in 0..w {
+            dst[r * ds + c] = avg(dst[r * ds + c], src[r * ss + c]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avg_avx2(dst: &mut [u8], ds: usize, src: &[u8], ss: usize, w: usize, h: usize) {
+    use std::arch::x86_64::*;
+    let (d, s) = (dst.as_mut_ptr(), src.as_ptr());
+    for r in 0..h {
+        unsafe {
+            let (d, s) = (d.add(r * ds), s.add(r * ss));
+            match w {
+                16 => {
+                    let v = _mm_avg_epu8(
+                        _mm_loadu_si128(d as *const __m128i),
+                        _mm_loadu_si128(s as *const __m128i),
+                    );
+                    _mm_storeu_si128(d as *mut __m128i, v);
+                }
+                8 => {
+                    let v = _mm_avg_epu8(
+                        _mm_loadl_epi64(d as *const __m128i),
+                        _mm_loadl_epi64(s as *const __m128i),
+                    );
+                    _mm_storel_epi64(d as *mut __m128i, v);
+                }
+                4 => {
+                    let v = _mm_avg_epu8(
+                        _mm_cvtsi32_si128((d as *const i32).read_unaligned()),
+                        _mm_cvtsi32_si128((s as *const i32).read_unaligned()),
+                    );
+                    (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v));
+                }
+                _ => {
+                    for c in 0..w {
+                        *d.add(c) = avg(*d.add(c), *s.add(c));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn avg_neon(dst: &mut [u8], ds: usize, src: &[u8], ss: usize, w: usize, h: usize) {
+    use std::arch::aarch64::*;
+    let (d, s) = (dst.as_mut_ptr(), src.as_ptr());
+    for r in 0..h {
+        unsafe {
+            let (d, s) = (d.add(r * ds), s.add(r * ss));
+            match w {
+                16 => vst1q_u8(d, vrhaddq_u8(vld1q_u8(d), vld1q_u8(s))),
+                8 => vst1_u8(d, vrhadd_u8(vld1_u8(d), vld1_u8(s))),
+                _ => {
+                    for c in 0..w {
+                        *d.add(c) = avg(*d.add(c), *s.add(c));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Weighted bi-prediction (8.4.2.3.2) of `w`x`h` samples from `a` and `b` (sharing stride `s`):
 /// `clip(((a * w0 + b * w1 + 2^log_wd) >> (log_wd + 1)) + off)`, where `off` is the already
 /// rounded `(o0 + o1 + 1) >> 1`.
@@ -443,10 +536,16 @@ mod x86 {
 }
 
 /// Horizontal half-sample filter `b` (8.4.2.2.1) for `rows` rows from `s` into `t` (stride 16).
-/// `t` must hold `rows * 16` bytes.
+/// Row `r` goes to `t + r * ts`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn h_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
+unsafe fn h_lowpass_avx2<const W: usize>(
+    t: *mut u8,
+    ts: usize,
+    s: *const u8,
+    ss: usize,
+    rows: usize,
+) {
     use std::arch::x86_64::*;
     use x86::*;
     let r16 = _mm256_set1_epi16(16);
@@ -462,7 +561,7 @@ unsafe fn h_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, ro
                 load_w16::<W>(p.add(3)),
             );
             let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(v, r16));
-            store::<W>(t.add(r * 16), pack16(v));
+            store::<W>(t.add(r * ts), pack16(v));
         }
     }
 }
@@ -470,7 +569,13 @@ unsafe fn h_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, ro
 /// Vertical half-sample filter `h` for `rows` rows from `s` into `t` (stride 16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn v_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
+unsafe fn v_lowpass_avx2<const W: usize>(
+    t: *mut u8,
+    ts: usize,
+    s: *const u8,
+    ss: usize,
+    rows: usize,
+) {
     use std::arch::x86_64::*;
     use x86::*;
     let r16 = _mm256_set1_epi16(16);
@@ -483,7 +588,7 @@ unsafe fn v_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, ro
         for r in 0..rows {
             let f = load_w16::<W>(s.add((r + 3) * ss));
             let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(tap6(a, b, c, d, e, f), r16));
-            store::<W>(t.add(r * 16), pack16(v));
+            store::<W>(t.add(r * ts), pack16(v));
             (a, b, c, d, e) = (b, c, d, e, f);
         }
     }
@@ -492,7 +597,13 @@ unsafe fn v_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, ro
 /// Centre half-sample filter `j`: horizontal `i16` intermediates, then the vertical filter in `i32`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn hv_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
+unsafe fn hv_lowpass_avx2<const W: usize>(
+    t: *mut u8,
+    ts: usize,
+    s: *const u8,
+    ss: usize,
+    rows: usize,
+) {
     use std::arch::x86_64::*;
     use x86::*;
     let mut mid = [_mm256_setzero_si256(); 21];
@@ -529,17 +640,17 @@ unsafe fn hv_lowpass_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, r
         );
         let lo = _mm256_srai_epi32::<10>(_mm256_add_epi32(lo, r512));
         let hi = _mm256_srai_epi32::<10>(_mm256_add_epi32(hi, r512));
-        unsafe { store::<W>(t.add(r * 16), pack16(_mm256_packs_epi32(lo, hi))) };
+        unsafe { store::<W>(t.add(r * ts), pack16(_mm256_packs_epi32(lo, hi))) };
     }
 }
 
 /// Copies `rows` rows of `W` samples from `s` into `t` (stride 16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn copy_avx2<const W: usize>(t: *mut u8, s: *const u8, ss: usize, rows: usize) {
+unsafe fn copy_avx2<const W: usize>(t: *mut u8, ts: usize, s: *const u8, ss: usize, rows: usize) {
     use x86::*;
     for r in 0..rows {
-        unsafe { store::<W>(t.add(r * 16), load::<W>(s.add(r * ss))) };
+        unsafe { store::<W>(t.add(r * ts), load::<W>(s.add(r * ss))) };
     }
 }
 
@@ -565,48 +676,58 @@ unsafe fn luma_avx2_w<const W: usize>(
     let mut b0 = std::mem::MaybeUninit::<[u8; 256]>::uninit();
     let mut b1 = std::mem::MaybeUninit::<[u8; 256]>::uninit();
     let (t0, t1) = (b0.as_mut_ptr() as *mut u8, b1.as_mut_ptr() as *mut u8);
-    // t0 (and t1 when two samples are averaged) per Table 8-12's sample positions.
+    // A phase that is one filter's output is written straight to `dst` when the block is as
+    // wide as the vectors; otherwise t0 (and t1 when two samples are averaged) per Table 8-12.
+    let direct = w == W && matches!((mx, my), (0, 0) | (2, 0) | (0, 2) | (2, 2));
+    let (o, os) = if direct {
+        (dst.as_mut_ptr(), ds)
+    } else {
+        (t0, 16)
+    };
     let two = unsafe {
         match (mx, my) {
             (0, 0) => {
-                copy_avx2::<W>(t0, s, ss, h);
+                copy_avx2::<W>(o, os, s, ss, h);
                 false
             }
             (_, 0) => {
-                h_lowpass_avx2::<W>(t0, s, ss, h);
+                h_lowpass_avx2::<W>(o, os, s, ss, h);
                 if mx != 2 {
-                    copy_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
+                    copy_avx2::<W>(t1, 16, s.add((mx == 3) as usize), ss, h);
                 }
                 mx != 2
             }
             (0, _) => {
-                v_lowpass_avx2::<W>(t0, s, ss, h);
+                v_lowpass_avx2::<W>(o, os, s, ss, h);
                 if my != 2 {
-                    copy_avx2::<W>(t1, s.add((my == 3) as usize * ss), ss, h);
+                    copy_avx2::<W>(t1, 16, s.add((my == 3) as usize * ss), ss, h);
                 }
                 my != 2
             }
             (2, 2) => {
-                hv_lowpass_avx2::<W>(t0, s, ss, h);
+                hv_lowpass_avx2::<W>(o, os, s, ss, h);
                 false
             }
             (2, _) => {
-                hv_lowpass_avx2::<W>(t0, s, ss, h);
-                h_lowpass_avx2::<W>(t1, s.add((my == 3) as usize * ss), ss, h);
+                hv_lowpass_avx2::<W>(t0, 16, s, ss, h);
+                h_lowpass_avx2::<W>(t1, 16, s.add((my == 3) as usize * ss), ss, h);
                 true
             }
             (_, 2) => {
-                hv_lowpass_avx2::<W>(t0, s, ss, h);
-                v_lowpass_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
+                hv_lowpass_avx2::<W>(t0, 16, s, ss, h);
+                v_lowpass_avx2::<W>(t1, 16, s.add((mx == 3) as usize), ss, h);
                 true
             }
             _ => {
-                h_lowpass_avx2::<W>(t0, s.add((my == 3) as usize * ss), ss, h);
-                v_lowpass_avx2::<W>(t1, s.add((mx == 3) as usize), ss, h);
+                h_lowpass_avx2::<W>(t0, 16, s.add((my == 3) as usize * ss), ss, h);
+                v_lowpass_avx2::<W>(t1, 16, s.add((mx == 3) as usize), ss, h);
                 true
             }
         }
     };
+    if direct {
+        return;
+    }
     for r in 0..h {
         unsafe {
             let mut v = load::<W>(t0.add(r * 16));
@@ -639,33 +760,62 @@ unsafe fn chroma_avx2(
 ) {
     use std::arch::x86_64::*;
     let (fx, fy) = (fx as i16, fy as i16);
-    // maddubs pairs (s[c], s[c + 1]) with weights (A, B) for the upper row and (C, D) for the lower.
-    let ab = _mm_set1_epi16(((fx * (8 - fy)) << 8) | ((8 - fx) * (8 - fy)));
-    let cd = _mm_set1_epi16(((fx * fy) << 8) | ((8 - fx) * fy));
     let r32 = _mm_set1_epi16(32);
     let s = unsafe { src.as_ptr().add(off) };
-    let row = |r: usize| unsafe {
-        let p = s.add(r * ss);
-        _mm_unpacklo_epi8(
-            _mm_loadl_epi64(p as *const __m128i),
-            _mm_loadl_epi64(p.add(1) as *const __m128i),
-        )
+    let mut store = |r: usize, v: __m128i| unsafe {
+        let d = dst.as_mut_ptr().add(r * ds);
+        match w {
+            8 => _mm_storel_epi64(d as *mut __m128i, v),
+            4 => (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
+            _ => (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16),
+        }
     };
-    let mut top = row(0);
-    for r in 0..h {
-        let bot = row(r + 1);
-        let v = _mm_add_epi16(_mm_maddubs_epi16(top, ab), _mm_maddubs_epi16(bot, cd));
+    let ld = |r: usize, c: usize| unsafe { _mm_loadl_epi64(s.add(r * ss + c) as *const __m128i) };
+    let round = |v: __m128i| {
         let v = _mm_srli_epi16::<6>(_mm_add_epi16(v, r32));
-        let v = _mm_packus_epi16(v, v);
-        unsafe {
-            let d = dst.as_mut_ptr().add(r * ds);
-            match w {
-                8 => _mm_storel_epi64(d as *mut __m128i, v),
-                4 => (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
-                _ => (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16),
+        _mm_packus_epi16(v, v)
+    };
+    match (fx, fy) {
+        // Whole-sample position: (64 * a + 32) >> 6 = a.
+        (0, 0) => {
+            for r in 0..h {
+                store(r, ld(r, 0));
             }
         }
-        top = bot;
+        // One-dimensional cases (8.4.2.2.2 with B = D = 0 or C = D = 0): one maddubs per row
+        // over (a, b) pairs, horizontally or vertically.
+        (_, 0) => {
+            let ab = _mm_set1_epi16((fx << 11) | ((8 - fx) << 3));
+            for r in 0..h {
+                store(
+                    r,
+                    round(_mm_maddubs_epi16(_mm_unpacklo_epi8(ld(r, 0), ld(r, 1)), ab)),
+                );
+            }
+        }
+        (0, _) => {
+            let ac = _mm_set1_epi16((fy << 11) | ((8 - fy) << 3));
+            let mut top = ld(0, 0);
+            for r in 0..h {
+                let bot = ld(r + 1, 0);
+                store(r, round(_mm_maddubs_epi16(_mm_unpacklo_epi8(top, bot), ac)));
+                top = bot;
+            }
+        }
+        _ => {
+            // maddubs pairs (s[c], s[c + 1]) with weights (A, B) for the upper row and (C, D)
+            // for the lower.
+            let ab = _mm_set1_epi16(((fx * (8 - fy)) << 8) | ((8 - fx) * (8 - fy)));
+            let cd = _mm_set1_epi16(((fx * fy) << 8) | ((8 - fx) * fy));
+            let row = |r: usize| _mm_unpacklo_epi8(ld(r, 0), ld(r, 1));
+            let mut top = row(0);
+            for r in 0..h {
+                let bot = row(r + 1);
+                let v = _mm_add_epi16(_mm_maddubs_epi16(top, ab), _mm_maddubs_epi16(bot, cd));
+                store(r, round(v));
+                top = bot;
+            }
+        }
     }
 }
 
@@ -1080,6 +1230,28 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn avg_matches_scalar() {
+        let a = plane(16, 16, 21);
+        let b = plane(16, 16, 22);
+        for &(w, h) in &[
+            (16, 16),
+            (16, 8),
+            (8, 8),
+            (8, 4),
+            (4, 4),
+            (4, 2),
+            (2, 2),
+            (2, 4),
+        ] {
+            let mut x = a.clone();
+            let mut y = a.clone();
+            h264_avg(&mut x, 16, &b, 16, w, h);
+            h264_avg_scalar(&mut y, 16, &b, 16, w, h);
+            assert_eq!(x, y, "{w}x{h}");
         }
     }
 

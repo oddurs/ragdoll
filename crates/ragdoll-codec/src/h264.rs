@@ -2309,15 +2309,22 @@ pub fn decode_cavlc_block(
     let tbl = nc_to_table_idx(nc);
 
     // Match coeff_token prefix
+    let tables = cavlc_tables();
     let (total_coeff, trailing_ones) = if is_chroma_dc {
-        match_vlc_pair(
-            r,
-            &CHROMA_DC_COEFF_TOKEN_LEN,
-            &CHROMA_DC_COEFF_TOKEN_BITS,
-            20,
-        )?
+        match tables.chroma_dc_coeff_token.decode(r, 20) {
+            Some(i) => (i / 4, i % 4),
+            None => match_vlc_pair(
+                r,
+                &CHROMA_DC_COEFF_TOKEN_LEN,
+                &CHROMA_DC_COEFF_TOKEN_BITS,
+                20,
+            )?,
+        }
     } else {
-        match_vlc_pair(r, &COEFF_TOKEN_LEN[tbl], &COEFF_TOKEN_BITS[tbl], 68)?
+        match tables.coeff_token[tbl].decode(r, 68) {
+            Some(i) => (i / 4, i % 4),
+            None => match_vlc_pair(r, &COEFF_TOKEN_LEN[tbl], &COEFF_TOKEN_BITS[tbl], 68)?,
+        }
     };
 
     if total_coeff == 0 {
@@ -2390,19 +2397,27 @@ pub fn decode_cavlc_block(
     let mut zeros_left = if total_coeff == max_coeff {
         0usize
     } else if is_chroma_dc {
-        match_vlc_index(
-            r,
-            &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1],
-            &CHROMA_DC_TOTAL_ZEROS_BITS[total_coeff - 1],
-            max_coeff - total_coeff + 1,
-        )?
+        let count = max_coeff - total_coeff + 1;
+        match tables.chroma_dc_total_zeros[total_coeff - 1].decode(r, count) {
+            Some(z) => z,
+            None => match_vlc_index(
+                r,
+                &CHROMA_DC_TOTAL_ZEROS_LEN[total_coeff - 1],
+                &CHROMA_DC_TOTAL_ZEROS_BITS[total_coeff - 1],
+                count,
+            )?,
+        }
     } else {
-        match_vlc_index(
-            r,
-            &TOTAL_ZEROS_LEN[total_coeff - 1],
-            &TOTAL_ZEROS_BITS[total_coeff - 1],
-            max_coeff - total_coeff + 1,
-        )?
+        let count = max_coeff - total_coeff + 1;
+        match tables.total_zeros[total_coeff - 1].decode(r, count) {
+            Some(z) => z,
+            None => match_vlc_index(
+                r,
+                &TOTAL_ZEROS_LEN[total_coeff - 1],
+                &TOTAL_ZEROS_BITS[total_coeff - 1],
+                count,
+            )?,
+        }
     };
 
     let mut pos = total_coeff + zeros_left - 1;
@@ -2415,7 +2430,10 @@ pub fn decode_cavlc_block(
     for lv in levels.iter().copied().take(total_coeff).skip(1) {
         let run_before = if zeros_left > 0 {
             let vlc_idx = (zeros_left - 1).min(6);
-            match_vlc_index(r, &RUN_LEN[vlc_idx], &RUN_BITS[vlc_idx], zeros_left + 1)?
+            match tables.run[vlc_idx].decode(r, zeros_left + 1) {
+                Some(run) => run,
+                None => match_vlc_index(r, &RUN_LEN[vlc_idx], &RUN_BITS[vlc_idx], zeros_left + 1)?,
+            }
         } else {
             0
         };
@@ -2428,6 +2446,124 @@ pub fn decode_cavlc_block(
     }
 
     Ok(total_coeff)
+}
+
+/// A CAVLC code table (`lens[i]`/`bits[i]` per symbol `i`) as two-level lookup tables: 8 bits,
+/// then a subtable for longer codes.
+struct VlcTable {
+    max_len: u32,
+    /// `(len << 16) | symbol` for a code of up to 8 bits, `SUB | offset` for a subtable, 0 for
+    /// no code.
+    l1: [u32; 256],
+    l2: Vec<u32>,
+}
+
+const VLC_SUB: u32 = 1 << 31;
+
+impl VlcTable {
+    fn new(lens: &[u8], bits: &[u8]) -> Self {
+        let max_len = lens.iter().copied().max().unwrap_or(0).max(1) as u32;
+        let mut t = Self {
+            max_len,
+            l1: [0; 256],
+            l2: Vec::new(),
+        };
+        let sub_bits = max_len.saturating_sub(8);
+        for (sym, (&l, &b)) in lens.iter().zip(bits).enumerate() {
+            let (l, code) = (l as u32, b as u32);
+            if l == 0 {
+                continue;
+            }
+            let entry = (l << 16) | sym as u32;
+            if l <= 8 {
+                // Every 8-bit prefix starting with the code; the first symbol wins, as in a scan.
+                let first = (code << (8 - l)) as usize;
+                for slot in &mut t.l1[first..first + (1 << (8 - l))] {
+                    if *slot == 0 {
+                        *slot = entry;
+                    }
+                }
+            } else {
+                let top = (code >> (l - 8)) as usize;
+                if t.l1[top] & VLC_SUB == 0 {
+                    if t.l1[top] != 0 {
+                        continue; // shadowed by a shorter code
+                    }
+                    t.l1[top] = VLC_SUB | t.l2.len() as u32;
+                    t.l2.resize(t.l2.len() + (1 << sub_bits), 0);
+                }
+                let base = (t.l1[top] & !VLC_SUB) as usize;
+                let rest = code & ((1 << (l - 8)) - 1);
+                let first = (rest << (sub_bits - (l - 8))) as usize;
+                for slot in &mut t.l2[base + first..base + first + (1 << (sub_bits - (l - 8)))] {
+                    if *slot == 0 {
+                        *slot = entry;
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// The symbol of the next code if it is below `count`, consuming the code; `None` (nothing
+    /// consumed) when the stream has fewer than `max_len` bits left or holds no such code.
+    #[inline]
+    fn decode(&self, r: &mut BitReader<'_>, count: usize) -> Option<usize> {
+        let peek = r.peek_bits(self.max_len).ok()? as u32;
+        let e = if self.max_len <= 8 {
+            self.l1[(peek << (8 - self.max_len)) as usize]
+        } else {
+            let e = self.l1[(peek >> (self.max_len - 8)) as usize];
+            if e & VLC_SUB != 0 {
+                let sub = peek & ((1 << (self.max_len - 8)) - 1);
+                self.l2[(e & !VLC_SUB) as usize + sub as usize]
+            } else {
+                e
+            }
+        };
+        let sym = (e & 0xffff) as usize;
+        if e == 0 || sym >= count {
+            return None;
+        }
+        r.consume_buffered(e >> 16);
+        Some(sym)
+    }
+}
+
+/// Lookup tables for the CAVLC codes, built on first use.
+struct CavlcTables {
+    coeff_token: [VlcTable; 4],
+    chroma_dc_coeff_token: VlcTable,
+    total_zeros: Vec<VlcTable>,
+    chroma_dc_total_zeros: Vec<VlcTable>,
+    run: Vec<VlcTable>,
+}
+
+fn cavlc_tables() -> &'static CavlcTables {
+    static TABLES: std::sync::OnceLock<CavlcTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| CavlcTables {
+        coeff_token: std::array::from_fn(|t| {
+            VlcTable::new(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
+        }),
+        chroma_dc_coeff_token: VlcTable::new(
+            &CHROMA_DC_COEFF_TOKEN_LEN,
+            &CHROMA_DC_COEFF_TOKEN_BITS,
+        ),
+        total_zeros: (0..15)
+            .map(|i| VlcTable::new(&TOTAL_ZEROS_LEN[i], &TOTAL_ZEROS_BITS[i]))
+            .collect(),
+        chroma_dc_total_zeros: (0..3)
+            .map(|i| {
+                VlcTable::new(
+                    &CHROMA_DC_TOTAL_ZEROS_LEN[i],
+                    &CHROMA_DC_TOTAL_ZEROS_BITS[i],
+                )
+            })
+            .collect(),
+        run: (0..7)
+            .map(|i| VlcTable::new(&RUN_LEN[i], &RUN_BITS[i]))
+            .collect(),
+    })
 }
 
 fn match_vlc_pair(
@@ -5029,6 +5165,52 @@ pub fn roundtrip_block4x4_dct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cavlc_lookup_tables_match_the_linear_scan() {
+        let t = cavlc_tables();
+        let mut tables: Vec<(&VlcTable, &[u8], &[u8])> = Vec::new();
+        for k in 0..4 {
+            tables.push((&t.coeff_token[k], &COEFF_TOKEN_LEN[k], &COEFF_TOKEN_BITS[k]));
+        }
+        tables.push((
+            &t.chroma_dc_coeff_token,
+            &CHROMA_DC_COEFF_TOKEN_LEN,
+            &CHROMA_DC_COEFF_TOKEN_BITS,
+        ));
+        for k in 0..15 {
+            tables.push((&t.total_zeros[k], &TOTAL_ZEROS_LEN[k], &TOTAL_ZEROS_BITS[k]));
+        }
+        for k in 0..3 {
+            tables.push((
+                &t.chroma_dc_total_zeros[k],
+                &CHROMA_DC_TOTAL_ZEROS_LEN[k],
+                &CHROMA_DC_TOTAL_ZEROS_BITS[k],
+            ));
+        }
+        for k in 0..7 {
+            tables.push((&t.run[k], &RUN_LEN[k], &RUN_BITS[k]));
+        }
+        let mut x = 0x2545_f491_u32;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // Bias towards leading zeros so long codes occur.
+            let bytes = (x >> (x % 9)).to_be_bytes();
+            for &(table, lens, bits) in &tables {
+                for count in [lens.len(), lens.len() / 2 + 1, 1] {
+                    let (mut a, mut b) = (BitReader::new(&bytes), BitReader::new(&bytes));
+                    let fast = table.decode(&mut a, count);
+                    let slow = match_vlc_index(&mut b, lens, bits, count).ok();
+                    if let Some(sym) = fast {
+                        assert_eq!(Some(sym), slow, "{bytes:?} count {count}");
+                        assert_eq!(a.read_bits(8).ok(), b.read_bits(8).ok());
+                    }
+                }
+            }
+        }
+    }
 
     /// Moving diagonal gradient plus a drifting block, so P-frames carry real motion and residuals.
     fn moving_frame(w: usize, h: usize, t: usize) -> VideoFrame {
