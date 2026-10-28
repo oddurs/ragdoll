@@ -385,12 +385,22 @@ fn parse_pred_weight_table(
                 luma: (1 << luma_log2, 0),
                 chroma: [(1 << chroma_log2, 0); 2],
             };
+            // Weights and offsets are 8-bit signed (7.4.3.2).
+            let pair = |r: &mut BitReader| -> Result<(i32, i32)> {
+                let (w, o) = (r.read_se()?, r.read_se()?);
+                if !(-128..=127).contains(&w) || !(-128..=127).contains(&o) {
+                    return Err(RagdollError::InvalidSyntax(
+                        "H.264 prediction weight or offset out of range",
+                    ));
+                }
+                Ok((w as i32, o as i32))
+            };
             if r.read_bit()? {
-                e.luma = (r.read_se()? as i32, r.read_se()? as i32);
+                e.luma = pair(r)?;
             }
             if has_chroma && r.read_bit()? {
                 for c in &mut e.chroma {
-                    *c = (r.read_se()? as i32, r.read_se()? as i32);
+                    *c = pair(r)?;
                 }
             }
             entries.push(e);

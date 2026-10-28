@@ -109,6 +109,14 @@ fn mv_far(a: [i16; 2], b: [i16; 2], ylim: i32) -> bool {
 
 /// Whether two inter blocks predict from different pictures or with vectors 4 or more quarter samples apart.
 fn motion_differs(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
+    // Identical motion on both sides (the common case inside a partition) never differs.
+    if st.ref_pic[0][p] == st.ref_pic[0][q]
+        && st.ref_pic[1][p] == st.ref_pic[1][q]
+        && st.mv[0][p] == st.mv[0][q]
+        && st.mv[1][p] == st.mv[1][q]
+    {
+        return false;
+    }
     let rp = [st.ref_pic[0][p], st.ref_pic[1][p]];
     let rq = [st.ref_pic[0][q], st.ref_pic[1][q]];
     let mp = [st.mv[0][p], st.mv[1][p]];

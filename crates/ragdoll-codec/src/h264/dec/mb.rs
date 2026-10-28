@@ -374,10 +374,11 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// Reference list `list` as seen by the current macroblock.
-    fn refs(&self, list: usize) -> &[RefPic] {
-        match &self.cx.field_refs {
+    fn refs(&self, list: usize) -> &'c [RefPic] {
+        let cx = self.cx;
+        match &cx.field_refs {
             Some(f) if self.field => &f[self.mb.y & 1][list],
-            _ => &self.cx.refs[list],
+            _ => &cx.refs[list],
         }
     }
 
@@ -763,7 +764,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 CBP_ME_420.get(code)
             };
-            let (i, p) = *entry.ok_or(bad("H.264 coded_block_pattern out of range"))?;
+            let (i, p) = *entry.ok_or_else(|| bad("H.264 coded_block_pattern out of range"))?;
             return Ok(if intra { i } else { p });
         }
         // Luma: condTermFlagN = 1 when the neighbouring 8x8 block has its CBP bit clear (skip counts as clear).
@@ -1371,7 +1372,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.refs(list)
             .get(idx as usize)
             .map(|r| r.id)
-            .ok_or(bad("H.264 ref_idx beyond the reference list"))
+            .ok_or_else(|| bad("H.264 ref_idx beyond the reference list"))
     }
 
     /// Writes motion for the MB-relative 4x4 rectangle `(bx, by, w, h)` of one list.
@@ -1773,8 +1774,11 @@ impl<'a, 'c> Dec<'a, 'c> {
                 continue;
             }
             let (bx8, by8) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-            for sub in 0..4 {
+            // With direct_8x8_inference the four 4x4 blocks share the corner co-located block,
+            // so the 8x8 is derived once.
+            for sub in 0..if inference { 1 } else { 4 } {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
+                let n = if inference { 2 } else { 1 };
                 // Co-located 4x4 block (corner of the 8x8 with direct_8x8_inference).
                 let (cbx, cby) = if inference {
                     ((b8 & 1) * 3, (b8 >> 1) * 3)
@@ -1842,10 +1846,14 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let r = refs[list];
                     let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
                     let id = self.ref_id(list, r)?;
-                    self.fill_motion(bx, by, 1, 1, list, (r, mv), id, [0, 0]);
+                    self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
                 }
-                let i = self.st.b4(mx4 + bx, my4 + by);
-                self.st.direct[i] = true;
+                for y in by..by + n {
+                    for x in bx..bx + n {
+                        let i = self.st.b4(mx4 + x, my4 + y);
+                        self.st.direct[i] = true;
+                    }
+                }
             }
         }
         Ok(())
@@ -2035,44 +2043,34 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             (self.st.width, self.st.height)
         };
-        let mut pred = [[0u8; 256]; 2];
-        let mut used = [false; 2];
+        let mut rp: [Option<&RefPic>; 2] = [None, None];
         for list in 0..2 {
-            if refs[list] < 0 {
-                continue;
+            if refs[list] >= 0 {
+                rp[list] = Some(
+                    self.refs(list)
+                        .get(refs[list] as usize)
+                        .ok_or_else(|| bad("H.264 ref_idx beyond list"))?,
+                );
             }
-            let rp = self
-                .refs(list)
-                .get(refs[list] as usize)
-                .ok_or(bad("H.264 ref_idx beyond list"))?;
-            recon::mc_luma(
-                &rp.planes[0],
-                pw,
-                ph,
-                x,
-                y,
-                w,
-                h,
-                mvs[list],
-                &mut pred[list],
-            );
-            used[list] = true;
         }
-        if !used[0] && !used[1] {
+        if rp.iter().all(Option::is_none) {
             return Err(bad("H.264 inter block without prediction"));
         }
+        let used = rp.map(|r| r.is_some());
+        let planes = |list: usize| &rp[list].expect("used list").planes;
         let wt = self.weighting(refs, 0);
-        let mut out = [0u8; 256];
-        recon::weighted_combine(
-            used[0].then_some(&pred[0][..w * h]),
-            used[1].then_some(&pred[1][..w * h]),
+        let d = o + y * ls + x;
+        recon::predict_block(
+            &mut self.st.planes[0][d..],
+            ls,
+            w,
+            h,
+            used,
             wt,
-            &mut out[..w * h],
+            |list, out, os| {
+                recon::mc_luma(&planes(list)[0], pw, ph, x, y, w, h, mvs[list], out, os)
+            },
         );
-        for r in 0..h {
-            let d = o + (y + r) * ls + x;
-            self.st.planes[0][d..d + w].copy_from_slice(&out[r * w..r * w + w]);
-        }
         if self.cx.sps.chroma_array_type() == 0 {
             return Ok(());
         }
@@ -2080,42 +2078,39 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (cw, ch, cpw, cph) = (w / 2, h / 2, pw / 2, ph / 2);
         let (cx, cy) = (x / 2, y / 2);
         let cur_parity = self.field_parity();
+        let mut cmv = mvs;
+        for list in 0..2 {
+            // Between fields of opposite parity the chroma vector is offset by a quarter chroma
+            // sample (Table 8-9).
+            if let (Some(cur), Some(Some(r))) = (cur_parity, rp[list].map(|r| r.parity)) {
+                cmv[list][1] = cmv[list][1].wrapping_add(2 * (cur as i16 - r as i16));
+            }
+        }
         for p in 0..2 {
-            let mut pc = [[0u8; 64]; 2];
-            for list in 0..2 {
-                if used[list] {
-                    let rp = &self.refs(list)[refs[list] as usize];
-                    // Between fields of opposite parity the chroma vector is offset by a
-                    // quarter chroma sample (Table 8-9).
-                    let mut mv = mvs[list];
-                    if let (Some(cur), Some(r)) = (cur_parity, rp.parity) {
-                        mv[1] = mv[1].wrapping_add(2 * (cur as i16 - r as i16));
-                    }
+            let wt = self.weighting(refs, 1 + p);
+            let d = co + cy * cs + cx;
+            recon::predict_block(
+                &mut self.st.planes[1 + p][d..],
+                cs,
+                cw,
+                ch,
+                used,
+                wt,
+                |list, out, os| {
                     recon::mc_chroma(
-                        &rp.planes[1 + p],
+                        &planes(list)[1 + p],
                         cpw,
                         cph,
                         cx,
                         cy,
                         cw,
                         ch,
-                        mv,
-                        &mut pc[list],
-                    );
-                }
-            }
-            let wt = self.weighting(refs, 1 + p);
-            let mut out = [0u8; 64];
-            recon::weighted_combine(
-                used[0].then_some(&pc[0][..cw * ch]),
-                used[1].then_some(&pc[1][..cw * ch]),
-                wt,
-                &mut out[..cw * ch],
+                        cmv[list],
+                        out,
+                        os,
+                    )
+                },
             );
-            for r in 0..ch {
-                let d = co + (cy + r) * cs + cx;
-                self.st.planes[1 + p][d..d + cw].copy_from_slice(&out[r * cw..r * cw + cw]);
-            }
         }
         Ok(())
     }
