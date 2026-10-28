@@ -333,8 +333,9 @@ impl PicState {
         }
     }
 
-    /// Restores macroblock `addr`'s coding state (all but availability) to that of a new picture.
-    pub fn clear_mb(&mut self, addr: usize) {
+    /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
+    /// row `y`, to that of a new picture.
+    pub fn clear_mb(&mut self, addr: usize, x: usize, y: usize) {
         self.cbp[addr] = 0;
         self.qp[addr] = 0;
         self.qpc[addr] = [0; 2];
@@ -342,7 +343,6 @@ impl PicState {
         self.chroma_pred_mode[addr] = 0;
         self.cbf_dc[addr] = 0;
         self.motion_edges[addr] = ANY_INNER_EDGE;
-        let (x, y) = (addr % self.mb_w, addr / self.mb_w);
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
         fill_rect::<_, 4>(&mut self.nz, i, w, 4, false);
@@ -366,8 +366,8 @@ impl PicState {
             if self.mb_type[addr] != MbType::None {
                 continue;
             }
-            self.clear_mb(addr);
             let (x, y) = (addr % self.mb_w, addr / self.mb_w);
+            self.clear_mb(addr, x, y);
             // Frame lines the macroblock covers: in an MBAFF frame a field pair interleaves.
             // The pair's other macroblock decides whether the pair is a field pair.
             let pair_field = self.mbaff && {

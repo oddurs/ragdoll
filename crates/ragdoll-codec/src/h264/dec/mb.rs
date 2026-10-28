@@ -303,6 +303,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (x, y) = if self.st.mbaff {
             let pair = addr / 2;
             (pair % w, 2 * (pair / w) + addr % 2)
+        } else if addr == self.mb.addr + 1 {
+            // Decoding order without MBAFF is raster order: the next MB needs no division.
+            if self.mb.x + 1 < w {
+                (self.mb.x + 1, self.mb.y)
+            } else {
+                (0, self.mb.y + 1)
+            }
         } else {
             (addr % w, addr / w)
         };
@@ -433,7 +440,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.mb = self.pos(addr);
         let a = self.mb.addr;
         if self.st.recycled {
-            self.st.clear_mb(a);
+            self.st.clear_mb(a, self.mb.x, self.mb.y);
         }
         self.partial_motion = false;
         self.st.slice_num[a] = self.cx.slice_num;
