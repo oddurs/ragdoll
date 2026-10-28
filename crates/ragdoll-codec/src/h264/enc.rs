@@ -2685,6 +2685,19 @@ impl EncState {
         // boundary strength 0 on every edge.
         let quiet = |m: usize| !self.mb_is_intra[m] && self.mb_cbp_luma[m] == 0;
         let mv_of = |mb_x: usize, mb_y: usize| self.mv_grid[mb_y * 4 * g_stride + mb_x * 4];
+        // Non-zero 4x4 blocks of one grid row of four, bit `c` for column `c`.
+        let nz_row = |nnz: &[u8], g: usize| -> u32 {
+            let w = u32::from_le_bytes(nnz[g..g + 4].try_into().unwrap());
+            let hi = (((w & 0x7f7f_7f7f) + 0x7f7f_7f7f) | w) & 0x8080_8080;
+            ((hi >> 7) & 1) | ((hi >> 14) & 2) | ((hi >> 21) & 4) | ((hi >> 28) & 8)
+        };
+        // Column `c` of four such rows, bit `k` for row `k`.
+        let nz_col = |rows: &[u32; 4], c: usize| -> u32 {
+            ((rows[0] >> c) & 1)
+                | (((rows[1] >> c) & 1) << 1)
+                | (((rows[2] >> c) & 1) << 2)
+                | (((rows[3] >> c) & 1) << 3)
+        };
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
                 let m = mb_y * mb_w + mb_x;
@@ -2695,71 +2708,76 @@ impl EncState {
                 {
                     continue;
                 }
+                let g0 = mb_y * 4 * g_stride + mb_x * 4;
                 let intra = self.mb_is_intra[m];
                 // Every partition is 16x16, so motion only differs across macroblock edges, and
                 // a macroblock without luma residual needs none of its internal edges filtered.
                 let internal = intra || self.mb_cbp_luma[m] != 0;
+                let skip_odd = self.mb_8x8_flag[m];
+                let rows: [u32; 4] =
+                    std::array::from_fn(|r| nz_row(&self.luma_nnz, g0 + r * g_stride));
+                let qp_q = self.mb_qps[m] as i32;
+                let qpc_q = chroma_qp(qp_q, chroma_qp_offset) as i32;
                 for dir in 0..2 {
                     for e in 0..4 {
                         let pm = match (e, dir) {
                             (0, 0) if mb_x > 0 => m - 1,
-                            (0, _) if dir == 1 && mb_y > 0 => m - mb_w,
+                            (0, 1) if mb_y > 0 => m - mb_w,
                             (0, _) => continue,
-                            _ if !internal || (e & 1 == 1 && self.mb_8x8_flag[m]) => continue,
+                            _ if !internal || (e & 1 == 1 && skip_odd) => continue,
                             _ => m,
                         };
                         let bs = if intra || self.mb_is_intra[pm] {
                             [if e == 0 { 4 } else { 3 }; 4]
                         } else {
-                            let motion = e == 0 && {
-                                let (gq, gp) = (
-                                    (mb_y * 4) * g_stride + mb_x * 4,
-                                    if dir == 0 {
-                                        (mb_y * 4) * g_stride + mb_x * 4 - 1
-                                    } else {
-                                        (mb_y * 4 - 1) * g_stride + mb_x * 4
-                                    },
-                                );
-                                self.ref_grid[gq] != self.ref_grid[gp]
-                                    || (self.mv_grid[gq][0] - self.mv_grid[gp][0]).abs() >= 4
-                                    || (self.mv_grid[gq][1] - self.mv_grid[gp][1]).abs() >= 4
-                            };
-                            std::array::from_fn(|k| {
-                                let (gq, gp) = if dir == 0 {
-                                    let g = (mb_y * 4 + k) * g_stride + mb_x * 4 + e;
-                                    (g, g - 1)
-                                } else {
-                                    let g = (mb_y * 4 + e) * g_stride + mb_x * 4 + k;
-                                    (g, g - g_stride)
-                                };
-                                if self.luma_nnz[gq] > 0 || self.luma_nnz[gp] > 0 {
-                                    2
-                                } else {
-                                    u8::from(motion)
+                            // Bit k: the 4x4 blocks on either side of segment k hold levels.
+                            let coded = match (dir, e) {
+                                (0, 0) => {
+                                    nz_col(&rows, 0)
+                                        | (0..4).fold(0, |a, k| {
+                                            a | u32::from(self.luma_nnz[g0 + k * g_stride - 1] != 0)
+                                                << k
+                                        })
                                 }
-                            })
+                                (0, _) => nz_col(&rows, e) | nz_col(&rows, e - 1),
+                                (_, 0) => rows[0] | nz_row(&self.luma_nnz, g0 - g_stride),
+                                _ => rows[e] | rows[e - 1],
+                            };
+                            let motion = e == 0 && {
+                                let gp = if dir == 0 { g0 - 1 } else { g0 - g_stride };
+                                let (mq, mp) = (self.mv_grid[g0], self.mv_grid[gp]);
+                                self.ref_grid[g0] != self.ref_grid[gp]
+                                    || (mq[0] - mp[0]).abs() >= 4
+                                    || (mq[1] - mp[1]).abs() >= 4
+                            };
+                            if coded == 0 && !motion {
+                                continue;
+                            }
+                            let other = u8::from(motion);
+                            std::array::from_fn(|k| if coded >> k & 1 != 0 { 2 } else { other })
                         };
-                        if bs == [0; 4] {
-                            continue;
-                        }
-                        let (qp_q, qp_p) = (self.mb_qps[m] as i32, self.mb_qps[pm] as i32);
+                        let (qp, qpc) = if pm == m {
+                            (qp_q, qpc_q)
+                        } else {
+                            let qp_p = self.mb_qps[pm] as i32;
+                            (
+                                (qp_q + qp_p + 1) >> 1,
+                                (qpc_q + chroma_qp(qp_p, chroma_qp_offset) as i32 + 1) >> 1,
+                            )
+                        };
                         let (x, y) = if dir == 0 {
                             (mb_x * 16 + e * 4, mb_y * 16)
                         } else {
                             (mb_x * 16, mb_y * 16 + e * 4)
                         };
-                        if let Some(f) = EdgeFilter::new((qp_q + qp_p + 1) >> 1, bs) {
+                        if let Some(f) = EdgeFilter::new(qp, bs) {
                             f.apply(&mut self.cur.y, x, y, dir, false);
                         }
-                        if e & 1 == 0 {
-                            let qpc = (chroma_qp(qp_q, chroma_qp_offset) as i32
-                                + chroma_qp(qp_p, chroma_qp_offset) as i32
-                                + 1)
-                                >> 1;
-                            if let Some(f) = EdgeFilter::new(qpc, bs) {
-                                f.apply(&mut self.cur.u, x / 2, y / 2, dir, true);
-                                f.apply(&mut self.cur.v, x / 2, y / 2, dir, true);
-                            }
+                        if e & 1 == 0
+                            && let Some(f) = EdgeFilter::new(qpc, bs)
+                        {
+                            f.apply(&mut self.cur.u, x / 2, y / 2, dir, true);
+                            f.apply(&mut self.cur.v, x / 2, y / 2, dir, true);
                         }
                     }
                 }
@@ -2767,6 +2785,24 @@ impl EncState {
         }
     }
 }
+
+/// `tc0` per boundary strength 0..=4 at each indexA (`-1`: no filtering; `0` with strength 4,
+/// which the strong filter ignores).
+static DEBLOCK_TC0: [[i8; 5]; 52] = {
+    let mut t = [[0i8; 5]; 52];
+    let mut q = 0;
+    while q < 52 {
+        t[q] = [
+            -1,
+            H264_DEBLOCK_TC0[q][0] as i8,
+            H264_DEBLOCK_TC0[q][1] as i8,
+            H264_DEBLOCK_TC0[q][2] as i8,
+            0,
+        ];
+        q += 1;
+    }
+    t
+};
 
 /// Thresholds of one edge for the `ragdoll-simd` deblocking kernels (`FFmpeg` conventions).
 struct EdgeFilter {
@@ -2782,15 +2818,12 @@ impl EdgeFilter {
     fn new(qp: i32, bs: [u8; 4]) -> Option<Self> {
         let ia = qp.clamp(0, 51) as usize;
         let (alpha, beta) = (H264_DEBLOCK_ALPHA[ia] as i32, H264_DEBLOCK_BETA[ia] as i32);
+        let tc = &DEBLOCK_TC0[ia];
         (alpha != 0 && beta != 0).then(|| Self {
             alpha,
             beta,
-            tc0: bs.map(|b| match b {
-                0 => -1,
-                4 => 0,
-                _ => H264_DEBLOCK_TC0[ia][b as usize - 1] as i8,
-            }),
-            strong: bs == [4; 4],
+            tc0: bs.map(|b| tc[b.min(4) as usize]),
+            strong: bs[0] == 4,
         })
     }
 

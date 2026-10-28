@@ -571,10 +571,13 @@ fn intra_satd_x3_from(
 
 /// Row stride and width of the planes of a [`HpelWindow`].
 pub const HPEL_WIN_W: usize = 32;
+/// Columns of each row of a [`HpelWindow`] that [`hpel_window`] interpolates: a $16\times16$
+/// block displaced by up to one sample either way spans 18.
+pub const HPEL_COLS: usize = 24;
 /// Rows of the planes of a [`HpelWindow`].
 pub const HPEL_WIN_H: usize = 18;
 
-/// The three half-sample planes of ITU-T H.264 8.4.2.2.1 over a `HPEL_WIN_W` x `HPEL_WIN_H`
+/// The three half-sample planes of ITU-T H.264 8.4.2.2.1 over a `HPEL_COLS` x `HPEL_WIN_H`
 /// window, row-major with stride `HPEL_WIN_W`. With `(x, y)` the window's top-left integer sample:
 /// `h` holds `b` at `(x + c + 1/2, y + r)`, `v` holds `h` at `(x + c, y + r + 1/2)` and `c` holds
 /// `j` at `(x + c + 1/2, y + r + 1/2)`.
@@ -596,7 +599,8 @@ impl Default for HpelWindow {
 }
 
 /// Interpolates the half-sample planes of the window whose top-left integer sample is `src[off]`
-/// (stride `ss`). Reads rows `-2..=HPEL_WIN_H + 2` and columns `-2..=HPEL_WIN_W + 2` around it.
+/// (stride `ss`), columns `0..HPEL_COLS` of each row; the others are left as they are. Reads rows
+/// `-2..=HPEL_WIN_H + 2` and columns `-2..=HPEL_WIN_W + 2` around it.
 ///
 /// # Panics
 /// If `src` lacks those margins.
@@ -636,7 +640,7 @@ pub fn hpel_window_scalar(src: &[u8], off: usize, ss: usize, out: &mut HpelWindo
     };
     let clip = |v: i32| v.clamp(0, 255) as u8;
     for r in 0..HPEL_WIN_H as isize {
-        for c in 0..HPEL_WIN_W as isize {
+        for c in 0..HPEL_COLS as isize {
             let i = r as usize * HPEL_WIN_W + c as usize;
             out.h[i] = clip((h_raw(r, c) + 16) >> 5);
             let v = tap6(
@@ -1402,58 +1406,88 @@ fn tap6_epi16(t: [std::arch::x86_64::__m256i; 6]) -> std::arch::x86_64::__m256i 
 #[target_feature(enable = "avx2")]
 unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
     use std::arch::x86_64::*;
-    const ROWS: usize = HPEL_WIN_H + 5;
     unsafe {
-        let ld = |r: isize, c: isize| {
-            let q = p.offset(r * ss as isize + c) as *const __m128i;
-            _mm256_cvtepu8_epi16(_mm_loadu_si128(q))
-        };
-        // 16 lanes of 0..=255 values to bytes, in order.
-        let store = |dst: *mut u8, x: __m256i| {
-            let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
-            _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(packed));
-        };
         let (r16, r512) = (_mm256_set1_epi16(16), _mm256_set1_epi32(512));
         let (one, m5, p20) = (
             _mm256_set1_epi16(1),
             _mm256_set1_epi16(-5),
             _mm256_set1_epi16(20),
         );
-        for chunk in 0..HPEL_WIN_W / 16 {
-            let c0 = (chunk * 16) as isize;
-            // Unrounded horizontal taps and widened samples of rows -2..=HPEL_WIN_H + 2.
-            let mut hr = [_mm256_setzero_si256(); ROWS];
-            let mut sr = [_mm256_setzero_si256(); ROWS];
-            for k in 0..ROWS {
-                let r = k as isize - 2;
-                hr[k] = tap6_epi16(std::array::from_fn(|t| ld(r, c0 - 2 + t as isize)));
-                sr[k] = ld(r, c0);
-            }
-            for r in 0..HPEL_WIN_H {
-                let o = r * HPEL_WIN_W + chunk * 16;
-                let b = _mm256_srai_epi16::<5>(_mm256_add_epi16(hr[r + 2], r16));
-                store(out.h.as_mut_ptr().add(o), b);
-                let v = tap6_epi16([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
-                store(
-                    out.v.as_mut_ptr().add(o),
-                    _mm256_srai_epi16::<5>(_mm256_add_epi16(v, r16)),
-                );
-                // The centre tap on the unrounded intermediates needs 32 bits: multiply-add the
-                // symmetric pairs, interleaved per 128-bit lane (packs restores the order).
-                let pairs = [
-                    (hr[r], hr[r + 5], one),
-                    (hr[r + 1], hr[r + 4], m5),
-                    (hr[r + 2], hr[r + 3], p20),
-                ];
-                let (mut lo, mut hi) = (r512, r512);
-                for (a, b, k) in pairs {
-                    lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), k));
-                    hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
+        // The three planes of `OUT` register rows from `ld(row, column)` (16 widened samples),
+        // handing each to `st(plane, row, values)`; rows -2..OUT + 3 are read.
+        macro_rules! pass {
+            ($out:expr, $c0:expr, $ld:expr, $st:expr) => {{
+                const ROWS: usize = $out + 5;
+                let (ld, st) = ($ld, $st);
+                // Unrounded horizontal taps and widened samples of the rows.
+                let mut hr = [_mm256_setzero_si256(); ROWS];
+                let mut sr = [_mm256_setzero_si256(); ROWS];
+                for k in 0..ROWS {
+                    let r = k as isize - 2;
+                    hr[k] = tap6_epi16(std::array::from_fn(|t| ld(r, $c0 - 2 + t as isize)));
+                    sr[k] = ld(r, $c0);
                 }
-                let (lo, hi) = (_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
-                store(out.c.as_mut_ptr().add(o), _mm256_packs_epi32(lo, hi));
-            }
+                for r in 0..$out {
+                    st(
+                        0,
+                        r,
+                        _mm256_srai_epi16::<5>(_mm256_add_epi16(hr[r + 2], r16)),
+                    );
+                    let v =
+                        tap6_epi16([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
+                    st(1, r, _mm256_srai_epi16::<5>(_mm256_add_epi16(v, r16)));
+                    // The centre tap on the unrounded intermediates needs 32 bits: multiply-add
+                    // the symmetric pairs, interleaved per 128-bit lane (packs restores the order).
+                    let pairs = [
+                        (hr[r], hr[r + 5], one),
+                        (hr[r + 1], hr[r + 4], m5),
+                        (hr[r + 2], hr[r + 3], p20),
+                    ];
+                    let (mut lo, mut hi) = (r512, r512);
+                    for (a, b, k) in pairs {
+                        lo =
+                            _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), k));
+                        hi =
+                            _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
+                    }
+                    let (lo, hi) = (_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
+                    st(2, r, _mm256_packs_epi32(lo, hi));
+                }
+            }};
         }
+        let planes = [out.h.as_mut_ptr(), out.v.as_mut_ptr(), out.c.as_mut_ptr()];
+        let row = |r: isize, c: isize| p.offset(r * ss as isize + c);
+        // Columns 0..16, one row per register.
+        pass!(
+            HPEL_WIN_H,
+            0,
+            |r: isize, c: isize| _mm256_cvtepu8_epi16(_mm_loadu_si128(row(r, c) as *const __m128i)),
+            |plane: usize, r: usize, x: __m256i| {
+                let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
+                let dst = planes[plane].add(r * HPEL_WIN_W) as *mut __m128i;
+                _mm_storeu_si128(dst, _mm256_castsi256_si128(packed));
+            }
+        );
+        // Columns 16..24: rows r and r + HPEL_WIN_H / 2 side by side in the two 128-bit lanes.
+        const HALF: usize = HPEL_WIN_H / 2;
+        pass!(
+            HALF,
+            16,
+            |r: isize, c: isize| {
+                let lo = _mm_loadl_epi64(row(r, c) as *const __m128i);
+                let hi = _mm_loadl_epi64(row(r + HALF as isize, c) as *const __m128i);
+                _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(lo, hi))
+            },
+            |plane: usize, r: usize, x: __m256i| {
+                let packed = _mm256_packus_epi16(x, x);
+                let dst = planes[plane].add(r * HPEL_WIN_W + 16);
+                _mm_storel_epi64(dst as *mut __m128i, _mm256_castsi256_si128(packed));
+                _mm_storel_epi64(
+                    dst.add(HALF * HPEL_WIN_W) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(packed),
+                );
+            }
+        );
     }
 }
 
@@ -1476,7 +1510,7 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
         let ld = |r: isize, c: isize| {
             vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.offset(r * ss as isize + c))))
         };
-        for chunk in 0..HPEL_WIN_W / 8 {
+        for chunk in 0..HPEL_COLS / 8 {
             let c0 = (chunk * 8) as isize;
             let mut hr = [vdupq_n_s16(0); ROWS];
             let mut sr = [vdupq_n_s16(0); ROWS];
