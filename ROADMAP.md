@@ -166,7 +166,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`####······` 33% · 10 of 30 done
+`####······` 40% · 12 of 30 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -195,8 +195,6 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 ### in progress
 
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
-- [ ] `SIMD-0083` AAC-LC decoder is 13x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
-- [ ] `SIMD-0084` FLAC decoder is 2.5x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
 - [ ] `SIMD-0087` Opus decoder slower than FFmpeg's native decoder (0.58x CELT, 0.69x SILK) <sup>kernel · p1</sup>
 
 ### shipped
@@ -211,6 +209,8 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [x] `BUG-0079` AAC-LC decoder diverges from FFmpeg (26 dB SNR) and loses sync at 256 kbit/s <sup>bug · p1 · codec-audio</sup>
 - [x] `BUG-0080` Ogg Opus decode keeps the encoder padding after the final granule position <sup>bug · p2 · format</sup>
 - [x] `BUG-0081` OggMuxer writes one page per packet, adding about 12 % overhead to Opus at 96 kbit/s <sup>bug · p2 · format</sup>
+- [x] `SIMD-0083` AAC-LC decoder is 13x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
+- [x] `SIMD-0084` FLAC decoder is 2.5x slower than FFmpeg's <sup>kernel · p2 · codec-audio</sup>
 
 ## Unscheduled
 

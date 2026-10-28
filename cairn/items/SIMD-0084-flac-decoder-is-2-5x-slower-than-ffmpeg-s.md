@@ -3,12 +3,12 @@ id: 84
 uid: abddebad-4386-4961-bad6-f96b3ca95391
 title: FLAC decoder is 2.5x slower than FFmpeg's
 type: kernel
-status: doing
+status: done
 milestone: m11-validation
 assignee: Claude
-claimed: 2026-10-28
 created: 2026-10-28
 updated: 2026-10-28
+closed_at: 2026-10-28
 priority: p2
 effort: s
 area: codec-audio
@@ -40,3 +40,7 @@ MD5: decode_stream still verifies (the lib.rs integrity test requires it, and th
 ## 2026-10-28
 
 Result on the 60 s level-5 file, best of 8 rounds x 7 runs back to back: decode_stream 36.6 ms, decode_stream_unverified 22.2 ms, FFmpeg 45.0-46.0 ms (was 139 ms). Callgrind: 466M / 319M instructions vs 1585M before and 589M for avbench. Left on the table: the order-8 loop is bound by the single scalar imul port (8 multiplies per sample) plus spills of the ring history; MD5 is a serial chain and now the largest cost in the verified path.
+
+## Result
+
+FLAC decode 139 ms -> 36.6 ms with MD5 (22.2 ms without, decode_stream_unverified) per 60 s 16-bit stereo vs FFmpeg 45 ms: 64-bit Rice cache, fused order-specialised LPC restore with 32-bit sums when safe, BMI2 multiversioning, AVX2/NEON decorrelate+interleave, faster MD5, CLMUL CRC-16.
