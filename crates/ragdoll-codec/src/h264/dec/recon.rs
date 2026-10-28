@@ -435,18 +435,7 @@ pub fn predict_block(
     scratch: &mut [[u8; 256]; 2],
     mut predict: impl FnMut(usize, &mut [u8], usize),
 ) {
-    // Weights equal to 2^logWD with zero offsets reduce exactly to default prediction:
-    // ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
-    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
-    let wt = match (used, wt) {
-        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
-            Weighting::Default
-        }
-        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
-        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
-        _ => wt,
-    };
-    match (used, wt) {
+    match (used, effective_weighting(used, wt)) {
         ([true, false], Weighting::Default) => predict(0, dst, ds),
         ([false, true], Weighting::Default) => predict(1, dst, ds),
         ([true, true], Weighting::Default) => {
@@ -473,6 +462,21 @@ pub fn predict_block(
             }
         }
         ([false, false], Weighting::Default) => {}
+    }
+}
+
+/// `wt` for the lists in `used`, with weights that reduce exactly to default prediction
+/// (2^logWD with zero offsets) replaced by [`Weighting::Default`]:
+/// ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
+pub fn effective_weighting(used: [bool; 2], wt: Weighting) -> Weighting {
+    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
+    match (used, wt) {
+        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
+            Weighting::Default
+        }
+        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
+        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
+        _ => wt,
     }
 }
 

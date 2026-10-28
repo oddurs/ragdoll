@@ -21,6 +21,7 @@ use super::tables::{
     B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, FIELD_SCAN4X4,
     FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN4X4, SCAN8X8, chroma_qp,
 };
+use ragdoll_simd::h264_avg;
 
 /// A reference picture as seen by one slice.
 pub struct RefPic {
@@ -2271,6 +2272,72 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
+    /// [`Self::mc_rect`] with default weighted prediction for every component (8.4.2.3.1): one
+    /// list is copied, two are averaged.
+    #[allow(clippy::too_many_arguments)]
+    fn mc_rect_default(
+        &mut self,
+        rp: [Option<&RefPic>; 2],
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        pw: usize,
+        ph: usize,
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        let (o, ls, _, _) = self.view(0);
+        let d = o + y * ls + x;
+        let dst = &mut self.st.planes[0][d..];
+        match rp {
+            [Some(r), None] | [None, Some(r)] => {
+                let l = rp[0].is_none() as usize;
+                recon::mc_luma(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, ls);
+            }
+            [Some(r0), Some(r1)] => {
+                recon::mc_luma(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, ls);
+                let t = &mut self.scratch[0];
+                recon::mc_luma(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], t, 16);
+                h264_avg(dst, ls, t, 16, w, h);
+            }
+            [None, None] => {}
+        }
+        if self.cx.sps.chroma_array_type() == 0 {
+            return Ok(());
+        }
+        let (co, cs, _, _) = self.view(1);
+        let (cw, ch, cpw, cph) = (w / 2, h / 2, pw / 2, ph / 2);
+        let (cx, cy) = (x / 2, y / 2);
+        let mut cmv = mvs;
+        if let Some(cur) = self.field_parity() {
+            for list in 0..2 {
+                // Between fields of opposite parity the chroma vector is offset by a quarter
+                // chroma sample (Table 8-9).
+                if let Some(Some(r)) = rp[list].map(|r| r.parity) {
+                    cmv[list][1] = cmv[list][1].wrapping_add(2 * (cur as i16 - r as i16));
+                }
+            }
+        }
+        let d = co + cy * cs + cx;
+        for p in 1..3 {
+            let dst = &mut self.st.planes[p][d..];
+            match rp {
+                [Some(r), None] | [None, Some(r)] => {
+                    let l = rp[0].is_none() as usize;
+                    recon::mc_chroma(&r.planes[p], cpw, cph, cx, cy, cw, ch, cmv[l], dst, cs);
+                }
+                [Some(r0), Some(r1)] => {
+                    recon::mc_chroma(&r0.planes[p], cpw, cph, cx, cy, cw, ch, cmv[0], dst, cs);
+                    let t = &mut self.scratch[0];
+                    recon::mc_chroma(&r1.planes[p], cpw, cph, cx, cy, cw, ch, cmv[1], t, 16);
+                    h264_avg(dst, cs, t, 16, cw, ch);
+                }
+                [None, None] => {}
+            }
+        }
+        Ok(())
+    }
+
     fn mc_rect(
         &mut self,
         bx: usize,
@@ -2303,8 +2370,11 @@ impl<'a, 'c> Dec<'a, 'c> {
             return Err(bad("H.264 inter block without prediction"));
         }
         let used = rp.map(|r| r.is_some());
+        let wt = recon::effective_weighting(used, self.weighting(refs, 0));
+        if self.cx.sh.weights.is_none() && matches!(wt, Weighting::Default) {
+            return self.mc_rect_default(rp, x, y, w, h, pw, ph, mvs);
+        }
         let planes = |list: usize| &rp[list].expect("used list").planes;
-        let wt = self.weighting(refs, 0);
         let d = o + y * ls + x;
         recon::predict_block(
             &mut self.st.planes[0][d..],
