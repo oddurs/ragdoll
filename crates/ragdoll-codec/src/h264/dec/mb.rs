@@ -103,6 +103,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         implicit,
         implicit_field,
         scratch: [[0; 256]; 2],
+        partial_motion: false,
     };
     d.run(first, total)
 }
@@ -185,6 +186,8 @@ struct Dec<'a, 'c> {
     implicit_field: [Vec<[i32; 2]>; 2],
     /// Prediction samples of the second list, or of both for weighted prediction.
     scratch: [[u8; 256]; 2],
+    /// The current MB's motion was stored for less than the whole MB, so it may vary.
+    partial_motion: bool,
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -420,6 +423,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if self.st.recycled {
             self.st.clear_mb(a);
         }
+        self.partial_motion = false;
         self.st.slice_num[a] = self.cx.slice_num;
         self.st.mb_field[a] = self.field;
     }
@@ -1323,12 +1327,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 }
                 if total > 0 {
                     let l8 = if intra { 0 } else { 1 };
-                    for k in 0..64 {
-                        if sc[k] != 0 {
-                            let pos = scan8[k];
-                            res.luma8[b8][pos] = dq.scale8(l8, qp, pos, sc[k] as i32);
-                        }
-                    }
+                    dq.scale8_block(l8, qp, &sc, scan8, &mut res.luma8[b8]);
                     res.luma_coded |= 0xF << (b8 * 4);
                 }
                 continue;
@@ -1354,13 +1353,8 @@ impl<'a, 'c> Dec<'a, 'c> {
                 self.st.nnz[j] = n as u8;
                 self.st.nz[j] = n > 0;
                 if n > 0 {
-                    let off = 16 - max;
-                    for k in 0..max {
-                        if sc[k] != 0 {
-                            let pos = scan4[k + off];
-                            res.luma[blk][pos] = dq.scale4(lst, qp, pos, sc[k] as i32);
-                        }
-                    }
+                    // Intra_16x16 blocks keep their DC at position 0 (scan offset 1).
+                    dq.scale4_block(lst, qp, &sc[..max], 16 - max, scan4, &mut res.luma[blk]);
                     res.luma_coded |= 1 << blk;
                 }
             }
@@ -1417,13 +1411,8 @@ impl<'a, 'c> Dec<'a, 'c> {
                 let j = self.st.c4(x4, y4);
                 self.st.nnz_c[p][j] = n as u8;
                 if n > 0 {
-                    for k in 0..15 {
-                        if sc[k] != 0 {
-                            let pos = scan4[k + 1];
-                            res.chroma[p][blk][pos] =
-                                dq.scale4(lst + 1 + p, qpc[p] as i32, pos, sc[k] as i32);
-                        }
-                    }
+                    let out = &mut res.chroma[p][blk];
+                    dq.scale4_block(lst + 1 + p, qpc[p] as i32, &sc, 1, scan4, out);
                     res.chroma_coded[p] |= 1 << blk;
                 }
             }
@@ -1473,6 +1462,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             put::<_, N>(&mut st.ref_pic[list], i, pic);
             put::<_, N>(&mut st.mvd[list], i, mvd);
         }
+        self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
         for y in by..by + h {
             let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + y);
             match w {
@@ -1870,7 +1860,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     (bx, by)
                 };
-                let (col_ref, col_mv, col_pic, vscale) = self.colocated(cbx, cby);
+                // Spatial prediction only looks at the co-located block for a reference index 0.
+                let (col_ref, col_mv, col_pic, vscale) =
+                    if spatial && (direct_zero || (sp_ref[0] != 0 && sp_ref[1] != 0)) {
+                        (-1, [0, 0], NO_PIC, 0)
+                    } else {
+                        self.colocated(cbx, cby)
+                    };
                 let (refs, mvs) = if spatial {
                     let col_zero = col_short
                         && col_ref == 0
@@ -2119,7 +2115,9 @@ impl<'a, 'c> Dec<'a, 'c> {
             let k = key(s, bx, by);
             (by..by + n).all(|y| (bx..bx + n).all(|x| key(s, x, y) == k))
         };
-        if same(self.st, 0, 0, 4) {
+        // Motion stored only for the whole MB (the other list left at its reset value) is one
+        // motion without comparing.
+        if !self.partial_motion || same(self.st, 0, 0, 4) {
             self.st.uniform[self.mb.addr] = true;
             let k = key(self.st, 0, 0);
             return self.mc_rect(0, 0, 4, 4, [k.0, k.2], [k.1, k.3]);

@@ -107,6 +107,36 @@ impl Edges {
 
 /// Predicts an `n`x`n` block (`n` = 4 or 8) with Intra4x4/Intra8x8 `mode` into `out` (row-major, stride `n`).
 pub fn predict_nxn(n: usize, mode: u8, e: &Edges, out: &mut [u8]) {
+    // Vertical, horizontal and DC fill rows; the directional modes go sample by sample.
+    match mode {
+        0 => {
+            for row in out[..n * n].chunks_exact_mut(n) {
+                row.copy_from_slice(&e.top[..n]);
+            }
+            return;
+        }
+        1 => {
+            for (row, &l) in out[..n * n].chunks_exact_mut(n).zip(&e.left) {
+                row.fill(l);
+            }
+            return;
+        }
+        2 => {
+            let ni = n as i32;
+            let st: i32 = e.top[..n].iter().map(|&v| v as i32).sum();
+            let sl: i32 = e.left[..n].iter().map(|&v| v as i32).sum();
+            let sh = if n == 4 { 2 } else { 3 };
+            let dc = match (e.has_top, e.has_left) {
+                (true, true) => (st + sl + ni) >> (sh + 1),
+                (false, true) => (sl + (ni >> 1)) >> sh,
+                (true, false) => (st + (ni >> 1)) >> sh,
+                (false, false) => 128,
+            };
+            out[..n * n].fill(dc as u8);
+            return;
+        }
+        _ => {}
+    }
     let t = |x: i32| e.top[x as usize] as i32;
     let l = |y: i32| e.left[y as usize] as i32;
     // p[x, -1] for x >= -1 and p[-1, y] for y >= -1.

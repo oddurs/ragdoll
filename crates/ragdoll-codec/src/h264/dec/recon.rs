@@ -3,8 +3,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_luma_mc, h264_weight_bi, h264_weight_uni,
-    luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_idct4_add, h264_luma_mc, h264_weight_bi,
+    h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -43,25 +43,55 @@ impl Dequant {
         Self { ls4, ls8 }
     }
 
-    /// Scales one 4x4 AC (or full) coefficient at raster `pos` (8.5.12.1).
+    /// Scales scanned 4x4 coefficients `sc[k]` (raster position `scan[k + off]`) into `out`
+    /// (8.5.12.1). Every position is written: a zero coefficient scales to zero, so no branch
+    /// on the (unpredictable) coefficient values is needed.
     #[inline]
-    pub fn scale4(&self, list: usize, qp: i32, pos: usize, c: i32) -> i32 {
-        let ls = self.ls4[list][(qp % 6) as usize][pos];
+    pub fn scale4_block(
+        &self,
+        list: usize,
+        qp: i32,
+        sc: &[i16],
+        off: usize,
+        scan: &[usize; 16],
+        out: &mut [i32; 16],
+    ) {
+        let ls = &self.ls4[list][(qp % 6) as usize];
+        let scan = &scan[off..off + sc.len()];
         if qp >= 24 {
-            (c * ls) << (qp / 6 - 4)
+            let sh = qp / 6 - 4;
+            for (&c, &pos) in sc.iter().zip(scan) {
+                out[pos] = (c as i32 * ls[pos]) << sh;
+            }
         } else {
-            (c * ls + (1 << (3 - qp / 6))) >> (4 - qp / 6)
+            let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
+            for (&c, &pos) in sc.iter().zip(scan) {
+                out[pos] = (c as i32 * ls[pos] + rnd) >> sh;
+            }
         }
     }
 
-    /// Scales one 8x8 coefficient at raster `pos` (8.5.13.1).
+    /// [`Dequant::scale4_block`] for an 8x8 block (8.5.13.1).
     #[inline]
-    pub fn scale8(&self, list: usize, qp: i32, pos: usize, c: i32) -> i32 {
-        let ls = self.ls8[list][(qp % 6) as usize][pos];
+    pub fn scale8_block(
+        &self,
+        list: usize,
+        qp: i32,
+        sc: &[i16; 64],
+        scan: &[usize; 64],
+        out: &mut [i32; 64],
+    ) {
+        let ls = &self.ls8[list][(qp % 6) as usize];
         if qp >= 36 {
-            (c * ls) << (qp / 6 - 6)
+            let sh = qp / 6 - 6;
+            for (&c, &pos) in sc.iter().zip(scan) {
+                out[pos] = (c as i32 * ls[pos]) << sh;
+            }
         } else {
-            (c * ls + (1 << (5 - qp / 6))) >> (6 - qp / 6)
+            let (sh, rnd) = (6 - qp / 6, 1 << (5 - qp / 6));
+            for (&c, &pos) in sc.iter().zip(scan) {
+                out[pos] = (c as i32 * ls[pos] + rnd) >> sh;
+            }
         }
     }
 }
@@ -119,31 +149,9 @@ fn clip(v: i32) -> u8 {
 }
 
 /// Inverse 4x4 transform of raster coefficients `d` and addition to `dst` (8.5.12.2).
+#[inline]
 pub fn idct4_add(dst: &mut [u8], stride: usize, d: &[i32; 16]) {
-    let mut f = [0i32; 16];
-    for i in 0..4 {
-        let r = &d[i * 4..i * 4 + 4];
-        let e0 = r[0] + r[2];
-        let e1 = r[0] - r[2];
-        let e2 = (r[1] >> 1) - r[3];
-        let e3 = r[1] + (r[3] >> 1);
-        f[i * 4] = e0 + e3;
-        f[i * 4 + 1] = e1 + e2;
-        f[i * 4 + 2] = e1 - e2;
-        f[i * 4 + 3] = e0 - e3;
-    }
-    for j in 0..4 {
-        let (f0, f1, f2, f3) = (f[j], f[4 + j], f[8 + j], f[12 + j]);
-        let g0 = f0 + f2;
-        let g1 = f0 - f2;
-        let g2 = (f1 >> 1) - f3;
-        let g3 = f1 + (f3 >> 1);
-        let h = [g0 + g3, g1 + g2, g1 - g2, g0 - g3];
-        for (i, v) in h.iter().enumerate() {
-            let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + ((v + 32) >> 6));
-        }
-    }
+    h264_idct4_add(dst, stride, d);
 }
 
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
