@@ -647,47 +647,48 @@ pub fn overlay_rgba_row_onto_rgb24_scalar(dst_rgb: &mut [u8], src_rgba: &[u8], w
 /// [`overlay_rgba_row_onto_rgb24_scalar`] bit-for-bit across all alpha values (`0..=255`) and odd widths.
 pub fn overlay_rgba_row_onto_rgb24(dst_rgb: &mut [u8], src_rgba: &[u8], width: usize) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut x = 0usize;
-        let v255 = vdup_n_u8(255);
-        let v128 = vdupq_n_u16(128);
-        while x + 8 <= width {
-            let s = vld4_u8(src_rgba.as_ptr().add(x * 4));
-            let mut d = vld3_u8(dst_rgb.as_ptr().add(x * 3));
-            let sa = s.3;
-            let inv_a = vsub_u8(v255, sa);
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut x = 0usize;
+            let v255 = vdup_n_u8(255);
+            let v128 = vdupq_n_u16(128);
+            while x + 8 <= width {
+                let s = vld4_u8(src_rgba.as_ptr().add(x * 4));
+                let mut d = vld3_u8(dst_rgb.as_ptr().add(x * 3));
+                let sa = s.3;
+                let inv_a = vsub_u8(v255, sa);
 
-            // R
-            let tr = vmlal_u8(vmull_u8(s.0, sa), d.0, inv_a);
-            let xr = vaddq_u16(tr, v128);
-            d.0 = vshrn_n_u16(vaddq_u16(xr, vshrq_n_u16(xr, 8)), 8);
+                // R
+                let tr = vmlal_u8(vmull_u8(s.0, sa), d.0, inv_a);
+                let xr = vaddq_u16(tr, v128);
+                d.0 = vshrn_n_u16(vaddq_u16(xr, vshrq_n_u16(xr, 8)), 8);
 
-            // G
-            let tg = vmlal_u8(vmull_u8(s.1, sa), d.1, inv_a);
-            let xg = vaddq_u16(tg, v128);
-            d.1 = vshrn_n_u16(vaddq_u16(xg, vshrq_n_u16(xg, 8)), 8);
+                // G
+                let tg = vmlal_u8(vmull_u8(s.1, sa), d.1, inv_a);
+                let xg = vaddq_u16(tg, v128);
+                d.1 = vshrn_n_u16(vaddq_u16(xg, vshrq_n_u16(xg, 8)), 8);
 
-            // B
-            let tb = vmlal_u8(vmull_u8(s.2, sa), d.2, inv_a);
-            let xb = vaddq_u16(tb, v128);
-            d.2 = vshrn_n_u16(vaddq_u16(xb, vshrq_n_u16(xb, 8)), 8);
+                // B
+                let tb = vmlal_u8(vmull_u8(s.2, sa), d.2, inv_a);
+                let xb = vaddq_u16(tb, v128);
+                d.2 = vshrn_n_u16(vaddq_u16(xb, vshrq_n_u16(xb, 8)), 8);
 
-            vst3_u8(dst_rgb.as_mut_ptr().add(x * 3), d);
-            x += 8;
+                vst3_u8(dst_rgb.as_mut_ptr().add(x * 3), d);
+                x += 8;
+            }
+            if x < width {
+                overlay_rgba_row_onto_rgb24_scalar(
+                    &mut dst_rgb[x * 3..],
+                    &src_rgba[x * 4..],
+                    width - x,
+                );
+            }
         }
-        if x < width {
-            overlay_rgba_row_onto_rgb24_scalar(
-                &mut dst_rgb[x * 3..],
-                &src_rgba[x * 4..],
-                width - x,
-            );
-        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        overlay_rgba_row_onto_rgb24_scalar(dst_rgb, src_rgba, width);
-    }
+    overlay_rgba_row_onto_rgb24_scalar(dst_rgb, src_rgba, width);
 }
 
 /// Scalar reference row kernel for alpha-blending `width` samples of planar luma/chroma (`src`, `alpha`) onto `dst`.
@@ -703,30 +704,31 @@ pub fn overlay_plane_row_u8_scalar(dst: &mut [u8], src: &[u8], alpha: &[u8], wid
 /// SIMD-accelerated (`aarch64` NEON) planar alpha-blending row kernel matching [`overlay_plane_row_u8_scalar`] bit-for-bit.
 pub fn overlay_plane_row_u8(dst: &mut [u8], src: &[u8], alpha: &[u8], width: usize) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut x = 0usize;
-        let v255 = vdup_n_u8(255);
-        let v128 = vdupq_n_u16(128);
-        while x + 8 <= width {
-            let vs = vld1_u8(src.as_ptr().add(x));
-            let va = vld1_u8(alpha.as_ptr().add(x));
-            let vd = vld1_u8(dst.as_ptr().add(x));
-            let inv_a = vsub_u8(v255, va);
-            let t = vmlal_u8(vmull_u8(vs, va), vd, inv_a);
-            let x16 = vaddq_u16(t, v128);
-            let out = vshrn_n_u16(vaddq_u16(x16, vshrq_n_u16(x16, 8)), 8);
-            vst1_u8(dst.as_mut_ptr().add(x), out);
-            x += 8;
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut x = 0usize;
+            let v255 = vdup_n_u8(255);
+            let v128 = vdupq_n_u16(128);
+            while x + 8 <= width {
+                let vs = vld1_u8(src.as_ptr().add(x));
+                let va = vld1_u8(alpha.as_ptr().add(x));
+                let vd = vld1_u8(dst.as_ptr().add(x));
+                let inv_a = vsub_u8(v255, va);
+                let t = vmlal_u8(vmull_u8(vs, va), vd, inv_a);
+                let x16 = vaddq_u16(t, v128);
+                let out = vshrn_n_u16(vaddq_u16(x16, vshrq_n_u16(x16, 8)), 8);
+                vst1_u8(dst.as_mut_ptr().add(x), out);
+                x += 8;
+            }
+            if x < width {
+                overlay_plane_row_u8_scalar(&mut dst[x..], &src[x..], &alpha[x..], width - x);
+            }
         }
-        if x < width {
-            overlay_plane_row_u8_scalar(&mut dst[x..], &src[x..], &alpha[x..], width - x);
-        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        overlay_plane_row_u8_scalar(dst, src, alpha, width);
-    }
+    overlay_plane_row_u8_scalar(dst, src, alpha, width);
 }
 
 /// Alpha-blends `overlay` (`Rgba8` or converted to `Rgba8`) onto `base` (`Yuv420p` or `Rgb24`) at `(x_offset, y_offset)`.
@@ -1019,182 +1021,183 @@ pub fn tonemap_linear_bt2020_row_oklab_scalar(
 /// SIMD-accelerated (`aarch64` NEON `float32x4_t`) perceptual Oklab HDR-to-SDR row kernel.
 pub fn tonemap_linear_bt2020_row_oklab(hdr_bt2020_rgb: &[f32], dst_rgb24: &mut [u8], width: usize) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        #[inline(always)]
-        unsafe fn vcbrtq_f32_neon(x: float32x4_t) -> float32x4_t {
-            unsafe {
-                let mut a = [0.0f32; 4];
-                vst1q_f32(a.as_mut_ptr(), x);
-                let mut g = [0.0f32; 4];
-                for i in 0..4 {
-                    g[i] = if a[i] <= 1e-12 {
-                        0.0
-                    } else {
-                        f32::from_bits(0x2a51_37a0u32 + (a[i].to_bits() / 3))
-                    };
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        unsafe {
+            use std::arch::aarch64::*;
+            #[inline(always)]
+            unsafe fn vcbrtq_f32_neon(x: float32x4_t) -> float32x4_t {
+                unsafe {
+                    let mut a = [0.0f32; 4];
+                    vst1q_f32(a.as_mut_ptr(), x);
+                    let mut g = [0.0f32; 4];
+                    for i in 0..4 {
+                        g[i] = if a[i] <= 1e-12 {
+                            0.0
+                        } else {
+                            f32::from_bits(0x2a51_37a0u32 + (a[i].to_bits() / 3))
+                        };
+                    }
+                    let y0 = vld1q_f32(g.as_ptr());
+                    let mask = vcgtq_f32(x, vdupq_n_f32(1e-12));
+                    let safe_y0 = vbslq_f32(mask, y0, vdupq_n_f32(1.0));
+                    let y1 = vmulq_n_f32(
+                        vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y0, safe_y0)), safe_y0, 2.0),
+                        1.0 / 3.0,
+                    );
+                    let safe_y1 = vbslq_f32(mask, y1, vdupq_n_f32(1.0));
+                    let y2 = vmulq_n_f32(
+                        vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y1, safe_y1)), safe_y1, 2.0),
+                        1.0 / 3.0,
+                    );
+                    vbslq_f32(mask, y2, vdupq_n_f32(0.0))
                 }
-                let y0 = vld1q_f32(g.as_ptr());
-                let mask = vcgtq_f32(x, vdupq_n_f32(1e-12));
-                let safe_y0 = vbslq_f32(mask, y0, vdupq_n_f32(1.0));
-                let y1 = vmulq_n_f32(
-                    vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y0, safe_y0)), safe_y0, 2.0),
-                    1.0 / 3.0,
+            }
+
+            let oetf = srgb_oetf_lut();
+            let mut x = 0usize;
+            let v_zero = vdupq_n_f32(0.0);
+            let v_eps = vdupq_n_f32(1e-6);
+            let v_one = vdupq_n_f32(1.0);
+            let v_inv_w2 = vdupq_n_f32(1.0 / (3.6657 * 3.6657));
+            let v_025 = vdupq_n_f32(0.25);
+            let v_8192 = vdupq_n_f32(8192.0);
+            let v_half = vdupq_n_f32(0.5);
+
+            while x + 4 <= width {
+                let rgb = vld3q_f32(hdr_bt2020_rgb.as_ptr().add(x * 3));
+                let r = vmaxq_f32(rgb.0, v_zero);
+                let g = vmaxq_f32(rgb.1, v_zero);
+                let b = vmaxq_f32(rgb.2, v_zero);
+
+                let l = vmlaq_n_f32(
+                    vmlaq_n_f32(vmulq_n_f32(r, 0.6167597), g, 0.3601880),
+                    b,
+                    0.0230523,
                 );
-                let safe_y1 = vbslq_f32(mask, y1, vdupq_n_f32(1.0));
-                let y2 = vmulq_n_f32(
-                    vmlaq_n_f32(vdivq_f32(x, vmulq_f32(safe_y1, safe_y1)), safe_y1, 2.0),
-                    1.0 / 3.0,
+                let m = vmlaq_n_f32(
+                    vmlaq_n_f32(vmulq_n_f32(r, 0.2651317), g, 0.6358516),
+                    b,
+                    0.0990167,
                 );
-                vbslq_f32(mask, y2, vdupq_n_f32(0.0))
+                let s = vmlaq_n_f32(
+                    vmlaq_n_f32(vmulq_n_f32(r, 0.1001279), g, 0.2038784),
+                    b,
+                    0.6959937,
+                );
+
+                let l_ = vcbrtq_f32_neon(vmaxq_f32(l, v_zero));
+                let m_ = vcbrtq_f32_neon(vmaxq_f32(m, v_zero));
+                let s_ = vcbrtq_f32_neon(vmaxq_f32(s, v_zero));
+
+                let ok_l = vmlsq_n_f32(
+                    vmlaq_n_f32(vmulq_n_f32(l_, 0.21045426), m_, 0.7936178),
+                    s_,
+                    0.004072047,
+                );
+                let ok_a = vmlaq_n_f32(
+                    vmlsq_n_f32(vmulq_n_f32(l_, 1.9779985), m_, 2.4285922),
+                    s_,
+                    0.4505937,
+                );
+                let ok_b = vmlsq_n_f32(
+                    vmlaq_n_f32(vmulq_n_f32(l_, 0.025904037), m_, 0.78277177),
+                    s_,
+                    0.80867577,
+                );
+
+                let l_src = vmaxq_f32(ok_l, v_eps);
+                let num = vmulq_f32(l_src, vmlaq_f32(v_one, l_src, v_inv_w2));
+                let den = vaddq_f32(v_one, l_src);
+                let l_mapped = vdivq_f32(num, den);
+                let l_clamped = vminq_f32(vmaxq_f32(l_mapped, v_zero), v_one);
+                let ratio = vminq_f32(vmaxq_f32(vdivq_f32(l_mapped, l_src), v_zero), v_one);
+                let desat = vsubq_f32(v_one, vmulq_f32(v_025, vmulq_f32(l_clamped, l_clamped)));
+                let c_scale = vmulq_f32(ratio, desat);
+                let a_mapped = vmulq_f32(ok_a, c_scale);
+                let b_mapped = vmulq_f32(ok_b, c_scale);
+
+                let lm = vmlaq_n_f32(
+                    vmlaq_n_f32(l_mapped, a_mapped, 0.39633778),
+                    b_mapped,
+                    0.21580376,
+                );
+                let mm = vmlsq_n_f32(
+                    vmlsq_n_f32(l_mapped, a_mapped, 0.105561346),
+                    b_mapped,
+                    0.06385417,
+                );
+                let sm = vmlsq_n_f32(
+                    vmlsq_n_f32(l_mapped, a_mapped, 0.08948418),
+                    b_mapped,
+                    1.2914855,
+                );
+
+                let l_lin = vmulq_f32(vmulq_f32(lm, lm), lm);
+                let m_lin = vmulq_f32(vmulq_f32(mm, mm), mm);
+                let s_lin = vmulq_f32(vmulq_f32(sm, sm), sm);
+
+                let r709 = vminq_f32(
+                    vmaxq_f32(
+                        vmlaq_n_f32(
+                            vmlsq_n_f32(vmulq_n_f32(l_lin, 4.0767417), m_lin, 3.3077116),
+                            s_lin,
+                            0.23096993,
+                        ),
+                        v_zero,
+                    ),
+                    v_one,
+                );
+                let g709 = vminq_f32(
+                    vmaxq_f32(
+                        vmlsq_n_f32(
+                            vmlaq_n_f32(vmulq_n_f32(l_lin, -1.268438), m_lin, 2.6097574),
+                            s_lin,
+                            0.34131938,
+                        ),
+                        v_zero,
+                    ),
+                    v_one,
+                );
+                let b709 = vminq_f32(
+                    vmaxq_f32(
+                        vmlaq_n_f32(
+                            vmlsq_n_f32(vmulq_n_f32(l_lin, -0.0041960863), m_lin, 0.7034186),
+                            s_lin,
+                            1.7076147,
+                        ),
+                        v_zero,
+                    ),
+                    v_one,
+                );
+
+                let ri = vcvtq_u32_f32(vmlaq_f32(v_half, r709, v_8192));
+                let gi = vcvtq_u32_f32(vmlaq_f32(v_half, g709, v_8192));
+                let bi = vcvtq_u32_f32(vmlaq_f32(v_half, b709, v_8192));
+                let mut r_idx = [0u32; 4];
+                let mut g_idx = [0u32; 4];
+                let mut b_idx = [0u32; 4];
+                vst1q_u32(r_idx.as_mut_ptr(), ri);
+                vst1q_u32(g_idx.as_mut_ptr(), gi);
+                vst1q_u32(b_idx.as_mut_ptr(), bi);
+                for i in 0..4 {
+                    dst_rgb24[(x + i) * 3] = oetf[r_idx[i] as usize];
+                    dst_rgb24[(x + i) * 3 + 1] = oetf[g_idx[i] as usize];
+                    dst_rgb24[(x + i) * 3 + 2] = oetf[b_idx[i] as usize];
+                }
+                x += 4;
+            }
+            if x < width {
+                tonemap_linear_bt2020_row_oklab_scalar(
+                    &hdr_bt2020_rgb[x * 3..],
+                    &mut dst_rgb24[x * 3..],
+                    width - x,
+                );
             }
         }
-
-        let oetf = srgb_oetf_lut();
-        let mut x = 0usize;
-        let v_zero = vdupq_n_f32(0.0);
-        let v_eps = vdupq_n_f32(1e-6);
-        let v_one = vdupq_n_f32(1.0);
-        let v_inv_w2 = vdupq_n_f32(1.0 / (3.6657 * 3.6657));
-        let v_025 = vdupq_n_f32(0.25);
-        let v_8192 = vdupq_n_f32(8192.0);
-        let v_half = vdupq_n_f32(0.5);
-
-        while x + 4 <= width {
-            let rgb = vld3q_f32(hdr_bt2020_rgb.as_ptr().add(x * 3));
-            let r = vmaxq_f32(rgb.0, v_zero);
-            let g = vmaxq_f32(rgb.1, v_zero);
-            let b = vmaxq_f32(rgb.2, v_zero);
-
-            let l = vmlaq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(r, 0.6167597), g, 0.3601880),
-                b,
-                0.0230523,
-            );
-            let m = vmlaq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(r, 0.2651317), g, 0.6358516),
-                b,
-                0.0990167,
-            );
-            let s = vmlaq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(r, 0.1001279), g, 0.2038784),
-                b,
-                0.6959937,
-            );
-
-            let l_ = vcbrtq_f32_neon(vmaxq_f32(l, v_zero));
-            let m_ = vcbrtq_f32_neon(vmaxq_f32(m, v_zero));
-            let s_ = vcbrtq_f32_neon(vmaxq_f32(s, v_zero));
-
-            let ok_l = vmlsq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(l_, 0.21045426), m_, 0.7936178),
-                s_,
-                0.004072047,
-            );
-            let ok_a = vmlaq_n_f32(
-                vmlsq_n_f32(vmulq_n_f32(l_, 1.9779985), m_, 2.4285922),
-                s_,
-                0.4505937,
-            );
-            let ok_b = vmlsq_n_f32(
-                vmlaq_n_f32(vmulq_n_f32(l_, 0.025904037), m_, 0.78277177),
-                s_,
-                0.80867577,
-            );
-
-            let l_src = vmaxq_f32(ok_l, v_eps);
-            let num = vmulq_f32(l_src, vmlaq_f32(v_one, l_src, v_inv_w2));
-            let den = vaddq_f32(v_one, l_src);
-            let l_mapped = vdivq_f32(num, den);
-            let l_clamped = vminq_f32(vmaxq_f32(l_mapped, v_zero), v_one);
-            let ratio = vminq_f32(vmaxq_f32(vdivq_f32(l_mapped, l_src), v_zero), v_one);
-            let desat = vsubq_f32(v_one, vmulq_f32(v_025, vmulq_f32(l_clamped, l_clamped)));
-            let c_scale = vmulq_f32(ratio, desat);
-            let a_mapped = vmulq_f32(ok_a, c_scale);
-            let b_mapped = vmulq_f32(ok_b, c_scale);
-
-            let lm = vmlaq_n_f32(
-                vmlaq_n_f32(l_mapped, a_mapped, 0.39633778),
-                b_mapped,
-                0.21580376,
-            );
-            let mm = vmlsq_n_f32(
-                vmlsq_n_f32(l_mapped, a_mapped, 0.105561346),
-                b_mapped,
-                0.06385417,
-            );
-            let sm = vmlsq_n_f32(
-                vmlsq_n_f32(l_mapped, a_mapped, 0.08948418),
-                b_mapped,
-                1.2914855,
-            );
-
-            let l_lin = vmulq_f32(vmulq_f32(lm, lm), lm);
-            let m_lin = vmulq_f32(vmulq_f32(mm, mm), mm);
-            let s_lin = vmulq_f32(vmulq_f32(sm, sm), sm);
-
-            let r709 = vminq_f32(
-                vmaxq_f32(
-                    vmlaq_n_f32(
-                        vmlsq_n_f32(vmulq_n_f32(l_lin, 4.0767417), m_lin, 3.3077116),
-                        s_lin,
-                        0.23096993,
-                    ),
-                    v_zero,
-                ),
-                v_one,
-            );
-            let g709 = vminq_f32(
-                vmaxq_f32(
-                    vmlsq_n_f32(
-                        vmlaq_n_f32(vmulq_n_f32(l_lin, -1.268438), m_lin, 2.6097574),
-                        s_lin,
-                        0.34131938,
-                    ),
-                    v_zero,
-                ),
-                v_one,
-            );
-            let b709 = vminq_f32(
-                vmaxq_f32(
-                    vmlaq_n_f32(
-                        vmlsq_n_f32(vmulq_n_f32(l_lin, -0.0041960863), m_lin, 0.7034186),
-                        s_lin,
-                        1.7076147,
-                    ),
-                    v_zero,
-                ),
-                v_one,
-            );
-
-            let ri = vcvtq_u32_f32(vmlaq_f32(v_half, r709, v_8192));
-            let gi = vcvtq_u32_f32(vmlaq_f32(v_half, g709, v_8192));
-            let bi = vcvtq_u32_f32(vmlaq_f32(v_half, b709, v_8192));
-            let mut r_idx = [0u32; 4];
-            let mut g_idx = [0u32; 4];
-            let mut b_idx = [0u32; 4];
-            vst1q_u32(r_idx.as_mut_ptr(), ri);
-            vst1q_u32(g_idx.as_mut_ptr(), gi);
-            vst1q_u32(b_idx.as_mut_ptr(), bi);
-            for i in 0..4 {
-                dst_rgb24[(x + i) * 3] = oetf[r_idx[i] as usize];
-                dst_rgb24[(x + i) * 3 + 1] = oetf[g_idx[i] as usize];
-                dst_rgb24[(x + i) * 3 + 2] = oetf[b_idx[i] as usize];
-            }
-            x += 4;
-        }
-        if x < width {
-            tonemap_linear_bt2020_row_oklab_scalar(
-                &hdr_bt2020_rgb[x * 3..],
-                &mut dst_rgb24[x * 3..],
-                width - x,
-            );
-        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        tonemap_linear_bt2020_row_oklab_scalar(hdr_bt2020_rgb, dst_rgb24, width);
-    }
+    tonemap_linear_bt2020_row_oklab_scalar(hdr_bt2020_rgb, dst_rgb24, width);
 }
 
 /// Converts an HDR `BT.2020 PQ` (`SMPTE2084`) or `HLG` (`ARIB-STD-B67`) [`VideoFrame`]

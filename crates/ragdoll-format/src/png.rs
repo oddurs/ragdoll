@@ -159,21 +159,23 @@ pub fn unfilter_png_scanline(
         // 2: Up
         2 => {
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use std::arch::aarch64::*;
-                let mut i = 0usize;
-                while i + 16 <= n {
-                    let vc = vld1q_u8(cur.as_ptr().add(i));
-                    let vp = vld1q_u8(prev.as_ptr().add(i));
-                    vst1q_u8(cur.as_mut_ptr().add(i), vaddq_u8(vc, vp));
-                    i += 16;
+            if ragdoll_core::dispatch::neon() {
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let mut i = 0usize;
+                    while i + 16 <= n {
+                        let vc = vld1q_u8(cur.as_ptr().add(i));
+                        let vp = vld1q_u8(prev.as_ptr().add(i));
+                        vst1q_u8(cur.as_mut_ptr().add(i), vaddq_u8(vc, vp));
+                        i += 16;
+                    }
+                    while i < n {
+                        cur[i] = cur[i].wrapping_add(prev[i]);
+                        i += 1;
+                    }
                 }
-                while i < n {
-                    cur[i] = cur[i].wrapping_add(prev[i]);
-                    i += 1;
-                }
+                return Ok(());
             }
-            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..n {
                 cur[i] = cur[i].wrapping_add(prev[i]);
             }

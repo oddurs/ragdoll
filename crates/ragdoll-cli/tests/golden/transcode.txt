@@ -1,0 +1,1 @@
+[ragdoll transcode] v.mp4 -> text_t.mp4 | frames=30 gops=2 threads=<n> | in=4115 B out=2864 B (1.44:1) | <n> ms (<n> fps, <n> GB/s)

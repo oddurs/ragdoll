@@ -21,10 +21,13 @@ git checkout -b my-change
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RAGDOLL_SIMD=scalar cargo test --workspace
 cargo run --release -- self-test
 ```
 
-Then push your branch and open a pull request. CI runs formatting, Clippy and the full test suite on `aarch64` Linux, and builds the website if you changed it.
+Then push your branch and open a pull request. CI runs formatting, Clippy and the full test suite on `aarch64` (NEON) and `x86_64` (AVX2) Linux, then again with `RAGDOLL_SIMD=scalar` on the scalar reference paths, and builds the website if you changed it.
+
+The interop tests compare against FFmpeg and need `ffmpeg` and `ffprobe` installed; CI pins Ubuntu 24.04's FFmpeg 6.1.1. Without them the tests fail, unless you set `RAGDOLL_ALLOW_MISSING_TOOLS=1` to skip them. The CLI's text output is pinned by snapshots in `crates/ragdoll-cli/tests/golden/`: after an intended change, rewrite them with `RAGDOLL_BLESS=1 cargo test -p ragdoll-cli --test cli`.
 
 ## Pull requests
 

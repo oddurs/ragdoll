@@ -74,15 +74,14 @@ pub fn decimate_2x2_u8(
     src_height: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             decimate_2x2_u8_neon(src, src_stride, dst, dst_stride, src_width, src_height);
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        decimate_2x2_u8_scalar(src, src_stride, dst, dst_stride, src_width, src_height);
-    }
+    decimate_2x2_u8_scalar(src, src_stride, dst, dst_stride, src_width, src_height);
 }
 
 pub fn decimate_2x2_u8_scalar(

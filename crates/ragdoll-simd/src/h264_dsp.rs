@@ -121,15 +121,13 @@ pub fn put_h264_qpel16_mc_u8(
     dst: &mut [u8; 256],
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         unsafe {
             put_h264_qpel16_mc_u8_neon(src, src_stride, width, height, x0, y0, mx, my, dst);
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        put_h264_qpel16_mc_u8_scalar(src, src_stride, width, height, x0, y0, mx, my, dst);
-    }
+    put_h264_qpel16_mc_u8_scalar(src, src_stride, width, height, x0, y0, mx, my, dst);
 }
 
 /// Interpolates an $8\times8$ luma sub-block at integer position `(x0, y0)` and quarter-pel phase `(mx, my)` (`0..=3`).
@@ -447,15 +445,13 @@ pub fn put_h264_chroma_mc8_u8(
     dst: &mut [u8; 64],
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         unsafe {
             put_h264_chroma_mc8_u8_neon(src, src_stride, width, height, cx0, cy0, fx, fy, dst);
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        put_h264_chroma_mc8_u8_scalar(src, src_stride, width, height, cx0, cy0, fx, fy, dst);
-    }
+    put_h264_chroma_mc8_u8_scalar(src, src_stride, width, height, cx0, cy0, fx, fy, dst);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -767,11 +763,9 @@ pub fn predict_intra_4x4_u8(
     stride: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
-        if dst.len() >= 3 * stride + 4 {
-            unsafe { predict_intra_4x4_u8_neon(mode, top, left, top_left, dst, stride) };
-            return;
-        }
+    if ragdoll_core::dispatch::neon() && dst.len() >= 3 * stride + 4 {
+        unsafe { predict_intra_4x4_u8_neon(mode, top, left, top_left, dst, stride) };
+        return;
     }
     predict_intra_4x4_u8_scalar(mode, top, left, top_left, dst, stride);
 }

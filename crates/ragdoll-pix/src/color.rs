@@ -160,37 +160,31 @@ pub fn yuv420p_to_rgb24(
     mat: &YuvRgbMatrix,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             yuv420p_to_rgb24_neon(
                 y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride,
                 width, height, mat,
             );
         }
+        return;
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe {
-                yuv420p_to_rgb24_avx2(
-                    y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride,
-                    width, height, mat,
-                );
-            }
-        } else {
-            yuv420p_to_rgb24_scalar(
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2
+        unsafe {
+            yuv420p_to_rgb24_avx2(
                 y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride,
                 width, height, mat,
             );
         }
+        return;
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        yuv420p_to_rgb24_scalar(
-            y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride, width,
-            height, mat,
-        );
-    }
+    yuv420p_to_rgb24_scalar(
+        y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, rgb_dst, rgb_stride, width,
+        height, mat,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -457,7 +451,8 @@ pub fn yuv420p_to_rgba8(
     mat: &YuvRgbMatrix,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             yuv420p_to_rgba_or_bgra_neon::<false>(
                 y_plane,
@@ -473,23 +468,21 @@ pub fn yuv420p_to_rgba8(
                 mat,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        yuv420p_to_rgba8_scalar(
-            y_plane,
-            y_stride,
-            u_plane,
-            u_stride,
-            v_plane,
-            v_stride,
-            rgba_dst,
-            rgba_stride,
-            width,
-            height,
-            mat,
-        );
-    }
+    yuv420p_to_rgba8_scalar(
+        y_plane,
+        y_stride,
+        u_plane,
+        u_stride,
+        v_plane,
+        v_stride,
+        rgba_dst,
+        rgba_stride,
+        width,
+        height,
+        mat,
+    );
 }
 
 /// Converts a planar `YUV420p` image into packed `BGRA8` (`alpha = 255`).
@@ -508,7 +501,8 @@ pub fn yuv420p_to_bgra8(
     mat: &YuvRgbMatrix,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             yuv420p_to_rgba_or_bgra_neon::<true>(
                 y_plane,
@@ -524,23 +518,21 @@ pub fn yuv420p_to_bgra8(
                 mat,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        yuv420p_to_bgra8_scalar(
-            y_plane,
-            y_stride,
-            u_plane,
-            u_stride,
-            v_plane,
-            v_stride,
-            bgra_dst,
-            bgra_stride,
-            width,
-            height,
-            mat,
-        );
-    }
+    yuv420p_to_bgra8_scalar(
+        y_plane,
+        y_stride,
+        u_plane,
+        u_stride,
+        v_plane,
+        v_stride,
+        bgra_dst,
+        bgra_stride,
+        width,
+        height,
+        mat,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -810,19 +802,18 @@ pub fn nv12_to_rgb24(
     mat: &YuvRgbMatrix,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             nv12_to_rgb24_neon(
                 y_plane, y_stride, uv_plane, uv_stride, rgb_dst, rgb_stride, width, height, mat,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        nv12_to_rgb24_scalar(
-            y_plane, y_stride, uv_plane, uv_stride, rgb_dst, rgb_stride, width, height, mat,
-        );
-    }
+    nv12_to_rgb24_scalar(
+        y_plane, y_stride, uv_plane, uv_stride, rgb_dst, rgb_stride, width, height, mat,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1019,21 +1010,20 @@ pub fn rgb24_to_yuv420p(
     mat: &YuvRgbMatrix,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
         unsafe {
             rgb24_to_yuv420p_neon(
                 rgb_src, rgb_stride, y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
                 width, height, mat,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        rgb24_to_yuv420p_scalar(
-            rgb_src, rgb_stride, y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, width,
-            height, mat,
-        );
-    }
+    rgb24_to_yuv420p_scalar(
+        rgb_src, rgb_stride, y_plane, y_stride, u_plane, u_stride, v_plane, v_stride, width,
+        height, mat,
+    );
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -1513,7 +1503,7 @@ pub fn dither_plane_u16le_to_u8_bayer(
     assert!((9..=16).contains(&src_bits));
     #[cfg(target_arch = "aarch64")]
     {
-        if src_bits == 10 {
+        if src_bits == 10 && ragdoll_core::dispatch::neon() {
             unsafe {
                 dither_plane_u10le_to_u8_bayer_neon(
                     src_u16le,

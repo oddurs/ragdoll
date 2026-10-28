@@ -20,19 +20,20 @@ pub fn sad_plane_u8(
     width: usize, height: usize,
 ) -> u64 {
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         // NEON is mandatory on aarch64. The kernel slices each row
         // with checked indexing before loading from it.
-        unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
+        return unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        return unsafe { sad_plane_u8_avx2(a, a_stride, b, b_stride, width, height) };
     }
+    sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
 }
 ```
 
-This is the real wrapper from `crates/ragdoll-simd/src/metrics.rs`, lightly reformatted and commented.
+This is the real wrapper from `crates/ragdoll-simd/src/metrics.rs`, lightly reformatted and commented. `neon()` and `avx2()` report the best level the CPU supports, unless the `RAGDOLL_SIMD` environment variable (`scalar`, `neon` or `avx2`) forces one. CI runs the whole test suite twice on each architecture, once with `RAGDOLL_SIMD=scalar`, so every end-to-end test also checks that the SIMD paths change nothing.
 
 ## Differential testing
 
@@ -48,8 +49,8 @@ There are no tolerances. If a kernel uses a different rounding order from its re
 
 | ISA | Status |
 | :-- | :-- |
-| `aarch64` NEON (Advanced SIMD) | 28 kernels. NEON is mandatory on 64-bit ARM, so no runtime detection is needed. |
-| `x86_64` AVX2 | Detected at runtime by `SimdLevel::detect()`. No kernels yet; the scalar references run instead. |
+| `aarch64` NEON (Advanced SIMD) | 28 kernels. NEON is mandatory on 64-bit ARM, so no detection is needed; `RAGDOLL_SIMD=scalar` turns it off. |
+| `x86_64` AVX2 | Detected at runtime. Plane SAD and SSE, SSIM statistics, the start-code scanner, RBSP unescaping, 8-tap scaling and YUV-to-RGB have AVX2 versions; the other kernels run their scalar references. |
 | Everything else | Scalar references. |
 
 Adding a new ISA means adding a sibling to tier 2 and a branch in tier 3. The reference and the tests already exist.

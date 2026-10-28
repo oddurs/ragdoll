@@ -1,0 +1,43 @@
+================================================================================
+  RAGDOLL v0.1.0 — 100% Safe Rust, Explicit SIMD, Zero-Copy Media Engine
+  Hardware SIMD : <simd>
+  CPU Topology  : <cpu>
+================================================================================
+
+USAGE:
+  ragdoll <SUBCOMMAND> [OPTIONS] [--power-mode performance|efficiency|balanced | --battery-saver]
+
+SUBCOMMANDS:
+  probe <FILE> [--gop-map] [--json]
+      Sub-millisecond container/codec inspection, CICP colorimetry,
+      bitrate sparkline, and ASCII GOP waterfall visualization.
+
+  remux <IN> <OUT> [--faststart] [--json]
+      Zero-copy mmap -> writev remuxing across .mp4, .mkv, .ts, .flac, .ogg, .y4m, and .wav.
+
+  transcode <IN> <OUT> [--video h264|rgdi] [--audio aac|opus|flac|copy|none] [--sample-rate HZ] [--channels N] [--loudness LUFS] [--true-peak DBTP] [--scale WxH] [--filter lanczos3|mitchell|bilinear|spline36] [--crop W:H:X:Y] [--auto-crop] [--pad W:H:X:Y] [--rotate 90|180|270|hflip|vflip] [--fps NUM[/DEN]] [--overlay FILE] [--tonemap] [--qp N] [--threads N] [--power-mode MODE] [--recipe file.toml] [--json]
+      Work-stealing GOP-parallel video & audio transcoding, spatial/HDR filters, Kaiser polyphase resampling, EBU R128 loudness normalization, or TOML recipe execution.
+
+  cut <IN> <OUT> [--from <TIME>] [--to <TIME>] [--keyframes-only] [--qp N] [--json]
+      Smart-GOP frame-accurate non-linear editing: re-encodes only boundary GOPs and zero-copy copies interior GOPs.
+
+  concat <IN1> <IN2> ... -o <OUT> [--json]
+      Zero-copy multi-segment splicing with monotonic 128-bit PTS/DTS offset normalization.
+
+  package <IN> -o <OUT_DIR> [--ladder SPEC] [--segment-duration SEC] [--json]
+      One-command CMAF fMP4 HLS (master.m3u8) + DASH (manifest.mpd) + WebVTT trick-play ABR packager.
+
+  extract <IN> [-o <OUT>] [--at <SEC>] [--thumbnails <N> --grid <CxR>] [--json]
+      Fast keyframe seek and single-frame or contact-sheet (.png/.jpg/.ppm/.y4m) extraction.
+
+  metrics <REF> <DIST> [--json]
+      SIMD perceptual video quality analyzer (PSNR, 8x8 SSIM, 5-Scale MS-SSIM, VMAF-Lite).
+
+  synth <OUT> [--resolution WxH] [--fps N] [--duration SEC] [--json]
+      Procedural SIMD test media generator (SMPTE bars, zone-plates, stereo harmonies).
+
+  bench [--compare-ffmpeg] [--json]
+      Automated speed + hardware PMU instruction/cycle/energy benchmark suite across 7 workloads.
+
+  self-test
+      Run SIMD vs. scalar bit-exact differential kernel verification.

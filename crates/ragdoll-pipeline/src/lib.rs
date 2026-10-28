@@ -200,6 +200,9 @@ pub const DEFAULT_PIPELINE_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 /// Battery-saver memory budget (`64 MiB`) for [`GopRingPipeline`] in `PowerMode::Efficiency`.
 pub const EFFICIENCY_PIPELINE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Frames per independently encoded GOP in [`GopRingPipeline`] (an IDR every 15 frames).
+pub const GOP_FRAMES: usize = 15;
+
 /// The memory budget for the active [`PowerMode`]: `256 MiB`, or `64 MiB` in
 /// `PowerMode::Efficiency`.
 pub fn default_pipeline_memory_budget() -> usize {
@@ -370,11 +373,12 @@ impl GopRingPipeline {
         } else {
             self.worker_threads.max(1)
         };
-        let max_gop_for_threads = total_frames.div_ceil(eff_workers).max(1);
+        // A fixed GOP length keeps the output independent of the thread count and power mode
+        // (`0061`); short inputs simply use fewer workers.
         let gop_size = if is_abr {
             total_frames.max(1)
         } else {
-            15usize.min(max_gop_for_threads)
+            GOP_FRAMES
         };
         let max_gops_wave = self.max_gops_per_wave(src_w, src_h, dst_w, dst_h, gop_size);
         let frame_bytes = (src_w * src_h * 3 / 2)
@@ -5029,11 +5033,7 @@ faststart = true
         assert!(mpd_text.contains("stream_0/init.mp4"));
 
         // Optional ffprobe verification of cut.mp4, concat.mp4, and CMAF init+seg
-        if std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .is_ok()
-        {
+        if ragdoll_core::testing::require_tool("ffprobe") {
             for p in [&cut_mp4, &concat_mp4] {
                 let st = std::process::Command::new("ffprobe")
                     .args(["-v", "error", "-show_entries", "format=duration"])

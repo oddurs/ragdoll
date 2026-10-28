@@ -83,6 +83,17 @@ impl SimdLevel {
         }
     }
 
+    /// The level kernels dispatch to: [`Self::detect`], unless `RAGDOLL_SIMD` forces another
+    /// (see [`ragdoll_core::dispatch`]).
+    #[inline]
+    pub fn active() -> Self {
+        match ragdoll_core::dispatch::SimdDispatch::active() {
+            ragdoll_core::dispatch::SimdDispatch::Neon => Self::Neon,
+            ragdoll_core::dispatch::SimdDispatch::Avx2 => Self::Avx2,
+            ragdoll_core::dispatch::SimdDispatch::Scalar => Self::Scalar,
+        }
+    }
+
     #[inline]
     pub const fn name(self) -> &'static str {
         match self {

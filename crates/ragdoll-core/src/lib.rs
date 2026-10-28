@@ -10,11 +10,13 @@
 pub mod bitstream;
 pub mod color;
 pub mod crc;
+pub mod dispatch;
 pub mod error;
 pub mod format;
 pub mod frame;
 pub mod packet;
 pub mod power;
+pub mod testing;
 pub mod time;
 
 pub use bitstream::{

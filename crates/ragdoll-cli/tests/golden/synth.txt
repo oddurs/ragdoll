@@ -1,0 +1,1 @@
+[ragdoll synth] procedural://64x36@30fps -> text_s.y4m | frames=6 gops=1 threads=<n> | in=20736 B out=20834 B (1.00:1) | <n> ms (<n> fps, <n> GB/s)

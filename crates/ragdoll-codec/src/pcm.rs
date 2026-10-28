@@ -28,18 +28,20 @@ pub fn pcm_s16_to_f32(src: &[i16], dst: &mut [f32]) {
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let v_scale = vdupq_n_f32(S16_TO_F32_SCALE);
-        while i + 8 <= n {
-            let s16x8 = vld1q_s16(src.as_ptr().add(i));
-            let lo_s32 = vmovl_s16(vget_low_s16(s16x8));
-            let hi_s32 = vmovl_high_s16(s16x8);
-            let lo_f32 = vmulq_f32(vcvtq_f32_s32(lo_s32), v_scale);
-            let hi_f32 = vmulq_f32(vcvtq_f32_s32(hi_s32), v_scale);
-            vst1q_f32(dst.as_mut_ptr().add(i), lo_f32);
-            vst1q_f32(dst.as_mut_ptr().add(i + 4), hi_f32);
-            i += 8;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            let v_scale = vdupq_n_f32(S16_TO_F32_SCALE);
+            while i + 8 <= n {
+                let s16x8 = vld1q_s16(src.as_ptr().add(i));
+                let lo_s32 = vmovl_s16(vget_low_s16(s16x8));
+                let hi_s32 = vmovl_high_s16(s16x8);
+                let lo_f32 = vmulq_f32(vcvtq_f32_s32(lo_s32), v_scale);
+                let hi_f32 = vmulq_f32(vcvtq_f32_s32(hi_s32), v_scale);
+                vst1q_f32(dst.as_mut_ptr().add(i), lo_f32);
+                vst1q_f32(dst.as_mut_ptr().add(i + 4), hi_f32);
+                i += 8;
+            }
         }
     }
 
@@ -63,23 +65,25 @@ pub fn pcm_f32_to_s16(src: &[f32], dst: &mut [i16]) {
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let v_scale = vdupq_n_f32(F32_TO_S16_SCALE);
-        let v_min = vdupq_n_f32(-32768.0);
-        let v_max = vdupq_n_f32(32767.0);
-        while i + 8 <= n {
-            let f_lo = vld1q_f32(src.as_ptr().add(i));
-            let f_hi = vld1q_f32(src.as_ptr().add(i + 4));
-            let s_lo = vminq_f32(vmaxq_f32(vmulq_f32(f_lo, v_scale), v_min), v_max);
-            let s_hi = vminq_f32(vmaxq_f32(vmulq_f32(f_hi, v_scale), v_min), v_max);
-            let i32_lo = vcvtaq_s32_f32(s_lo);
-            let i32_hi = vcvtaq_s32_f32(s_hi);
-            let i16_lo = vqmovn_s32(i32_lo);
-            let i16_hi = vqmovn_s32(i32_hi);
-            let combined = vcombine_s16(i16_lo, i16_hi);
-            vst1q_s16(dst.as_mut_ptr().add(i), combined);
-            i += 8;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            let v_scale = vdupq_n_f32(F32_TO_S16_SCALE);
+            let v_min = vdupq_n_f32(-32768.0);
+            let v_max = vdupq_n_f32(32767.0);
+            while i + 8 <= n {
+                let f_lo = vld1q_f32(src.as_ptr().add(i));
+                let f_hi = vld1q_f32(src.as_ptr().add(i + 4));
+                let s_lo = vminq_f32(vmaxq_f32(vmulq_f32(f_lo, v_scale), v_min), v_max);
+                let s_hi = vminq_f32(vmaxq_f32(vmulq_f32(f_hi, v_scale), v_min), v_max);
+                let i32_lo = vcvtaq_s32_f32(s_lo);
+                let i32_hi = vcvtaq_s32_f32(s_hi);
+                let i16_lo = vqmovn_s32(i32_lo);
+                let i16_hi = vqmovn_s32(i32_hi);
+                let combined = vcombine_s16(i16_lo, i16_hi);
+                vst1q_s16(dst.as_mut_ptr().add(i), combined);
+                i += 8;
+            }
         }
     }
 
@@ -127,13 +131,15 @@ pub fn deinterleave_stereo_i32(interleaved: &[i32], left: &mut [i32], right: &mu
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= frames {
-            let pair = vld2q_s32(interleaved.as_ptr().add(i * 2));
-            vst1q_s32(left.as_mut_ptr().add(i), pair.0);
-            vst1q_s32(right.as_mut_ptr().add(i), pair.1);
-            i += 4;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            while i + 4 <= frames {
+                let pair = vld2q_s32(interleaved.as_ptr().add(i * 2));
+                vst1q_s32(left.as_mut_ptr().add(i), pair.0);
+                vst1q_s32(right.as_mut_ptr().add(i), pair.1);
+                i += 4;
+            }
         }
     }
 
@@ -161,13 +167,15 @@ pub fn interleave_stereo_i32(left: &[i32], right: &[i32], dst: &mut [i32]) {
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= frames {
-            let l = vld1q_s32(left.as_ptr().add(i));
-            let r = vld1q_s32(right.as_ptr().add(i));
-            vst2q_s32(dst.as_mut_ptr().add(i * 2), int32x4x2_t(l, r));
-            i += 4;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            while i + 4 <= frames {
+                let l = vld1q_s32(left.as_ptr().add(i));
+                let r = vld1q_s32(right.as_ptr().add(i));
+                vst2q_s32(dst.as_mut_ptr().add(i * 2), int32x4x2_t(l, r));
+                i += 4;
+            }
         }
     }
 
@@ -206,16 +214,18 @@ pub fn decorrelate_mid_side_i32(left: &[i32], right: &[i32], mid: &mut [i32], si
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= n {
-            let l = vld1q_s32(left.as_ptr().add(i));
-            let r = vld1q_s32(right.as_ptr().add(i));
-            let m = vhaddq_s32(l, r);
-            let s = vsubq_s32(l, r);
-            vst1q_s32(mid.as_mut_ptr().add(i), m);
-            vst1q_s32(side.as_mut_ptr().add(i), s);
-            i += 4;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            while i + 4 <= n {
+                let l = vld1q_s32(left.as_ptr().add(i));
+                let r = vld1q_s32(right.as_ptr().add(i));
+                let m = vhaddq_s32(l, r);
+                let s = vsubq_s32(l, r);
+                vst1q_s32(mid.as_mut_ptr().add(i), m);
+                vst1q_s32(side.as_mut_ptr().add(i), s);
+                i += 4;
+            }
         }
     }
 
@@ -250,17 +260,19 @@ pub fn reconstruct_mid_side_i32(mid: &[i32], side: &[i32], left: &mut [i32], rig
     let mut i = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= n {
-            let m = vld1q_s32(mid.as_ptr().add(i));
-            let s = vld1q_s32(side.as_ptr().add(i));
-            let s_half = vshrq_n_s32(s, 1);
-            let r = vsubq_s32(m, s_half);
-            let l = vaddq_s32(r, s);
-            vst1q_s32(left.as_mut_ptr().add(i), l);
-            vst1q_s32(right.as_mut_ptr().add(i), r);
-            i += 4;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            while i + 4 <= n {
+                let m = vld1q_s32(mid.as_ptr().add(i));
+                let s = vld1q_s32(side.as_ptr().add(i));
+                let s_half = vshrq_n_s32(s, 1);
+                let r = vsubq_s32(m, s_half);
+                let l = vaddq_s32(r, s);
+                vst1q_s32(left.as_mut_ptr().add(i), l);
+                vst1q_s32(right.as_mut_ptr().add(i), r);
+                i += 4;
+            }
         }
     }
 

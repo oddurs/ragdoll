@@ -164,13 +164,10 @@ pub fn encode_rgdi_plane_scalar(plane: &Plane, qstep_shift: u8, dst: &mut Vec<u8
 /// Vectorized `aarch64` NEON encoder for a single 8-bit plane in `RGDI` format.
 pub fn encode_rgdi_plane(plane: &Plane, qstep_shift: u8, dst: &mut Vec<u8>) {
     #[cfg(target_arch = "aarch64")]
-    {
-        encode_rgdi_plane_neon(plane, qstep_shift, dst);
+    if ragdoll_core::dispatch::neon() {
+        return encode_rgdi_plane_neon(plane, qstep_shift, dst);
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        encode_rgdi_plane_scalar(plane, qstep_shift, dst);
-    }
+    encode_rgdi_plane_scalar(plane, qstep_shift, dst);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -273,6 +270,7 @@ pub fn decode_rgdi_plane(src: &[u8], qstep_shift: u8, plane: &mut Plane) -> Resu
 
     let stride = plane.stride();
     let plane_buf = plane.data_mut();
+    let use_neon = ragdoll_core::dispatch::neon();
 
     while chunk_idx < total_chunks && pos < src.len() {
         let tag = src[pos];
@@ -287,17 +285,17 @@ pub fn decode_rgdi_plane(src: &[u8], qstep_shift: u8, plane: &mut Plane) -> Resu
                 let x0 = c * 16;
                 let row_start = y * stride + x0;
 
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    use std::arch::aarch64::*;
-                    let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
-                    let v_shift = vdupq_n_s8(qstep_shift as i8);
-                    let v_half = vdupq_n_u8(half_step);
-                    let recon = vorrq_u8(vshlq_u8(p, v_shift), v_half);
-                    vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
+                if use_neon {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        use std::arch::aarch64::*;
+                        let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
+                        let v_shift = vdupq_n_s8(qstep_shift as i8);
+                        let v_half = vdupq_n_u8(half_step);
+                        let recon = vorrq_u8(vshlq_u8(p, v_shift), v_half);
+                        vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
+                    }
+                } else {
                     for k in 0..16 {
                         plane_buf[row_start + k] =
                             (prev_shifted[x0 + k] << qstep_shift) | half_step;
@@ -325,20 +323,20 @@ pub fn decode_rgdi_plane(src: &[u8], qstep_shift: u8, plane: &mut Plane) -> Resu
             }
             pos += 8;
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use std::arch::aarch64::*;
-                let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
-                let d = vld1q_u8(d_bytes.as_ptr());
-                let cur = vaddq_u8(p, d);
-                vst1q_u8(prev_shifted.as_mut_ptr().add(x0), cur);
-                let v_shift = vdupq_n_s8(qstep_shift as i8);
-                let v_half = vdupq_n_u8(half_step);
-                let recon = vorrq_u8(vshlq_u8(cur, v_shift), v_half);
-                vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
+            if use_neon {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
+                    let d = vld1q_u8(d_bytes.as_ptr());
+                    let cur = vaddq_u8(p, d);
+                    vst1q_u8(prev_shifted.as_mut_ptr().add(x0), cur);
+                    let v_shift = vdupq_n_s8(qstep_shift as i8);
+                    let v_half = vdupq_n_u8(half_step);
+                    let recon = vorrq_u8(vshlq_u8(cur, v_shift), v_half);
+                    vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
+                }
+            } else {
                 for k in 0..16 {
                     let cur = prev_shifted[x0 + k].wrapping_add(d_bytes[k]);
                     prev_shifted[x0 + k] = cur;
@@ -356,20 +354,20 @@ pub fn decode_rgdi_plane(src: &[u8], qstep_shift: u8, plane: &mut Plane) -> Resu
             let x0 = c * 16;
             let row_start = y * stride + x0;
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use std::arch::aarch64::*;
-                let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
-                let d = vld1q_u8(src.as_ptr().add(pos));
-                let cur = vaddq_u8(p, d);
-                vst1q_u8(prev_shifted.as_mut_ptr().add(x0), cur);
-                let v_shift = vdupq_n_s8(qstep_shift as i8);
-                let v_half = vdupq_n_u8(half_step);
-                let recon = vorrq_u8(vshlq_u8(cur, v_shift), v_half);
-                vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
+            if use_neon {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let p = vld1q_u8(prev_shifted.as_ptr().add(x0));
+                    let d = vld1q_u8(src.as_ptr().add(pos));
+                    let cur = vaddq_u8(p, d);
+                    vst1q_u8(prev_shifted.as_mut_ptr().add(x0), cur);
+                    let v_shift = vdupq_n_s8(qstep_shift as i8);
+                    let v_half = vdupq_n_u8(half_step);
+                    let recon = vorrq_u8(vshlq_u8(cur, v_shift), v_half);
+                    vst1q_u8(plane_buf.as_mut_ptr().add(row_start), recon);
+                }
+            } else {
                 for k in 0..16 {
                     let cur = prev_shifted[x0 + k].wrapping_add(src[pos + k]);
                     prev_shifted[x0 + k] = cur;

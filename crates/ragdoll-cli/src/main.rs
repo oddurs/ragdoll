@@ -58,13 +58,45 @@ use ragdoll_simd::{
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if let Err(err) = run_cli(&args) {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    match run_cli(&args) {
+        Ok(()) => {}
+        Err(CliError::Usage(msg)) => {
+            eprintln!("error: {msg}\nrun `ragdoll --help` for usage");
+            std::process::exit(2);
+        }
+        Err(CliError::Failed(err)) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
     }
 }
 
-pub fn run_cli(args: &[String]) -> Result<()> {
+/// Why a command failed: a usage error exits with status 2, a runtime failure with status 1.
+#[derive(Debug)]
+pub enum CliError {
+    Usage(String),
+    Failed(RagdollError),
+}
+
+impl From<RagdollError> for CliError {
+    fn from(e: RagdollError) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Failed(RagdollError::Io(e))
+    }
+}
+
+pub type CliResult = std::result::Result<(), CliError>;
+
+fn usage(msg: impl Into<String>) -> CliError {
+    CliError::Usage(msg.into())
+}
+
+pub fn run_cli(args: &[String]) -> CliResult {
     let mut filtered = Vec::with_capacity(args.len());
     let mut power_mode = PowerMode::Performance;
     let mut i = 0;
@@ -91,7 +123,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         let topo = CpuTopology::detect();
         println!(
             "ragdoll 0.1.0 ({} | {} P-cores + {} E-cores)",
-            SimdLevel::detect().name(),
+            SimdLevel::active().name(),
             topo.p_cores,
             topo.e_cores
         );
@@ -112,25 +144,18 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         "synth" => cmd_synth(rest),
         "bench" => cmd_bench(rest),
         "self-test" | "selftest" => {
+            if let Some(other) = rest.first() {
+                return Err(usage(format!("self-test takes no arguments: {other}")));
+            }
             run_self_test();
             Ok(())
         }
-        other => Err(RagdollError::InvalidSyntax("unknown subcommand").with_context(other)),
-    }
-}
-
-trait ErrorContext {
-    fn with_context(self, detail: &str) -> Self;
-}
-
-impl ErrorContext for RagdollError {
-    fn with_context(self, detail: &str) -> Self {
-        RagdollError::InvalidData(format!("{self}: {detail}"))
+        other => Err(usage(format!("unknown subcommand: {other}"))),
     }
 }
 
 fn print_help() {
-    let simd = SimdLevel::detect();
+    let simd = SimdLevel::active();
     let topo = CpuTopology::detect();
     println!("================================================================================");
     println!("  RAGDOLL v0.1.0 — 100% Safe Rust, Explicit SIMD, Zero-Copy Media Engine");
@@ -270,7 +295,7 @@ pub fn render_gop_waterfall(sizes: &[(bool, u32)], max_frames: usize) -> String 
     out
 }
 
-fn cmd_probe(args: &[String]) -> Result<()> {
+fn cmd_probe(args: &[String]) -> CliResult {
     let mut file_path = None;
     let mut show_gop = false;
     let mut json = false;
@@ -283,12 +308,12 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                 file_path = Some(s.to_string())
             }
             other if other != "-" && other.starts_with('-') => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
             _ => {}
         }
     }
-    let path = file_path.ok_or(RagdollError::InvalidSyntax("probe requires <FILE>"))?;
+    let path = file_path.ok_or_else(|| usage("probe requires <FILE>"))?;
     let rep: ProbeReport = probe_file_detailed(&path)?;
 
     if json {
@@ -420,7 +445,7 @@ fn print_probe_json(rep: &ProbeReport) {
     println!("}}");
 }
 
-fn cmd_remux(args: &[String]) -> Result<()> {
+fn cmd_remux(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut format_override: Option<String> = None;
     let mut json = false;
@@ -434,13 +459,13 @@ fn cmd_remux(args: &[String]) -> Result<()> {
             }
             s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
     }
     if positional.len() < 2 {
-        return Err(RagdollError::InvalidSyntax("remux requires <IN> <OUT>"));
+        return Err(usage("remux requires <IN> <OUT>"));
     }
     let tel = remux_file_with_format(&positional[0], &positional[1], format_override.as_deref())?;
     if !is_stdout_path(&positional[1]) {
@@ -449,7 +474,7 @@ fn cmd_remux(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_transcode(args: &[String]) -> Result<()> {
+fn cmd_transcode(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut opts = TranscodeOptions::default();
     let mut recipe_path: Option<String> = None;
@@ -583,7 +608,7 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
             }
             s if s == "-" || !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
@@ -609,7 +634,7 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
         execute_recipe(&recipe)?
     } else {
         if positional.len() < 2 {
-            return Err(RagdollError::InvalidSyntax(
+            return Err(usage(
                 "transcode requires <IN> <OUT> or --recipe <FILE.toml>",
             ));
         }
@@ -622,7 +647,7 @@ fn cmd_transcode(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_cut(args: &[String]) -> Result<()> {
+fn cmd_cut(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut opts = CutOptions {
         qp: 20,
@@ -650,13 +675,13 @@ fn cmd_cut(args: &[String]) -> Result<()> {
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
     }
     if positional.len() < 2 {
-        return Err(RagdollError::InvalidSyntax(
+        return Err(usage(
             "cut requires <IN> <OUT> [--from <TIME>] [--to <TIME>]",
         ));
     }
@@ -687,7 +712,7 @@ fn cmd_cut(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_concat(args: &[String]) -> Result<()> {
+fn cmd_concat(args: &[String]) -> CliResult {
     let mut inputs = Vec::new();
     let mut out_opt: Option<String> = None;
     let mut json = false;
@@ -701,7 +726,7 @@ fn cmd_concat(args: &[String]) -> Result<()> {
             }
             s if !s.starts_with('-') => inputs.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
@@ -711,9 +736,7 @@ fn cmd_concat(args: &[String]) -> Result<()> {
     } else if inputs.len() >= 2 {
         inputs.pop().unwrap()
     } else {
-        return Err(RagdollError::InvalidSyntax(
-            "concat requires <IN1> <IN2> ... -o <OUT>",
-        ));
+        return Err(usage("concat requires <IN1> <IN2> ... -o <OUT>"));
     };
     let rep = concat_media(&inputs, &out_path)?;
     if json {
@@ -741,7 +764,7 @@ fn cmd_concat(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_package(args: &[String]) -> Result<()> {
+fn cmd_package(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut out_dir_opt: Option<String> = None;
     let mut opts = PackageOptions::default();
@@ -769,17 +792,17 @@ fn cmd_package(args: &[String]) -> Result<()> {
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
     }
-    let in_path = positional.first().ok_or(RagdollError::InvalidSyntax(
-        "package requires <IN> -o <OUT_DIR>",
-    ))?;
+    let in_path = positional
+        .first()
+        .ok_or_else(|| usage("package requires <IN> -o <OUT_DIR>"))?;
     let out_dir = out_dir_opt
         .or_else(|| positional.get(1).cloned())
-        .ok_or(RagdollError::InvalidSyntax("package requires -o <OUT_DIR>"))?;
+        .ok_or_else(|| usage("package requires -o <OUT_DIR>"))?;
     let rep = package_abr(in_path, &out_dir, &opts)?;
     if json {
         println!(
@@ -807,7 +830,7 @@ fn cmd_package(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_extract(args: &[String]) -> Result<()> {
+fn cmd_extract(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut out_opt: Option<String> = None;
     let mut at_sec: Option<f64> = None;
@@ -839,7 +862,7 @@ fn cmd_extract(args: &[String]) -> Result<()> {
             }
             s if !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
         i += 1;
@@ -847,13 +870,10 @@ fn cmd_extract(args: &[String]) -> Result<()> {
 
     let in_path = positional
         .first()
-        .ok_or(RagdollError::InvalidSyntax("extract requires <IN>"))?;
-    let out_path =
-        out_opt
-            .or_else(|| positional.get(1).cloned())
-            .ok_or(RagdollError::InvalidSyntax(
-                "extract requires -o <OUT> or <OUT>",
-            ))?;
+        .ok_or_else(|| usage("extract requires <IN>"))?;
+    let out_path = out_opt
+        .or_else(|| positional.get(1).cloned())
+        .ok_or_else(|| usage("extract requires -o <OUT> or <OUT>"))?;
 
     let thumbs = thumb_count.map(|n| (n, grid.0, grid.1));
     let tel = extract_media(in_path, &out_path, at_sec, thumbs)?;
@@ -861,7 +881,7 @@ fn cmd_extract(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_metrics(args: &[String]) -> Result<()> {
+fn cmd_metrics(args: &[String]) -> CliResult {
     let mut positional = Vec::new();
     let mut json = false;
     for arg in args {
@@ -869,12 +889,12 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             "--json" | "-j" => json = true,
             s if !s.starts_with('-') => positional.push(s.to_string()),
             other => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
         }
     }
     if positional.len() < 2 {
-        return Err(RagdollError::InvalidSyntax("metrics requires <REF> <DIST>"));
+        return Err(usage("metrics requires <REF> <DIST>"));
     }
     let (rep, frames, elapsed_ms) = evaluate_media_metrics(&positional[0], &positional[1])?;
     let fps = (frames as f64) / (elapsed_ms / 1000.0).max(1e-9);
@@ -924,7 +944,7 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_synth(args: &[String]) -> Result<()> {
+fn cmd_synth(args: &[String]) -> CliResult {
     let mut out_path: Option<String> = None;
     let mut dims = (1280usize, 720usize);
     let mut fps = 30i64;
@@ -951,14 +971,14 @@ fn cmd_synth(args: &[String]) -> Result<()> {
             }
             s if !s.starts_with('-') && out_path.is_none() => out_path = Some(s.to_string()),
             other if other.starts_with('-') => {
-                return Err(RagdollError::InvalidSyntax("unknown option").with_context(other));
+                return Err(usage(format!("unknown option: {other}")));
             }
             _ => {}
         }
         i += 1;
     }
 
-    let out = out_path.ok_or(RagdollError::InvalidSyntax("synth requires <OUT>"))?;
+    let out = out_path.ok_or_else(|| usage("synth requires <OUT>"))?;
     let tel = synth_media(&out, dims.0, dims.1, fps, duration)?;
     print_telemetry(&tel, json);
     Ok(())
@@ -1057,7 +1077,13 @@ fn run_external_batch_with_telemetry(
     Ok(scaled)
 }
 
-fn cmd_bench(args: &[String]) -> Result<()> {
+fn cmd_bench(args: &[String]) -> CliResult {
+    if let Some(other) = args
+        .iter()
+        .find(|a| !matches!(a.as_str(), "--compare-ffmpeg" | "-c" | "--json" | "-j"))
+    {
+        return Err(usage(format!("unknown option: {other}")));
+    }
     let compare_ffmpeg = args.iter().any(|a| a == "--compare-ffmpeg" || a == "-c");
     let json = args.iter().any(|a| a == "--json" || a == "-j");
 
@@ -2244,7 +2270,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     let topo = CpuTopology::detect();
     if json {
         println!("{{");
-        println!("  \"simd\": \"{}\",", SimdLevel::detect().name());
+        println!("  \"simd\": \"{}\",", SimdLevel::active().name());
         println!(
             "  \"cpu_topology\": {{\"logical_cores\": {}, \"p_cores\": {}, \"e_cores\": {}}},",
             topo.total_cores, topo.p_cores, topo.e_cores
@@ -2288,7 +2314,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
         );
         println!(
             "  RAGDOLL v1.0.0 12-WORKLOAD SPEED & BATTERY EFFICIENCY BENCHMARK SUITE — SIMD: {} | CPU: {} P-Cores + {} E-Cores",
-            SimdLevel::detect().name(),
+            SimdLevel::active().name(),
             topo.p_cores,
             topo.e_cores
         );

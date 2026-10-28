@@ -610,7 +610,7 @@ pub fn unescape_rbsp_into(src: &[u8], dst: &mut Vec<u8>) {
     let mut zeros = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    {
+    if crate::dispatch::neon() {
         use std::arch::aarch64::*;
         unsafe {
             let v_zero = vdupq_n_u8(0);
@@ -651,7 +651,7 @@ pub fn unescape_rbsp_into(src: &[u8], dst: &mut Vec<u8>) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if crate::dispatch::avx2() {
             #[target_feature(enable = "avx2")]
             unsafe fn unescape_rbsp_avx2(
                 src: &[u8],

@@ -37,20 +37,19 @@ pub fn polyphase_dot16_f32_scalar(src: &[f32], taps: &[f32; 16]) -> f32 {
 pub fn polyphase_dot16_f32(src: &[f32], taps: &[f32; 16]) -> f32 {
     debug_assert!(src.len() >= 16);
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let sp = src.as_ptr();
-        let tp = taps.as_ptr();
-        let mut acc0 = vmulq_f32(vld1q_f32(sp), vld1q_f32(tp));
-        let mut acc1 = vmulq_f32(vld1q_f32(sp.add(4)), vld1q_f32(tp.add(4)));
-        acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(8)), vld1q_f32(tp.add(8)));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(12)), vld1q_f32(tp.add(12)));
-        vaddvq_f32(vaddq_f32(acc0, acc1))
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let sp = src.as_ptr();
+            let tp = taps.as_ptr();
+            let mut acc0 = vmulq_f32(vld1q_f32(sp), vld1q_f32(tp));
+            let mut acc1 = vmulq_f32(vld1q_f32(sp.add(4)), vld1q_f32(tp.add(4)));
+            acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(8)), vld1q_f32(tp.add(8)));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(12)), vld1q_f32(tp.add(12)));
+            vaddvq_f32(vaddq_f32(acc0, acc1))
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        polyphase_dot16_f32_scalar(src, taps)
-    }
+    polyphase_dot16_f32_scalar(src, taps)
 }
 
 /// Scalar reference: 32-tap `f32` polyphase dot product.
@@ -75,22 +74,21 @@ pub fn polyphase_dot32_f32_scalar(src: &[f32], taps: &[f32; 32]) -> f32 {
 pub fn polyphase_dot32_f32(src: &[f32], taps: &[f32; 32]) -> f32 {
     debug_assert!(src.len() >= 32);
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let sp = src.as_ptr();
-        let tp = taps.as_ptr();
-        let mut acc0 = vmulq_f32(vld1q_f32(sp), vld1q_f32(tp));
-        let mut acc1 = vmulq_f32(vld1q_f32(sp.add(4)), vld1q_f32(tp.add(4)));
-        for k in (8..32).step_by(8) {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(k)), vld1q_f32(tp.add(k)));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(k + 4)), vld1q_f32(tp.add(k + 4)));
-        }
-        vaddvq_f32(vaddq_f32(acc0, acc1))
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let sp = src.as_ptr();
+            let tp = taps.as_ptr();
+            let mut acc0 = vmulq_f32(vld1q_f32(sp), vld1q_f32(tp));
+            let mut acc1 = vmulq_f32(vld1q_f32(sp.add(4)), vld1q_f32(tp.add(4)));
+            for k in (8..32).step_by(8) {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(k)), vld1q_f32(tp.add(k)));
+                acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(k + 4)), vld1q_f32(tp.add(k + 4)));
+            }
+            vaddvq_f32(vaddq_f32(acc0, acc1))
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        polyphase_dot32_f32_scalar(src, taps)
-    }
+    polyphase_dot32_f32_scalar(src, taps)
 }
 
 /// Scalar reference: arbitrary-tap (`16, 32, 64`) `f32` polyphase dot product.
@@ -130,29 +128,28 @@ pub fn polyphase_dot_f32(src: &[f32], taps: &[f32]) -> f32 {
         return polyphase_dot32_f32(src, t);
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let sp = src.as_ptr();
-        let tp = taps.as_ptr();
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut k = 0usize;
-        while k + 8 <= n {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(k)), vld1q_f32(tp.add(k)));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(k + 4)), vld1q_f32(tp.add(k + 4)));
-            k += 8;
-        }
-        let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
-        while k < n {
-            sum += src[k] * taps[k];
-            k += 1;
-        }
-        sum
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let sp = src.as_ptr();
+            let tp = taps.as_ptr();
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            let mut k = 0usize;
+            while k + 8 <= n {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(sp.add(k)), vld1q_f32(tp.add(k)));
+                acc1 = vfmaq_f32(acc1, vld1q_f32(sp.add(k + 4)), vld1q_f32(tp.add(k + 4)));
+                k += 8;
+            }
+            let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+            while k < n {
+                sum += src[k] * taps[k];
+                k += 1;
+            }
+            sum
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        polyphase_dot_f32_scalar(src, taps)
-    }
+    polyphase_dot_f32_scalar(src, taps)
 }
 
 /// Scalar reference: 16-tap Q15 fixed-point (`32768 = 1.0`) `i16` polyphase dot product.
@@ -171,25 +168,24 @@ pub fn polyphase_dot16_q15_i16_scalar(src: &[i16], taps: &[i16; 16]) -> i16 {
 pub fn polyphase_dot16_q15_i16(src: &[i16], taps: &[i16; 16]) -> i16 {
     debug_assert!(src.len() >= 16);
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let s0 = vld1q_s16(src.as_ptr());
-        let s1 = vld1q_s16(src.as_ptr().add(8));
-        let t0 = vld1q_s16(taps.as_ptr());
-        let t1 = vld1q_s16(taps.as_ptr().add(8));
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let s0 = vld1q_s16(src.as_ptr());
+            let s1 = vld1q_s16(src.as_ptr().add(8));
+            let t0 = vld1q_s16(taps.as_ptr());
+            let t1 = vld1q_s16(taps.as_ptr().add(8));
 
-        let mut acc = vmull_s16(vget_low_s16(s0), vget_low_s16(t0));
-        acc = vmlal_high_s16(acc, s0, t0);
-        acc = vmlal_s16(acc, vget_low_s16(s1), vget_low_s16(t1));
-        acc = vmlal_high_s16(acc, s1, t1);
+            let mut acc = vmull_s16(vget_low_s16(s0), vget_low_s16(t0));
+            acc = vmlal_high_s16(acc, s0, t0);
+            acc = vmlal_s16(acc, vget_low_s16(s1), vget_low_s16(t1));
+            acc = vmlal_high_s16(acc, s1, t1);
 
-        let sum = vaddvq_s32(acc) + 16384;
-        (sum >> 15).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            let sum = vaddvq_s32(acc) + 16384;
+            (sum >> 15).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        polyphase_dot16_q15_i16_scalar(src, taps)
-    }
+    polyphase_dot16_q15_i16_scalar(src, taps)
 }
 
 /// Scalar reference: 32-tap Q15 fixed-point `i16` polyphase dot product.
@@ -208,22 +204,21 @@ pub fn polyphase_dot32_q15_i16_scalar(src: &[i16], taps: &[i16; 32]) -> i16 {
 pub fn polyphase_dot32_q15_i16(src: &[i16], taps: &[i16; 32]) -> i16 {
     debug_assert!(src.len() >= 32);
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut acc = vdupq_n_s32(0);
-        for k in (0..32).step_by(8) {
-            let s = vld1q_s16(src.as_ptr().add(k));
-            let t = vld1q_s16(taps.as_ptr().add(k));
-            acc = vmlal_s16(acc, vget_low_s16(s), vget_low_s16(t));
-            acc = vmlal_high_s16(acc, s, t);
-        }
-        let sum = vaddvq_s32(acc) + 16384;
-        (sum >> 15).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let mut acc = vdupq_n_s32(0);
+            for k in (0..32).step_by(8) {
+                let s = vld1q_s16(src.as_ptr().add(k));
+                let t = vld1q_s16(taps.as_ptr().add(k));
+                acc = vmlal_s16(acc, vget_low_s16(s), vget_low_s16(t));
+                acc = vmlal_high_s16(acc, s, t);
+            }
+            let sum = vaddvq_s32(acc) + 16384;
+            (sum >> 15).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        polyphase_dot32_q15_i16_scalar(src, taps)
-    }
+    polyphase_dot32_q15_i16_scalar(src, taps)
 }
 
 // ============================================================================
@@ -242,7 +237,7 @@ pub fn rematrix_stereo_to_mono_f32_scalar(stereo: &[f32], mono: &mut [f32], gain
 pub fn rematrix_stereo_to_mono_f32(stereo: &[f32], mono: &mut [f32], gain: f32) {
     let frames = (stereo.len() / 2).min(mono.len());
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         let mut i = 0usize;
         unsafe {
             use std::arch::aarch64::*;
@@ -261,11 +256,9 @@ pub fn rematrix_stereo_to_mono_f32(stereo: &[f32], mono: &mut [f32], gain: f32) 
                 gain,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        rematrix_stereo_to_mono_f32_scalar(&stereo[..frames * 2], &mut mono[..frames], gain);
-    }
+    rematrix_stereo_to_mono_f32_scalar(&stereo[..frames * 2], &mut mono[..frames], gain);
 }
 
 /// Scalar reference: Mono to Stereo upmix (`[M0 * gain, M0 * gain, ...]`).
@@ -282,7 +275,7 @@ pub fn rematrix_mono_to_stereo_f32_scalar(mono: &[f32], stereo: &mut [f32], gain
 pub fn rematrix_mono_to_stereo_f32(mono: &[f32], stereo: &mut [f32], gain: f32) {
     let frames = mono.len().min(stereo.len() / 2);
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         let mut i = 0usize;
         unsafe {
             use std::arch::aarch64::*;
@@ -300,11 +293,9 @@ pub fn rematrix_mono_to_stereo_f32(mono: &[f32], stereo: &mut [f32], gain: f32) 
                 gain,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        rematrix_mono_to_stereo_f32_scalar(&mono[..frames], &mut stereo[..frames * 2], gain);
-    }
+    rematrix_mono_to_stereo_f32_scalar(&mono[..frames], &mut stereo[..frames * 2], gain);
 }
 
 /// Scalar reference: ITU-R BS.775 `5.1` (`L, R, C, LFE, Ls, Rs`) to Stereo downmix:
@@ -354,7 +345,7 @@ pub fn rematrix_5_1_to_stereo_f32(
 ) {
     let frames = (src_5_1.len() / 6).min(dst_stereo.len() / 2);
     #[cfg(target_arch = "aarch64")]
-    {
+    if ragdoll_core::dispatch::neon() {
         let norm = if normalize {
             1.0 / (1.0 + c_mix + s_mix + lfe_mix)
         } else {
@@ -416,18 +407,16 @@ pub fn rematrix_5_1_to_stereo_f32(
                 normalize,
             );
         }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        rematrix_5_1_to_stereo_f32_scalar(
-            &src_5_1[..frames * 6],
-            &mut dst_stereo[..frames * 2],
-            c_mix,
-            s_mix,
-            lfe_mix,
-            normalize,
-        );
-    }
+    rematrix_5_1_to_stereo_f32_scalar(
+        &src_5_1[..frames * 6],
+        &mut dst_stereo[..frames * 2],
+        c_mix,
+        s_mix,
+        lfe_mix,
+        normalize,
+    );
 }
 
 /// Scalar reference: general $N_{\text{in}} \times M_{\text{out}}$ channel rematrixing over interleaved `f32` frames.
@@ -472,36 +461,38 @@ pub fn rematrix_nxm_f32(
     let mut f = 0usize;
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut in_planar = [[0.0f32; 16]; 8];
-        let mut out_planar = [[0.0f32; 16]; 8];
-        while f + 16 <= frames {
-            for k in 0..16 {
-                let s_base = (f + k) * in_channels;
-                for ic in 0..in_channels {
-                    in_planar[ic][k] = src[s_base + ic];
-                }
-            }
-            for oc in 0..out_channels {
-                let m_row = &matrix[oc * in_channels..(oc + 1) * in_channels];
-                for blk in (0..16).step_by(4) {
-                    let mut acc = vdupq_n_f32(0.0);
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut in_planar = [[0.0f32; 16]; 8];
+            let mut out_planar = [[0.0f32; 16]; 8];
+            while f + 16 <= frames {
+                for k in 0..16 {
+                    let s_base = (f + k) * in_channels;
                     for ic in 0..in_channels {
-                        let g = vdupq_n_f32(m_row[ic]);
-                        let v_in = vld1q_f32(in_planar[ic].as_ptr().add(blk));
-                        acc = vaddq_f32(acc, vmulq_f32(v_in, g));
+                        in_planar[ic][k] = src[s_base + ic];
                     }
-                    vst1q_f32(out_planar[oc].as_mut_ptr().add(blk), acc);
                 }
-            }
-            for k in 0..16 {
-                let d_base = (f + k) * out_channels;
                 for oc in 0..out_channels {
-                    dst[d_base + oc] = out_planar[oc][k];
+                    let m_row = &matrix[oc * in_channels..(oc + 1) * in_channels];
+                    for blk in (0..16).step_by(4) {
+                        let mut acc = vdupq_n_f32(0.0);
+                        for ic in 0..in_channels {
+                            let g = vdupq_n_f32(m_row[ic]);
+                            let v_in = vld1q_f32(in_planar[ic].as_ptr().add(blk));
+                            acc = vaddq_f32(acc, vmulq_f32(v_in, g));
+                        }
+                        vst1q_f32(out_planar[oc].as_mut_ptr().add(blk), acc);
+                    }
                 }
+                for k in 0..16 {
+                    let d_base = (f + k) * out_channels;
+                    for oc in 0..out_channels {
+                        dst[d_base + oc] = out_planar[oc][k];
+                    }
+                }
+                f += 16;
             }
-            f += 16;
         }
     }
 
@@ -568,30 +559,30 @@ pub fn biquad_process_4ch_f32(
     y_out: &mut [f32; 4],
 ) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vx = vld1q_f32(x.as_ptr());
-        let vz1 = vld1q_f32(z1.as_ptr());
-        let vz2 = vld1q_f32(z2.as_ptr());
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            let vx = vld1q_f32(x.as_ptr());
+            let vz1 = vld1q_f32(z1.as_ptr());
+            let vz2 = vld1q_f32(z2.as_ptr());
 
-        let vb0 = vdupq_n_f32(coeffs.b0);
-        let vb1 = vdupq_n_f32(coeffs.b1);
-        let vb2 = vdupq_n_f32(coeffs.b2);
-        let va1 = vdupq_n_f32(coeffs.a1);
-        let va2 = vdupq_n_f32(coeffs.a2);
+            let vb0 = vdupq_n_f32(coeffs.b0);
+            let vb1 = vdupq_n_f32(coeffs.b1);
+            let vb2 = vdupq_n_f32(coeffs.b2);
+            let va1 = vdupq_n_f32(coeffs.a1);
+            let va2 = vdupq_n_f32(coeffs.a2);
 
-        let vy = vaddq_f32(vmulq_f32(vb0, vx), vz1);
-        let new_z1 = vaddq_f32(vsubq_f32(vmulq_f32(vb1, vx), vmulq_f32(va1, vy)), vz2);
-        let new_z2 = vsubq_f32(vmulq_f32(vb2, vx), vmulq_f32(va2, vy));
+            let vy = vaddq_f32(vmulq_f32(vb0, vx), vz1);
+            let new_z1 = vaddq_f32(vsubq_f32(vmulq_f32(vb1, vx), vmulq_f32(va1, vy)), vz2);
+            let new_z2 = vsubq_f32(vmulq_f32(vb2, vx), vmulq_f32(va2, vy));
 
-        vst1q_f32(z1.as_mut_ptr(), new_z1);
-        vst1q_f32(z2.as_mut_ptr(), new_z2);
-        vst1q_f32(y_out.as_mut_ptr(), vy);
+            vst1q_f32(z1.as_mut_ptr(), new_z1);
+            vst1q_f32(z2.as_mut_ptr(), new_z2);
+            vst1q_f32(y_out.as_mut_ptr(), vy);
+        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        biquad_process_4ch_f32_scalar(coeffs, x, z1, z2, y_out);
-    }
+    biquad_process_4ch_f32_scalar(coeffs, x, z1, z2, y_out);
 }
 
 /// ITU-R BS.1770-4 Annex 2 Table 3 4-phase 12-tap polyphase FIR filter bank (`h[0..48]` centered at $n = 24$),
@@ -634,19 +625,18 @@ pub fn true_peak_4x_12tap_sample_f32_scalar(history: &[f32; 12]) -> f32 {
 #[inline]
 pub fn true_peak_4x_12tap_sample_f32(history: &[f32; 12]) -> f32 {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut acc = vdupq_n_f32(0.0);
-        for (k, &x) in history.iter().enumerate() {
-            let vt = vld1q_f32(TRUE_PEAK_12X4_TAPS[k].as_ptr());
-            acc = vaddq_f32(acc, vmulq_n_f32(vt, x));
-        }
-        vmaxvq_f32(vabsq_f32(acc))
+    if ragdoll_core::dispatch::neon() {
+        return unsafe {
+            use std::arch::aarch64::*;
+            let mut acc = vdupq_n_f32(0.0);
+            for (k, &x) in history.iter().enumerate() {
+                let vt = vld1q_f32(TRUE_PEAK_12X4_TAPS[k].as_ptr());
+                acc = vaddq_f32(acc, vmulq_n_f32(vt, x));
+            }
+            vmaxvq_f32(vabsq_f32(acc))
+        };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        true_peak_4x_12tap_sample_f32_scalar(history)
-    }
+    true_peak_4x_12tap_sample_f32_scalar(history)
 }
 
 /// Scalar reference: applies linear `gain` to `samples` in-place while clamping to `[-ceiling, ceiling]`.
@@ -664,16 +654,18 @@ pub fn apply_gain_true_peak_limit_f32(samples: &mut [f32], gain: f32, ceiling: f
     let n = samples.len();
     let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vg = vdupq_n_f32(gain);
-        let vmax = vdupq_n_f32(ceiling);
-        let vmin = vdupq_n_f32(-ceiling);
-        while i + 4 <= n {
-            let v = vld1q_f32(samples.as_ptr().add(i));
-            let scaled = vminq_f32(vmaxq_f32(vmulq_f32(v, vg), vmin), vmax);
-            vst1q_f32(samples.as_mut_ptr().add(i), scaled);
-            i += 4;
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            let vg = vdupq_n_f32(gain);
+            let vmax = vdupq_n_f32(ceiling);
+            let vmin = vdupq_n_f32(-ceiling);
+            while i + 4 <= n {
+                let v = vld1q_f32(samples.as_ptr().add(i));
+                let scaled = vminq_f32(vmaxq_f32(vmulq_f32(v, vg), vmin), vmax);
+                vst1q_f32(samples.as_mut_ptr().add(i), scaled);
+                i += 4;
+            }
         }
     }
     if i < n {
@@ -971,20 +963,22 @@ pub fn window_overlap_add_f32(
     assert!(overlap_state.len() >= m && pcm_out.len() >= m);
     let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= m {
-            let v_prev = vld1q_f32(overlap_state.as_ptr().add(i));
-            let v_lo = vld1q_f32(imdct_buf.as_ptr().add(i));
-            let w_lo = vld1q_f32(window.as_ptr().add(i));
-            let v_hi = vld1q_f32(imdct_buf.as_ptr().add(m + i));
-            let w_hi = vld1q_f32(window.as_ptr().add(m + i));
+    if ragdoll_core::dispatch::neon() {
+        unsafe {
+            use std::arch::aarch64::*;
+            while i + 4 <= m {
+                let v_prev = vld1q_f32(overlap_state.as_ptr().add(i));
+                let v_lo = vld1q_f32(imdct_buf.as_ptr().add(i));
+                let w_lo = vld1q_f32(window.as_ptr().add(i));
+                let v_hi = vld1q_f32(imdct_buf.as_ptr().add(m + i));
+                let w_hi = vld1q_f32(window.as_ptr().add(m + i));
 
-            let out = vaddq_f32(v_prev, vmulq_f32(v_lo, w_lo));
-            let next_ov = vmulq_f32(v_hi, w_hi);
-            vst1q_f32(pcm_out.as_mut_ptr().add(i), out);
-            vst1q_f32(overlap_state.as_mut_ptr().add(i), next_ov);
-            i += 4;
+                let out = vaddq_f32(v_prev, vmulq_f32(v_lo, w_lo));
+                let next_ov = vmulq_f32(v_hi, w_hi);
+                vst1q_f32(pcm_out.as_mut_ptr().add(i), out);
+                vst1q_f32(overlap_state.as_mut_ptr().add(i), next_ov);
+                i += 4;
+            }
         }
     }
     if i < m {

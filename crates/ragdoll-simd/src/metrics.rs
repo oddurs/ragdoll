@@ -9,21 +9,15 @@ pub fn sad_plane_u8(
     height: usize,
 ) -> u64 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { sad_plane_u8_neon(a, a_stride, b, b_stride, width, height) };
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { sad_plane_u8_avx2(a, a_stride, b, b_stride, width, height) }
-        } else {
-            sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
-        }
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { sad_plane_u8_avx2(a, a_stride, b, b_stride, width, height) };
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
-    }
+    sad_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -170,21 +164,15 @@ pub fn sse_plane_u8(
     height: usize,
 ) -> u64 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sse_plane_u8_neon(a, a_stride, b, b_stride, width, height) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { sse_plane_u8_neon(a, a_stride, b, b_stride, width, height) };
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { sse_plane_u8_avx2(a, a_stride, b, b_stride, width, height) }
-        } else {
-            sse_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
-        }
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { sse_plane_u8_avx2(a, a_stride, b, b_stride, width, height) };
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        sse_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
-    }
+    sse_plane_u8_scalar(a, a_stride, b, b_stride, width, height)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -348,13 +336,10 @@ pub struct SsimWindowStats {
 #[inline]
 pub fn ssim_window_8x8_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> SsimWindowStats {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { ssim_window_8x8_u8_neon(a, a_stride, b, b_stride) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { ssim_window_8x8_u8_neon(a, a_stride, b, b_stride) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        ssim_window_8x8_u8_scalar(a, a_stride, b, b_stride)
-    }
+    ssim_window_8x8_u8_scalar(a, a_stride, b, b_stride)
 }
 
 pub fn ssim_window_8x8_u8_scalar(
@@ -441,21 +426,15 @@ pub fn ssim_end1_8bit(s1: i32, s2: i32, ss: i32, s12: i32) -> f32 {
 #[inline]
 pub fn ssim_4x4xn_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, sums: &mut [[i32; 4]]) {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { ssim_4x4xn_u8_neon(a, a_stride, b, b_stride, sums) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { ssim_4x4xn_u8_neon(a, a_stride, b, b_stride, sums) };
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { ssim_4x4xn_u8_avx2(a, a_stride, b, b_stride, sums) }
-        } else {
-            ssim_4x4xn_u8_scalar(a, a_stride, b, b_stride, sums)
-        }
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { ssim_4x4xn_u8_avx2(a, a_stride, b, b_stride, sums) };
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        ssim_4x4xn_u8_scalar(a, a_stride, b, b_stride, sums)
-    }
+    ssim_4x4xn_u8_scalar(a, a_stride, b, b_stride, sums)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -716,13 +695,10 @@ pub fn ssim_to_db(ssim: f64) -> f64 {
 #[inline]
 pub fn satd_4x4_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { satd_4x4_u8_neon(a, a_stride, b, b_stride) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { satd_4x4_u8_neon(a, a_stride, b, b_stride) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        satd_4x4_u8_scalar(a, a_stride, b, b_stride)
-    }
+    satd_4x4_u8_scalar(a, a_stride, b, b_stride)
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -848,13 +824,10 @@ pub fn satd_8x8_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 
 #[inline]
 pub fn sad_16x16_u8(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sad_16x16_u8_neon(a, a_stride, b, b_stride) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { sad_16x16_u8_neon(a, a_stride, b, b_stride) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        sad_16x16_u8_scalar(a, a_stride, b, b_stride)
-    }
+    sad_16x16_u8_scalar(a, a_stride, b, b_stride)
 }
 
 pub fn sad_16x16_u8_scalar(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize) -> u32 {
@@ -891,13 +864,10 @@ unsafe fn sad_16x16_u8_neon(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize
 #[inline]
 pub fn sad_block_256_u8(a: &[u8; 256], b: &[u8; 256]) -> u32 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sad_block_256_u8_neon(a, b) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { sad_block_256_u8_neon(a, b) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        sad_block_256_u8_scalar(a, b)
-    }
+    sad_block_256_u8_scalar(a, b)
 }
 
 pub fn sad_block_256_u8_scalar(a: &[u8; 256], b: &[u8; 256]) -> u32 {
@@ -949,13 +919,10 @@ unsafe fn sad_block_256_u8_neon(a: &[u8; 256], b: &[u8; 256]) -> u32 {
 #[inline]
 pub fn sad_block_64_u8(a: &[u8; 64], b: &[u8; 64]) -> u32 {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { sad_block_64_u8_neon(a, b) }
+    if ragdoll_core::dispatch::neon() {
+        return unsafe { sad_block_64_u8_neon(a, b) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        sad_block_64_u8_scalar(a, b)
-    }
+    sad_block_64_u8_scalar(a, b)
 }
 
 pub fn sad_block_64_u8_scalar(a: &[u8; 64], b: &[u8; 64]) -> u32 {
@@ -1001,10 +968,8 @@ unsafe fn sad_block_64_u8_neon(a: &[u8; 64], b: &[u8; 64]) -> u32 {
 #[inline]
 pub fn flac_eval_fixed_orders_l1(samples: &[i32]) -> [u64; 5] {
     #[cfg(target_arch = "aarch64")]
-    {
-        if samples.len() >= 8 {
-            return unsafe { flac_eval_fixed_orders_l1_neon(samples) };
-        }
+    if ragdoll_core::dispatch::neon() && samples.len() >= 8 {
+        return unsafe { flac_eval_fixed_orders_l1_neon(samples) };
     }
     flac_eval_fixed_orders_l1_scalar(samples)
 }

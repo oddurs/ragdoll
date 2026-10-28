@@ -14,15 +14,25 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-Dwarnings"
+  # Interop tests fail when `ffmpeg` / `ffprobe` are missing; CI never sets
+  # RAGDOLL_ALLOW_MISSING_TOOLS. The reference build is Ubuntu 24.04's FFmpeg 6.1.1,
+  # pinned to the release-pocket package so it cannot change under the tests.
+  FFMPEG_PACKAGE_VERSION: "7:6.1.1-3ubuntu5"
 
 jobs:
   check:
     name: Format, Clippy & Differential Tests (aarch64 NEON)
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install pinned FFmpeg
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "ffmpeg=${FFMPEG_PACKAGE_VERSION}"
+          ffmpeg -version | head -1 | grep -F "ffmpeg version 6.1.1-3ubuntu5"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,16 +48,27 @@ jobs:
       - name: Strict lints (clippy)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run unit & SIMD differential tests
+      - name: Run unit, interop & SIMD differential tests (NEON)
         run: cargo test --workspace
+
+      - name: Run the same tests on the scalar reference paths
+        run: cargo test --workspace
+        env:
+          RAGDOLL_SIMD: scalar
 
   check-x86_64:
     name: AVX2 Differential Tests (x86_64)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install pinned FFmpeg
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "ffmpeg=${FFMPEG_PACKAGE_VERSION}"
+          ffmpeg -version | head -1 | grep -F "ffmpeg version 6.1.1-3ubuntu5"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,5 +81,13 @@ jobs:
       - name: Strict lints (clippy x86_64)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run x86_64 AVX2 unit & SIMD differential tests
-        run: cargo test -p ragdoll-core -p ragdoll-simd -p ragdoll-pix
+      - name: Run unit, interop & SIMD differential tests (AVX2)
+        run: cargo test --workspace
+
+      - name: Run the same tests on the scalar reference paths
+        run: cargo test --workspace
+        env:
+          RAGDOLL_SIMD: scalar
+
+      - name: Run `ragdoll self-test` and `bench --json` (slow)
+        run: cargo test -p ragdoll-cli --test cli -- --ignored

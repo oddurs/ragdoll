@@ -186,18 +186,16 @@ impl PolyphaseFilterBank {
 #[inline]
 pub fn hscale_row_8tap_q14(src_row: &[u8], dst_row: &mut [u8], bank: &PolyphaseFilterBank) {
     #[cfg(target_arch = "aarch64")]
-    {
-        if src_row.len() >= 8 {
-            unsafe { hscale_row_8tap_q14_neon(src_row, dst_row, bank) };
-            return;
-        }
+    if src_row.len() >= 8 && ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        unsafe { hscale_row_8tap_q14_neon(src_row, dst_row, bank) };
+        return;
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if src_row.len() >= 8 && std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { hscale_row_8tap_q14_avx2(src_row, dst_row, bank) };
-            return;
-        }
+    if src_row.len() >= 8 && ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2
+        unsafe { hscale_row_8tap_q14_avx2(src_row, dst_row, bank) };
+        return;
     }
     hscale_row_8tap_q14_scalar(src_row, dst_row, bank);
 }
@@ -315,21 +313,16 @@ unsafe fn hscale_row_8tap_q14_neon(src_row: &[u8], dst_row: &mut [u8], bank: &Po
 #[inline]
 pub fn vscale_row_8tap_q14(rows: [&[u8]; 8], weights: &[i16; 8], dst_row: &mut [u8], width: usize) {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { vscale_row_8tap_q14_neon(rows, weights, dst_row, width) }
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        return unsafe { vscale_row_8tap_q14_neon(rows, weights, dst_row, width) };
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { vscale_row_8tap_q14_avx2(rows, weights, dst_row, width) }
-        } else {
-            vscale_row_8tap_q14_scalar(rows, weights, dst_row, width)
-        }
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2
+        return unsafe { vscale_row_8tap_q14_avx2(rows, weights, dst_row, width) };
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        vscale_row_8tap_q14_scalar(rows, weights, dst_row, width)
-    }
+    vscale_row_8tap_q14_scalar(rows, weights, dst_row, width)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -448,11 +441,10 @@ unsafe fn vscale_row_8tap_q14_neon(
 #[inline]
 pub fn hscale_row_8tap_q14_to_q6(src_row: &[u8], dst_row: &mut [i16], bank: &PolyphaseFilterBank) {
     #[cfg(target_arch = "aarch64")]
-    {
-        if src_row.len() >= 8 {
-            unsafe { hscale_row_8tap_q14_to_q6_neon(src_row, dst_row, bank) };
-            return;
-        }
+    if src_row.len() >= 8 && ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        unsafe { hscale_row_8tap_q14_to_q6_neon(src_row, dst_row, bank) };
+        return;
     }
     hscale_row_8tap_q14_to_q6_scalar(src_row, dst_row, bank);
 }
@@ -575,13 +567,11 @@ pub fn vscale_row_8tap_q6_to_u8(
     width: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { vscale_row_8tap_q6_to_u8_neon(rows, weights, dst_row, width) }
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on all aarch64 CPUs
+        return unsafe { vscale_row_8tap_q6_to_u8_neon(rows, weights, dst_row, width) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        vscale_row_8tap_q6_to_u8_scalar(rows, weights, dst_row, width)
-    }
+    vscale_row_8tap_q6_to_u8_scalar(rows, weights, dst_row, width)
 }
 
 pub fn vscale_row_8tap_q6_to_u8_scalar(
