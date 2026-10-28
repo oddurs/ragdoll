@@ -471,10 +471,8 @@ unsafe fn luma_avx2(
     s[5] = out(nq1, q1);
     s[6] = out(nq2, q2);
     if ystride == 1 {
-        for i in 1..7 {
-            unsafe {
-                _mm_storeu_si128(base.sub(4 * xstride).add(i * xstride) as *mut __m128i, s[i])
-            };
+        for (i, v) in s.iter().enumerate().take(7).skip(1) {
+            unsafe { _mm_storeu_si128(base.sub(4 * xstride).add(i * xstride) as *mut __m128i, *v) };
         }
     } else {
         let rows = unsafe { transpose_8x16(&s) };
@@ -494,7 +492,7 @@ mod tests {
         (0..32 * 32)
             .map(|i| {
                 x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                let base = 100 + ((i % 32) as i32) * 2 + ((i / 32) as i32);
+                let base = 100 + (i % 32) * 2 + i / 32;
                 (base + ((x >> 16) % 9) as i32 - 4 + if (x >> 28) == 0 { 60 } else { 0 })
                     .clamp(0, 255) as u8
             })
