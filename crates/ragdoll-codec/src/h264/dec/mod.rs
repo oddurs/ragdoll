@@ -85,6 +85,8 @@ pub struct Core {
     next_id: u32,
     period: u32,
     out: Vec<Output>,
+    /// The last picture's state, whose buffers the next picture reuses.
+    spare: Option<PicState>,
 }
 
 impl Default for Core {
@@ -124,6 +126,7 @@ impl Core {
             next_id: 0,
             period: 0,
             out: Vec::new(),
+            spare: None,
         }
     }
 
@@ -293,7 +296,21 @@ impl Core {
             PictureType::P
         };
         self.cur = Some(CurPic {
-            st: PicState::new(structure, mb_w, mb_h, sps.mbaff && !sh.field_pic),
+            st: {
+                let mut st = PicState::recycle(
+                    self.spare.take(),
+                    structure,
+                    mb_w,
+                    mb_h,
+                    sps.mbaff && !sh.field_pic,
+                );
+                // Monochrome pictures never write chroma samples.
+                if st.recycled && sps.chroma_array_type() == 0 {
+                    st.planes[1].fill(128);
+                    st.planes[2].fill(128);
+                }
+                st
+            },
             first: sh.clone(),
             sps,
             pps,
@@ -388,6 +405,7 @@ impl Core {
             return;
         };
         let has_chroma = cur.sps.chroma_array_type() != 0;
+        cur.st.restore_undecoded();
         deblock::deblock_picture(&mut cur.st, &cur.slices, has_chroma);
         let sh = cur.first.clone();
         let sps = cur.sps.clone();
@@ -412,12 +430,13 @@ impl Core {
             Some(s) => s,
             None => match self.dpb.pics.iter().position(|p| p.id == cur.store_id) {
                 Some(i) if cur.second_field => self.dpb.pics.swap_remove(i),
-                _ => FrameStore::new(
+                _ => self.dpb.new_store(
                     cur.store_id,
                     cur.st.width,
                     cur.st.height * if parity.is_some() { 2 } else { 1 },
                     cur.st.mb_w,
                     cur.st.mb_h * if parity.is_some() { 2 } else { 1 },
+                    parity.is_some(),
                 ),
             },
         };
@@ -540,9 +559,12 @@ impl Core {
             self.dpb.pics.push(store);
         } else if !complete && let Some(pd) = &mut self.pending {
             pd.store = Some(store);
+        } else {
+            self.dpb.release(store);
         }
         let keep = self.pending.as_ref().map(|p| p.id);
         self.dpb.drop_unused(keep);
+        self.spare = Some(cur.st);
     }
 
     /// Removes and returns the oldest finished frame in decode order.

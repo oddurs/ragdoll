@@ -414,6 +414,9 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn begin_mb(&mut self, addr: usize) {
         self.mb = self.pos(addr);
         let a = self.mb.addr;
+        if self.st.recycled {
+            self.st.clear_mb(a);
+        }
         self.st.slice_num[a] = self.cx.slice_num;
         self.st.mb_field[a] = self.field;
     }
@@ -426,21 +429,24 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// chroma) location `(xn, yn)` relative to the current macroblock's top-left sample, and the
     /// location `(xw, yw)` inside it. Availability is not checked.
     fn locate(&self, xn: isize, yn: isize, chroma: bool) -> Option<(usize, usize, usize)> {
-        let s: isize = if chroma { 8 } else { 16 };
+        // MB size `s = 1 << sh`; positions are non-negative once range-checked, so shifts and
+        // masks stand in for division.
+        let sh = if chroma { 3 } else { 4 };
+        let s: isize = 1 << sh;
         let (w, h) = (self.st.mb_w as isize, self.st.mb_h as isize);
         let px = self.mb.x as isize * s + xn;
         if px < 0 || px >= w * s {
             return None;
         }
-        let nx = (px / s) as usize;
-        let xw = (px % s) as usize;
+        let nx = (px >> sh) as usize;
+        let xw = (px & (s - 1)) as usize;
         if !self.st.mbaff {
             let py = self.mb.y as isize * s + yn;
             if py < 0 || py >= h * s {
                 return None;
             }
-            let addr = (py / s) as usize * self.st.mb_w + nx;
-            return Some((addr, xw, (py % s) as usize));
+            let addr = (py >> sh) as usize * self.st.mb_w + nx;
+            return Some((addr, xw, (py & (s - 1)) as usize));
         }
         // MBAFF: the location is geometric in the frame; a field MB of parity p covers the
         // frame lines `pair_top + p + 2k`.
@@ -471,13 +477,35 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Index into the per-4x4 arrays of the block at `(xw, yw)` (samples) inside MB `addr`.
     fn b4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
-        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        let (x, y) = self.mb_pos(addr);
         self.st.b4(x * 4 + xw / 4, y * 4 + yw / 4)
+    }
+
+    /// Column and row of macroblock `addr`. Neighbours lie within two rows of the current MB, so
+    /// those rows are tried before dividing.
+    #[inline]
+    fn mb_pos(&self, addr: usize) -> (usize, usize) {
+        let w = self.st.mb_w;
+        let y = self.mb.y;
+        let row = y * w;
+        if addr >= row {
+            if addr < row + w {
+                return (addr - row, y);
+            }
+            if addr < row + 2 * w {
+                return (addr - row - w, y + 1);
+            }
+        } else if addr + w >= row {
+            return (addr + w - row, y - 1);
+        } else if addr + 2 * w >= row {
+            return (addr + 2 * w - row, y - 2);
+        }
+        (addr % w, addr / w)
     }
 
     /// Index into the per-chroma-4x4 arrays of the block at chroma `(xw, yw)` inside MB `addr`.
     fn c4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
-        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        let (x, y) = self.mb_pos(addr);
         self.st.c4(x * 2 + xw / 4, y * 2 + yw / 4)
     }
 
@@ -1388,13 +1416,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         pic: u32,
         mvd: [u8; 2],
     ) {
+        // Fixed-size stores per width: a slice fill of a few elements becomes a memset call.
+        fn put<T: Copy, const N: usize>(dst: &mut [T], i: usize, v: T) {
+            dst[i..i + N].copy_from_slice(&[v; N]);
+        }
+        fn row<const N: usize>(
+            st: &mut PicState,
+            list: usize,
+            i: usize,
+            m: Mv,
+            pic: u32,
+            mvd: [u8; 2],
+        ) {
+            put::<_, N>(&mut st.ref_idx[list], i, m.0);
+            put::<_, N>(&mut st.mv[list], i, m.1);
+            put::<_, N>(&mut st.ref_pic[list], i, pic);
+            put::<_, N>(&mut st.mvd[list], i, mvd);
+        }
         for y in by..by + h {
-            for x in bx..bx + w {
-                let i = self.st.b4(self.mb.x * 4 + x, self.mb.y * 4 + y);
-                self.st.ref_idx[list][i] = m.0;
-                self.st.mv[list][i] = m.1;
-                self.st.ref_pic[list][i] = pic;
-                self.st.mvd[list][i] = mvd;
+            let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + y);
+            match w {
+                1 => row::<1>(self.st, list, i, m, pic, mvd),
+                2 => row::<2>(self.st, list, i, m, pic, mvd),
+                3 => row::<3>(self.st, list, i, m, pic, mvd),
+                _ => row::<4>(self.st, list, i, m, pic, mvd),
             }
         }
     }

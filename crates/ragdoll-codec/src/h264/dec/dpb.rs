@@ -115,24 +115,69 @@ pub struct Dpb {
     pub pics: Vec<FrameStore>,
     /// `MaxLongTermFrameIdx`, `None` meaning "no long-term frame indices".
     pub max_long_term_frame_idx: Option<u32>,
+    /// Stores no longer needed, kept so their buffers are reused instead of reallocated.
+    free: Vec<FrameStore>,
 }
+
+/// Recycled frame stores kept at most.
+const FREE_STORES: usize = 4;
 
 impl Dpb {
     pub fn new() -> Self {
         Self {
             pics: Vec::new(),
             max_long_term_frame_idx: None,
+            free: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
-        self.pics.clear();
+        for p in std::mem::take(&mut self.pics) {
+            self.release(p);
+        }
         self.max_long_term_frame_idx = None;
     }
 
     /// Removes frame stores with no reference field, except the store with id `keep`.
     pub fn drop_unused(&mut self, keep: Option<u32>) {
-        self.pics.retain(|p| p.is_reference() || Some(p.id) == keep);
+        let unused: Vec<FrameStore> = self
+            .pics
+            .extract_if(.., |p| !p.is_reference() && Some(p.id) != keep)
+            .collect();
+        for p in unused {
+            self.release(p);
+        }
+    }
+
+    /// Keeps a store no longer needed for reuse by [`Dpb::new_store`].
+    pub fn release(&mut self, store: FrameStore) {
+        if self.free.len() < FREE_STORES {
+            self.free.push(store);
+        }
+    }
+
+    /// An empty frame store, reusing a released one of the same geometry when there is one.
+    /// `init` as for [`FrameStore::reuse`].
+    pub fn new_store(
+        &mut self,
+        id: u32,
+        width: usize,
+        height: usize,
+        mb_w: usize,
+        mb_h: usize,
+        init: bool,
+    ) -> FrameStore {
+        let fits = |s: &FrameStore| {
+            s.width == width && s.height == height && s.motion.mb_intra.len() == mb_w * mb_h
+        };
+        match self.free.iter().position(fits) {
+            Some(i) => {
+                let mut s = self.free.swap_remove(i);
+                s.reuse(id, init);
+                s
+            }
+            None => FrameStore::new(id, width, height, mb_w, mb_h),
+        }
     }
 
     /// Updates `FrameNumWrap` of short-term references relative to the current `frame_num` (8.2.4.1).
