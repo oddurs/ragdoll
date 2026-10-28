@@ -71,6 +71,38 @@ impl AlignedBuffer {
         Self { ptr, len, cap }
     }
 
+    /// A buffer of `rows` rows of `stride` bytes, row `y` starting with `row(y)` (at most
+    /// `stride` bytes) and zero-filled after it, plus zeroed tail padding. Every byte is written
+    /// once, without zero-filling first.
+    pub fn from_rows<'a>(
+        stride: usize,
+        rows: usize,
+        mut row: impl FnMut(usize) -> &'a [u8],
+    ) -> Self {
+        let len = stride.saturating_mul(rows);
+        let cap = align_up_64(len) + INPUT_BUFFER_PADDING_SIZE;
+        let layout = Layout::from_size_align(cap, CACHE_LINE_ALIGN)
+            .expect("valid 64-byte aligned allocation layout");
+        // Safety: cap >= 64 > 0 and align is 64 (power of two).
+        let raw = unsafe { alloc::alloc(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
+            alloc::handle_alloc_error(layout);
+        };
+        // Safety: each row's `stride` bytes and then the tail `cap - len` bytes are written in
+        // full, within the allocation, before the buffer is read.
+        unsafe {
+            for y in 0..rows {
+                let src = row(y);
+                let n = src.len().min(stride);
+                let dst = raw.add(y * stride);
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+                std::ptr::write_bytes(dst.add(n), 0, stride - n);
+            }
+            std::ptr::write_bytes(raw.add(len), 0, cap - len);
+        }
+        Self { ptr, len, cap }
+    }
+
     /// Copies a byte slice into a new 64-byte-aligned buffer with 64 bytes of zeroed tail padding.
     pub fn from_slice(data: &[u8]) -> Self {
         let mut buf = Self::new_zeroed(data.len());
@@ -200,6 +232,28 @@ pub struct Plane {
 }
 
 impl Plane {
+    /// A plane whose row `y` holds `row(y)` (truncated to the row width), zero-padded.
+    pub fn from_rows<'a>(
+        width: usize,
+        height: usize,
+        bytes_per_sample: usize,
+        mut row: impl FnMut(usize) -> &'a [u8],
+    ) -> Self {
+        let row_bytes = width.saturating_mul(bytes_per_sample);
+        let stride = optimal_plane_stride(row_bytes);
+        Self {
+            buf: AlignedBuffer::from_rows(stride, height, |y| {
+                let r = row(y);
+                &r[..r.len().min(row_bytes)]
+            }),
+            width,
+            height,
+            row_bytes,
+            stride,
+            bytes_per_sample,
+        }
+    }
+
     pub fn new(width: usize, height: usize, bytes_per_sample: usize) -> Self {
         let row_bytes = width.saturating_mul(bytes_per_sample);
         let stride = optimal_plane_stride(row_bytes);
@@ -399,6 +453,32 @@ impl VideoFrame {
             let bps = format.plane_bytes_per_sample(p);
             planes.push(Plane::new(pw, ph, bps));
         }
+        Self {
+            planes,
+            width,
+            height,
+            format,
+            colorimetry: Colorimetry::default(),
+            pts: Timestamp::default(),
+            duration: 0,
+            keyframe: true,
+            pict_type: PictureType::I,
+        }
+    }
+
+    /// A frame whose plane `p` has row `y` copied from `row(p, y)`, without zero-filling first.
+    pub fn from_rows<'a>(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        mut row: impl FnMut(usize, usize) -> &'a [u8],
+    ) -> Self {
+        let planes = (0..format.num_planes())
+            .map(|p| {
+                let (pw, ph) = format.plane_dimensions(width, height, p);
+                Plane::from_rows(pw, ph, format.plane_bytes_per_sample(p), |y| row(p, y))
+            })
+            .collect();
         Self {
             planes,
             width,
@@ -653,6 +733,36 @@ impl Drop for PooledVideoFrame {
     fn drop(&mut self) {
         if let Some(frame) = self.frame.take() {
             self.pool.release(frame);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_rows_copies_rows_and_zeroes_padding() {
+        let rows: Vec<Vec<u8>> = (0..5)
+            .map(|y| (0..7).map(|x| (y * 10 + x + 1) as u8).collect())
+            .collect();
+        let f = VideoFrame::from_rows(7, 5, PixelFormat::Yuv420p, |p, y| {
+            if p == 0 { &rows[y] } else { &rows[y][..4] }
+        });
+        let mut reference = VideoFrame::new(7, 5, PixelFormat::Yuv420p);
+        for p in 0..3 {
+            let w = reference.plane(p).width();
+            let h = reference.plane(p).height();
+            for (y, row) in rows.iter().enumerate().take(h) {
+                reference.plane_mut(p).row_mut(y)[..w].copy_from_slice(&row[..w]);
+            }
+        }
+        for p in 0..3 {
+            assert_eq!(
+                f.plane(p).buf.as_padded_slice(),
+                reference.plane(p).buf.as_padded_slice(),
+                "plane {p}"
+            );
         }
     }
 }

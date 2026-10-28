@@ -2,7 +2,10 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use ragdoll_simd::{put_h264_chroma_mc8_u8, put_h264_qpel16_mc_u8};
+use ragdoll_simd::{
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_luma_mc, h264_weight_bi, h264_weight_uni,
+    luma_mc_cols,
+};
 
 use super::ps::WeightScales;
 use super::tables::{NORM_ADJUST_4X4, NORM_ADJUST_8X8, SCAN4X4, SCAN8X8, norm4_class, norm8_class};
@@ -189,7 +192,12 @@ pub fn idct8_add(dst: &mut [u8], stride: usize, d: &[i32; 64]) {
     }
 }
 
-/// Luma prediction samples for a `w`x`h` block at pixel `(x, y)` displaced by quarter-pel `mv`.
+/// Columns of the stack window an edge-extended luma or chroma block is copied into.
+const EMU_STRIDE: usize = 24;
+
+/// Luma prediction samples for a `w`x`h` block at pixel `(x, y)` displaced by quarter-pel `mv`,
+/// written to `dst` with stride `ds`. Blocks whose filter taps reach past the picture read an
+/// edge-extended copy (8.4.2.2.1 clamps reference coordinates to the picture).
 #[allow(clippy::too_many_arguments)]
 pub fn mc_luma(
     src: &[u8],
@@ -200,28 +208,71 @@ pub fn mc_luma(
     w: usize,
     h: usize,
     mv: [i16; 2],
-    out: &mut [u8],
+    dst: &mut [u8],
+    ds: usize,
 ) {
-    let mut tmp = [0u8; 256];
     let ix = x as isize + (mv[0] as isize >> 2);
     let iy = y as isize + (mv[1] as isize >> 2);
-    put_h264_qpel16_mc_u8(
+    let (fx, fy) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
+    let cols = luma_mc_cols(w);
+    if ix >= 2 && iy >= 2 && ix as usize + cols <= width && iy as usize + h + 3 <= height {
+        h264_luma_mc(
+            dst,
+            ds,
+            src,
+            iy as usize * width + ix as usize,
+            width,
+            w,
+            h,
+            fx,
+            fy,
+        );
+        return;
+    }
+    let mut win = [0u8; EMU_STRIDE * 21];
+    edge_window(
+        &mut win,
         src,
         width,
-        width,
         height,
-        ix,
-        iy,
-        (mv[0] & 3) as u8,
-        (mv[1] & 3) as u8,
-        &mut tmp,
+        ix - 2,
+        iy - 2,
+        cols + 2,
+        h + 5,
     );
-    for r in 0..h {
-        out[r * w..r * w + w].copy_from_slice(&tmp[r * 16..r * 16 + w]);
+    h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
+}
+
+/// Copies the `cols`x`rows` window at `(x0, y0)` of a `width`x`height` plane into `win` (stride
+/// [`EMU_STRIDE`]), clamping coordinates to the plane (FFmpeg's `emulated_edge_mc`).
+#[allow(clippy::too_many_arguments)]
+fn edge_window(
+    win: &mut [u8],
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x0: isize,
+    y0: isize,
+    cols: usize,
+    rows: usize,
+) {
+    let inside = x0 >= 0 && x0 as usize + cols <= width;
+    for r in 0..rows {
+        let sy = (y0 + r as isize).clamp(0, height as isize - 1) as usize;
+        let row = &src[sy * width..sy * width + width];
+        let out = &mut win[r * EMU_STRIDE..r * EMU_STRIDE + cols];
+        if inside {
+            out.copy_from_slice(&row[x0 as usize..x0 as usize + cols]);
+        } else {
+            for (c, o) in out.iter_mut().enumerate() {
+                *o = row[(x0 + c as isize).clamp(0, width as isize - 1) as usize];
+            }
+        }
     }
 }
 
-/// Chroma (4:2:0) prediction samples for a `w`x`h` chroma block at chroma pixel `(x, y)`.
+/// Chroma (4:2:0) prediction samples for a `w`x`h` chroma block at chroma pixel `(x, y)`,
+/// written to `dst` with stride `ds`.
 #[allow(clippy::too_many_arguments)]
 pub fn mc_chroma(
     src: &[u8],
@@ -232,24 +283,83 @@ pub fn mc_chroma(
     w: usize,
     h: usize,
     mv: [i16; 2],
-    out: &mut [u8],
+    dst: &mut [u8],
+    ds: usize,
 ) {
-    let mut tmp = [0u8; 64];
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
-    put_h264_chroma_mc8_u8(
-        src,
-        width,
-        width,
-        height,
-        ix,
-        iy,
-        (mv[0] & 7) as u8,
-        (mv[1] & 7) as u8,
-        &mut tmp,
-    );
-    for r in 0..h {
-        out[r * w..r * w + w].copy_from_slice(&tmp[r * 8..r * 8 + w]);
+    let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
+    let cols = chroma_mc_cols(w);
+    if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
+        h264_chroma_mc(
+            dst,
+            ds,
+            src,
+            iy as usize * width + ix as usize,
+            width,
+            w,
+            h,
+            fx,
+            fy,
+        );
+        return;
+    }
+    let mut win = [0u8; EMU_STRIDE * 9];
+    edge_window(&mut win, src, width, height, ix, iy, cols, h + 1);
+    h264_chroma_mc(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
+}
+
+/// Predicts a `w`x`h` block from the lists in `used` and combines them into `dst` (stride `ds`)
+/// per 8.4.2.3. `predict(list, out, stride)` writes one list's prediction samples.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_block(
+    dst: &mut [u8],
+    ds: usize,
+    w: usize,
+    h: usize,
+    used: [bool; 2],
+    wt: Weighting,
+    scratch: &mut [[u8; 256]; 2],
+    mut predict: impl FnMut(usize, &mut [u8], usize),
+) {
+    // Weights equal to 2^logWD with zero offsets reduce exactly to default prediction:
+    // ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
+    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
+    let wt = match (used, wt) {
+        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
+            Weighting::Default
+        }
+        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
+        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
+        _ => wt,
+    };
+    match (used, wt) {
+        ([true, false], Weighting::Default) => predict(0, dst, ds),
+        ([false, true], Weighting::Default) => predict(1, dst, ds),
+        ([true, true], Weighting::Default) => {
+            predict(0, dst, ds);
+            let t = &mut scratch[0];
+            predict(1, t, 16);
+            h264_avg(dst, ds, t, 16, w, h);
+        }
+        (_, Weighting::Weighted(log_wd, [(w0, o0), (w1, o1)])) => {
+            let t = scratch;
+            for list in 0..2 {
+                if used[list] {
+                    predict(list, &mut t[list], 16);
+                }
+            }
+            match used {
+                [true, true] => {
+                    let off = (o0 + o1 + 1) >> 1;
+                    h264_weight_bi(dst, ds, &t[0], &t[1], 16, w, h, log_wd, w0, w1, off);
+                }
+                [true, false] => h264_weight_uni(dst, ds, &t[0], 16, w, h, log_wd, w0, o0),
+                [false, true] => h264_weight_uni(dst, ds, &t[1], 16, w, h, log_wd, w1, o1),
+                [false, false] => {}
+            }
+        }
+        ([false, false], Weighting::Default) => {}
     }
 }
 
@@ -259,38 +369,4 @@ pub enum Weighting {
     Default,
     /// `(logWD, [(w0, o0), (w1, o1)])` for one component.
     Weighted(u32, [(i32, i32); 2]),
-}
-
-/// Combines prediction samples `p0`/`p1` (either may be absent) into `dst` (8.4.2.3).
-pub fn weighted_combine(p0: Option<&[u8]>, p1: Option<&[u8]>, wt: Weighting, dst: &mut [u8]) {
-    match (p0, p1, wt) {
-        (Some(a), Some(b), Weighting::Default) => {
-            for i in 0..dst.len() {
-                dst[i] = ((a[i] as u16 + b[i] as u16 + 1) >> 1) as u8;
-            }
-        }
-        (Some(a), None, Weighting::Default) | (None, Some(a), Weighting::Default) => {
-            dst.copy_from_slice(&a[..dst.len()]);
-        }
-        (Some(a), Some(b), Weighting::Weighted(log_wd, [(w0, o0), (w1, o1)])) => {
-            let round = 1 << log_wd;
-            let off = (o0 + o1 + 1) >> 1;
-            for i in 0..dst.len() {
-                let v = ((a[i] as i32 * w0 + b[i] as i32 * w1 + round) >> (log_wd + 1)) + off;
-                dst[i] = clip(v);
-            }
-        }
-        (Some(a), None, Weighting::Weighted(log_wd, [(w, o), _]))
-        | (None, Some(a), Weighting::Weighted(log_wd, [_, (w, o)])) => {
-            for i in 0..dst.len() {
-                let v = if log_wd >= 1 {
-                    ((a[i] as i32 * w + (1 << (log_wd - 1))) >> log_wd) + o
-                } else {
-                    a[i] as i32 * w + o
-                };
-                dst[i] = clip(v);
-            }
-        }
-        (None, None, _) => {}
-    }
 }

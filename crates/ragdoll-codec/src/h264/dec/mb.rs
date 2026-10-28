@@ -102,6 +102,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         field: cx.sh.field_pic,
         implicit,
         implicit_field,
+        scratch: [[0; 256]; 2],
     };
     d.run(first, total)
 }
@@ -182,6 +183,8 @@ struct Dec<'a, 'c> {
     field: bool,
     implicit: Vec<[i32; 2]>,
     implicit_field: [Vec<[i32; 2]>; 2],
+    /// Prediction samples of the second list, or of both for weighted prediction.
+    scratch: [[u8; 256]; 2],
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -374,10 +377,11 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// Reference list `list` as seen by the current macroblock.
-    fn refs(&self, list: usize) -> &[RefPic] {
-        match &self.cx.field_refs {
+    fn refs(&self, list: usize) -> &'c [RefPic] {
+        let cx = self.cx;
+        match &cx.field_refs {
             Some(f) if self.field => &f[self.mb.y & 1][list],
-            _ => &self.cx.refs[list],
+            _ => &cx.refs[list],
         }
     }
 
@@ -413,6 +417,9 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn begin_mb(&mut self, addr: usize) {
         self.mb = self.pos(addr);
         let a = self.mb.addr;
+        if self.st.recycled {
+            self.st.clear_mb(a);
+        }
         self.st.slice_num[a] = self.cx.slice_num;
         self.st.mb_field[a] = self.field;
     }
@@ -424,23 +431,41 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Neighbouring location (6.4.12): the macroblock covering the luma (or, with `chroma`, 4:2:0
     /// chroma) location `(xn, yn)` relative to the current macroblock's top-left sample, and the
     /// location `(xw, yw)` inside it. Availability is not checked.
+    #[inline]
     fn locate(&self, xn: isize, yn: isize, chroma: bool) -> Option<(usize, usize, usize)> {
-        let s: isize = if chroma { 8 } else { 16 };
+        // MB size `s = 1 << sh`; positions are non-negative once range-checked, so shifts and
+        // masks stand in for division.
+        let sh = if chroma { 3 } else { 4 };
+        let s: isize = 1 << sh;
         let (w, h) = (self.st.mb_w as isize, self.st.mb_h as isize);
         let px = self.mb.x as isize * s + xn;
         if px < 0 || px >= w * s {
             return None;
         }
-        let nx = (px / s) as usize;
-        let xw = (px % s) as usize;
+        let nx = (px >> sh) as usize;
+        let xw = (px & (s - 1)) as usize;
         if !self.st.mbaff {
             let py = self.mb.y as isize * s + yn;
             if py < 0 || py >= h * s {
                 return None;
             }
-            let addr = (py / s) as usize * self.st.mb_w + nx;
-            return Some((addr, xw, (py % s) as usize));
+            let addr = (py >> sh) as usize * self.st.mb_w + nx;
+            return Some((addr, xw, (py & (s - 1)) as usize));
         }
+        self.locate_mbaff(yn, sh, nx, xw)
+    }
+
+    /// [`Self::locate`] in an MBAFF frame, for column `nx` and `xw` already found.
+    #[inline(never)]
+    fn locate_mbaff(
+        &self,
+        yn: isize,
+        sh: u32,
+        nx: usize,
+        xw: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let s: isize = 1 << sh;
+        let h = self.st.mb_h as isize;
         // MBAFF: the location is geometric in the frame; a field MB of parity p covers the
         // frame lines `pair_top + p + 2k`.
         let my = self.mb.y as isize;
@@ -470,13 +495,35 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Index into the per-4x4 arrays of the block at `(xw, yw)` (samples) inside MB `addr`.
     fn b4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
-        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        let (x, y) = self.mb_pos(addr);
         self.st.b4(x * 4 + xw / 4, y * 4 + yw / 4)
+    }
+
+    /// Column and row of macroblock `addr`. Neighbours lie within two rows of the current MB, so
+    /// those rows are tried before dividing.
+    #[inline]
+    fn mb_pos(&self, addr: usize) -> (usize, usize) {
+        let w = self.st.mb_w;
+        let y = self.mb.y;
+        let row = y * w;
+        if addr >= row {
+            if addr < row + w {
+                return (addr - row, y);
+            }
+            if addr < row + 2 * w {
+                return (addr - row - w, y + 1);
+            }
+        } else if addr + w >= row {
+            return (addr + w - row, y - 1);
+        } else if addr + 2 * w >= row {
+            return (addr + 2 * w - row, y - 2);
+        }
+        (addr % w, addr / w)
     }
 
     /// Index into the per-chroma-4x4 arrays of the block at chroma `(xw, yw)` inside MB `addr`.
     fn c4_of(&self, addr: usize, xw: usize, yw: usize) -> usize {
-        let (x, y) = (addr % self.st.mb_w, addr / self.st.mb_w);
+        let (x, y) = self.mb_pos(addr);
         self.st.c4(x * 2 + xw / 4, y * 2 + yw / 4)
     }
 
@@ -498,6 +545,28 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
     /// current MB are available when their bit is set in `done` (by `luma4x4BlkIdx`).
     fn blk(&self, xn: isize, yn: isize, done: u16) -> Option<(usize, usize)> {
+        if !self.st.mbaff {
+            // Without MBAFF the 4x4 block follows from absolute luma coordinates directly.
+            let px = (self.mb.x * 16) as isize + xn;
+            let py = (self.mb.y * 16) as isize + yn;
+            if px < 0
+                || py < 0
+                || px >= (self.st.mb_w * 16) as isize
+                || py >= (self.st.mb_h * 16) as isize
+            {
+                return None;
+            }
+            let (px, py) = (px as usize, py as usize);
+            let a = (py >> 4) * self.st.mb_w + (px >> 4);
+            if a == self.mb.addr {
+                if done & (1 << BLK4_AT[(py & 15) >> 2][(px & 15) >> 2]) == 0 {
+                    return None;
+                }
+            } else if !self.mb_avail(a) {
+                return None;
+            }
+            return Some((a, self.st.b4(px >> 2, py >> 2)));
+        }
         let (a, xw, yw) = self.locate(xn, yn, false)?;
         if a == self.mb.addr {
             if done & (1 << BLK4_AT[yw / 4][xw / 4]) == 0 {
@@ -763,7 +832,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 CBP_ME_420.get(code)
             };
-            let (i, p) = *entry.ok_or(bad("H.264 coded_block_pattern out of range"))?;
+            let (i, p) = *entry.ok_or_else(|| bad("H.264 coded_block_pattern out of range"))?;
             return Ok(if intra { i } else { p });
         }
         // Luma: condTermFlagN = 1 when the neighbouring 8x8 block has its CBP bit clear (skip counts as clear).
@@ -1371,7 +1440,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.refs(list)
             .get(idx as usize)
             .map(|r| r.id)
-            .ok_or(bad("H.264 ref_idx beyond the reference list"))
+            .ok_or_else(|| bad("H.264 ref_idx beyond the reference list"))
     }
 
     /// Writes motion for the MB-relative 4x4 rectangle `(bx, by, w, h)` of one list.
@@ -1387,13 +1456,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         pic: u32,
         mvd: [u8; 2],
     ) {
+        // Fixed-size stores per width: a slice fill of a few elements becomes a memset call.
+        fn put<T: Copy, const N: usize>(dst: &mut [T], i: usize, v: T) {
+            dst[i..i + N].copy_from_slice(&[v; N]);
+        }
+        fn row<const N: usize>(
+            st: &mut PicState,
+            list: usize,
+            i: usize,
+            m: Mv,
+            pic: u32,
+            mvd: [u8; 2],
+        ) {
+            put::<_, N>(&mut st.ref_idx[list], i, m.0);
+            put::<_, N>(&mut st.mv[list], i, m.1);
+            put::<_, N>(&mut st.ref_pic[list], i, pic);
+            put::<_, N>(&mut st.mvd[list], i, mvd);
+        }
         for y in by..by + h {
-            for x in bx..bx + w {
-                let i = self.st.b4(self.mb.x * 4 + x, self.mb.y * 4 + y);
-                self.st.ref_idx[list][i] = m.0;
-                self.st.mv[list][i] = m.1;
-                self.st.ref_pic[list][i] = pic;
-                self.st.mvd[list][i] = mvd;
+            let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + y);
+            match w {
+                1 => row::<1>(self.st, list, i, m, pic, mvd),
+                2 => row::<2>(self.st, list, i, m, pic, mvd),
+                3 => row::<3>(self.st, list, i, m, pic, mvd),
+                _ => row::<4>(self.st, list, i, m, pic, mvd),
             }
         }
     }
@@ -1401,6 +1487,24 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Motion of the available block covering luma `(xn, yn)` relative to the current MB, in the
     /// current MB's frame/field units (8.4.1.3.2): an MBAFF neighbour of the other kind has its
     /// reference index and vertical vector rescaled.
+    /// [`Self::neighbour`] for both lists, locating the block once.
+    fn neighbour_pair(&self, xn: isize, yn: isize, done: u16) -> [Option<Mv>; 2] {
+        let Some((a, i)) = self.blk(xn, yn, done) else {
+            return [None, None];
+        };
+        [0, 1].map(|list| {
+            let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
+            if r < 0 || !self.st.mbaff {
+                return Some((r, mv));
+            }
+            Some(match (self.field, self.st.mb_field[a]) {
+                (true, false) => (r * 2, [mv[0], mv[1] / 2]),
+                (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
+                _ => (r, mv),
+            })
+        })
+    }
+
     fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Option<Mv> {
         let (a, i) = self.blk(xn, yn, done)?;
         let (r, mv) = (self.st.ref_idx[list][i], self.st.mv[list][i]);
@@ -1432,34 +1536,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let c = self
             .neighbour(list, x + (w * 4) as isize, y - 1, done)
             .or_else(|| self.neighbour(list, x - 1, y - 1, done));
-        match part {
-            Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
-            Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-            Some((Part::P8x16, 0)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-            Some((Part::P8x16, 1)) if c.is_some_and(|n| n.0 == refidx) => return c.unwrap().1,
-            _ => {}
-        }
-        let (a, b, c) = if b.is_none() && c.is_none() && a.is_some() {
-            (a, a, a)
-        } else {
-            (a, b, c)
-        };
-        let un = (-1i8, [0i16; 2]);
-        let (a, b, c) = (a.unwrap_or(un), b.unwrap_or(un), c.unwrap_or(un));
-        let matches = [a.0 == refidx, b.0 == refidx, c.0 == refidx];
-        if matches.iter().filter(|&&m| m).count() == 1 {
-            return if matches[0] {
-                a.1
-            } else if matches[1] {
-                b.1
-            } else {
-                c.1
-            };
-        }
-        [
-            median(a.1[0], b.1[0], c.1[0]),
-            median(a.1[1], b.1[1], c.1[1]),
-        ]
+        mvp_from(a, b, c, refidx, part)
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
@@ -1740,21 +1817,27 @@ impl<'a, 'c> Dec<'a, 'c> {
         let col_short = !self.refs(1)[0].long;
         let inference = self.cx.sps.direct_8x8_inference;
         let spatial = self.cx.sh.direct_spatial;
-        let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
 
         // Spatial: reference indices and predictors from the MB neighbours (8.4.1.2.2).
         let mut sp_ref = [-1i8; 2];
         let mut sp_mv = [[0i16; 2]; 2];
         let mut direct_zero = false;
         if spatial {
-            for list in 0..2 {
-                let a = self.neighbour(list, -1, 0, 0);
-                let b = self.neighbour(list, 0, -1, 0);
-                let c = self
-                    .neighbour(list, 16, -1, 0)
-                    .or_else(|| self.neighbour(list, -1, -1, 0));
+            // Neighbours A, B and C (or D) of the whole MB, as for a 16x16 partition's predictor.
+            let mut nb = [[None; 3]; 2];
+            let a = self.neighbour_pair(-1, 0, 0);
+            let b = self.neighbour_pair(0, -1, 0);
+            let c = self.neighbour_pair(16, -1, 0);
+            // C falls back to D when unavailable; availability is the same for both lists.
+            let c = if c[0].is_none() {
+                self.neighbour_pair(-1, -1, 0)
+            } else {
+                c
+            };
+            for (list, n) in nb.iter_mut().enumerate() {
                 let rr = |n: Option<Mv>| n.map_or(-1, |n| n.0);
-                sp_ref[list] = min_positive(rr(a), min_positive(rr(b), rr(c)));
+                sp_ref[list] = min_positive(rr(a[list]), min_positive(rr(b[list]), rr(c[list])));
+                *n = [a[list], b[list], c[list]];
             }
             if sp_ref[0] < 0 && sp_ref[1] < 0 {
                 sp_ref = [0, 0];
@@ -1762,18 +1845,24 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 for list in 0..2 {
                     if sp_ref[list] >= 0 {
-                        sp_mv[list] = self.mvp(list, 0, 0, 4, sp_ref[list], None, 0);
+                        let [a, b, c] = nb[list];
+                        sp_mv[list] = mvp_from(a, b, c, sp_ref[list], None);
                     }
                 }
             }
         }
 
+        // With 8x8 inference, motion of each 8x8 is collected first so that a macroblock whose
+        // 8x8s agree is stored once.
+        let mut per8: [Option<DirectMotion>; 4] = [None; 4];
         for b8 in 0..4 {
             if mask & (1 << b8) == 0 {
                 continue;
             }
             let (bx8, by8) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-            for sub in 0..4 {
+            // With direct_8x8_inference the four 4x4 blocks share the corner co-located block,
+            // so the 8x8 is derived once.
+            for sub in 0..if inference { 1 } else { 4 } {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 // Co-located 4x4 block (corner of the 8x8 with direct_8x8_inference).
                 let (cbx, cby) = if inference {
@@ -1838,15 +1927,47 @@ impl<'a, 'c> Dec<'a, 'c> {
                     };
                     ([ref0, 0], [mv0, mv1])
                 };
-                for list in 0..2 {
-                    let r = refs[list];
-                    let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
-                    let id = self.ref_id(list, r)?;
-                    self.fill_motion(bx, by, 1, 1, list, (r, mv), id, [0, 0]);
+                if inference {
+                    per8[b8] = Some((refs, mvs));
+                } else {
+                    self.store_direct(bx, by, 1, refs, mvs)?;
                 }
-                let i = self.st.b4(mx4 + bx, my4 + by);
-                self.st.direct[i] = true;
             }
+        }
+        if inference {
+            let first = per8[0];
+            if mask == 0xF && per8.iter().all(|p| *p == first) {
+                let (refs, mvs) = first.expect("all four 8x8s");
+                return self.store_direct(0, 0, 4, refs, mvs);
+            }
+            for (b8, p) in per8.iter().enumerate() {
+                if let Some((refs, mvs)) = *p {
+                    self.store_direct((b8 & 1) * 2, (b8 >> 1) * 2, 2, refs, mvs)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores direct-mode motion for the MB-relative `n`x`n` 4x4 blocks at `(bx, by)`.
+    fn store_direct(
+        &mut self,
+        bx: usize,
+        by: usize,
+        n: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        for list in 0..2 {
+            let r = refs[list];
+            let (r, mv) = if r < 0 { (-1, [0, 0]) } else { (r, mvs[list]) };
+            let id = self.ref_id(list, r)?;
+            self.fill_motion(bx, by, n, n, list, (r, mv), id, [0, 0]);
+        }
+        let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
+        for y in by..by + n {
+            let i = self.st.b4(mx4 + bx, my4 + y);
+            self.st.direct[i..i + n].fill(true);
         }
         Ok(())
     }
@@ -1999,6 +2120,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             (by..by + n).all(|y| (bx..bx + n).all(|x| key(s, x, y) == k))
         };
         if same(self.st, 0, 0, 4) {
+            self.st.uniform[self.mb.addr] = true;
             let k = key(self.st, 0, 0);
             return self.mc_rect(0, 0, 4, 4, [k.0, k.2], [k.1, k.3]);
         }
@@ -2035,44 +2157,35 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             (self.st.width, self.st.height)
         };
-        let mut pred = [[0u8; 256]; 2];
-        let mut used = [false; 2];
+        let mut rp: [Option<&RefPic>; 2] = [None, None];
         for list in 0..2 {
-            if refs[list] < 0 {
-                continue;
+            if refs[list] >= 0 {
+                rp[list] = Some(
+                    self.refs(list)
+                        .get(refs[list] as usize)
+                        .ok_or_else(|| bad("H.264 ref_idx beyond list"))?,
+                );
             }
-            let rp = self
-                .refs(list)
-                .get(refs[list] as usize)
-                .ok_or(bad("H.264 ref_idx beyond list"))?;
-            recon::mc_luma(
-                &rp.planes[0],
-                pw,
-                ph,
-                x,
-                y,
-                w,
-                h,
-                mvs[list],
-                &mut pred[list],
-            );
-            used[list] = true;
         }
-        if !used[0] && !used[1] {
+        if rp.iter().all(Option::is_none) {
             return Err(bad("H.264 inter block without prediction"));
         }
+        let used = rp.map(|r| r.is_some());
+        let planes = |list: usize| &rp[list].expect("used list").planes;
         let wt = self.weighting(refs, 0);
-        let mut out = [0u8; 256];
-        recon::weighted_combine(
-            used[0].then_some(&pred[0][..w * h]),
-            used[1].then_some(&pred[1][..w * h]),
+        let d = o + y * ls + x;
+        recon::predict_block(
+            &mut self.st.planes[0][d..],
+            ls,
+            w,
+            h,
+            used,
             wt,
-            &mut out[..w * h],
+            &mut self.scratch,
+            |list, out, os| {
+                recon::mc_luma(&planes(list)[0], pw, ph, x, y, w, h, mvs[list], out, os)
+            },
         );
-        for r in 0..h {
-            let d = o + (y + r) * ls + x;
-            self.st.planes[0][d..d + w].copy_from_slice(&out[r * w..r * w + w]);
-        }
         if self.cx.sps.chroma_array_type() == 0 {
             return Ok(());
         }
@@ -2080,46 +2193,85 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (cw, ch, cpw, cph) = (w / 2, h / 2, pw / 2, ph / 2);
         let (cx, cy) = (x / 2, y / 2);
         let cur_parity = self.field_parity();
+        let mut cmv = mvs;
+        for list in 0..2 {
+            // Between fields of opposite parity the chroma vector is offset by a quarter chroma
+            // sample (Table 8-9).
+            if let (Some(cur), Some(Some(r))) = (cur_parity, rp[list].map(|r| r.parity)) {
+                cmv[list][1] = cmv[list][1].wrapping_add(2 * (cur as i16 - r as i16));
+            }
+        }
         for p in 0..2 {
-            let mut pc = [[0u8; 64]; 2];
-            for list in 0..2 {
-                if used[list] {
-                    let rp = &self.refs(list)[refs[list] as usize];
-                    // Between fields of opposite parity the chroma vector is offset by a
-                    // quarter chroma sample (Table 8-9).
-                    let mut mv = mvs[list];
-                    if let (Some(cur), Some(r)) = (cur_parity, rp.parity) {
-                        mv[1] = mv[1].wrapping_add(2 * (cur as i16 - r as i16));
-                    }
+            let wt = self.weighting(refs, 1 + p);
+            let d = co + cy * cs + cx;
+            recon::predict_block(
+                &mut self.st.planes[1 + p][d..],
+                cs,
+                cw,
+                ch,
+                used,
+                wt,
+                &mut self.scratch,
+                |list, out, os| {
                     recon::mc_chroma(
-                        &rp.planes[1 + p],
+                        &planes(list)[1 + p],
                         cpw,
                         cph,
                         cx,
                         cy,
                         cw,
                         ch,
-                        mv,
-                        &mut pc[list],
-                    );
-                }
-            }
-            let wt = self.weighting(refs, 1 + p);
-            let mut out = [0u8; 64];
-            recon::weighted_combine(
-                used[0].then_some(&pc[0][..cw * ch]),
-                used[1].then_some(&pc[1][..cw * ch]),
-                wt,
-                &mut out[..cw * ch],
+                        cmv[list],
+                        out,
+                        os,
+                    )
+                },
             );
-            for r in 0..ch {
-                let d = co + (cy + r) * cs + cx;
-                self.st.planes[1 + p][d..d + cw].copy_from_slice(&out[r * cw..r * cw + cw]);
-            }
         }
         Ok(())
     }
 }
+
+/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
+fn mvp_from(
+    a: Option<Mv>,
+    b: Option<Mv>,
+    c: Option<Mv>,
+    refidx: i8,
+    part: Option<(Part, usize)>,
+) -> [i16; 2] {
+    match part {
+        Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
+        Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
+        Some((Part::P8x16, 0)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
+        Some((Part::P8x16, 1)) if c.is_some_and(|n| n.0 == refidx) => return c.unwrap().1,
+        _ => {}
+    }
+    let (a, b, c) = if b.is_none() && c.is_none() && a.is_some() {
+        (a, a, a)
+    } else {
+        (a, b, c)
+    };
+    let un = (-1i8, [0i16; 2]);
+    let (a, b, c) = (a.unwrap_or(un), b.unwrap_or(un), c.unwrap_or(un));
+    let matches = [a.0 == refidx, b.0 == refidx, c.0 == refidx];
+    if matches.iter().filter(|&&m| m).count() == 1 {
+        return if matches[0] {
+            a.1
+        } else if matches[1] {
+            b.1
+        } else {
+            c.1
+        };
+    }
+    [
+        median(a.1[0], b.1[0], c.1[0]),
+        median(a.1[1], b.1[1], c.1[1]),
+    ]
+}
+
+/// Reference indices and vectors of both lists for one direct-mode block.
+type DirectMotion = ([i8; 2], [[i16; 2]; 2]);
 
 fn combine_nc(a: Option<u8>, b: Option<u8>) -> u8 {
     match (a, b) {

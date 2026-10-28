@@ -118,6 +118,36 @@ impl FrameStore {
     }
 
     /// POC of the frame: the smaller POC of its decoded fields.
+    /// Makes a recycled store a new, empty one with id `id`. With `init`, samples and motion are
+    /// reset too (a field picture fills only half of them); a frame picture replaces both.
+    pub fn reuse(&mut self, id: u32, init: bool) {
+        self.id = id;
+        self.field_planes = Default::default();
+        self.field_poc = [0; 2];
+        self.decoded = [false; 2];
+        self.kind = [RefKind::Unused; 2];
+        self.frame_num = 0;
+        self.frame_num_wrap = 0;
+        self.long_term_frame_idx = 0;
+        if init {
+            let planes = Arc::make_mut(&mut self.planes);
+            planes[0].fill(0);
+            planes[1].fill(128);
+            planes[2].fill(128);
+            let n = self.motion.mb_intra.len();
+            let m = Arc::make_mut(&mut self.motion);
+            for l in 0..2 {
+                m.mv[l].fill([0; 2]);
+                m.ref_idx[l].fill(-1);
+                m.ref_pic[l].fill(NO_PIC);
+            }
+            m.mb_intra.fill(true);
+            m.mb_field.fill(false);
+            debug_assert_eq!(m.mb_intra.len(), n);
+        }
+        Arc::make_mut(&mut self.motion).mbaff = false;
+    }
+
     pub fn poc(&self) -> i32 {
         match self.decoded {
             [true, true] => self.field_poc[0].min(self.field_poc[1]),
@@ -210,8 +240,14 @@ pub struct PicState {
     pub ref_idx: [Vec<i8>; 2],
     pub ref_pic: [Vec<u32>; 2],
     pub direct: Vec<bool>,
+    /// Per macroblock: inter prediction used one motion for all 16 blocks.
+    pub uniform: Vec<bool>,
     /// Per 4x4 chroma block of each plane: total_coeff of the AC block.
     pub nnz_c: [Vec<u8>; 2],
+    /// The buffers were reused from an earlier picture: each macroblock's state is restored by
+    /// [`PicState::clear_mb`] when it is decoded, and [`PicState::restore_undecoded`] restores
+    /// what no slice covered.
+    pub recycled: bool,
 }
 
 impl PicState {
@@ -245,7 +281,104 @@ impl PicState {
             ref_idx: [vec![-1; b4], vec![-1; b4]],
             ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
             direct: vec![false; b4],
+            uniform: vec![false; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
+            recycled: false,
+        }
+    }
+
+    /// A state for a new picture, reusing `old`'s buffers when the geometry matches. Only the
+    /// availability state (`slice_num`, `mb_type`, `mb_field`) is reset here.
+    pub fn recycle(
+        old: Option<Self>,
+        structure: Structure,
+        mb_w: usize,
+        mb_h: usize,
+        mbaff: bool,
+    ) -> Self {
+        match old {
+            Some(mut st) if st.mb_w == mb_w && st.mb_h == mb_h => {
+                st.structure = structure;
+                st.mbaff = mbaff;
+                st.slice_num.fill(u32::MAX);
+                st.mb_type.fill(MbType::None);
+                st.mb_field.fill(matches!(structure, Structure::Field(_)));
+                st.recycled = true;
+                st
+            }
+            _ => Self::new(structure, mb_w, mb_h, mbaff),
+        }
+    }
+
+    /// Restores macroblock `addr`'s coding state (all but availability) to that of a new picture.
+    pub fn clear_mb(&mut self, addr: usize) {
+        self.cbp[addr] = 0;
+        self.qp[addr] = 0;
+        self.qpc[addr] = [0; 2];
+        self.t8x8[addr] = false;
+        self.chroma_pred_mode[addr] = 0;
+        self.cbf_dc[addr] = 0;
+        self.uniform[addr] = false;
+        let (x, y) = (addr % self.mb_w, addr / self.mb_w);
+        for r in 0..4 {
+            let i = self.b4(x * 4, y * 4 + r);
+            self.nnz[i..i + 4].copy_from_slice(&[0; 4]);
+            self.nz[i..i + 4].copy_from_slice(&[false; 4]);
+            self.intra_mode[i..i + 4].copy_from_slice(&[-1; 4]);
+            self.direct[i..i + 4].copy_from_slice(&[false; 4]);
+            for l in 0..2 {
+                self.mv[l][i..i + 4].copy_from_slice(&[[0; 2]; 4]);
+                self.mvd[l][i..i + 4].copy_from_slice(&[[0; 2]; 4]);
+                self.ref_idx[l][i..i + 4].copy_from_slice(&[-1; 4]);
+                self.ref_pic[l][i..i + 4].copy_from_slice(&[NO_PIC; 4]);
+            }
+        }
+        for r in 0..2 {
+            let i = self.c4(x * 2, y * 2 + r);
+            for c in &mut self.nnz_c {
+                c[i..i + 2].copy_from_slice(&[0; 2]);
+            }
+        }
+    }
+
+    /// For a recycled state: gives every macroblock no slice decoded the state and samples of a
+    /// new picture (luma 0, chroma 128).
+    pub fn restore_undecoded(&mut self) {
+        if !self.recycled {
+            return;
+        }
+        let (w, cw) = (self.width, self.width / 2);
+        for addr in 0..self.mb_w * self.mb_h {
+            if self.mb_type[addr] != MbType::None {
+                continue;
+            }
+            self.clear_mb(addr);
+            let (x, y) = (addr % self.mb_w, addr / self.mb_w);
+            // Frame lines the macroblock covers: in an MBAFF frame a field pair interleaves.
+            // The pair's other macroblock decides whether the pair is a field pair.
+            let pair_field = self.mbaff && {
+                let p = if y % 2 == 0 {
+                    addr + self.mb_w
+                } else {
+                    addr - self.mb_w
+                };
+                self.mb_type[p] != MbType::None && self.mb_field[p]
+            };
+            let lines = |n: usize, top: usize| -> Vec<usize> {
+                if pair_field {
+                    (0..n).map(|k| (y & !1) * n + (y & 1) + 2 * k).collect()
+                } else {
+                    (0..n).map(|k| top + k).collect()
+                }
+            };
+            for line in lines(16, y * 16) {
+                self.planes[0][line * w + x * 16..line * w + x * 16 + 16].fill(0);
+            }
+            for line in lines(8, y * 8) {
+                for c in 1..3 {
+                    self.planes[c][line * cw + x * 8..line * cw + x * 8 + 8].fill(128);
+                }
+            }
         }
     }
 
@@ -261,20 +394,23 @@ impl PicState {
         y4 * self.mb_w * 2 + x4
     }
 
-    /// Copies samples and motion into `store` (interleaving rows for a field picture).
-    pub fn write_into(&self, store: &mut FrameStore) {
+    /// Moves samples and motion into `store`: a frame picture swaps buffers with it (leaving this
+    /// state with the store's old buffers, for [`PicState::recycle`]); a field picture's rows are
+    /// copied into its lines.
+    pub fn write_into(&mut self, store: &mut FrameStore) {
         let parity = match self.structure {
             Structure::Frame => None,
             Structure::Field(p) => Some(p),
         };
         let planes = store.planes_mut(parity);
-        for (c, (dst, src)) in planes.iter_mut().zip(self.planes.iter()).enumerate() {
+        for (c, (dst, src)) in planes.iter_mut().zip(self.planes.iter_mut()).enumerate() {
             let (w, h) = if c == 0 {
                 (self.width, self.height)
             } else {
                 (self.width / 2, self.height / 2)
             };
             match parity {
+                None if dst.len() == src.len() => std::mem::swap(dst, src),
                 None => dst[..w * h].copy_from_slice(&src[..w * h]),
                 Some(p) => {
                     for y in 0..h {
@@ -287,6 +423,18 @@ impl PicState {
         let m = Arc::make_mut(&mut store.motion);
         m.mbaff = self.mbaff;
         let stride = self.mb_w * 4;
+        if parity.is_none() && m.mv[0].len() == self.mv[0].len() {
+            for l in 0..2 {
+                std::mem::swap(&mut m.mv[l], &mut self.mv[l]);
+                std::mem::swap(&mut m.ref_idx[l], &mut self.ref_idx[l]);
+                std::mem::swap(&mut m.ref_pic[l], &mut self.ref_pic[l]);
+            }
+            for (i, t) in self.mb_type.iter().enumerate() {
+                m.mb_intra[i] = t.is_intra();
+            }
+            m.mb_field.copy_from_slice(&self.mb_field);
+            return;
+        }
         for mby in 0..self.mb_h {
             let fy = match parity {
                 None => mby,

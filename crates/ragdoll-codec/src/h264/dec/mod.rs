@@ -85,6 +85,8 @@ pub struct Core {
     next_id: u32,
     period: u32,
     out: Vec<Output>,
+    /// The last picture's state, whose buffers the next picture reuses.
+    spare: Option<PicState>,
 }
 
 impl Default for Core {
@@ -124,6 +126,7 @@ impl Core {
             next_id: 0,
             period: 0,
             out: Vec::new(),
+            spare: None,
         }
     }
 
@@ -293,7 +296,21 @@ impl Core {
             PictureType::P
         };
         self.cur = Some(CurPic {
-            st: PicState::new(structure, mb_w, mb_h, sps.mbaff && !sh.field_pic),
+            st: {
+                let mut st = PicState::recycle(
+                    self.spare.take(),
+                    structure,
+                    mb_w,
+                    mb_h,
+                    sps.mbaff && !sh.field_pic,
+                );
+                // Monochrome pictures never write chroma samples.
+                if st.recycled && sps.chroma_array_type() == 0 {
+                    st.planes[1].fill(128);
+                    st.planes[2].fill(128);
+                }
+                st
+            },
             first: sh.clone(),
             sps,
             pps,
@@ -388,6 +405,7 @@ impl Core {
             return;
         };
         let has_chroma = cur.sps.chroma_array_type() != 0;
+        cur.st.restore_undecoded();
         deblock::deblock_picture(&mut cur.st, &cur.slices, has_chroma);
         let sh = cur.first.clone();
         let sps = cur.sps.clone();
@@ -412,12 +430,13 @@ impl Core {
             Some(s) => s,
             None => match self.dpb.pics.iter().position(|p| p.id == cur.store_id) {
                 Some(i) if cur.second_field => self.dpb.pics.swap_remove(i),
-                _ => FrameStore::new(
+                _ => self.dpb.new_store(
                     cur.store_id,
                     cur.st.width,
                     cur.st.height * if parity.is_some() { 2 } else { 1 },
                     cur.st.mb_w,
                     cur.st.mb_h * if parity.is_some() { 2 } else { 1 },
+                    parity.is_some(),
                 ),
             },
         };
@@ -540,9 +559,12 @@ impl Core {
             self.dpb.pics.push(store);
         } else if !complete && let Some(pd) = &mut self.pending {
             pd.store = Some(store);
+        } else {
+            self.dpb.release(store);
         }
         let keep = self.pending.as_ref().map(|p| p.id);
         self.dpb.drop_unused(keep);
+        self.spare = Some(cur.st);
     }
 
     /// Removes and returns the oldest finished frame in decode order.
@@ -601,24 +623,20 @@ fn make_output(
 ) -> VideoFrame {
     let (x0, y0, w, h) = sps.crop_rect();
     let (x0, y0, w, h) = (x0 as usize, y0 as usize, w as usize, h as usize);
-    let mut f = VideoFrame::new(w, h, PixelFormat::Yuv420p);
     let pw = store.width;
-    for y in 0..h {
-        let src = &store.planes[0][(y0 + y) * pw + x0..(y0 + y) * pw + x0 + w];
-        f.plane_mut(0).row_mut(y)[..w].copy_from_slice(src);
-    }
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    for c in 0..2 {
-        for y in 0..ch {
-            let row = f.plane_mut(1 + c).row_mut(y);
-            if sps.chroma_array_type() == 0 {
-                row[..cw].fill(128);
-            } else {
-                let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
-                row[..cw].copy_from_slice(&store.planes[1 + c][o..o + cw]);
-            }
+    let cw = w.div_ceil(2);
+    let grey = vec![128u8; if sps.chroma_array_type() == 0 { cw } else { 0 }];
+    let mut f = VideoFrame::from_rows(w, h, PixelFormat::Yuv420p, |p, y| {
+        if p == 0 {
+            let o = (y0 + y) * pw + x0;
+            &store.planes[0][o..o + w]
+        } else if sps.chroma_array_type() == 0 {
+            &grey
+        } else {
+            let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
+            &store.planes[p][o..o + cw]
         }
-    }
+    });
     f.colorimetry = sps.colorimetry;
     f.keyframe = idr;
     f.pict_type = pict_type;

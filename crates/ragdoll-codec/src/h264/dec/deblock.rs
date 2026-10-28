@@ -2,6 +2,7 @@
 
 use super::picture::{MbType, NO_PIC, PicState, Structure};
 use super::tables::{ALPHA, BETA, TC0};
+use ragdoll_simd::{h264_chroma_deblock, h264_luma_deblock};
 
 /// Per-slice deblocking controls.
 #[derive(Clone, Copy, Debug)]
@@ -35,13 +36,21 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
             };
             let left = mb_x > 0 && neighbour_ok(addr - 1);
             let top = mb_y > 0 && neighbour_ok(addr - mb_w);
+            let t8 = st.t8x8[addr];
+            let local = EdgeCtx::new(st, mb_x, mb_y);
+            // An inter MB with one motion and no luma coefficients has bS 0 on every inner edge.
+            let no_inner = !local.intra[0] && st.uniform[addr] && st.cbp[addr] & 0xF == 0;
             for dir in 0..2 {
                 let filter_mb_edge = if dir == 0 { left } else { top };
                 for edge in 0..4 {
-                    if edge == 0 && !filter_mb_edge {
+                    // Odd edges only exist in luma, which has none inside 8x8 transform blocks.
+                    if (edge == 0 && !filter_mb_edge)
+                        || (edge > 0 && no_inner)
+                        || (t8 && edge % 2 == 1)
+                    {
                         continue;
                     }
-                    let bs = edge_strengths(st, mb_x, mb_y, dir, edge);
+                    let bs = local.strengths(st, dir, edge);
                     if bs == [0; 4] {
                         continue;
                     }
@@ -50,10 +59,8 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
                         (0, _) => addr - mb_w,
                         _ => addr,
                     };
-                    if !(st.t8x8[addr] && edge % 2 == 1) {
-                        let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
-                        filter_luma_edge(st, mb_x, mb_y, dir, edge, bs, qp, sl);
-                    }
+                    let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
+                    filter_luma_edge(st, mb_x, mb_y, dir, edge, bs, qp, sl);
                     if has_chroma && edge % 2 == 0 {
                         for c in 0..2 {
                             let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
@@ -66,41 +73,75 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
     }
 }
 
-/// Boundary strengths of the four 4-sample segments of `edge` (0..4) in direction `dir` (0 vertical, 1 horizontal).
-fn edge_strengths(st: &PicState, mb_x: usize, mb_y: usize, dir: usize, edge: usize) -> [u8; 4] {
-    let addr = mb_y * st.mb_w + mb_x;
-    // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and vertical
-    // vectors are compared in field units (4 quarter frame samples = 2 quarter field samples).
-    let field = matches!(st.structure, Structure::Field(_));
-    let mvy_limit = if field { 2 } else { 4 };
-    let mut bs = [0u8; 4];
-    for (k, slot) in bs.iter_mut().enumerate() {
-        let (qx, qy) = if dir == 0 {
-            (mb_x * 4 + edge, mb_y * 4 + k)
-        } else {
-            (mb_x * 4 + k, mb_y * 4 + edge)
-        };
-        let (px, py) = if dir == 0 { (qx - 1, qy) } else { (qx, qy - 1) };
-        let p_addr = (py / 4) * st.mb_w + px / 4;
-        let mb_edge = edge == 0;
-        let (pi, qi) = (st.b4(px, py), st.b4(qx, qy));
-        let p_intra = st.mb_type[p_addr].is_intra();
-        let q_intra = st.mb_type[addr].is_intra();
-        *slot = if p_intra || q_intra {
-            if mb_edge && !(field && dir == 1) {
+/// What bS derivation (8.7.2.1) needs to know about one macroblock: its position and whether
+/// it and its left and top neighbours are intra.
+struct EdgeCtx {
+    /// 4x4 index of the MB's top-left block, and the 4x4 stride.
+    b0: usize,
+    s: usize,
+    /// Intra: this MB, the left MB, the top MB.
+    intra: [bool; 3],
+    field: bool,
+    uniform: bool,
+}
+
+impl EdgeCtx {
+    fn new(st: &PicState, mb_x: usize, mb_y: usize) -> Self {
+        let addr = mb_y * st.mb_w + mb_x;
+        let s = st.mb_w * 4;
+        Self {
+            b0: mb_y * 4 * s + mb_x * 4,
+            s,
+            intra: [
+                st.mb_type[addr].is_intra(),
+                mb_x > 0 && st.mb_type[addr - 1].is_intra(),
+                mb_y > 0 && st.mb_type[addr - st.mb_w].is_intra(),
+            ],
+            field: matches!(st.structure, Structure::Field(_)),
+            uniform: st.uniform[addr],
+        }
+    }
+
+    /// Boundary strengths of the four 4-sample segments of `edge` (0..4) in direction `dir`
+    /// (0 vertical, 1 horizontal).
+    #[inline]
+    fn strengths(&self, st: &PicState, dir: usize, edge: usize) -> [u8; 4] {
+        // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and
+        // vertical vectors are compared in field units (4 quarter frame samples = 2 quarter
+        // field samples).
+        let p_intra = edge == 0 && self.intra[1 + dir];
+        if self.intra[0] || p_intra {
+            return [if edge == 0 && !(self.field && dir == 1) {
                 4
             } else {
                 3
-            }
-        } else if st.nz[pi] || st.nz[qi] {
-            2
-        } else if motion_differs(st, pi, qi, mvy_limit) {
-            1
-        } else {
-            0
-        };
+            }; 4];
+        }
+        let ylim = if self.field { 2 } else { 4 };
+        let (step, along) = if dir == 0 { (1, self.s) } else { (self.s, 1) };
+        let q0 = self.b0 + edge * step;
+        let mut bs = [0u8; 4];
+        for (k, slot) in bs.iter_mut().enumerate() {
+            let qi = q0 + k * along;
+            let pi = qi - step;
+            *slot = if st.nz[pi] || st.nz[qi] {
+                2
+            } else if edge > 0 && self.uniform {
+                0
+            } else {
+                let rp = [st.ref_pic[0][pi], st.ref_pic[1][pi]];
+                let rq = [st.ref_pic[0][qi], st.ref_pic[1][qi]];
+                let mp = [st.mv[0][pi], st.mv[1][pi]];
+                let mq = [st.mv[0][qi], st.mv[1][qi]];
+                if rp == rq && mp == mq {
+                    0
+                } else {
+                    motion_differs(rp, mp, rq, mq, ylim) as u8
+                }
+            };
+        }
+        bs
     }
-    bs
 }
 
 fn mv_far(a: [i16; 2], b: [i16; 2], ylim: i32) -> bool {
@@ -108,11 +149,18 @@ fn mv_far(a: [i16; 2], b: [i16; 2], ylim: i32) -> bool {
 }
 
 /// Whether two inter blocks predict from different pictures or with vectors 4 or more quarter samples apart.
-fn motion_differs(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
-    let rp = [st.ref_pic[0][p], st.ref_pic[1][p]];
-    let rq = [st.ref_pic[0][q], st.ref_pic[1][q]];
-    let mp = [st.mv[0][p], st.mv[1][p]];
-    let mq = [st.mv[0][q], st.mv[1][q]];
+#[inline]
+fn motion_differs(
+    rp: [u32; 2],
+    mp: [[i16; 2]; 2],
+    rq: [u32; 2],
+    mq: [[i16; 2]; 2],
+    ylim: i32,
+) -> bool {
+    // Identical motion on both sides (the common case inside a partition) never differs.
+    if rp[0] == rq[0] && rp[1] == rq[1] && mp[0] == mq[0] && mp[1] == mq[1] {
+        return false;
+    }
     let np = rp.iter().filter(|&&r| r != NO_PIC).count();
     let nq = rq.iter().filter(|&&r| r != NO_PIC).count();
     if np != nq {
@@ -139,6 +187,17 @@ fn motion_differs(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
         (mv_far(mp[0], mq[0], ylim) || mv_far(mp[1], mq[1], ylim))
             && (mv_far(mp[0], mq[1], ylim) || mv_far(mp[1], mq[0], ylim))
     }
+}
+
+/// [`motion_differs`] between 4x4 blocks `p` and `q` of `st`.
+fn blocks_differ(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
+    motion_differs(
+        [st.ref_pic[0][p], st.ref_pic[1][p]],
+        [st.mv[0][p], st.mv[1][p]],
+        [st.ref_pic[0][q], st.ref_pic[1][q]],
+        [st.mv[0][q], st.mv[1][q]],
+        ylim,
+    )
 }
 
 #[inline]
@@ -235,22 +294,44 @@ fn filter_luma_edge(
         return;
     }
     let w = st.width;
-    for k in 0..16 {
-        let b = bs[k / 4];
-        if b == 0 {
-            continue;
+    let (q0, xstride, ystride) = if dir == 0 {
+        (mb_y * 16 * w + mb_x * 16 + edge * 4, 1, w)
+    } else {
+        ((mb_y * 16 + edge * 4) * w + mb_x * 16, w, 1)
+    };
+    // bS 4 belongs to whole macroblock edges, so an edge is either all bS 4 or all below.
+    let strong = bs == [4; 4];
+    if strong || !bs.contains(&4) {
+        let tc0 = bs.map(|b| match b {
+            0 => -1,
+            4 => 0,
+            _ => TC0[ia][b as usize - 1] as i8,
+        });
+        h264_luma_deblock(
+            &mut st.planes[0],
+            q0,
+            xstride,
+            ystride,
+            alpha,
+            beta,
+            tc0,
+            strong,
+        );
+        return;
+    }
+    for (k, &b) in bs.iter().enumerate() {
+        for line in 4 * k..4 * k + 4 {
+            if b == 0 {
+                continue;
+            }
+            let tc0 = if b < 4 {
+                TC0[ia][b as usize - 1] as i32
+            } else {
+                0
+            };
+            let q = q0 + line * ystride;
+            filter_line(&mut st.planes[0], q, xstride, b, alpha, beta, tc0, false);
         }
-        let tc0 = if b < 4 {
-            TC0[ia][b as usize - 1] as i32
-        } else {
-            0
-        };
-        let (q0, step) = if dir == 0 {
-            ((mb_y * 16 + k) * w + mb_x * 16 + edge * 4, 1)
-        } else {
-            ((mb_y * 16 + edge * 4) * w + mb_x * 16 + k, w)
-        };
-        filter_line(&mut st.planes[0], q0, step, b, alpha, beta, tc0, false);
     }
 }
 
@@ -271,6 +352,22 @@ fn filter_chroma_edge(
         return;
     }
     let w = st.width / 2;
+    let (q0, xstride, ystride) = if dir == 0 {
+        (mb_y * 8 * w + mb_x * 8 + cedge * 4, 1, w)
+    } else {
+        ((mb_y * 8 + cedge * 4) * w + mb_x * 8, w, 1)
+    };
+    let strong = bs == [4; 4];
+    if strong || !bs.contains(&4) {
+        let tc0 = bs.map(|b| match b {
+            0 => -1,
+            4 => 0,
+            _ => TC0[ia][b as usize - 1] as i8,
+        });
+        let plane = &mut st.planes[1 + c];
+        h264_chroma_deblock(plane, q0, xstride, ystride, alpha, beta, tc0, strong);
+        return;
+    }
     for k in 0..8 {
         let b = bs[k / 2];
         if b == 0 {
@@ -281,12 +378,8 @@ fn filter_chroma_edge(
         } else {
             0
         };
-        let (q0, step) = if dir == 0 {
-            ((mb_y * 8 + k) * w + mb_x * 8 + cedge * 4, 1)
-        } else {
-            ((mb_y * 8 + cedge * 4) * w + mb_x * 8 + k, w)
-        };
-        filter_line(&mut st.planes[1 + c], q0, step, b, alpha, beta, tc0, true);
+        let q = q0 + k * ystride;
+        filter_line(&mut st.planes[1 + c], q, xstride, b, alpha, beta, tc0, true);
     }
 }
 
@@ -354,7 +447,7 @@ fn mbaff_bs(
     if pf != qf {
         return 1;
     }
-    motion_differs(st, pi, qi, if qf { 2 } else { 4 }) as u8
+    blocks_differ(st, pi, qi, if qf { 2 } else { 4 }) as u8
 }
 
 /// Deblocking of an MBAFF frame: macroblocks in decoding order (pairs, top MB first), with sample
