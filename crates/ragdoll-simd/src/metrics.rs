@@ -971,7 +971,92 @@ pub fn flac_eval_fixed_orders_l1(samples: &[i32]) -> [u64; 5] {
     if ragdoll_core::dispatch::neon() && samples.len() >= 8 {
         return unsafe { flac_eval_fixed_orders_l1_neon(samples) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && samples.len() >= 12 {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { flac_eval_fixed_orders_l1_avx2(samples) };
+    }
     flac_eval_fixed_orders_l1_scalar(samples)
+}
+
+/// AVX2 [`flac_eval_fixed_orders_l1`]: eight samples per step, each difference order formed from
+/// unaligned loads of `x[i - 4 ..= i]` in 32 bits.
+///
+/// Inputs within `±2^20` keep every difference within `±2^24`, so 128 steps of absolute values fit
+/// a 32-bit lane before they are widened into the 64-bit totals; wider inputs take the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn flac_eval_fixed_orders_l1_avx2(samples: &[i32]) -> [u64; 5] {
+    use std::arch::x86_64::*;
+    let n = samples.len();
+    let span = samples
+        .iter()
+        .fold(0u32, |acc, &s| acc | (s ^ (s >> 31)) as u32);
+    if span >= 1 << 20 {
+        return flac_eval_fixed_orders_l1_scalar(samples);
+    }
+    let mut l1 = flac_eval_fixed_orders_l1_scalar(&samples[..4]);
+    let p = samples.as_ptr();
+    let mut total = [_mm256_setzero_si256(); 5];
+    let widen = |acc: __m256i, t: &mut __m256i| {
+        let lo = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(acc));
+        let hi = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(acc));
+        *t = _mm256_add_epi64(*t, _mm256_add_epi64(lo, hi));
+    };
+    let mut i = 4;
+    while i + 8 <= n {
+        let steps = ((n - i) / 8).min(128);
+        let mut acc = [_mm256_setzero_si256(); 5];
+        for _ in 0..steps {
+            // Safety: `i >= 4` and `i + 8 <= n`.
+            let (x0, x1, x2, x3, x4) = unsafe {
+                (
+                    _mm256_loadu_si256(p.add(i) as *const __m256i),
+                    _mm256_loadu_si256(p.add(i - 1) as *const __m256i),
+                    _mm256_loadu_si256(p.add(i - 2) as *const __m256i),
+                    _mm256_loadu_si256(p.add(i - 3) as *const __m256i),
+                    _mm256_loadu_si256(p.add(i - 4) as *const __m256i),
+                )
+            };
+            let d1 = _mm256_sub_epi32(x0, x1);
+            let d1b = _mm256_sub_epi32(x1, x2);
+            let d1c = _mm256_sub_epi32(x2, x3);
+            let d1d = _mm256_sub_epi32(x3, x4);
+            let d2 = _mm256_sub_epi32(d1, d1b);
+            let d2b = _mm256_sub_epi32(d1b, d1c);
+            let d2c = _mm256_sub_epi32(d1c, d1d);
+            let d3 = _mm256_sub_epi32(d2, d2b);
+            let d3b = _mm256_sub_epi32(d2b, d2c);
+            let d4 = _mm256_sub_epi32(d3, d3b);
+            for (a, e) in acc.iter_mut().zip([x0, d1, d2, d3, d4]) {
+                *a = _mm256_add_epi32(*a, _mm256_abs_epi32(e));
+            }
+            i += 8;
+        }
+        for (a, t) in acc.into_iter().zip(total.iter_mut()) {
+            widen(a, t);
+        }
+    }
+    for (o, t) in l1.iter_mut().zip(total) {
+        let mut lanes = [0u64; 4];
+        // Safety: `lanes` holds 32 bytes.
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, t) };
+        *o += lanes.iter().sum::<u64>();
+    }
+    for i in i..n {
+        let s = |k: usize| samples[i - k] as i64;
+        let e = [
+            s(0),
+            s(0) - s(1),
+            s(0) - 2 * s(1) + s(2),
+            s(0) - 3 * s(1) + 3 * s(2) - s(3),
+            s(0) - 4 * s(1) + 6 * s(2) - 4 * s(3) + s(4),
+        ];
+        for (o, e) in l1.iter_mut().zip(e) {
+            *o += e.unsigned_abs();
+        }
+    }
+    l1
 }
 
 pub fn flac_eval_fixed_orders_l1_scalar(samples: &[i32]) -> [u64; 5] {

@@ -8,11 +8,13 @@
 //! - [`h264_deblock`]: 16-line luma and 8-line chroma H.264 deblocking edges, transposed in registers for vertical edges.
 //! - [`h264_idct`]: H.264 inverse 4x4 transform and reconstruction.
 //! - [`h264_mc`]: Partition-sized H.264 quarter-pel luma and eighth-pel chroma inter prediction.
+//! - [`flac_lpc`]: FLAC encoder windowed autocorrelation, LPC residual and Rice partition-sum kernels.
 //! - [`fixed`]: Q14 fixed-point polyphase dot products and $4\times4$ integer DCT/IDCT/Hadamard transforms.
 
 pub mod audio_dsp;
 pub mod dct4;
 pub mod fixed;
+pub mod flac_lpc;
 pub mod h264_deblock;
 pub mod h264_dsp;
 pub mod h264_idct;
@@ -39,6 +41,11 @@ pub use fixed::{
     Q14_HALF, Q14_ONE, add4x4_idct_u8, clamp_u8, convolve_8tap_q14_u8, convolve_8tap_q14_u8_scalar,
     forward_dct4x4, forward_dct4x4_scalar, forward_dct8x8, hadamard4x4, hadamard4x4_scalar,
     inverse_idct4x4, inverse_idct4x4_scalar, inverse_idct8x8, sub4x4_dct_u8,
+};
+pub use flac_lpc::{
+    FLAC_RICE_ESCAPED, flac_autocorr_f64, flac_autocorr_f64_scalar, flac_lpc_residual_i32,
+    flac_lpc_residual_i32_scalar, flac_rice_partition_costs, flac_rice_partition_costs_scalar,
+    flac_rice_partition_sums, flac_rice_partition_sums_scalar,
 };
 pub use h264_deblock::{
     h264_chroma_deblock, h264_chroma_deblock_scalar, h264_luma_deblock, h264_luma_deblock_scalar,

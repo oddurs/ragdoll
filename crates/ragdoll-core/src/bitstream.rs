@@ -580,6 +580,108 @@ impl BitWriter {
         self.write_rice_unsigned(folded, k);
     }
 
+    /// Writes each of `vals` as a zig-zag folded Golomb-Rice code with parameter `k` (`k <= 30`),
+    /// as FLAC residual partitions store them.
+    ///
+    /// On x86_64 the AVX2 dispatch level runs the same code compiled with BMI2 (which every AVX2
+    /// CPU has), whose flag-free variable shifts shorten the per-code work.
+    pub fn write_rice_signed_i32(&mut self, vals: &[i32], k: u32) {
+        debug_assert!(k <= 30);
+        #[cfg(target_arch = "x86_64")]
+        if crate::dispatch::avx2() && std::is_x86_feature_detected!("bmi2") {
+            // Safety: the CPU supports BMI2 (checked just above).
+            return unsafe { self.write_rice_signed_i32_bmi2(vals, k) };
+        }
+        self.write_rice_signed_i32_impl(vals, k)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "bmi1,bmi2")]
+    unsafe fn write_rice_signed_i32_bmi2(&mut self, vals: &[i32], k: u32) {
+        self.write_rice_signed_i32_impl(vals, k)
+    }
+
+    /// Codes are joined four at a time into one field of up to 64 bits, appended with a single
+    /// (mostly unpredictable) buffer-full test instead of one per code; groups too long for one
+    /// field, and codes of 63 or more bits, go one at a time.
+    #[inline(always)]
+    fn write_rice_signed_i32_impl(&mut self, vals: &[i32], k: u32) {
+        let mask = (1u64 << k) - 1;
+        let stop = 1u64 << k;
+        let mut buf = self.bit_buf;
+        let mut free = 64 - self.bits_in_buf;
+        let mut pos = self.out.len();
+        let mut cap = self.out.capacity();
+        let mut base = self.out.as_mut_ptr();
+        // `q` zeros, the stop bit and the `k` low bits form one field of `q + 1 + k` bits.
+        let code_len = |v: i32| {
+            let u = ((v << 1) ^ (v >> 31)) as u32 as u64;
+            (stop | (u & mask), (u >> k) + k as u64 + 1)
+        };
+        // Appends the low `len <= 64` bits of `field`.
+        macro_rules! append {
+            ($field:expr, $len:expr) => {{
+                let (field, len): (u64, u32) = ($field, $len);
+                if len < free {
+                    free -= len;
+                    buf |= field << free;
+                } else {
+                    if pos + 8 > cap {
+                        // Safety: bytes up to `pos` were written below.
+                        unsafe { self.out.set_len(pos) };
+                        self.out.reserve(vals.len() + 64);
+                        (cap, base) = (self.out.capacity(), self.out.as_mut_ptr());
+                    }
+                    let rest = len - free;
+                    // Safety: `pos + 8 <= cap`.
+                    unsafe {
+                        (base.add(pos) as *mut [u8; 8])
+                            .write_unaligned((buf | (field >> rest)).to_be_bytes())
+                    };
+                    pos += 8;
+                    free = 64 - rest;
+                    // `free` may be 64 here, where a single shift would not clear the word.
+                    buf = (field << 1) << (free - 1);
+                }
+            }};
+        }
+        let (quads, tail) = vals.as_chunks::<4>();
+        for quad in quads.iter().map(|q| &q[..]).chain(std::iter::once(tail)) {
+            if quad.len() == 4 {
+                let [(c0, l0), (c1, l1), (c2, l2), (c3, l3)] =
+                    [0, 1, 2, 3].map(|i| code_len(quad[i]));
+                let total = l0 + l1 + l2 + l3;
+                if total <= 64 {
+                    let field = (((((c0 << l1) | c1) << l2) | c2) << l3) | c3;
+                    append!(field, total as u32);
+                    continue;
+                }
+            }
+            for &v in quad {
+                let (code, len) = code_len(v);
+                if len < 64 {
+                    append!(code, len as u32);
+                } else {
+                    // Safety: bytes up to `pos` were written above.
+                    unsafe { self.out.set_len(pos) };
+                    (self.bit_buf, self.bits_in_buf) = (buf, 64 - free);
+                    let mut zeros = len - 1 - k as u64;
+                    while zeros >= 32 {
+                        self.write_bits(0, 32);
+                        zeros -= 32;
+                    }
+                    self.write_bits(0, zeros as u32);
+                    self.write_bits(code, k + 1);
+                    (buf, free) = (self.bit_buf, 64 - self.bits_in_buf);
+                    (pos, cap, base) = (self.out.len(), self.out.capacity(), self.out.as_mut_ptr());
+                }
+            }
+        }
+        // Safety: bytes up to `pos` were written above.
+        unsafe { self.out.set_len(pos) };
+        (self.bit_buf, self.bits_in_buf) = (buf, 64 - free);
+    }
+
     /// Pads with zero bits to the next byte boundary.
     #[inline]
     pub fn align_to_byte(&mut self) {
@@ -857,5 +959,55 @@ pub fn write_ebml_vint(val: u64, dst: &mut Vec<u8>) {
     let encoded = val | marker;
     for i in (0..width).rev() {
         dst.push((encoded >> (i * 8)) as u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The block Rice writer (both dispatch levels) matches one `write_rice_signed` per value,
+    /// from every starting bit offset, across long codes and extremal residuals.
+    #[test]
+    fn rice_block_writer_matches_per_value_writer() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for k in [0u32, 1, 3, 7, 14, 15, 30] {
+            // Values of up to `k + 12` bits keep the unary parts short enough to test quickly;
+            // 1000 and -777 still take the long-code path at small `k`.
+            for bits in [1u32, 4, 9, 17, 32].map(|b: u32| b.min(k + 12)) {
+                let mut vals: Vec<i32> = (0..300).map(|_| (next() as i32) >> (32 - bits)).collect();
+                vals.extend([0, -1, 1000, -777]);
+                if k == 30 {
+                    vals.extend([i32::MIN, i32::MAX, 1 << 20, -(1 << 25)]);
+                }
+                for lead in [0u32, 1, 7, 31, 32, 33, 63] {
+                    let mut a = BitWriter::new();
+                    let mut b = BitWriter::new();
+                    for _ in 0..lead {
+                        a.write_bit(true);
+                        b.write_bit(true);
+                    }
+                    a.write_rice_signed_i32(&vals[..150], k);
+                    a.write_rice_signed_i32(&vals[150..], k);
+                    for &v in &vals {
+                        b.write_rice_signed(v as i64, k);
+                    }
+                    a.write_bits(0x5, 3);
+                    b.write_bits(0x5, 3);
+                    assert_eq!(
+                        a.bits_written(),
+                        b.bits_written(),
+                        "k={k} bits={bits} lead={lead}"
+                    );
+                    assert_eq!(a.finish(), b.finish(), "k={k} bits={bits} lead={lead}");
+                }
+            }
+        }
     }
 }

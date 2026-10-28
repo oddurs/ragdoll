@@ -186,7 +186,6 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0088` H.264 decoder: multithreaded decoding to beat FFmpeg's frame-threaded throughput <sup>feature · p1</sup>
 - [ ] `SIMD-0089` H.264 encoder slower than x264 at equal compression (0.12x ultrafast) <sup>kernel · p1</sup>
 - [ ] `SIMD-0090` Opus encoder: beat libopus float speed (0.93x) <sup>kernel · p1</sup>
-- [ ] `SIMD-0091` FLAC encoder: match FFmpeg level 5 compression while staying faster <sup>kernel · p1</sup>
 
 ### up next
 
@@ -196,6 +195,7 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
 - [ ] `SIMD-0087` Opus decoder slower than FFmpeg's native decoder (0.58x CELT, 0.69x SILK) <sup>kernel · p1</sup>
+- [ ] `SIMD-0091` FLAC encoder: match FFmpeg level 5 compression while staying faster <sup>kernel · p1 · codec-audio</sup>
 
 ### shipped
 
