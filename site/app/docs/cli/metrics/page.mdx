@@ -8,7 +8,7 @@ Measure how closely a distorted video matches a reference. Frames are compared p
 ragdoll metrics <REFERENCE> <DISTORTED> [--json]
 ```
 
-The reference comes first. Both inputs must have the same dimensions; scale one with [`transcode --scale`](/docs/cli/transcode/) first if they don't.
+The reference comes first. Either input can be any video `transcode` decodes, such as MP4, Matroska, MPEG-TS or Y4M. Both inputs must have the same dimensions; scale one with [`transcode --scale`](/docs/cli/transcode/) first if they don't. Mismatched sizes are not yet reported as a clean error: the process aborts.
 
 ## Metrics
 
@@ -19,7 +19,9 @@ The reference comes first. Both inputs must have the same dimensions; scale one 
 | **MS-SSIM** | Y | Five-scale multi-scale SSIM with the standard Wang et al. weights. |
 | **VMAF-Lite** | Y | A fast approximation of VMAF built from a VIF-style information-fidelity term. Useful for tracking changes; it is not a substitute for libvmaf scores. |
 
-All metrics operate on 8-bit planes and use SIMD kernels on `aarch64`.
+All metrics operate on 8-bit planes. They use NEON kernels on `aarch64`; on `x86_64`, the sum-of-squared-error (PSNR) and SSIM statistics kernels use AVX2.
+
+Both inputs are decoded a batch at a time and compared in waves of 30 frames, so memory stays within the pipeline's budget however long the videos are.
 
 ## Example
 
@@ -30,15 +32,15 @@ ragdoll metrics sample.mp4 q30.mp4
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ RAGDOLL PERCEPTUAL QUALITY METRICS (60 frames in 67.23 ms / 892.4 fps)
+│ RAGDOLL PERCEPTUAL QUALITY METRICS (60 frames in 576.42 ms / 104.1 fps)
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ PSNR (dB)     : Y=53.86 dB | U=56.88 dB | V=50.88 dB | Avg=53.45 dB (6:1:1=53.86 dB)
-│ SSIM (8x8)    : Y=0.99778 (26.35 dB) | Avg=0.99756 | 5-Scale MS-SSIM=0.99801
-│ VMAF-Lite     : 95.69 / 100.0
+│ PSNR (dB)     : Y=49.11 dB | U=48.14 dB | V=47.76 dB | Avg=48.65 dB (6:1:1=48.82 dB)
+│ SSIM (8x8)    : Y=0.99522 (23.19 dB) | Avg=0.99513 | 5-Scale MS-SSIM=0.99618
+│ VMAF-Lite     : 86.05 / 100.0
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Identical inputs report `inf` for PSNR and SSIM in dB. In `--json` output, infinite PSNR values are written as `99.99` so the document stays valid JSON.
+Identical inputs report `inf` for PSNR and SSIM in dB. In `--json` output, infinite PSNR and SSIM dB values are written as `99.99` so the document stays valid JSON.
 
 If the two inputs have different frame counts, only the first `min(a, b)` frames are compared.
 
@@ -51,17 +53,17 @@ ragdoll metrics sample.mp4 q30.mp4 --json
 ```json
 {
   "frames": 60,
-  "elapsed_ms": 60.395,
-  "fps": 993.46,
-  "psnr_y": 53.8553,
-  "psnr_u": 56.8770,
-  "psnr_v": 50.8780,
-  "psnr_avg": 53.4506,
-  "psnr_yuv_611": 53.8608,
-  "ssim_y": 0.997781,
-  "ssim_avg": 0.997559,
-  "ssim_db": 26.3538,
-  "ms_ssim": 0.998009,
-  "vmaf_lite": 95.6922
+  "elapsed_ms": 580.437,
+  "fps": 103.37,
+  "psnr_y": 49.1116,
+  "psnr_u": 48.1433,
+  "psnr_v": 47.7584,
+  "psnr_avg": 48.6458,
+  "psnr_yuv_611": 48.8214,
+  "ssim_y": 0.995220,
+  "ssim_avg": 0.995132,
+  "ssim_db": 23.1935,
+  "ms_ssim": 0.996181,
+  "vmaf_lite": 86.0545
 }
 ```

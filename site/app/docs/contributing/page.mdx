@@ -25,9 +25,9 @@ RAGDOLL_SIMD=scalar cargo test --workspace
 cargo run --release -- self-test
 ```
 
-Then push your branch and open a pull request. CI runs formatting, Clippy and the full test suite on `aarch64` (NEON) and `x86_64` (AVX2) Linux, then again with `RAGDOLL_SIMD=scalar` on the scalar reference paths, and builds the website if you changed it.
+Then push your branch and open a pull request. CI checks formatting, runs Clippy and the full test suite on `aarch64` (NEON) and `x86_64` (AVX2) Linux, then runs the tests again with `RAGDOLL_SIMD=scalar` on the scalar reference paths, and builds the website if you changed it. `RAGDOLL_SIMD` (`scalar`, `neon` or `avx2`) forces the dispatch level for any run, so a SIMD change can be checked against its scalar reference end to end.
 
-The interop tests compare against FFmpeg and need `ffmpeg` and `ffprobe` installed; CI pins Ubuntu 24.04's FFmpeg 6.1.1. Without them the tests fail, unless you set `RAGDOLL_ALLOW_MISSING_TOOLS=1` to skip them. The CLI's text output is pinned by snapshots in `crates/ragdoll-cli/tests/golden/`: after an intended change, rewrite them with `RAGDOLL_BLESS=1 cargo test -p ragdoll-cli --test cli`.
+The interop tests compare against FFmpeg and need `ffmpeg` and `ffprobe` installed; CI pins Ubuntu 24.04's FFmpeg 6.1.1. Without them the tests fail, unless you set `RAGDOLL_ALLOW_MISSING_TOOLS=1` to skip them. Tests of your own that call reference tools can use `ragdoll_core::testing` (`require_tool`, `tool_succeeded`) to get the same behavior. The CLI's text output is pinned by snapshots in `crates/ragdoll-cli/tests/golden/`: after an intended change, rewrite them with `RAGDOLL_BLESS=1 cargo test -p ragdoll-cli --test cli`.
 
 ## Pull requests
 
@@ -41,14 +41,25 @@ Commit titles follow a short convention:
 <type>(<area>): <summary>
 ```
 
-**type** is one of `feature`, `kernel`, `benchmark`, `bug`, `chore` or `docs`. **area** is the crate or subsystem, such as `core`, `simd`, `pix`, `format`, `codec-video`, `codec-audio`, `pipeline`, `cli` or `bench`.
+**type** is one of `feature`, `kernel`, `benchmark`, `decision`, `bug`, `chore` or `docs`. **area** is the crate or subsystem, such as `core`, `simd`, `pix`, `format`, `codec-video`, `codec-audio`, `pipeline`, `cli`, `bench` or `arch`.
 
 ## Good first contributions
 
-- **AVX2 kernels.** Every NEON kernel already has a scalar reference and a differential test, so an AVX2 port has a precise target. `sad_plane_u8` and `find_annex_b_start_code` are good places to start.
+- **AVX2 kernels.** Every NEON kernel already has a scalar reference and a differential test, so an AVX2 port has a precise target. Plane SAD and SSE, SSIM, the start-code scanner, RBSP unescaping, 8-tap scaling and YUV-to-RGB are done; `sad_16x16_u8`, `satd_4x4_u8` and `rgb24_to_yuv420p` are good places to start.
 - **Benchmark reports** from Linux on Graviton, Ampere or Raspberry Pi 5, using `ragdoll bench --json`.
-- **Malformed inputs.** Truncated or corrupt files that make a demuxer panic instead of returning an error.
+- **Malformed inputs.** Truncated or corrupt files that make a demuxer or decoder panic instead of returning an error. Once fixed, the minimized file goes into the QA corpus as a regression case.
 - **Documentation.** These pages live in [`site/app/docs`](https://github.com/oddurs/ragdoll/tree/main/site/app/docs) as MDX.
+
+## The QA corpus
+
+Validation tooling lives in its own Cargo workspace under `qa/`, so nothing it needs reaches the library's `Cargo.lock`. `qa/corpus/manifest.toml` pins every corpus file by SHA-256 and size:
+
+```sh
+cd qa
+cargo run --release -- corpus fetch    # download the external tiers, verifying each file
+cargo run --release -- corpus verify   # fail on any missing file or hash mismatch
+cargo run --release -- corpus synth    # regenerate the synthesized tier and check it is byte-identical
+```
 
 ## Working on the website
 

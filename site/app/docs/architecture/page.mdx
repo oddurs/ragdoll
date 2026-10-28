@@ -24,12 +24,12 @@ Arrows point down to dependencies. `ragdoll-pipeline` and `ragdoll-cli` also use
 
 | Crate | Role | Main types |
 | :-- | :-- | :-- |
-| [`ragdoll-core`](/docs/crates/ragdoll-core/) | Shared vocabulary | `Rational64`, `Timestamp`, `VideoFrame`, `AudioFrame`, `FramePool`, `PacketSlice`, `BitReader`, `Colorimetry`, `PowerMode` |
-| [`ragdoll-simd`](/docs/crates/ragdoll-simd/) | Low-level kernels | Start-code scanning, SAD / SSE / SATD / SSIM, integer DCT and Hadamard, fixed-point convolution |
-| [`ragdoll-pix`](/docs/crates/ragdoll-pix/) | Pixel processing | `YuvRgbMatrix`, `PolyphaseFilterBank`, `ScaleFilter`, `QualityReport` |
-| [`ragdoll-format`](/docs/crates/ragdoll-format/) | Containers | `MmapSource`, `Mp4Demuxer`, `MkvMuxer`, `MpegTsDemuxer`, `Y4mMuxer`, `WavDemuxer` |
-| [`ragdoll-codec`](/docs/crates/ragdoll-codec/) | Codecs | `H264Encoder`, `H264Decoder`, `FlacEncoder`, `FlacDecoder`, `RagdollIntraEncoder`, `ObuPacket` |
-| [`ragdoll-pipeline`](/docs/crates/ragdoll-pipeline/) | Scheduling and whole-file operations | `GopRingPipeline`, `parallel_gop_map`, `PipelineRecipe`, `TranscodeOptions` |
+| [`ragdoll-core`](/docs/crates/ragdoll-core/) | Shared vocabulary | `Rational64`, `Timestamp`, `VideoFrame`, `AudioFrame`, `FramePool`, `PacketSlice`, `BitReader`, `Colorimetry`, `PowerMode`, SIMD `dispatch` |
+| [`ragdoll-simd`](/docs/crates/ragdoll-simd/) | Low-level kernels | Start-code scanning, SAD / SSE / SATD / SSIM, integer DCT and Hadamard, fixed-point convolution, H.264 motion compensation and deblocking, audio DSP |
+| [`ragdoll-pix`](/docs/crates/ragdoll-pix/) | Pixel processing | `YuvRgbMatrix`, `PolyphaseFilterBank`, `ScaleFilter`, `QualityReport`, crop / pad / rotate / overlay / tonemap |
+| [`ragdoll-format`](/docs/crates/ragdoll-format/) | Containers and images | `MmapSource`, `Mp4Demuxer`, `MkvMuxer`, `MpegTsDemuxer`, `OggDemuxer`, `FlacContainerMuxer`, `Y4mMuxer`, `WavDemuxer`, PNG and JPEG |
+| [`ragdoll-codec`](/docs/crates/ragdoll-codec/) | Codecs | `H264Encoder`, `H264Decoder`, `AacEncoder`, `AacDecoder`, `OpusEncoder`, `OpusDecoder`, `FlacEncoder`, `FlacDecoder`, `RagdollIntraEncoder`, `ObuPacket` |
+| [`ragdoll-pipeline`](/docs/crates/ragdoll-pipeline/) | Scheduling and whole-file operations | `VideoFrameStream`, `GopRingPipeline`, `GopRingEncoder`, `parallel_gop_map`, `TranscodeBuilder`, `PipelineRecipe`, `TranscodeOptions` |
 | `ragdoll-cli` | The `ragdoll` binary | Argument parsing, report rendering, benchmark harness |
 
 `ragdoll-format` depends only on `ragdoll-core` and `ragdoll-simd`, so a program that only needs containers never compiles a codec or the pixel engine.
@@ -38,14 +38,14 @@ Arrows point down to dependencies. `ragdoll-pipeline` and `ragdoll-cli` also use
 
 Following one `ragdoll transcode in.mp4 out.mkv --scale 1280x720` from start to finish:
 
-1. **Map.** `MmapSource::open` maps the input read-only and asks the kernel to prefetch it (`MADV_WILLNEED`).
-2. **Index.** `Mp4Demuxer::open` walks the box tree and flattens every track's sample tables into a `Vec<SampleEntry>`: 24 bytes per sample, with offset, size, timestamps and flags. No payload is read.
+1. **Map.** `MmapSource::open` maps the input read-only. No payload is read yet.
+2. **Index.** `Mp4Demuxer::open` walks the box tree and flattens every track's sample tables into a `Vec<SampleEntry>`: 24 bytes per sample, with offset, size, timestamps and flags.
 3. **Demux.** Packets are `PacketSlice<'mmap>` values whose payload is a slice of the map. H.264 access units are converted from AVCC to Annex-B framing for the decoder.
-4. **Decode.** `H264Decoder` reconstructs frames into 64-byte-aligned planes.
-5. **Partition.** `partition_into_gops` splits the frame sequence at keyframes. GOPs are independent, so they can be processed in parallel without coordination.
-6. **Scale and encode, in waves.** `GopRingPipeline` computes how many GOPs fit the memory budget at once, then hands each wave to `parallel_gop_map`. Workers take GOPs from a shared atomic counter, scale with a cached `PolyphaseFilterBank`, and encode. Frame buffers return to a `FramePool` for reuse by the next wave.
-7. **Sync.** `AvSyncController` rescales audio and subtitle packets to the output timebase with 128-bit arithmetic and interleaves all tracks by decode timestamp.
-8. **Mux.** `MkvMuxer` builds clusters and a `Cues` index, and writes header, payloads and trailer with vectored I/O.
+4. **Decode, in batches.** `VideoFrameStream` splits the video track into GOPs at IDR frames and decodes a wave of whole GOPs in parallel, one `H264Decoder` per GOP, as many as fit a quarter of the memory budget. Frames come out in presentation order, one batch at a time; the whole input is never decoded at once.
+5. **Filter.** Crop, pad, rotate, overlay, tone mapping and frame-rate changes, when asked for, are applied to each batch.
+6. **Scale and encode, in waves.** A `GopRingEncoder` (from `GopRingPipeline::streaming_encoder`) collects frames until a wave of 15-frame GOPs is complete, sized so the wave fits the memory budget. `parallel_gop_map` then hands the GOPs to workers, which take them from a shared atomic counter, scale with cached `PolyphaseFilterBank`s into frames from a `FramePool`, and encode each GOP as an independent IDR-started sequence. The wave's frames are then released before the next one.
+7. **Sync.** Audio and subtitle tracks are copied, or decoded, processed and re-encoded when asked. `AvSyncController` rescales their packets to the output timebase with 128-bit arithmetic and interleaves all tracks by decode timestamp.
+8. **Mux.** `MkvMuxer` builds clusters, a `SeekHead` and a `Cues` index, and writes header, payloads and trailer through a buffered output.
 
 ## Decisions behind the design
 
@@ -54,4 +54,4 @@ Four decisions shape the rest of the design:
 - **Pure Rust with explicit SIMD and no C.** Portability and memory safety come from Rust; speed comes from writing the kernels by hand instead of binding to C or assembly. See [SIMD & verification](/docs/architecture/simd/).
 - **Zero-copy demuxing and fused scanline processing.** Data is mapped rather than read, and pixel stages are fused so intermediate rows stay in L1 cache. See [Memory model](/docs/architecture/memory/).
 - **Subcommands and declarative recipes.** The CLI is organized by task, and anything you can type can also be written down as TOML.
-- **Opinionated production defaults.** Bounded-memory GOP streaming, keeping every track by default, and task-level verbs (such as the planned `cut`, `concat` and `package`) rather than low-level knobs.
+- **Opinionated production defaults.** Bounded-memory GOP streaming, keeping every track by default, and task-level verbs (such as `cut`, `concat` and `package`) rather than low-level knobs.

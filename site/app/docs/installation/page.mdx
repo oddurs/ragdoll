@@ -6,9 +6,9 @@ Ragdoll builds with a stable Rust toolchain and nothing else. There are no syste
 
 ## Requirements
 
-- **Rust 1.85 or newer** (the workspace uses the 2024 edition). Install it with [rustup](https://rustup.rs).
-- **A 64-bit target.** `aarch64` gets the NEON kernels; `x86_64` runs the scalar reference paths.
-- **Optional:** `ffmpeg` and `ffprobe` on your `PATH` if you want to run [`bench --compare-ffmpeg`](/docs/cli/bench/).
+- **A recent stable Rust toolchain.** The workspace uses the 2024 edition and language and library features stabilized in Rust 1.88, so older compilers cannot build it; CI uses the current stable release. Install it with [rustup](https://rustup.rs).
+- **A 64-bit target.** `aarch64` gets the NEON kernels; `x86_64` gets the AVX2 kernels when the CPU has AVX2, and the scalar reference paths otherwise.
+- **Optional:** `ffmpeg` and `ffprobe` on your `PATH` to run the interop tests (see [Contributing](/docs/contributing/)) or [`bench --compare-ffmpeg`](/docs/cli/bench/).
 
 ## Install the CLI
 
@@ -25,8 +25,10 @@ ragdoll --version
 ```
 
 ```text
-ragdoll 0.1.0 (aarch64 NEON (128-bit x 32 ASIMD) | 4 P-cores + 6 E-cores)
+ragdoll 0.1.0 (x86_64 AVX2 (256-bit) | 2 P-cores + 2 E-cores)
 ```
+
+That is a four-core Linux VM. On Apple Silicon the SIMD level reads `aarch64 NEON (128-bit x 32 ASIMD)` and the core counts come from the performance and efficiency clusters; on Linux, which reports no core types, the logical cores are split in half.
 
 ## Build from source
 
@@ -48,14 +50,16 @@ CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
 
 ## Verify your build
 
-Run the test suite, then the differential self-test. The self-test runs every SIMD kernel against its scalar reference on your hardware and prints throughput for both:
+Run the test suite, then the differential self-test. The self-test runs the hot SIMD kernels against their scalar references on your hardware and prints throughput for both:
 
 ```sh
 cargo test --workspace
 cargo run --release -- self-test
 ```
 
-Every row should end in `EXACT`. If one does not, please [open an issue](https://github.com/oddurs/ragdoll/issues) with the output and your CPU model.
+The interop tests compare against FFmpeg and fail when `ffmpeg` or `ffprobe` is missing; set `RAGDOLL_ALLOW_MISSING_TOOLS=1` to skip them instead.
+
+Every kernel row should report `EXACT` in its last column. If one does not, please [open an issue](https://github.com/oddurs/ragdoll/issues) with the output and your CPU model.
 
 ## Use the crates as a library
 

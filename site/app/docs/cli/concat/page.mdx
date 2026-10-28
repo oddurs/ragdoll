@@ -1,0 +1,69 @@
+export const metadata = { title: "ragdoll concat" };
+
+# ragdoll concat
+
+Join several files end to end. When every input has the same video codec, dimensions and codec configuration, `concat` splices their packets without decoding, offsetting each segment's timestamps so they continue where the previous one ended. Otherwise it decodes everything and re-encodes one H.264 stream.
+
+```sh
+ragdoll concat <IN1> <IN2> ... -o <OUT> [--json]
+ragdoll concat <IN1> <IN2> ... <OUT> [--json]
+```
+
+## Options
+
+| Option | Description |
+| :-- | :-- |
+| `<IN1> <IN2> ...` | Input files in playback order: MP4, Matroska / WebM or MPEG-TS. |
+| `-o <OUT>`, `--output` | Output file. Without `-o`, the last positional path is the output. `.mkv` / `.webm` write Matroska, `.ts` writes MPEG-TS, anything else MP4. |
+| `--json`, `-j` | Print the summary as JSON. |
+
+## Two paths
+
+**Packet copy.** The first input sets the track layout. If every later input has a video track with the same codec, width, height and codec configuration (`avcC` for H.264), packets are copied unchanged and only their timestamps move: each track continues from the end of the same track in the previous segment. Audio and subtitle tracks are carried along by track index. Nothing is decoded, so this is limited by I/O.
+
+**Re-encode.** If any input differs, every input is decoded a batch at a time, frames whose size differs from the first input are scaled to it with Lanczos-3, and the result is encoded as H.264 at QP 20 at the first input's frame rate. This path writes video only: audio and subtitle tracks are dropped. Memory stays within the pipeline's batch budget.
+
+The summary's `reencoded` field tells you which path ran.
+
+## Examples
+
+Split a file in two with [`cut`](/docs/cli/cut/), then put it back together:
+
+```sh
+ragdoll cut sample.mp4 a.mp4 --to 1.0
+ragdoll cut sample.mp4 b.mp4 --from 1.0
+ragdoll concat a.mp4 b.mp4 -o joined.mp4
+```
+
+```text
+RAGDOLL CONCAT: 2 segments -> joined.mp4 | 60 video pkts, 0 audio pkts (reencoded=false, 137757 B in 0.40 ms)
+```
+
+Both halves come from the same encode, so they are spliced by packet copy and `joined.mp4` decodes to exactly the frames of `sample.mp4`.
+
+Joining a 1280×720 file with a 640×360 one takes the re-encode path and scales the second to 1280×720:
+
+```sh
+ragdoll concat sample.mp4 in.mp4 -o mixed.mp4
+```
+
+```text
+RAGDOLL CONCAT: 2 segments -> mixed.mp4 | 120 video pkts, 0 audio pkts (reencoded=true, 339490 B in 1027.13 ms)
+```
+
+## JSON output
+
+```sh
+ragdoll concat a.mp4 b.mp4 joined2.mkv --json
+```
+
+```json
+{"operation":"concat","segments_merged":2,"video_packets":60,"audio_packets":0,"reencoded":false,"output_bytes":137352,"elapsed_ms":0.493}
+```
+
+`audio_packets` counts every non-video packet, subtitles included. On the re-encode path, `video_packets` is the number of frames encoded.
+
+## Notes
+
+- Concatenating files that came from the same encoder settings, such as segments cut from one source, takes the packet-copy path.
+- The inputs are demuxed into memory before splicing.

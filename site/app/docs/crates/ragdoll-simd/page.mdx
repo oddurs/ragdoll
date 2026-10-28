@@ -11,12 +11,14 @@ Architecture-specific kernels used throughout the workspace, each with a bit-exa
 ```rust
 use ragdoll_simd::SimdLevel;
 
-match SimdLevel::detect() {
+match SimdLevel::active() {
     SimdLevel::Neon => println!("NEON kernels active"),
-    SimdLevel::Avx2 => println!("AVX2 detected; scalar paths in use"),
+    SimdLevel::Avx2 => println!("AVX2 kernels active where they exist; scalar elsewhere"),
     SimdLevel::Scalar => println!("scalar paths in use"),
 }
 ```
+
+`SimdLevel::detect()` reports what the CPU supports; `SimdLevel::active()` reports what kernels actually use, which differs when the `RAGDOLL_SIMD` environment variable (`scalar`, `neon` or `avx2`) forces a level. The switch itself lives in [`ragdoll_core::dispatch`](/docs/crates/ragdoll-core/).
 
 Public functions dispatch automatically, so you do not need to check the level yourself. Kernels named `foo` generally have a public `foo_scalar` twin you can call directly when you need the reference result.
 
@@ -51,11 +53,30 @@ Public functions dispatch automatically, so you do not need to check the level y
 | `sub4x4_dct_u8`, `add4x4_idct_u8` | Fused residual-and-transform helpers. |
 | `convolve_8tap_q14_u8` | 8-tap filter in Q14 fixed point. |
 
+### `h264_dsp`: H.264 reconstruction
+
+| Function | Purpose |
+| :-- | :-- |
+| `put_h264_qpel16_mc_u8`, `put_h264_qpel8_mc_u8` | Quarter-pel luma motion compensation with the 6-tap filter. |
+| `put_h264_chroma_mc8_u8` | Eighth-pel bilinear chroma motion compensation. |
+| `h264_loop_filter_luma_edge_h_u8` / `_v_u8`, `h264_loop_filter_chroma_edge_h_u8` / `_v_u8` | In-loop deblocking of luma and chroma edges, with the `H264_DEBLOCK_ALPHA` / `BETA` / `TC0` tables. |
+| `predict_intra_4x4_u8` | The nine intra 4×4 prediction modes. |
+
+### `audio_dsp`: audio processing
+
+| Function | Purpose |
+| :-- | :-- |
+| `polyphase_dot16_f32`, `polyphase_dot32_f32`, `polyphase_dot_f32`, `polyphase_dot16_q15_i16`, `polyphase_dot32_q15_i16` | Polyphase dot products for the resampler, in `f32` and Q15. |
+| `rematrix_stereo_to_mono_f32`, `rematrix_mono_to_stereo_f32`, `rematrix_5_1_to_stereo_f32`, `rematrix_nxm_f32` | Channel down- and upmixing (ITU-R BS.775 coefficients for 5.1). |
+| `biquad_process_4ch_f32` | Four-channel biquad, used for the BS.1770 K-weighting filter in loudness measurement. |
+| `true_peak_4x_12tap_sample_f32`, `apply_gain_true_peak_limit_f32` | 4× oversampled true-peak measurement and gain with a ceiling. |
+| `MdctPlan`, `fft_complex_in_place`, `kbd_window_f32`, `sine_window_f32`, `window_overlap_add_f32` | MDCT, FFT, windows and overlap-add (the AAC encoder uses `MdctPlan` and the KBD window). |
+
 ## Adding a kernel
 
 1. Write `foo_scalar` first, and document the fixed-point format and rounding.
-2. Add a private `#[target_feature(enable = "neon")] unsafe fn foo_neon`.
-3. Make `pub fn foo` dispatch between them.
+2. Add a private `#[target_feature(enable = "neon")] unsafe fn foo_neon`, and an `_avx2` sibling if you are writing one.
+3. Make `pub fn foo` dispatch between them with `ragdoll_core::dispatch::neon()` and `avx2()`, falling back to `foo_scalar`.
 4. Add a differential test over odd sizes, unaligned tails and extremal values.
 5. Add a row to `ragdoll self-test` if the kernel is on a hot path.
 

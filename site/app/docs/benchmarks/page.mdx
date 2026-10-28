@@ -2,83 +2,104 @@ export const metadata = { title: "Benchmarks" };
 
 # Benchmarks
 
-Performance is a design goal, so it is measured continuously and compared against the most widely deployed implementation, FFmpeg. This page explains what was measured, how, and what the numbers do and do not show.
+Performance is a design goal, so it is measured and compared against the most widely deployed implementation, FFmpeg. This page explains what was measured, how, and what the numbers do and do not show. The short version: Ragdoll's codecs are correct, and most of them are not yet as fast as FFmpeg's.
 
 <Callout title="One machine, one harness">
-All numbers below come from a single Apple M4 (4 performance and 6 efficiency cores) and the project's own harness. Treat them as evidence of direction, not as a general claim. Run them on your own hardware before relying on them.
+The codec numbers below come from a single machine and were measured like for like: both libraries called in-process, on one thread, on the same inputs. Treat them as evidence of direction, not as a general claim, and run them on your own hardware before relying on them.
 </Callout>
 
-## Setup
+## Codecs against FFmpeg
 
 | | |
 | :-- | :-- |
-| **Hardware** | Apple M4, 4 P-cores + 6 E-cores, macOS |
-| **Ragdoll** | `v0.1.0`, `cargo build --release` (fat LTO, one codegen unit, `opt-level = 3`) |
-| **FFmpeg** | 9.0.2, built with `clang -O3 -mcpu=native` |
-| **Inputs** | Synthesized: 64-byte-aligned 3840×2160 planes, 16 MB bitstreams, procedural video and audio from [`synth`](/docs/cli/synth/) |
-| **Correctness** | Every Ragdoll kernel result is checked bit for bit against its scalar reference in the same run |
+| **Hardware** | x86_64 Xeon with AVX2 at 2.1 GHz, in a virtual machine |
+| **Ragdoll** | `v0.1.0`, `cargo build --release`, AVX2 dispatch |
+| **References** | libavcodec 6.1.1 (FFmpeg's H.264, AAC and FLAC codecs), x264 for H.264 encoding, and libopus, linked and called directly |
+| **Method** | In-process, single-threaded, timing codec calls only (no container parsing, file I/O or process start-up); best of several runs |
+| **Noise** | About ±15% from run to run |
+
+A ratio below 1.00× means Ragdoll is slower.
+
+| Workload | Ragdoll | Reference | Ratio |
+| :-- | --: | --: | --: |
+| H.264 decode, 1080p x264 High / CABAC, 6.2 Mbit/s | 29 fps | 181 fps | 0.16× |
+| H.264 decode, 720p Baseline | 77 fps | 834 fps | 0.09× |
+| H.264 encode, 720p, QP 26, 150 frames | 59 fps | 489 fps (x264 `ultrafast`) | 0.12× |
+| AAC-LC decode | 176× real time | 2367× real time | 0.07× |
+| Opus decode | — | libopus | about 0.8× |
+| Opus encode (CELT-only, restricted low delay) | — | libopus | about 1× |
+| FLAC encode | — | FFmpeg, level 5 | 1.5× |
+| FLAC decode | — | FFmpeg | 0.4× |
+
+### What the numbers mean
+
+- **H.264 decoding is about 6× slower than FFmpeg** on one thread, and Ragdoll decodes on one thread only: 1080p30 is just under real time. With four frame threads FFmpeg reaches 505 fps on the same 1080p stream. The output is bit-exact with the reference decoders; the work now is SIMD reconstruction and, later, threading.
+- **H.264 encoding is compared at matched settings.** At QP 26 Ragdoll's output is close to x264 `ultrafast` in size and quality, so that is the fair speed comparison. x264 `veryfast` runs at 98 fps and `medium` at 43 fps, both with much smaller files:
+
+  | 720p, QP 26 | Size | PSNR |
+  | :-- | --: | --: |
+  | Ragdoll | 3.26 MB | 45.73 dB |
+  | x264 `ultrafast` | 2.85 MB | 45.47 dB |
+  | x264 `veryfast` | 2.10 MB | 45.86 dB |
+
+- **The AAC-LC decoder is 13× slower** than FFmpeg's, while staying within the ISO/IEC 14496-26 conformance tolerance of FFmpeg's float decoder. The AAC encoder has no rate control yet, so it is not compared.
+- **Opus** decodes sample-exactly with libopus at about 0.8× its speed. In restricted-low-delay mode the encoder is byte-identical with libopus and about as fast.
+- **FLAC** encodes 1.5× faster than FFmpeg's level 5, but its files are about 11% larger. It decodes 2.5× slower, partly because Ragdoll verifies each file's MD5 signature and FFmpeg does not.
+
+## What `ragdoll bench` measures
+
+[`ragdoll bench`](/docs/cli/bench/) times twelve end-to-end workloads on synthesized inputs (probing, remuxing, 4K scaling, FLAC, thumbnails, quality metrics, H.264 transcoding, cutting, audio processing, tone mapping, packaging and a memory-bounded transcode). Each workload runs in-process, and the suite reports wall-clock time and throughput twice: in performance mode, and again in efficiency [power mode](/docs/power/). It is a quick way to see how Ragdoll behaves on your machine and to catch regressions between builds. A run on the machine above, trimmed:
+
+```text
+Workload                                        P-Core (ms)    P-Core Rate E-Core (ms) FFmpeg (ms) Speedup(P) Speedup(E)
+----------------------------------------------------------------------------------------------------------------------------------
+1. Container Probe & GOP Index (300f 4K MP4)        0.07 ms 15188.50 files/s     0.05 ms         N/A        N/A        N/A
+2. Zero-Copy Remux (MP4 -> MKV 16 MB 4K)            7.54 ms     2.09 GB/s      7.17 ms         N/A        N/A        N/A
+3. 4K -> 1080p Lanczos-3 Scaling (30 frames)      218.78 ms   137.12 fps     287.50 ms         N/A        N/A        N/A
+4. Lossless FLAC Encode+Decode (30s 48kHz 2ch)     80.36 ms   373.32 x RT     75.87 ms         N/A        N/A        N/A
+...
+7. 1080p H.264 Inter Transcode (60f Y4M->MP4)     739.84 ms    81.10 fps    1574.48 ms         N/A        N/A        N/A
+...
+12. Bounded-Mem (64 MiB) High-CRF Transcode       486.47 ms   123.34 fps     498.70 ms         N/A        N/A        N/A
+```
+
+Read these columns with care:
+
+- **The `E-Core` column** only moves work onto efficiency cores on macOS, where Ragdoll sets a background QoS class. Elsewhere, efficiency mode uses fewer threads, and the P-core / E-core split in the header is an estimate (half the logical cores each).
+- **The FFmpeg column is not like-for-like.** With `--compare-ffmpeg`, the suite runs the `ffmpeg` and `ffprobe` on your `PATH` as child processes, so each FFmpeg time includes process start-up, probing and file I/O, while each Ragdoll time is an in-process library call. On workloads that take milliseconds, FFmpeg's start-up dominates, and the speedups it prints say more about that than about either codec. The FFmpeg version shown in its output is a fixed label, not the version that ran. Use the codec table above for comparisons.
+- **The hardware table is not a measurement.** The second table, of instructions, cycles, power and energy, reads no performance counters on Linux (instructions and cycles print as 0), and its energy figures are CPU time multiplied by fixed per-core constants on every platform. Do not quote them as energy use.
 
 ## Kernels
 
-Single-threaded throughput of individual kernels on identical inputs.
+[`ragdoll self-test`](/docs/cli/self-test/) runs every SIMD kernel against its scalar reference on the same input, checks that the results match exactly, and prints the throughput of both. It measures how much each kernel gains from SIMD on your machine; it does not compare against FFmpeg. A run on the machine above, trimmed:
 
-| Kernel | FFmpeg 9.0.2 | Ragdoll | Ratio | Why |
-| :-- | --: | --: | --: | :-- |
-| Annex-B start-code scan, 16 MB | 7.21 GB/s | 32.61 GB/s | 4.52× | FFmpeg's `aarch64` path uses 64-bit SWAR and drops to bytewise scanning at each zero. Ragdoll stays in NEON across isolated zeros. |
-| CRC-32 (MPEG-2) | 0.59 GB/s | 2.56 GB/s | 4.34× | Slicing-by-8 tables, eight independent lookups per word. |
-| 4K → 1080p Lanczos-3 scale | 214.8 fps | 506.5 fps | 2.36× | Q6 `i16` intermediates in an 8-row L1 ring, 16 pixels per iteration, zero taps skipped. |
-| H.264 RBSP unescape | 5.14 GB/s | 10.65 GB/s | 2.07× | Copies 16 bytes at a time and re-enters NEON after each `00 00 03`. |
-| 4K plane SSIM | 5.04 Gpx/s | 10.06 Gpx/s | 2.00× | FFmpeg's `vf_ssim` has x86 assembly but no `aarch64` path. |
-| H.264 4×4 DCT + IDCT | 125.5 Mblk/s | 191.0 Mblk/s | 1.52× | In-register transpose and single-instruction rounding shift. |
-| 1080p RGB24 → YUV420p (BT.709) | 4.03 Gpx/s | 6.02 Gpx/s | 1.49× | Chroma averaging fused into the luma pass; no intermediate rows in memory. |
-| 4K plane SAD | 32.11 Gpx/s | 47.87 Gpx/s | 1.49× | Four independent accumulators per row. |
-| 4K plane SSE | 14.27 Gpx/s | 22.65 Gpx/s | 1.59× | As above. |
-| 8-tap polyphase horizontal scale | 3.17 Gpx/s | 3.78 Gpx/s | 1.19× | 8 pixels per iteration with pairwise reduction. |
+```text
+Kernel (4K 3840x2160 Luma / 16 MB Stream)      Scalar         NEON SIMD      Speedup   Check
+----------------------------------------------------------------------------------------------
+4K Plane SAD (sum |a - b|)                      7.36 Gpx/s      12.18 Gpx/s    1.66x    EXACT (49183200)
+4K Plane SSE (sum (a - b)^2)                    1.90 Gpx/s      10.96 Gpx/s    5.76x    EXACT (6295449600)
+4K Plane SSIM 4x4-Reuse (vf_ssim)               1.97 Gpx/s       4.88 Gpx/s    2.48x    EXACT (0.93131 / 11.63 dB)
+Annex-B Start-Code Scan (isolated 0x00s)        3.00 GB/s       14.72 GB/s     4.90x    EXACT
+H.264/HEVC RBSP Unescape (vextq_u8 pair)        0.90 GB/s        3.82 GB/s     4.22x    EXACT
+1080p YUV420p -> RGB24 (BT.709 vst3q_u8)        0.18 Gpx/s       0.26 Gpx/s    1.45x    EXACT
+...
+```
 
-**Provenance.** Both the Ragdoll kernel numbers and the end-to-end FFmpeg comparisons are reproducible in-tree via [`ragdoll self-test`](/docs/cli/self-test/) and [`ragdoll bench --compare-ffmpeg`](/docs/cli/bench/) (`crates/ragdoll-cli/src/main.rs`).
-
-## End-to-end workloads (12-Workload `v1.0` Suite)
-
-Whole-command comparisons from [`ragdoll bench --compare-ffmpeg`](/docs/cli/bench/).
-
-| Workload | FFmpeg 9.0.2 | Ragdoll, P-cores | Ratio | Ragdoll, E-cores only |
-| :-- | --: | --: | --: | --: |
-| 1. Probe and GOP index, 300-frame 4K MP4 | 31.89 ms | 0.16 ms | 202.81× | 0.24 ms (`1,106.7×` energy sav) |
-| 2. Remux MP4 → MKV, 16 MB | 24.48 ms | 5.62 ms | 4.35× | 17.00 ms (`31.5×` energy sav) |
-| 3. 4K → 1080p Lanczos-3, 30 frames | 126.60 ms | 17.19 ms | 7.37× | 52.33 ms (`8.9×` energy sav) |
-| 4. FLAC encode + decode, 30 s stereo | 108.14 ms | 25.77 ms | 4.20× | 62.25 ms (`13.0×` energy sav) |
-| 5. 4×4 contact sheet, 16 thumbnails | 26.35 ms | 4.23 ms | 6.23× | 13.10 ms (`4.7×` energy sav) |
-| 6. 4K PSNR + SSIM, 20 frames | 129.78 ms | 9.53 ms | 13.62× | 24.27 ms (`21.8×` energy sav) |
-| 7. 1080p H.264 transcode, 60 frames | 112.88 ms | 157.30 ms | 0.72× | 1168.58 ms (`2.2×` energy sav) |
-| 8. Smart-GOP frame-accurate trim (`cut`) | 48.59 ms | 11.53 ms | 4.22× | 44.20 ms (`33.1×` energy sav) |
-| 9. Audio resample 44.1→48k + R128 + AAC | 348.17 ms | 18.28 ms | 19.04× | 57.48 ms (`57.4×` energy sav) |
-| 10. HDR10 → SDR Oklab tonemap + overlay | 117.07 ms | 51.95 ms | 2.25× | 227.17 ms (`4.3×` energy sav) |
-| 11. CMAF HLS+DASH ABR packager (3 rends) | 37.91 ms | 32.68 ms | 1.16× | 96.14 ms (`2.0×` energy sav) |
-| 12. Bounded-mem (64 MiB) High-CRF transcode | 53.90 ms | 67.82 ms | 0.79× | 273.30 ms (`2.8×` energy sav) |
-
-### Interpreting the results
-
-- **Process start-up is included for FFmpeg and not for Ragdoll.** Ragdoll's workloads run in-process inside `bench`. FFmpeg's run as child processes, so each timing includes exec, dynamic linking and initialization, typically several milliseconds. For workloads that take tens of milliseconds, that is a large share.
-- **Workload 1 is not a fair ratio.** `ffprobe -show_packets -of json` serializes every packet as JSON, while Ragdoll builds its index in memory. The roughly 600× gap is mostly process start-up and output formatting, so no ratio is given.
-- **Workload 7 is not like-for-like.** FFmpeg runs libx264, a mature encoder that spends its time on rate-distortion decisions. Ragdoll's Constrained Baseline encoder makes far fewer decisions and produces much larger files. Until the production encoder lands, this row measures pipeline overhead, not encoder quality per second.
-- **Workload 6 compares different work.** FFmpeg's `psnr,ssim` filters run through the filter graph with format negotiation. Ragdoll computes the same metrics directly on decoded planes.
-- **E-core numbers** show the cost of [efficiency mode](/docs/power/). Restricted to efficiency cores, Ragdoll is slower than FFmpeg on performance cores for remux and scaling, and faster on the other workloads, at an estimated fraction of the energy.
-
-A fairer comparison, with in-process FFmpeg library calls, matched output sizes and quality, and more realistic inputs, is planned for the 1.0 release.
+The column is labelled `NEON SIMD` on every architecture; on `x86_64` it is the AVX2 path where one exists, and the scalar reference where it does not, which is why some rows show no gain. `RAGDOLL_SIMD=scalar|neon|avx2` forces a dispatch level.
 
 ## Reproduce
 
 ```sh
 git clone https://github.com/oddurs/ragdoll.git && cd ragdoll
+cargo build --release
 
-# Kernel throughput and correctness on this machine.
-cargo run --release -- self-test
+# Kernel correctness and SIMD gain on this machine.
+./target/release/ragdoll self-test
 
-# End-to-end workloads, Ragdoll only.
-cargo run --release -- bench
-
-# End-to-end workloads against the ffmpeg and ffprobe on your PATH.
-cargo run --release -- bench --compare-ffmpeg --json > results.json
+# End-to-end workloads, Ragdoll only, as JSON.
+./target/release/ragdoll bench --json > bench.json
 ```
 
-If your results differ meaningfully, please [open an issue](https://github.com/oddurs/ragdoll/issues) with the JSON output, `ragdoll --version`, and `ffmpeg -version`.
+The codec comparison above links FFmpeg's libraries into a separate harness that is not yet part of the repository; until it is, treat those figures as reported rather than reproducible.
+
+If your results differ meaningfully, or you find a regression between versions, please [open an issue](https://github.com/oddurs/ragdoll/issues) with the `bench --json` output, `ragdoll --version` (it prints the SIMD level and core count), your CPU model and operating system, and whether the machine was otherwise idle.

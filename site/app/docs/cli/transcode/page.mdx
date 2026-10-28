@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll transcode" };
 
 # ragdoll transcode
 
-Decode a video, optionally scale it, and encode it again, keeping audio and subtitle tracks in sync. `transcode` also converts audio between WAV and FLAC, converts subtitles between WebVTT and SRT, and runs [pipeline recipes](/docs/cli/recipes/).
+Decode a video, optionally filter and scale it, and encode it again, keeping audio and subtitle tracks in sync. `transcode` also converts and processes audio-only files, converts subtitles between WebVTT and SRT, and runs [pipeline recipes](/docs/cli/recipes/).
 
 ```sh
 ragdoll transcode <IN> <OUT> [OPTIONS]
@@ -11,50 +11,101 @@ ragdoll transcode --recipe <FILE.toml>
 
 ## Options
 
+### Video
+
 | Option | Default | Description |
 | :-- | :-- | :-- |
-| `<IN>` | | Input file, or `-` for stdin. |
-| `<OUT>` | | Output file, or `-` for stdout (MPEG-TS unless `--format` says otherwise). |
+| `<IN>` | | Input file, an image-sequence pattern such as `frames/f_%04d.png`, or `-` for stdin. |
+| `<OUT>` | | Output file, an image-sequence pattern, or `-` for stdout (MPEG-TS unless `--format` says otherwise). |
 | `--video <CODEC>`, `-c:v` | `h264` | Video encoder: `h264` or `rgdi`. |
+| `--profile <NAME>`, `-profile:v` | `baseline` | H.264 profile: `baseline` (Constrained Baseline, CAVLC), `main` or `high` (CABAC; `high` adds the 8×8 transform). Any other value means `high`. |
+| `--qp <N>` | `20` | Fixed H.264 quantization parameter, `0`–`51`. Lower is higher quality. |
+| `--crf <N>` | | Constant rate factor, `0`–`51`, with variance-adaptive quantization. Replaces `--qp`. |
+| `--bitrate <RATE>`, `-b:v` | | Average bitrate target, for example `2500k` or `2M`. A bare number is kbit/s. Takes precedence over `--crf`. |
+| `--maxrate <RATE>`, `--bufsize <SIZE>` | | VBV limits for `--crf` or `--bitrate`, in the same units. |
 | `--scale <WxH>`, `-s` | source size | Output dimensions, for example `1280x720`. |
 | `--filter <NAME>` | `lanczos3` | Scaling kernel: `lanczos3`, `spline36`, `mitchell` (alias `bicubic`), or `bilinear`. |
-| `--qp <N>` | `20` | H.264 quantization parameter, `0`–`51`. Lower is higher quality. |
-| `--threads <N>`, `-t` | `0` | Worker threads. `0` picks a count from the CPU topology and [power mode](/docs/power/). |
-| `--audio <CODEC>`, `-c:a` | `copy` | `copy` to keep audio tracks, `none` to drop them. |
+| `--crop <W:H[:X:Y]>` | | Crop to `W`×`H` at `X`,`Y`; without `X:Y` the crop is centered. |
+| `--auto-crop` | | Detect black borders on the first frame and crop them. |
+| `--pad <W:H[:X:Y]>` | | Pad with black to `W`×`H`, placing the picture at `X`,`Y`; centered without `X:Y`. |
+| `--rotate <MODE>` | | `90`, `180`, `270`, `hflip` or `vflip`. |
+| `--fps <NUM[/DEN]>`, `-r:v` | source rate | Change the frame rate by dropping or repeating frames, for example `24` or `30000/1001`. |
+| `--overlay <FILE>` | | Alpha-blend a PNG, JPEG or PPM image onto every frame. |
+| `--overlay-xy <X:Y>` | `0:0` | Position of the overlay's top-left corner. |
+| `--tonemap` | | Tone-map HDR to SDR in the Oklab color space. |
+| `--threads <N>`, `-t` | `0` | Worker threads. `0` picks a count from the CPU topology and [power mode](/docs/power/). The output is identical for every value. |
+
+Filters run in a fixed order: tone-map, crop (or auto-crop), pad, rotate, overlay, frame-rate change, then scale. The H.264 encoder starts a new GOP, with an IDR frame, every 15 frames.
+
+### Audio, subtitles and output
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `--audio <CODEC>`, `-c:a` | `copy` | `copy` keeps audio tracks as they are, `none` drops them, `aac`, `opus` or `flac` re-encode them. |
 | `--an` | | Same as `--audio none`. |
+| `--sample-rate <HZ>`, `-ar` | source rate | Resample audio with a polyphase Kaiser-windowed filter. |
+| `--channels <N>`, `-ac` | source layout | Remix to `N` channels. |
+| `--loudness <LUFS>`, `--lufs` | | Normalize integrated loudness to this EBU R128 target, for example `-16`. |
+| `--true-peak <DBTP>`, `--dbtp` | `-1.0` | True-peak ceiling used with `--loudness`. |
 | `--subs <CODEC>`, `-c:s` | `copy` | `copy`, `srt`, `vtt`, or `none`. In Matroska output, `srt` / `vtt` set the subtitle codec. |
 | `--sn` | | Same as `--subs none`. |
 | `--format <EXT>`, `-f` | from extension | Override the output container. |
 | `--recipe <FILE>`, `-r` | | Run a TOML recipe instead of positional arguments. |
 | `--json`, `-j` | | Print the summary as JSON. |
 
+With `--audio copy`, setting `--sample-rate`, `--channels` or `--loudness` re-encodes the track in its own codec (AAC stays AAC, Opus stays Opus, anything else becomes FLAC). The AAC and Opus encoders write at most two channels. The AAC encoder has no rate control yet, so its output size depends on the signal. Opus is encoded at 48 kHz.
+
 ## Output formats
 
 | Extension | Result |
 | :-- | :-- |
-| `.mp4`, `.mov` and anything else | H.264 or RGDI video in ISOBMFF, plus copied audio and subtitles. |
-| `.mkv`, `.webm` | H.264 or RGDI video in Matroska, plus copied audio and subtitles. |
-| `.ts` | H.264 video in MPEG-TS, plus copied audio. |
-| `.y4m` | Raw decoded (and scaled) YUV 4:2:0 frames. |
-| `.ppm` | The first frame as an RGB image. |
+| `.mp4`, `.mov` and anything else | H.264 or RGDI video in ISOBMFF, plus audio and subtitles (stored as WebVTT). |
+| `.mkv`, `.webm` | H.264 or RGDI video in Matroska, plus audio and subtitles. |
+| `.ts` | H.264 video in MPEG-TS, plus audio. Subtitle tracks are dropped. |
+| `.y4m` | Raw decoded (and filtered) YUV 4:2:0 frames. |
+| `.ppm`, `.png`, `.jpg` | The first frame as an RGB image. |
+| A pattern such as `out/f_%04d.png` | Every frame as a numbered PNG, JPEG or PPM file, starting at `1`. |
 | `.rgdi` | The first frame as a single RGDI packet. Use `--video rgdi` with `.mkv` or `.mp4` for a full RGDI stream. |
-| `.flac`, `.wav` | Audio-only conversion; see below. |
+| `.wav`, `.flac`, `.ogg`, `.opus`, `.aac`, `.m4a` | Audio-only conversion; see below. |
 | `.vtt`, `.srt` | Subtitle-only conversion; see below. |
 
 ## How it runs
 
-1. The input is memory-mapped and video packets are partitioned into independent GOPs at keyframe boundaries.
-2. GOPs are decoded, filtered, scaled, and encoded in parallel in bounded waves sized to fit the memory budget (`256 MiB` by default, `64 MiB` in efficiency mode). Frame buffers are recycled through `FramePool` between waves.
-3. Encoded GOPs are written in presentation order. Audio and subtitle packets are rescaled to the output timebase and interleaved by decode timestamp.
+1. The input is memory-mapped and decoded a batch at a time.
+2. Frames are filtered, scaled and encoded in parallel in bounded waves sized to fit the memory budget (`256 MiB` by default, `64 MiB` in efficiency mode), so memory use does not grow with the length of the video. With `--qp` or `--crf`, each 15-frame GOP is encoded independently on its own worker; with `--bitrate`, encoding runs on a single worker so rate control sees the whole stream. Either way the GOP layout is fixed, so the output does not depend on the thread count.
+3. Encoded GOPs are written in presentation order. Audio and subtitle packets are rescaled to the output timebase and interleaved with the video.
+
+Audio that is re-encoded or processed (resampling, remixing, loudness, audio-only conversion) is currently decoded whole into memory, about 1.4 GB per hour of 48 kHz stereo. Copied audio is not decoded.
 
 ## Examples
 
 ```sh
-# Downscale to 720p with the default Lanczos-3 kernel.
-ragdoll transcode input.mp4 output.mp4 --scale 1280x720
+# Downscale with the default Lanczos-3 kernel.
+ragdoll transcode sample.mp4 small.mp4 --scale 640x360 --qp 24
+```
+
+```text
+[ragdoll transcode] sample.mp4 -> small.mp4 | frames=60 gops=4 threads=4 | in=137757 B out=45166 B (3.05:1) | 345.05 ms (173.9 fps, 0.001 GB/s)
+```
+
+```sh
+# High profile with CRF, capped at 3 Mbit/s.
+ragdoll transcode input.mp4 output.mp4 --profile high --crf 23 --maxrate 3M --bufsize 6M
+
+# Average bitrate target.
+ragdoll transcode input.mp4 output.mp4 --bitrate 2M --maxrate 3M --bufsize 4M
 
 # Higher quality, eight workers, Spline36.
 ragdoll transcode input.mkv output.mkv --qp 16 --threads 8 --filter spline36
+
+# Crop to the centre, rotate, and drop to 15 fps.
+ragdoll transcode input.mp4 portrait.mp4 --crop 640:360 --rotate 90 --fps 15
+
+# Watermark in the top-left corner.
+ragdoll transcode input.mp4 branded.mp4 --overlay logo.png --overlay-xy 16:16
+
+# Re-encode audio to AAC at 44.1 kHz, normalized to -16 LUFS.
+ragdoll transcode input.mp4 output.mkv --audio aac --sample-rate 44100 --loudness -16
 
 # Drop audio and subtitles.
 ragdoll transcode input.mp4 video-only.mp4 --an --sn
@@ -62,8 +113,9 @@ ragdoll transcode input.mp4 video-only.mp4 --an --sn
 # Encode with the RGDI intra codec for fast editing round-trips.
 ragdoll transcode input.mp4 edit.mkv --video rgdi
 
-# Decode to raw YUV for another tool.
+# Decode to raw YUV, or to numbered PNG files.
 ragdoll transcode input.mp4 frames.y4m
+ragdoll transcode input.mp4 frames/f_%04d.png
 
 # Run on the efficiency cores only.
 ragdoll transcode input.mp4 output.mp4 --battery-saver
@@ -71,11 +123,16 @@ ragdoll transcode input.mp4 output.mp4 --battery-saver
 
 ## Audio and subtitles
 
-If either the input or the output is `.wav` or `.flac`, `transcode` performs an audio conversion:
+If either the input or the output has an audio extension (`.wav`, `.flac`, `.ogg`, `.opus`, `.aac`, `.m4a`), `transcode` performs an audio-only conversion. Inputs can be WAV, FLAC, Ogg (Opus or FLAC), ADTS AAC, or the audio track of an MP4. `.wav` writes 16-bit PCM, `.ogg` writes Opus (or FLAC with `--audio flac`), `.aac` writes ADTS and `.m4a` writes AAC in MP4. The resampling, channel and loudness options apply.
 
 ```sh
 ragdoll transcode master.wav master.flac
-ragdoll transcode master.flac master.wav
+ragdoll transcode master.flac master.ogg --audio opus
+ragdoll transcode master.flac broadcast.wav --sample-rate 44100 --loudness -23 --true-peak -1
+```
+
+```text
+[ragdoll transcode-audio] tone.wav -> tone2.flac | frames=1 gops=1 threads=1 | in=576044 B out=138504 B (4.16:1) | 5.11 ms (28181815.0 fps, 0.140 GB/s)
 ```
 
 If either side is `.vtt` or `.srt`, it converts subtitles:

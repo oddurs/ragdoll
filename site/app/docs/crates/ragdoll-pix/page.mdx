@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll-pix" };
 
 # ragdoll-pix
 
-Pixel processing: color conversion, scaling, dithering and quality measurement. Every hot loop runs as a fused scanline kernel, so intermediate rows stay in cache.
+Pixel processing: color conversion, scaling, dithering, video filters and quality measurement. Every hot loop runs as a fused scanline kernel, so intermediate rows stay in cache.
 
 [Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-pix)
 
@@ -15,10 +15,10 @@ Pixel processing: color conversion, scaling, dithering and quality measurement. 
 | `yuv420p_to_rgb24`, `yuv420p_to_rgba8`, `yuv420p_to_bgra8` | Planar 4:2:0 to packed RGB |
 | `nv12_to_rgb24` | Semi-planar 4:2:0 to RGB |
 | `rgb24_to_yuv420p` | RGB to planar 4:2:0, with 2×2 chroma averaging fused into the luma pass |
-| `rgb24_row_to_oklab`, `oklab_row_to_rgb24` | sRGB ↔ Oklab |
+| `rgb24_row_to_oklab`, `oklab_row_to_rgb24` | sRGB ↔ Oklab (`OklabColor`) |
 | `upsample_chroma_420_to_444` | Chroma upsampling |
 | `dither_plane_u16le_to_u8_bayer` | 10-bit to 8-bit with a 16×16 ordered Bayer matrix |
-| `convert_frame`, `convert_frame_into` | Whole-frame conversion between any supported `PixelFormat`s |
+| `convert_frame`, `convert_frame_into` | Whole-frame conversion between supported `PixelFormat`s and colorimetries |
 
 ## Scaling
 
@@ -30,7 +30,19 @@ use ragdoll_pix::{ScaleFilter, scale_frame};
 let small = scale_frame(&frame, 1280, 720, ScaleFilter::Lanczos3);
 ```
 
-The scaler is separable. The horizontal pass produces 14-bit Q6 rows into an 8-row ring buffer; the vertical pass consumes the ring as soon as enough rows are present. Taps that are zero are skipped.
+`scale_frame` handles planar YUV and gray frames; `scale_plane_with_banks` takes prebuilt banks. The scaler is separable: the horizontal pass produces 14-bit Q6 rows into an 8-row ring buffer, and the vertical pass consumes the ring as soon as the eight rows it needs are present. Every output pixel uses eight taps; when downscaling, the filter is widened for anti-aliasing up to what eight taps cover.
+
+## Filters (`filter`)
+
+The video filters behind `transcode --crop`, `--auto-crop`, `--pad`, `--rotate`, `--overlay` and `--tonemap`:
+
+| Function | Purpose |
+| :-- | :-- |
+| `crop_frame`, `detect_auto_crop` | Crop to a `CropRect` (`"W:H:X:Y"`, or `"W:H"` centered), or find black letterbox and pillarbox bars. |
+| `pad_frame` | Pad to a `PadSpec` (`"W:H:X:Y[:#RRGGBB]"`). |
+| `rotate_frame` | `RotationMode`: 90°, 180°, 270°, horizontal or vertical flip. |
+| `overlay_rgba_onto_frame` | Alpha-blend an RGBA image onto a YUV 4:2:0 or RGB frame. |
+| `tonemap_hdr_to_sdr_oklab` | BT.2020 PQ or HLG to BT.709 SDR, with tone mapping done in Oklab. |
 
 ## Quality metrics
 

@@ -8,41 +8,47 @@ This page lists what Ragdoll supports today, on `main`. It is deliberately conse
 
 ## Containers
 
+**Read** means a demuxer (or image decoder) exists; **Write** means a muxer (or image encoder) exists.
+
 | Container | Extensions | Read | Write | Notes |
 | :-- | :-- | :-: | :-: | :-- |
-| ISOBMFF / MP4 / QuickTime | `.mp4` `.mov` `.m4v` | <S v="yes" /> | <S v="yes" /> | Flat 24-byte sample index, `O(log n)` keyframe seek. Output is always fast-start (`moov` before `mdat`). Fragmented output (`moof` + `mdat`) through the library API. |
-| Matroska | `.mkv` | <S v="yes" /> | <S v="yes" /> | EBML parsing with branchless VINT decoding; `Cues` index written on output. |
-| WebM | `.webm` | <S v="yes" /> | <S v="partial" /> | Detected from the EBML DocType. Output is written with the Matroska muxer. |
-| MPEG-2 Transport Stream | `.ts` `.m2ts` | <S v="yes" /> | <S v="yes" /> | 188, 192 (M2TS) and 204-byte (FEC) packets, auto-detected. PAT/PMT with CRC-32. Annex-B ↔ AVCC conversion for H.264, ADTS framing for AAC. |
-| YUV4MPEG2 | `.y4m` | <S v="yes" /> | <S v="yes" /> | Uncompressed planar YUV. |
+| ISOBMFF / MP4 / QuickTime | `.mp4` `.mov` `.m4v` `.m4a` | <S v="yes" /> | <S v="yes" /> | Flat 24-byte sample index, `O(log n)` keyframe seek. Reads fragmented files (`moof` + `trun`). Output is fast-start (`moov` before `mdat`); fragmented and CMAF output (`init.mp4` + `.m4s` segments) through the library API and [`package`](/docs/cli/). Writes `avc1`, `hvc1`, `av01`, `vp09`, `mp4a`, `Opus`, `fLaC`, PCM and `wvtt` sample entries. |
+| Matroska | `.mkv` | <S v="yes" /> | <S v="yes" /> | EBML parsing with branchless VINT decoding; `SeekHead` and a `Cues` index written on output. |
+| WebM | `.webm` | <S v="yes" /> | <S v="partial" /> | Detected from the EBML DocType. The CLI writes `.webm` outputs with the Matroska muxer (DocType `matroska`); the library's `MkvMuxer::new_webm()` writes DocType `webm`. |
+| MPEG-2 Transport Stream | `.ts` `.m2ts` | <S v="yes" /> | <S v="yes" /> | Reads 188, 192 (M2TS) and 204-byte (FEC) packets, auto-detected. Writes 188-byte packets (192-byte M2TS through the library) with PAT/PMT/SDT, CRC-32 and PCR. Annex-B ↔ AVCC conversion for H.264, ADTS framing for AAC; Opus, FLAC and AV1 carried with registration descriptors. |
+| Ogg | `.ogg` `.opus` | <S v="yes" /> | <S v="yes" /> | Ogg Opus (RFC 7845) and Ogg FLAC, with Vorbis comments. Decoded Opus is trimmed to the stream's final granule position. |
+| FLAC (native) | `.flac` | <S v="yes" /> | <S v="yes" /> | `STREAMINFO`, `SEEKTABLE`, `VORBIS_COMMENT`, `PADDING` and `PICTURE` blocks. |
+| AAC (ADTS) | `.aac` | <S v="yes" /> | <S v="yes" /> | Raw ADTS streams, audio-only. |
+| YUV4MPEG2 | `.y4m` | <S v="yes" /> | <S v="yes" /> | Uncompressed 4:2:0 (8 and 10-bit), 4:2:2, 4:4:4 and mono. |
 | RIFF WAVE, RF64, BW64 | `.wav` | <S v="yes" /> | <S v="yes" /> | PCM 8/16/24/32-bit and 32-bit float. |
-| FLAC (native) | `.flac` | <S v="yes" /> | <S v="yes" /> | Stream with `STREAMINFO`. Seek tables and Vorbis comments are planned. |
+| PNG | `.png` | <S v="yes" /> | <S v="yes" /> | 8-bit, non-interlaced: gray, gray + alpha, RGB, RGBA and palette on read; gray, RGB and RGBA on write. Numbered sequences such as `frame_%04d.png`. |
+| JPEG | `.jpg` `.jpeg` | <S v="partial" /> | <S v="yes" /> | Baseline DCT (JFIF) only; progressive JPEGs are not decoded. |
 | Netpbm | `.ppm` `.pgm` | <S v="yes" /> | <S v="yes" /> | Binary `P6` (RGB) and `P5` (gray). Contact-sheet composition. |
 | WebVTT | `.vtt` | <S v="yes" /> | <S v="yes" /> | Standalone files, and `wvtt` samples inside MP4. |
 | SubRip | `.srt` | <S v="yes" /> | <S v="yes" /> | |
 | IVF | `.ivf` | <S v="inspect" /> | <S v="no" /> | Parsed for AV1 OBU inspection through the library. |
-| Ogg | `.ogg` `.opus` | <S v="planned" /> | <S v="planned" /> | |
-| HLS / DASH (CMAF) | `.m3u8` `.mpd` | <S v="no" /> | <S v="planned" /> | Planned as `ragdoll package`. |
+| HLS / DASH (CMAF) | `.m3u8` `.mpd` | <S v="no" /> | <S v="yes" /> | Written by `ragdoll package`: CMAF fMP4 segments, HLS and DASH manifests, and a WebVTT thumbnail track. |
 
 ## Video codecs
 
 | Codec | Decode | Encode | Notes |
 | :-- | :-: | :-: | :-- |
-| H.264 / AVC | <S v="partial" /> | <S v="partial" /> | Constrained Baseline: CAVLC, `I_16x16`, `I_PCM`, `P_L0_16x16`, `P_Skip`. SPS, PPS, slice header and SEI parsing. Main and High profile (CABAC, 8×8 transform, B-frames), full residual coding, quarter-pel motion and deblocking are in development. |
+| H.264 / AVC | <S v="yes" /> | <S v="partial" /> | **Decoder:** Baseline, Main and High profiles: CAVLC and CABAC, B-frames, 8×8 transform, weighted prediction, multiple slices, long-term references and MMCO, interlaced (PAFF and MBAFF), 8-bit 4:2:0 and 4:0:0. Output is bit-exact with the JM reference decoder and FFmpeg. Not supported: 4:2:2, 4:4:4 and high bit depth, lossless, SP/SI slices and slice groups (FMO). Single-threaded, so it is several times slower than FFmpeg. **Encoder:** Constrained Baseline (CAVLC) by default, or Main and High (CABAC, High adds the 8×8 transform). I and P slices only (no B-frames), 8-bit 4:2:0 input, an IDR every 15 frames in the CLI. Fixed QP, CRF or average bitrate with optional VBV limits. Compression is close to x264's `ultrafast` preset. |
 | RGDI (Ragdoll Fast-Intra) | <S v="yes" /> | <S v="yes" /> | Ragdoll's own intra-only codec for fast intermediate files. Not intended for distribution. |
-| AV1 | <S v="inspect" /> | <S v="no" /> | OBU parsing, sequence header inspection, `av1C` construction. Carried through MP4, Matroska and MPEG-TS. |
+| AV1 | <S v="inspect" /> | <S v="no" /> | Bitstream inspection only: OBU parsing, sequence header inspection, `av1C` construction. No AV1 decoding. Carried through MP4, Matroska and MPEG-TS. |
 | HEVC / H.265 | <S v="passthrough" /> | <S v="no" /> | Recognized in containers and copied by `remux`. |
 | VP9 | <S v="passthrough" /> | <S v="no" /> | Recognized in containers and copied by `remux`. |
 | Raw video | <S v="yes" /> | <S v="yes" /> | Via Y4M. |
+| PNG, JPEG | <S v="yes" /> | <S v="yes" /> | As still images and image sequences; see the container table for limits. |
 
 ## Audio codecs
 
 | Codec | Decode | Encode | Notes |
 | :-- | :-: | :-: | :-- |
-| FLAC | <S v="yes" /> | <S v="yes" /> | RFC 9639. Encoder uses fixed and LPC predictors with Rice coding and mid/side stereo; frames carry CRC-8 and CRC-16. |
+| AAC-LC | <S v="yes" /> | <S v="partial" /> | **Decoder:** mono to 5.1, 8–96 kHz; SCE/CPE/LFE/DSE/PCE/FIL elements, M/S and intensity stereo, PNS, TNS, pulse data and all window sequences. Within the ISO/IEC 14496-26 conformance tolerance of FFmpeg's float decoder. Coupling channel elements are rejected. **Encoder:** mono and stereo, long blocks only, and **no rate control**: the requested bitrate only selects a coarse quantizer offset, so the output bitrate follows the signal rather than the target. In MP4/M4A, Matroska, MPEG-TS and raw ADTS. |
+| Opus | <S v="yes" /> | <S v="partial" /> | **Decoder:** CELT, SILK and hybrid modes, mode switches, packet loss concealment, in-band FEC and DTX; sample-exact with fixed-point libopus 1.3.1 on the RFC 8251 test vectors. **Encoder:** CELT only (libopus's restricted low-delay mode), 48 kHz mono or stereo in 20 ms packets, VBR, constrained VBR or CBR; byte-identical with libopus 1.3.1 in that mode. The CLI resamples other rates to 48 kHz. In Ogg, Matroska/WebM, MP4 and MPEG-TS. |
+| FLAC | <S v="yes" /> | <S v="yes" /> | RFC 9639, 16 and 24-bit. Encoder uses fixed and LPC predictors with Rice coding and mid/side stereo; frames carry CRC-8 and CRC-16. |
 | PCM | <S v="yes" /> | <S v="yes" /> | `u8`, `s16le`, `s24le`, `s32le`, `f32le`, with SIMD conversion and interleaving. |
-| AAC-LC | <S v="passthrough" /> | <S v="planned" /> | ADTS framing handled for MPEG-TS. Decode and encode are planned. |
-| Opus | <S v="passthrough" /> | <S v="planned" /> | Decode and encode are planned. |
 
 ## Subtitles
 
@@ -53,7 +59,7 @@ This page lists what Ragdoll supports today, on `main`. It is deliberately conse
 
 ## Pixel formats
 
-`yuv420p`, `yuv422p`, `yuv444p`, `nv12`, `yuv420p10le`, `rgb24`, `rgba8`, `bgra8`, `gray8`, and 32-bit float linear RGB. Conversions between YUV and RGB support BT.601, BT.709 and BT.2020 matrices in limited and full range, plus Oklab. See [`ragdoll-pix`](/docs/crates/ragdoll-pix/).
+`yuv420p`, `yuv422p`, `yuv444p`, `nv12`, `yuv420p10le`, `rgb24`, `rgba8`, `bgra8`, `gray8`, and 32-bit float linear RGB and Oklab. Conversions between YUV and RGB support BT.601, BT.709 and BT.2020 matrices in limited and full range, plus Oklab. See [`ragdoll-pix`](/docs/crates/ragdoll-pix/).
 
 ## Colorimetry
 

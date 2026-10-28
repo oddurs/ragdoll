@@ -2,7 +2,7 @@ export const metadata = { title: "ragdoll-format" };
 
 # ragdoll-format
 
-Container demuxers and muxers. Demuxers work on a borrowed byte slice, usually a memory map, and return packets that borrow from it. See [Formats & codecs](/docs/formats/) for the support matrix.
+Container demuxers and muxers, plus PNG, JPEG and Netpbm images. Demuxers work on a borrowed byte slice, usually a memory map, and return packets that borrow from it. See [Formats & codecs](/docs/formats/) for the support matrix.
 
 [Source](https://github.com/oddurs/ragdoll/tree/main/crates/ragdoll-format)
 
@@ -10,10 +10,10 @@ Container demuxers and muxers. Demuxers work on a borrowed byte slice, usually a
 
 | Type | Purpose |
 | :-- | :-- |
-| `MmapSource` | Read-only memory map of a file. `open("-")` reads stdin into an aligned buffer instead. |
-| `StreamSource` | Chunked reader for sequential inputs. |
-| `OutputSink` | Buffered writer to a file or, for `-`, stdout. |
-| `VectoredWriter` | Collects buffers and writes them with `writev`. |
+| `MmapSource` | Read-only memory map of a file. `open("-")`, pipes and other non-regular files are read in 4 MiB chunks into an aligned buffer instead. `prefetch_range` and `release_range` advise the kernel (`MADV_WILLNEED` / `MADV_DONTNEED`). |
+| `StreamSource` | Alias of `MmapSource`. |
+| `OutputSink` | 256 KiB buffered writer to a file or, for `-`, stdout. |
+| `VectoredWriter` | Writes a list of slices in order, counting bytes, so muxers never assemble a contiguous copy first. |
 
 ## Modules
 
@@ -21,30 +21,38 @@ Container demuxers and muxers. Demuxers work on a borrowed byte slice, usually a
 
 - `Mp4Demuxer::open(&[u8])` parses the box tree and builds one `Mp4TrackIndex` per track, each with a flat `Vec<SampleEntry>`.
 - `next_packet()` iterates in file order; `packet_at(track, sample)` gives random access; `seek_to_timestamp` finds the nearest preceding keyframe by binary search.
-- `Mp4Muxer` writes a fast-start file with `finish(writer)`, or a fragmented one (initialization `moov` plus `moof` / `mdat` pairs) with `finish_fragmented`. It writes `avcC`, `colr`, and WebVTT `wvtt` sample entries.
+- Fragmented files (`moof` / `trun`) are read too.
+- `Mp4Muxer` writes a fast-start file with `finish(writer)`, or a fragmented one (initialization `moov` plus `moof` / `mdat` pairs) with `finish_fragmented`; `write_cmaf_init_segment` and `write_cmaf_media_segment` produce the CMAF segments `ragdoll package` uses. Sample entries cover H.264 (`avcC`), HEVC, AV1 (`av1C`), VP9, RGDI, AAC (`esds`), Opus (`dOps`), FLAC (`dfLa`), PCM and WebVTT (`wvtt`), with `colr` for video.
 
 ### `mkv`: Matroska and WebM
 
 - `MkvDemuxer` decodes EBML with branchless count-leading-zeros VINT parsing and reads `SimpleBlock` and `BlockGroup` payloads in place.
-- `MkvMuxer` writes `Info`, `Tracks`, clusters of `SimpleBlock`s and a `Cues` keyframe index.
+- `MkvMuxer::new_matroska()` writes `SeekHead`, `Info`, `Tracks`, clusters of `SimpleBlock`s and a `Cues` keyframe index; `MkvMuxer::new_webm()` does the same with DocType `webm`.
 
 ### `mpegts`: MPEG-2 Transport Stream
 
 - `MpegTsDemuxer` auto-detects 188, 192 and 204-byte packet strides (`detect_mpegts_stride_and_sync`) and finds sync bytes with the SIMD scanner. It parses PAT and PMT, reassembles PES packets, and decodes 33-bit PTS and DTS.
-- `MpegTsMuxer` writes 188-byte TS or 192-byte M2TS packets with PAT, PMT and SDT tables (CRC-32) and PCR clock references. It converts H.264 to Annex-B framing (`h264_avcc_to_annex_b_au`) and wraps AAC in ADTS (`aac_raw_to_adts`).
+- `MpegTsMuxer::new` writes 188-byte TS packets and `MpegTsMuxer::new_m2ts` 192-byte M2TS packets, with PAT, PMT and SDT tables (CRC-32) and PCR clock references. It converts H.264 to Annex-B framing (`h264_avcc_to_annex_b_au`), wraps AAC in ADTS (`aac_raw_to_adts`), and signals Opus, FLAC and AV1 with registration descriptors.
 
-### `y4m`, `wav`, `ppm`, `subtitle`
+### `ogg` and `flac`: audio containers
 
-- `Y4mDemuxer` / `Y4mMuxer`: YUV4MPEG2 uncompressed video, zero-copy on read.
+- `OggDemuxer` / `OggMuxer`: Ogg Opus (RFC 7845) and Ogg FLAC, with CRC-32 page framing, Vorbis comments and sample seeking. `build_ogg_page` writes a single page.
+- `FlacContainerDemuxer` / `FlacContainerMuxer`: native FLAC streams with `STREAMINFO`, `SEEKTABLE` (`FlacSeekPoint`), `VORBIS_COMMENT` (`VorbisComments`), `PADDING` and `PICTURE` blocks, and sample seeking.
+
+### `y4m`, `wav`, `ppm`, `png`, `jpeg`, `subtitle`
+
+- `Y4mDemuxer` / `Y4mMuxer`: YUV4MPEG2 uncompressed video, zero-copy on read. `Y4mDemuxer::open_mapped` releases the pages its frame index touched while scanning, so indexing a long file does not make it resident.
 - `WavDemuxer` / `WavMuxer`: RIFF, RF64 and BW64 WAVE with PCM and IEEE float.
 - `read_pnm_image` / `write_pnm_image`: Netpbm `P6` and `P5`. `compose_contact_sheet_rgb24` tiles frames into a grid.
+- `read_png_image` / `write_png_image`: 8-bit, non-interlaced PNG with its own zlib (`zlib_compress`, `zlib_decompress`). Image sequences such as `frame_%04d.png` are expanded by `expand_image_sequence_inputs`.
+- `read_jpeg_image` / `write_jpeg_image`: baseline JPEG (JFIF).
 - `SubtitleDemuxer` / `SubtitleMuxer`: WebVTT and SubRip, with millisecond timestamp parsing and formatting, plus `wrap_mp4_wvtt_sample` / `unwrap_mp4_wvtt_sample` for subtitles inside MP4.
 
 ## Transmuxing helpers
 
-`transmux_mp4_to_mkv`, `transmux_mp4_to_mpegts`, `transmux_mkv_to_mp4`, `transmux_mpegts_to_mp4` and `transmux_mpegts_to_mkv` each take an input slice and a writer, and are what `ragdoll remux` calls.
+`transmux_mp4_to_mkv`, `transmux_mp4_to_mpegts`, `transmux_mkv_to_mp4`, `transmux_mpegts_to_mp4` and `transmux_mpegts_to_mkv` each take an input slice and a writer, and back several of `ragdoll remux`'s conversions.
 
-`detect_container_format(&[u8])` identifies a container from its first bytes.
+`detect_container_format(&[u8])` identifies a container from its first bytes and returns a `ContainerFormat`; `probe_container(&[u8])` returns that plus every track's `TrackInfo`.
 
 ## Example
 

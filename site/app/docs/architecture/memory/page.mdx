@@ -22,15 +22,15 @@ pub struct PacketSlice<'a> {
 
 When a packet has to be changed (for example, converting H.264 between AVCC and Annex-B framing), the payload becomes an owned `AlignedBuffer`. Everything else stays borrowed.
 
-Non-seekable inputs (stdin and FIFOs) are read once into an aligned buffer, and the same slice-based code runs on that.
+Non-seekable inputs (stdin and FIFOs) are read once into an aligned buffer, and the same slice-based code runs on that. When a long Y4M input has been consumed, the decoder tells the kernel it may drop those pages (`MADV_DONTNEED`), so resident memory does not grow with the file.
 
 ## Outputs are gathered, not concatenated
 
-Muxers collect headers, payload slices and trailers as a list of buffers and write them through `VectoredWriter`, which issues vectored `writev` calls instead of first copying everything into one contiguous buffer. Every muxer in `ragdoll-format` (MP4, Matroska, MPEG-TS, Y4M, WAV and Netpbm) writes this way.
+Muxers collect headers, payload slices and trailers as a list of slices and hand them to `VectoredWriter`, which writes each one in order into the output's 256 KiB buffer instead of first assembling a contiguous copy per packet. The MP4, Matroska, MPEG-TS, Y4M, WAV and Netpbm muxers write this way.
 
 ## Sample indexes are flat
 
-Containers describe samples in different ways: MP4 uses `stts` / `ctts` / `stsz` / `stco` tables, Matroska uses clusters and block headers. The MP4, Matroska and Y4M demuxers flatten these into one `Vec<SampleEntry>` per track:
+Containers describe samples in different ways: MP4 uses `stts` / `ctts` / `stsz` / `stco` tables, Matroska uses clusters and block headers. The MP4, Matroska, Y4M, FLAC and Ogg demuxers flatten these into one `Vec<SampleEntry>` per track:
 
 ```rust
 #[repr(C)]
@@ -58,7 +58,17 @@ Every plane lives in an `AlignedBuffer`:
 
 ## Working sets are bounded
 
-`GopRingPipeline` decides how many GOPs to process at once from the source and destination frame sizes and a memory budget: 256 MiB by default, 64 MiB in [efficiency mode](/docs/power/). Each wave decodes, scales, and encodes its GOPs in parallel, returns its frames to `FramePool`, and hands encoded packets to the muxer before the next wave starts. Single-frame extraction (`extract --at`) seeks directly to the target GOP and decodes only that GOP.
+Decoded video never has to fit in memory all at once. A memory budget of 256 MiB by default, 64 MiB in [efficiency mode](/docs/power/), bounds it in `transcode`, `metrics`, `extract` (thumbnails, and `--at` on non-MP4 inputs), `concat`, `package` and `synth`.
+
+- **Decoding** goes through `VideoFrameStream`, which yields frames in presentation order a batch at a time. MP4 is decoded a wave of whole GOPs at a time, in parallel; Matroska and MPEG-TS through one decoder holding a 17-picture reorder window (enough for any conformant stream); Y4M frames are copied out of the map and their pages released.
+- **Encoding** goes through `GopRingEncoder`. `GopRingPipeline` works out how many GOPs fit the budget at once from the source and destination frame sizes; each wave is scaled and encoded in parallel, its frames go back to the `FramePool`, and only the compressed packets are kept until the muxer writes the file.
+- **Single frames:** `extract --at` on MP4 seeks to the GOP that contains the target frame and decodes only that GOP.
+
+Measured peak resident memory for a 720p transcode is 178 MB for an 8-second input and 191 MB for a 32-second one: four times the length, nearly the same footprint.
+
+<Callout kind="status" title="Known limitation: audio">
+Audio tracks are not streamed yet. When audio is re-encoded or processed (resampling, channel changes, loudness normalization, or an audio-only transcode), the whole track is decoded into memory: about 1.4 GB per hour of 48 kHz stereo held as 32-bit float. Copying audio through unchanged (the default for `transcode`) does not decode it.
+</Callout>
 
 ## Pixel stages stay in L1
 

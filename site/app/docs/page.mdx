@@ -5,12 +5,12 @@ export const metadata = { title: "Introduction" };
 Ragdoll is a media framework and command-line tool written entirely in Rust. It reads and writes containers, decodes and encodes video and audio, converts color and scales images, and measures quality. Every component is built from the bitstream up, with hand-written SIMD in the hot loops and no C libraries.
 
 <Callout kind="status" title="Pre-release software">
-Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, FLAC and Baseline H.264 work today; production-grade H.264 encoding is in active development. Interfaces will change before 1.0, and the H.264 encoder does not yet produce competitive compression. See [Roadmap](/docs/roadmap/) for what is available and what is next.
+Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, H.264 decoding and encoding, AAC-LC, Opus and FLAC work today. Interfaces will change before 1.0. The H.264 decoder is bit-exact but single-threaded and several times slower than FFmpeg, and the H.264 encoder compresses about as well as x264's `ultrafast` preset. See [Roadmap](/docs/roadmap/) for what is available and what is next.
 </Callout>
 
 ## What it is
 
-- **A CLI**, `ragdoll`, with one subcommand per task: [`probe`](/docs/cli/probe/), [`remux`](/docs/cli/remux/), [`transcode`](/docs/cli/transcode/), [`extract`](/docs/cli/extract/), [`metrics`](/docs/cli/metrics/), [`synth`](/docs/cli/synth/), [`bench`](/docs/cli/bench/) and [`self-test`](/docs/cli/self-test/).
+- **A CLI**, `ragdoll`, with one subcommand per task: [`probe`](/docs/cli/probe/), [`remux`](/docs/cli/remux/), [`transcode`](/docs/cli/transcode/), `cut`, `concat`, `package`, [`extract`](/docs/cli/extract/), [`metrics`](/docs/cli/metrics/), [`synth`](/docs/cli/synth/), [`bench`](/docs/cli/bench/) and [`self-test`](/docs/cli/self-test/). See [Command line](/docs/cli/) for all of them.
 - **A set of crates** you can depend on directly: timebases and frames in `ragdoll-core`, SIMD kernels in `ragdoll-simd`, pixel processing in `ragdoll-pix`, containers in `ragdoll-format`, codecs in `ragdoll-codec`, and the GOP-parallel scheduler in `ragdoll-pipeline`.
 - **A reference implementation.** Each optimized kernel has a plain scalar twin, and the test suite checks that they agree bit for bit.
 
@@ -18,9 +18,9 @@ Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, FLAC and 
 
 Ragdoll holds every component to the same four constraints.
 
-1. **No C libraries and no third-party crates.** The workspace's `Cargo.lock` contains exactly seven packages, all of them `ragdoll-*`. The only foreign calls are to the operating system (`mmap`, `writev`, QoS and `rusage`).
+1. **No C libraries and no third-party crates.** The workspace's `Cargo.lock` contains exactly seven packages, all of them `ragdoll-*`. The only foreign calls are to the operating system (`mmap` / `madvise`, `sysctlbyname`, QoS and `rusage`).
 2. **Explicit SIMD, verified.** Hot loops use architecture intrinsics directly rather than relying on auto-vectorization. `unsafe` is confined to those kernels, which sit behind safe slice APIs with upfront bounds checks. See [SIMD & verification](/docs/architecture/simd/).
-3. **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file. Muxers write with vectored I/O. Frames come from a pool of 64-byte-aligned buffers. See [Memory model](/docs/architecture/memory/).
+3. **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file. Muxers write header and payload slices straight to a buffered output instead of assembling them first. Frames come from a pool of 64-byte-aligned buffers, and video is processed in batches bounded by a memory budget. See [Memory model](/docs/architecture/memory/).
 4. **Verbs, not flag soup.** The CLI is organized around tasks. Options have names, outputs can be JSON, and pipelines can be declared in TOML. See [Command line](/docs/cli/).
 
 ## Platform support
@@ -28,8 +28,9 @@ Ragdoll holds every component to the same four constraints.
 | Platform | Status |
 | :-- | :-- |
 | macOS on Apple Silicon (`aarch64`) | Primary target. All NEON kernels, QoS-based [power modes](/docs/power/), PMU telemetry in `bench`. |
-| Linux on `aarch64` | Supported; this is what CI runs on (`ubuntu-24.04-arm`). NEON kernels active. Power modes fall back to OS scheduling. |
-| Linux / macOS / Windows on `x86_64` | Builds and runs on the scalar reference paths. AVX2 is detected at runtime, but no AVX2 kernels have been written yet. |
+| Linux on `aarch64` | Supported; CI runs here (`ubuntu-24.04-arm`). NEON kernels active. Power modes fall back to OS scheduling. |
+| Linux on `x86_64` | Supported; CI runs here too (`ubuntu-24.04`). AVX2 is detected at runtime and used for plane SAD and SSE, SSIM statistics, start-code scanning, RBSP unescaping, 8-tap scaling and YUV-to-RGB; the other kernels run their scalar references. |
+| Other `x86_64` systems (macOS, Windows) | Not tested in CI. Off Unix, inputs are read into memory instead of mapped. |
 
 ## Where to go next
 

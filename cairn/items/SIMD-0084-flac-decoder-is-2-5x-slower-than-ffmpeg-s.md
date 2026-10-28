@@ -3,8 +3,10 @@ id: 84
 uid: abddebad-4386-4961-bad6-f96b3ca95391
 title: FLAC decoder is 2.5x slower than FFmpeg's
 type: kernel
-status: backlog
+status: doing
 milestone: m11-validation
+assignee: Claude
+claimed: 2026-10-28
 created: 2026-10-28
 updated: 2026-10-28
 priority: p2

@@ -9,7 +9,7 @@ Ragdoll does not rely on the compiler to vectorize its hot loops, and it does no
 Every kernel in `ragdoll-simd`, `ragdoll-pix` and `ragdoll-codec` follows the same structure:
 
 1. **A scalar reference**, named with a `_scalar` suffix. It is written for clarity, documents its fixed-point format (`Q14`, `Q6` and so on) and rounding, and is the specification for the kernel.
-2. **An intrinsics implementation**, marked `#[target_feature(enable = "neon")]` and kept private. This is the only place `unsafe` appears.
+2. **An intrinsics implementation** per instruction set (`_neon`, `_avx2`), usually marked `#[target_feature(enable = "...")]`, and kept private. This is the only place `unsafe` appears.
 3. **A safe public wrapper** that takes ordinary slices and dispatches to the fastest implementation. Kernels re-slice each row with normal bounds-checked indexing before touching raw pointers, so bad dimensions panic instead of reading past a buffer.
 
 ```rust
@@ -33,7 +33,7 @@ pub fn sad_plane_u8(
 }
 ```
 
-This is the real wrapper from `crates/ragdoll-simd/src/metrics.rs`, lightly reformatted and commented. `neon()` and `avx2()` report the best level the CPU supports, unless the `RAGDOLL_SIMD` environment variable (`scalar`, `neon` or `avx2`) forces one. CI runs the whole test suite twice on each architecture, once with `RAGDOLL_SIMD=scalar`, so every end-to-end test also checks that the SIMD paths change nothing.
+This is the real wrapper from `crates/ragdoll-simd/src/metrics.rs`, lightly reformatted and commented. `ragdoll_core::dispatch::neon()` and `avx2()` report the best level the CPU supports, unless the `RAGDOLL_SIMD` environment variable (`scalar`, `neon` or `avx2`) forces one. The variable is read once, on first use; naming a level the CPU does not have is an error. `ragdoll_core::dispatch::SimdDispatch::active()` returns the level in use. CI runs the whole test suite twice on each architecture, once with `RAGDOLL_SIMD=scalar`, so every end-to-end test also checks that the SIMD paths change nothing.
 
 ## Differential testing
 
@@ -49,8 +49,8 @@ There are no tolerances. If a kernel uses a different rounding order from its re
 
 | ISA | Status |
 | :-- | :-- |
-| `aarch64` NEON (Advanced SIMD) | 28 kernels. NEON is mandatory on 64-bit ARM, so no detection is needed; `RAGDOLL_SIMD=scalar` turns it off. |
-| `x86_64` AVX2 | Detected at runtime. Plane SAD and SSE, SSIM statistics, the start-code scanner, RBSP unescaping, 8-tap scaling and YUV-to-RGB have AVX2 versions; the other kernels run their scalar references. |
+| `aarch64` NEON (Advanced SIMD) | Used throughout: scanning, metrics, transforms, scaling, color conversion, H.264 prediction and motion compensation, PCM, audio DSP and RGDI. NEON is mandatory on 64-bit ARM, so no detection is needed; `RAGDOLL_SIMD=scalar` turns it off. |
+| `x86_64` AVX2 | Detected at runtime. Plane SAD and SSE, SSIM statistics, the start-code scanner, RBSP unescaping, 8-tap scaling and YUV-to-RGB have AVX2 versions; the other kernels run their scalar references. `RAGDOLL_SIMD=scalar` turns it off. |
 | Everything else | Scalar references. |
 
 Adding a new ISA means adding a sibling to tier 2 and a branch in tier 3. The reference and the tests already exist.
@@ -63,7 +63,7 @@ A few patterns recur across the kernels:
 - **Saturating the pipes.** Plane SAD and SSE keep four independent accumulators per scanline so that all four ASIMD units on Apple's performance cores stay busy.
 - **Narrow fixed point.** The scaler's vertical pass works on 14-bit signed `Q6` intermediates in `i16`, which doubles lane count over `i32` and keeps an 8-row ring buffer in L1.
 - **Register transposes.** The 4×4 DCT and IDCT transpose in registers with `vtrn1` / `vtrn2` and round with a single `vrshr_n_s16::<6>`.
-- **Table-driven CRCs.** CRC-8, CRC-16 and CRC-32 use compile-time slicing-by-8 tables, eight independent lookups per 64-bit word.
+- **Table-driven CRCs.** CRC-16 and CRC-32 use compile-time slicing-by-8 tables, eight independent lookups per 64-bit word; CRC-8 uses a single byte-wise table.
 
 ## Safety boundary
 
@@ -71,6 +71,6 @@ A few patterns recur across the kernels:
 
 - **Intrinsics**, inside private tier-2 functions.
 - **Aligned buffers**: `AlignedBuffer` in `ragdoll-core` allocates 64-byte-aligned memory and reinterprets it as `i16` or `f32` samples.
-- **Operating-system calls**: `mmap` / `munmap` / `madvise`, `writev`, `pthread_set_qos_class_self_np`, `sysctlbyname`, `getrusage` and `proc_pid_rusage`.
+- **Operating-system calls**: `mmap` / `munmap` / `madvise`, `pthread_set_qos_class_self_np`, `sysctlbyname`, `getrusage` and `proc_pid_rusage`.
 
-Bitstream parsing, entropy coding and container logic are otherwise safe Rust. Malformed input is reported as `RagdollError`, and a 10,000-mutation fuzz corpus to prove they never panic is planned before 1.0.
+Bitstream parsing, entropy coding and container logic are otherwise safe Rust. Malformed input is reported as `RagdollError`. A test in `ragdoll-pipeline` feeds the demuxers, decoders and image readers more than 10,000 deterministic mutations (truncations, bit flips, corrupted length fields, noise bursts) of valid MP4, Matroska, MPEG-TS, Y4M, WAV, H.264, FLAC, AAC, Opus, AV1, PNG and JPEG inputs, and fails if any of them panics.

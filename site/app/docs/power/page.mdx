@@ -15,15 +15,17 @@ ragdoll transcode input.mp4 output.mp4 --battery-saver   # same thing
 | :-- | :-- | :-- | :-- | :-- |
 | `performance` (default) | | All logical cores | `QOS_CLASS_USER_INITIATED` | 256 MiB |
 | `balanced` | `default`, `normal` | All logical cores | `QOS_CLASS_DEFAULT` | 256 MiB |
-| `efficiency` | `eco`, `battery`, `low-power`, `e-core` | Efficiency-core count, or half the logical cores if that is larger | `QOS_CLASS_BACKGROUND` | 64 MiB |
+| `efficiency` | `eco`, `battery`, `low-power`, `ecore`, `e-core` | Efficiency-core count, or half the logical cores if that is larger | `QOS_CLASS_BACKGROUND` | 64 MiB |
 
-An explicit `--threads N` on `transcode` overrides the automatic thread count.
+An explicit `--threads N` on `transcode` overrides the automatic thread count. The memory budget bounds how much decoded video `transcode`, `metrics`, `extract`, `concat`, `package` and `synth` hold at once; see [Memory model](/docs/architecture/memory/).
+
+The mode changes only how the work is scheduled, never the result: output is byte-identical across power modes and thread counts.
 
 ## How efficiency mode works
 
 On Apple Silicon, threads at `QOS_CLASS_BACKGROUND` are scheduled onto the efficiency cluster, which lets the performance cores stay power-gated. Ragdoll reads the core counts from `hw.perflevel0.logicalcpu` and `hw.perflevel1.logicalcpu` and sizes its worker pool to the efficiency cluster. The pipeline's memory budget also drops from 256 MiB to 64 MiB.
 
-The work takes longer but uses much less energy. On an M4, the end-to-end workloads run roughly 2.5× to 6× slower in efficiency mode and use roughly 3× to 6× less energy than in performance mode. Run [`ragdoll bench`](/docs/cli/bench/) to see the numbers for your machine.
+The work takes longer, in exchange for running on the cores that draw the least power. Run [`ragdoll bench`](/docs/cli/bench/) to compare wall-clock times across modes on your machine. Its energy column is an estimate, not a measurement: CPU cycles (on macOS) or CPU time multiplied by fixed per-core-type constants.
 
 ## Other platforms
 

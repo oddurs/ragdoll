@@ -3,8 +3,10 @@ id: 76
 uid: 753e8266-7387-458c-bed6-228b0b080436
 title: 'H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation'
 type: kernel
-status: backlog
+status: doing
 milestone: m11-validation
+assignee: Claude
+claimed: 2026-10-28
 depends_on:
 - 75
 created: 2026-10-28
