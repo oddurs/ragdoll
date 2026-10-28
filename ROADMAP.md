@@ -158,7 +158,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`##········` 11% · 2 of 19 done
+`##········` 15% · 3 of 20 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -175,6 +175,7 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
 - [ ] `BUG-0079` AAC-LC decoder diverges from FFmpeg (26 dB SNR) and loses sync at 256 kbit/s <sup>bug · p1 · codec-audio</sup>
 - [ ] `BUG-0080` Ogg Opus decode keeps the encoder padding after the final granule position <sup>bug · p2 · format</sup>
+- [ ] `BUG-0081` OggMuxer writes one page per packet, adding about 12 % overhead to Opus at 96 kbit/s <sup>bug · p2 · format</sup>
 
 ### up next
 
@@ -183,12 +184,12 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `0062` qa/ workspace and tiered media corpus manager <sup>feature · p1 · arch</sup>
 - [ ] `0071` Refresh website and README for the H.264, audio, editing, packaging and SDK work <sup>docs · p1 · arch</sup>
 - [ ] `BUG-0072` transcode and metrics decode the whole input into memory, so peak RSS grows with input length <sup>bug · p0 · pipeline</sup>
-- [ ] `BUG-0078` Opus encoder writes streams that no other decoder can read <sup>bug · p0 · codec-audio</sup>
 
 ### shipped
 
 - [x] `0075` H.264 decoder: bit-exact with FFmpeg on the JVT conformance suite and x264 streams <sup>feature · p0 · codec-video</sup>
 - [x] `0077` Opus decoder: RFC 6716 decoding, sample-exact with fixed-point libopus on the RFC 8251 test vectors <sup>feature · p0 · codec-audio</sup>
+- [x] `BUG-0078` Opus encoder writes streams that no other decoder can read <sup>bug · p0 · codec-audio</sup>
 
 ## Unscheduled
 

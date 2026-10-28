@@ -62,7 +62,6 @@ impl Ec {
     }
 
     /// Starts encoding into a buffer of `size` bytes (`ec_enc_init`).
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn encoder(size: usize) -> Self {
         Self {
             buf: vec![0; size],
@@ -96,11 +95,6 @@ impl Ec {
         b += (r > CORRECTION[b as usize]) as u32;
         l = (l << 3) + b as i32;
         nbits.wrapping_sub(l as u32)
-    }
-
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
-    pub fn range_bytes(&self) -> u32 {
-        self.offs
     }
 
     // ----- decoding --------------------------------------------------------------------------
@@ -341,7 +335,6 @@ impl Ec {
     }
 
     /// `ec_encode_bin`.
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn encode_bin(&mut self, fl: u32, fh: u32, bits: u32) {
         let r = self.rng >> bits;
         if fl > 0 {
@@ -369,7 +362,6 @@ impl Ec {
     }
 
     /// `ec_enc_icdf`.
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn enc_icdf(&mut self, s: usize, icdf: &[u8], ftb: u32) {
         let r = self.rng >> ftb;
         if s > 0 {
@@ -420,7 +412,6 @@ impl Ec {
     }
 
     /// `ec_laplace_encode`; `value` may be clamped to what the model can code.
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn laplace_encode(&mut self, value: &mut i32, fs: u32, decay: i32) {
         const MINP: u32 = 1;
         const NMIN: u32 = 16;
@@ -455,7 +446,6 @@ impl Ec {
     }
 
     /// `ec_enc_shrink`.
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn enc_shrink(&mut self, size: u32) {
         let src = (self.storage - self.end_offs) as usize;
         let dst = (size - self.end_offs) as usize;
@@ -465,7 +455,6 @@ impl Ec {
     }
 
     /// `ec_enc_done`: flushes the coder; the packet is `buf[..storage]`.
-    #[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
     pub fn enc_done(&mut self) {
         let mut l = CODE_BITS as i32 - ilog(self.rng);
         let mut msk = (CODE_TOP - 1) >> l;

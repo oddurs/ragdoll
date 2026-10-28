@@ -44,7 +44,6 @@ fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
 }
 
 /// `compute_band_energies`: Q`SIG_SHIFT`-free band amplitudes of the MDCT output.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn compute_band_energies(x: &[i32], band_e: &mut [i32], end: usize, c: usize, lm: i32) {
     let n = 120usize << lm;
     for ch in 0..c {
@@ -72,7 +71,6 @@ pub fn compute_band_energies(x: &[i32], band_e: &mut [i32], end: usize, c: usize
 }
 
 /// `normalise_bands`.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn normalise_bands(
     freq: &[i32],
     x: &mut [i16],
@@ -222,7 +220,6 @@ pub fn anti_collapse(
     }
 }
 
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 fn compute_channel_weights(ex: i32, ey: i32) -> [i32; 2] {
     let min_e = ex.min(ey);
     let ex = ex.wrapping_add(min_e / 3);
@@ -976,6 +973,8 @@ pub struct AllBands<'a> {
     pub lm: i32,
     pub coded_bands: i32,
     pub disable_inv: bool,
+    /// Encoder complexity; 8 and above enables the stereo theta RDO search.
+    pub complexity: i32,
 }
 
 /// `quant_all_bands`: codes every band of `x` (`C` channels of `120 << LM` coefficients).
@@ -997,6 +996,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         lm,
         coded_bands,
         disable_inv,
+        complexity,
     } = p;
     let m = 1usize << lm;
     let bb: i32 = if short_blocks { m as i32 } else { 1 };
@@ -1004,7 +1004,8 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
     let nsize = m * EBANDS[NB_EBANDS - 1] as usize - norm_offset;
     let mut norm = vec![0i16; c * nsize];
     let norm2_off = nsize;
-    let resynth = !encode;
+    let theta_rdo = encode && c == 2 && !dual_stereo && complexity >= 8;
+    let resynth = !encode || theta_rdo;
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;
     let frame_n = 120usize << lm;
@@ -1138,7 +1139,71 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         } else {
             let lb = lowband(&norm, 0);
             let lo = (!last).then(|| &mut norm[out_off..out_off + n]);
-            if c == 2 {
+            if c == 2 && theta_rdo && (i as i32) < intensity {
+                // Code the band with theta rounded down and up; keep the less distorted.
+                let w = compute_channel_weights(band_e[i], band_e[i + NB_EBANDS]);
+                let cm = (x_cm | y_cm) as i32;
+                let ec_save = ctx.ec.clone();
+                let (seed_save, rem_save) = (ctx.seed, ctx.remaining_bits);
+                let x_save = x_buf[xs..xs + n].to_vec();
+                let y_save = y_buf[xs..xs + n].to_vec();
+                ctx.theta_round = -1;
+                x_cm = quant_band_stereo(
+                    &mut ctx,
+                    &mut x_buf[xs..xs + n],
+                    &mut y_buf[xs..xs + n],
+                    n,
+                    b,
+                    bb,
+                    lb.as_deref(),
+                    lm,
+                    (!last).then(|| &mut norm[out_off..out_off + n]),
+                    cm,
+                );
+                let dist0 = mul16_32_q15(w[0], inner_prod(&x_save, &x_buf[xs..xs + n]))
+                    + mul16_32_q15(w[1], inner_prod(&y_save, &y_buf[xs..xs + n]));
+                let cm2 = x_cm;
+                let ec_save2 = ctx.ec.clone();
+                let (seed_save2, rem_save2) = (ctx.seed, ctx.remaining_bits);
+                let x_save2 = x_buf[xs..xs + n].to_vec();
+                let y_save2 = y_buf[xs..xs + n].to_vec();
+                let norm_save2 = (!last).then(|| norm[out_off..out_off + n].to_vec());
+                *ctx.ec = ec_save;
+                ctx.seed = seed_save;
+                ctx.remaining_bits = rem_save;
+                x_buf[xs..xs + n].copy_from_slice(&x_save);
+                y_buf[xs..xs + n].copy_from_slice(&y_save);
+                if i == start + 1 {
+                    special_hybrid_folding(&mut norm, norm2_off, start, m, dual_stereo);
+                }
+                ctx.theta_round = 1;
+                x_cm = quant_band_stereo(
+                    &mut ctx,
+                    &mut x_buf[xs..xs + n],
+                    &mut y_buf[xs..xs + n],
+                    n,
+                    b,
+                    bb,
+                    lb.as_deref(),
+                    lm,
+                    (!last).then(|| &mut norm[out_off..out_off + n]),
+                    cm,
+                );
+                let dist1 = mul16_32_q15(w[0], inner_prod(&x_save, &x_buf[xs..xs + n]))
+                    + mul16_32_q15(w[1], inner_prod(&y_save, &y_buf[xs..xs + n]));
+                if dist0 >= dist1 {
+                    x_cm = cm2;
+                    *ctx.ec = ec_save2;
+                    ctx.seed = seed_save2;
+                    ctx.remaining_bits = rem_save2;
+                    ctx.theta_round = -1;
+                    x_buf[xs..xs + n].copy_from_slice(&x_save2);
+                    y_buf[xs..xs + n].copy_from_slice(&y_save2);
+                    if let Some(s) = norm_save2 {
+                        norm[out_off..out_off + n].copy_from_slice(&s);
+                    }
+                }
+            } else if c == 2 {
                 ctx.theta_round = 0;
                 x_cm = quant_band_stereo(
                     &mut ctx,

@@ -27,15 +27,15 @@ const PLC_PITCH_LAG_MIN: usize = 100;
 const PREEMPH: i32 = 27853;
 const STRIDE: usize = DECODE_BUFFER_SIZE + OVERLAP;
 
-const TF_SELECT_TABLE: [[i8; 8]; 4] = [
+pub(super) const TF_SELECT_TABLE: [[i8; 8]; 4] = [
     [0, -1, 0, -1, 0, -1, 0, -1],
     [0, -1, 0, -2, 1, 0, 1, -1],
     [0, -2, 0, -3, 2, 0, 1, -1],
     [0, -2, 0, -3, 3, 0, 1, -1],
 ];
-const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
-const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
-const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
+pub(super) const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
+pub(super) const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
+pub(super) const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
 
 /// The decoder's error for a frame it cannot handle (bad size or internal overrun).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +313,7 @@ impl CeltDecoder {
         let mut x = vec![0i16; c * n];
         quant_all_bands(
             AllBands {
+                complexity: 0,
                 encode: false,
                 start,
                 end,

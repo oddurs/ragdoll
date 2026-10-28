@@ -13,9 +13,7 @@ pub struct Cpx {
 }
 
 /// A static FFT configuration (`kiss_fft_state`).
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub struct FftState {
-    pub nfft: usize,
     pub scale: i32,
     pub scale_shift: i32,
     pub shift: i32,
@@ -25,7 +23,6 @@ pub struct FftState {
 
 pub static FFT_STATES: [FftState; 4] = [
     FftState {
-        nfft: 480,
         scale: 17476,
         scale_shift: 8,
         shift: -1,
@@ -33,7 +30,6 @@ pub static FFT_STATES: [FftState; 4] = [
         bitrev: &FFT_BITREV480,
     },
     FftState {
-        nfft: 240,
         scale: 17476,
         scale_shift: 7,
         shift: 1,
@@ -41,7 +37,6 @@ pub static FFT_STATES: [FftState; 4] = [
         bitrev: &FFT_BITREV240,
     },
     FftState {
-        nfft: 120,
         scale: 17476,
         scale_shift: 6,
         shift: 2,
@@ -49,7 +44,6 @@ pub static FFT_STATES: [FftState; 4] = [
         bitrev: &FFT_BITREV120,
     },
     FftState {
-        nfft: 60,
         scale: 17476,
         scale_shift: 5,
         shift: 3,
@@ -378,7 +372,6 @@ pub fn mdct_backward(
 
 /// `clt_mdct_forward`: forward MDCT of `input` (`N/2 + overlap` samples) into `stride`-interleaved
 /// coefficients.
-#[allow(dead_code)] // Encoder side, used by the CELT encoder (BUG-0078).
 pub fn mdct_forward(
     input: &[i32],
     out: &mut [i32],
