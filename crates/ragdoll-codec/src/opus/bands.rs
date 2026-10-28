@@ -18,6 +18,8 @@ use super::rate::{
 use super::vq::{SPREAD_AGGRESSIVE, alg_quant, alg_unquant, renormalise_vector, stereo_itheta};
 
 pub const NORM_SCALING: i32 = 16384;
+/// Widest band: the last one at LM 3 (`8 * (100 - 78)` coefficients).
+pub const MAX_BAND: usize = 176;
 const Q15ONE: i32 = 32767;
 
 #[inline]
@@ -130,28 +132,43 @@ pub fn denormalise_bands(
         } else {
             g = exp2_frac(lg & ((1 << DB_SHIFT) - 1)) as i16 as i32;
         }
-        let mut j = m * EBANDS[i] as usize;
-        if shift < 0 {
-            if shift <= -2 {
-                g = 16384;
-                shift = -2;
-            }
-            while j < band_end {
-                freq[f] = shl32(mul16(x[xi] as i32, g), -shift);
-                f += 1;
-                xi += 1;
-                j += 1;
-            }
-        } else {
-            while j < band_end {
-                freq[f] = mul16(x[xi] as i32, g) >> shift;
-                f += 1;
-                xi += 1;
-                j += 1;
-            }
+        let len = band_end - m * EBANDS[i] as usize;
+        let (out, inp) = (&mut freq[f..f + len], &x[xi..xi + len]);
+        if shift <= -2 {
+            g = 16384;
+            shift = -2;
         }
+        denormalise_band(out, inp, g, shift);
+        f += len;
+        xi += len;
     }
     freq[bound..n].fill(0);
+}
+
+/// One band of [`denormalise_bands`]: `out[i] = MULT16_16(x[i], g)` shifted right by `shift`
+/// (left for a negative one).
+pub(super) fn denormalise_band(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::denormalise_avx2(out, x, g, shift) };
+        denormalise_band_scalar(&mut out[done..], &x[done..], g, shift);
+        return;
+    }
+    denormalise_band_scalar(out, x, g, shift);
+}
+
+/// Scalar reference of [`denormalise_band`].
+pub fn denormalise_band_scalar(out: &mut [i32], x: &[i16], g: i32, shift: i32) {
+    if shift < 0 {
+        for (o, &v) in out.iter_mut().zip(x) {
+            *o = shl32(mul16(v as i32, g), -shift);
+        }
+    } else {
+        for (o, &v) in out.iter_mut().zip(x) {
+            *o = mul16(v as i32, g) >> shift;
+        }
+    }
 }
 
 /// `anti_collapse`: fills collapsed short blocks with noise.
@@ -220,6 +237,25 @@ pub fn anti_collapse(
     }
 }
 
+/// `out[i] = MULT16_16_Q15(g, x[i])` truncated to 16 bits.
+pub(super) fn mul_q15(out: &mut [i16], x: &[i16], g: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        if unsafe { super::simd::mul_q15_avx2(out, x, g) } {
+            return;
+        }
+    }
+    mul_q15_scalar(out, x, g);
+}
+
+/// Scalar reference of [`mul_q15`].
+pub fn mul_q15_scalar(out: &mut [i16], x: &[i16], g: i32) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = mul16_q15(g, v as i32) as i16;
+    }
+}
+
 fn compute_channel_weights(ex: i32, ey: i32) -> [i32; 2] {
     let min_e = ex.min(ey);
     let ex = ex.wrapping_add(min_e / 3);
@@ -276,11 +312,41 @@ fn stereo_merge(x: &mut [i16], y: &mut [i16], mid: i32, n: usize) {
     if kr < 7 {
         kr = 7;
     }
-    for j in 0..n {
-        let l = mul16_p15(mid, x[j] as i32) as i16 as i32;
-        let r = y[j] as i32;
-        x[j] = pshr32(mul16(lgain, sub16(l, r)), kl + 1) as i16;
-        y[j] = pshr32(mul16(rgain, add16(l, r)), kr + 1) as i16;
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        if unsafe {
+            super::simd::stereo_merge_avx2(
+                &mut x[..n],
+                &mut y[..n],
+                mid,
+                lgain,
+                kl + 1,
+                rgain,
+                kr + 1,
+            )
+        } {
+            return;
+        }
+    }
+    stereo_merge_scalar(&mut x[..n], &mut y[..n], mid, lgain, kl + 1, rgain, kr + 1);
+}
+
+/// Scalar reference of the final loop of `stereo_merge`.
+pub fn stereo_merge_scalar(
+    x: &mut [i16],
+    y: &mut [i16],
+    mid: i32,
+    lgain: i32,
+    lsh: i32,
+    rgain: i32,
+    rsh: i32,
+) {
+    for (xv, yv) in x.iter_mut().zip(y.iter_mut()) {
+        let l = mul16_p15(mid, *xv as i32) as i16 as i32;
+        let r = *yv as i32;
+        *xv = pshr32(mul16(lgain, sub16(l, r)), lsh) as i16;
+        *yv = pshr32(mul16(rgain, add16(l, r)), rsh) as i16;
     }
 }
 
@@ -290,7 +356,8 @@ const ORDERY_TABLE: [usize; 30] = [
 
 fn deinterleave_hadamard(x: &mut [i16], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp = vec![0i16; n];
+    let mut tmp = [0i16; MAX_BAND];
+    let tmp = &mut tmp[..n];
     if hadamard {
         let ordery = &ORDERY_TABLE[stride - 2..];
         for i in 0..stride {
@@ -305,12 +372,13 @@ fn deinterleave_hadamard(x: &mut [i16], n0: usize, stride: usize, hadamard: bool
             }
         }
     }
-    x[..n].copy_from_slice(&tmp);
+    x[..n].copy_from_slice(tmp);
 }
 
 fn interleave_hadamard(x: &mut [i16], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp = vec![0i16; n];
+    let mut tmp = [0i16; MAX_BAND];
+    let tmp = &mut tmp[..n];
     if hadamard {
         let ordery = &ORDERY_TABLE[stride - 2..];
         for i in 0..stride {
@@ -325,14 +393,26 @@ fn interleave_hadamard(x: &mut [i16], n0: usize, stride: usize, hadamard: bool) 
             }
         }
     }
-    x[..n].copy_from_slice(&tmp);
+    x[..n].copy_from_slice(tmp);
 }
 
 /// `haar1`.
 pub fn haar1(x: &mut [i16], n0: usize, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::haar1_avx2(x, n0, stride) };
+        haar1_scalar(x, n0, stride, done / (2 * stride));
+        return;
+    }
+    haar1_scalar(x, n0, stride, 0);
+}
+
+/// Scalar reference of [`haar1`], from pair `j0` of every run on.
+pub fn haar1_scalar(x: &mut [i16], n0: usize, stride: usize, j0: usize) {
     let n0 = n0 >> 1;
     for i in 0..stride {
-        for j in 0..n0 {
+        for j in j0..n0 {
             let a = stride * 2 * j + i;
             let b = stride * (2 * j + 1) + i;
             let tmp1 = mul16(23170, x[a] as i32);
@@ -760,13 +840,24 @@ fn quant_band(
     if tf_change > 0 {
         recombine = tf_change;
     }
-    let mut lb: Option<Vec<i16>> = lowband.map(|l| l[..n].to_vec());
+    // The folding source is transformed along with the band only when the band is; only
+    // then does it need a copy (as in libopus).
+    let transformed = recombine > 0 || ((n_b & 1) == 0 && tf_change < 0) || b0_orig > 1;
+    let mut lb_store: [i16; MAX_BAND];
+    let (mut lb, lb_direct): (Option<&mut [i16]>, Option<&[i16]>) = match lowband {
+        Some(l) if transformed => {
+            lb_store = [0; MAX_BAND];
+            lb_store[..n].copy_from_slice(&l[..n]);
+            (Some(&mut lb_store[..n]), None)
+        }
+        l => (None, l),
+    };
     const BIT_INTERLEAVE_TABLE: [i32; 16] = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3];
     for k in 0..recombine {
         if encode {
             haar1(x, n >> k, 1 << k);
         }
-        if let Some(l) = lb.as_mut() {
+        if let Some(l) = lb.as_deref_mut() {
             haar1(l, n >> k, 1 << k);
         }
         fill = BIT_INTERLEAVE_TABLE[(fill & 0xF) as usize]
@@ -778,7 +869,7 @@ fn quant_band(
         if encode {
             haar1(x, n_b, b_cnt as usize);
         }
-        if let Some(l) = lb.as_mut() {
+        if let Some(l) = lb.as_deref_mut() {
             haar1(l, n_b, b_cnt as usize);
         }
         fill |= fill << b_cnt;
@@ -793,11 +884,12 @@ fn quant_band(
         if encode {
             deinterleave_hadamard(x, n_b >> recombine, (b0 << recombine) as usize, long_blocks);
         }
-        if let Some(l) = lb.as_mut() {
+        if let Some(l) = lb.as_deref_mut() {
             deinterleave_hadamard(l, n_b >> recombine, (b0 << recombine) as usize, long_blocks);
         }
     }
-    let mut cm = quant_partition(ctx, x, n, b, b_cnt, lb.as_deref(), lm, gain, fill);
+    let lowband = lb.as_deref().or(lb_direct);
+    let mut cm = quant_partition(ctx, x, n, b, b_cnt, lowband, lm, gain, fill);
     if ctx.resynth {
         if b0 > 1 {
             interleave_hadamard(x, n_b >> recombine, (b0 << recombine) as usize, long_blocks);
@@ -821,9 +913,7 @@ fn quant_band(
         b_cnt <<= recombine;
         if let Some(lo) = lowband_out {
             let nn = sqrt(shl32(n0 as i32, 22));
-            for j in 0..n0 {
-                lo[j] = mul16_q15(nn, x[j] as i32) as i16;
-            }
+            mul_q15(&mut lo[..n0], &x[..n0], nn);
         }
         cm &= ((1u64 << b_cnt) - 1) as u32;
     }
@@ -955,6 +1045,44 @@ fn special_hybrid_folding(norm: &mut [i16], norm2_off: usize, start: usize, m: u
     }
 }
 
+/// Where a band's folding source (`lowband`, at `eff` unless that is -1) and its
+/// `lowband_out` (at `out_off`, unless it is the last band) lie in the normalised spectrum.
+struct Lowband {
+    eff: i32,
+    out_off: usize,
+    n: usize,
+    last: bool,
+}
+
+impl Lowband {
+    /// The two regions of `norm[base..]`, which libopus aliases. The source ends at or before
+    /// `lowband_out` unless it starts at 0 in a band wider than its offset; only then is it
+    /// copied into `scratch`.
+    fn split<'a>(
+        &self,
+        norm: &'a mut [i16],
+        base: usize,
+        scratch: &'a mut [i16; MAX_BAND],
+    ) -> (Option<&'a [i16]>, Option<&'a mut [i16]>) {
+        let n = self.n;
+        let lo = base + self.out_off;
+        if self.eff < 0 {
+            return (None, (!self.last).then(|| &mut norm[lo..lo + n]));
+        }
+        let ls = base + self.eff as usize;
+        if self.last {
+            return (Some(&norm[ls..ls + n]), None);
+        }
+        if ls + n <= lo {
+            let (head, tail) = norm.split_at_mut(lo);
+            (Some(&head[ls..ls + n]), Some(&mut tail[..n]))
+        } else {
+            scratch[..n].copy_from_slice(&norm[ls..ls + n]);
+            (Some(&scratch[..n]), Some(&mut norm[lo..lo + n]))
+        }
+    }
+}
+
 /// Inputs of [`quant_all_bands`] besides the coefficient buffer.
 pub struct AllBands<'a> {
     pub encode: bool,
@@ -975,6 +1103,9 @@ pub struct AllBands<'a> {
     pub disable_inv: bool,
     /// Encoder complexity; 8 and above enables the stereo theta RDO search.
     pub complexity: i32,
+    /// Working memory for the normalised spectrum that later bands fold from, at least
+    /// `C * 8 * 78` values. It needs no clearing: every value read is written first.
+    pub norm: &'a mut [i16],
 }
 
 /// `quant_all_bands`: codes every band of `x` (`C` channels of `120 << LM` coefficients).
@@ -997,17 +1128,19 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         coded_bands,
         disable_inv,
         complexity,
+        norm: norm_scratch,
     } = p;
     let m = 1usize << lm;
     let bb: i32 = if short_blocks { m as i32 } else { 1 };
     let norm_offset = m * EBANDS[start] as usize;
     let nsize = m * EBANDS[NB_EBANDS - 1] as usize - norm_offset;
-    let mut norm = vec![0i16; c * nsize];
+    let norm = &mut norm_scratch[..c * nsize];
     let norm2_off = nsize;
     let theta_rdo = encode && c == 2 && !dual_stereo && complexity >= 8;
     let resynth = !encode || theta_rdo;
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;
+    let mut lb_scratch = [0i16; MAX_BAND];
     let frame_n = 120usize << lm;
     let (x_buf, y_buf) = x.split_at_mut(frame_n);
     let mut ctx = BandCtx {
@@ -1049,7 +1182,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
             lowband_offset = i;
         }
         if i == start + 1 {
-            special_hybrid_folding(&mut norm, norm2_off, start, m, dual_stereo);
+            special_hybrid_folding(norm, norm2_off, start, m, dual_stereo);
         }
         let tf_change = tf_res[i];
         ctx.tf_change = tf_change;
@@ -1099,47 +1232,48 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
             }
         }
         let out_off = xs - norm_offset;
-        let lowband = |buf: &[i16], base: usize| -> Option<Vec<i16>> {
-            (effective_lowband != -1).then(|| {
-                buf[base + effective_lowband as usize..base + effective_lowband as usize + n]
-                    .to_vec()
-            })
+        let lbs = Lowband {
+            eff: effective_lowband,
+            out_off,
+            n,
+            last,
         };
         if dual_stereo {
-            let lb = lowband(&norm, 0);
-            {
-                let lo = (!last).then(|| &mut norm[out_off..out_off + n]);
-                x_cm = quant_band(
-                    &mut ctx,
-                    &mut x_buf[xs..xs + n],
-                    n,
-                    b / 2,
-                    bb,
-                    lb.as_deref(),
-                    lm,
-                    lo,
-                    Q15ONE,
-                    x_cm as i32,
-                );
-            }
-            let lb2 = lowband(&norm, norm2_off);
-            let lo2 = (!last).then(|| &mut norm[norm2_off + out_off..norm2_off + out_off + n]);
+            let (lb, lo) = lbs.split(norm, 0, &mut lb_scratch);
+            x_cm = quant_band(
+                &mut ctx,
+                &mut x_buf[xs..xs + n],
+                n,
+                b / 2,
+                bb,
+                lb,
+                lm,
+                lo,
+                Q15ONE,
+                x_cm as i32,
+            );
+            let (lb2, lo2) = lbs.split(norm, norm2_off, &mut lb_scratch);
             y_cm = quant_band(
                 &mut ctx,
                 &mut y_buf[xs..xs + n],
                 n,
                 b / 2,
                 bb,
-                lb2.as_deref(),
+                lb2,
                 lm,
                 lo2,
                 Q15ONE,
                 y_cm as i32,
             );
         } else {
-            let lb = lowband(&norm, 0);
-            let lo = (!last).then(|| &mut norm[out_off..out_off + n]);
             if c == 2 && theta_rdo && (i as i32) < intensity {
+                // The folding source, copied as it may overlap this band's `lowband_out`.
+                let lb = (effective_lowband != -1).then(|| {
+                    let o = effective_lowband as usize;
+                    let mut a = [0i16; MAX_BAND];
+                    a[..n].copy_from_slice(&norm[o..o + n]);
+                    a
+                });
                 // Code the band with theta rounded down and up; keep the less distorted.
                 let w = compute_channel_weights(band_e[i], band_e[i + NB_EBANDS]);
                 let cm = (x_cm | y_cm) as i32;
@@ -1155,7 +1289,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                     n,
                     b,
                     bb,
-                    lb.as_deref(),
+                    lb.as_ref().map(|a| &a[..n]),
                     lm,
                     (!last).then(|| &mut norm[out_off..out_off + n]),
                     cm,
@@ -1174,7 +1308,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                 x_buf[xs..xs + n].copy_from_slice(&x_save);
                 y_buf[xs..xs + n].copy_from_slice(&y_save);
                 if i == start + 1 {
-                    special_hybrid_folding(&mut norm, norm2_off, start, m, dual_stereo);
+                    special_hybrid_folding(norm, norm2_off, start, m, dual_stereo);
                 }
                 ctx.theta_round = 1;
                 x_cm = quant_band_stereo(
@@ -1184,7 +1318,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                     n,
                     b,
                     bb,
-                    lb.as_deref(),
+                    lb.as_ref().map(|a| &a[..n]),
                     lm,
                     (!last).then(|| &mut norm[out_off..out_off + n]),
                     cm,
@@ -1205,6 +1339,7 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                 }
             } else if c == 2 {
                 ctx.theta_round = 0;
+                let (lb, lo) = lbs.split(norm, 0, &mut lb_scratch);
                 x_cm = quant_band_stereo(
                     &mut ctx,
                     &mut x_buf[xs..xs + n],
@@ -1212,19 +1347,20 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                     n,
                     b,
                     bb,
-                    lb.as_deref(),
+                    lb,
                     lm,
                     lo,
                     (x_cm | y_cm) as i32,
                 );
             } else {
+                let (lb, lo) = lbs.split(norm, 0, &mut lb_scratch);
                 x_cm = quant_band(
                     &mut ctx,
                     &mut x_buf[xs..xs + n],
                     n,
                     b,
                     bb,
-                    lb.as_deref(),
+                    lb,
                     lm,
                     lo,
                     Q15ONE,

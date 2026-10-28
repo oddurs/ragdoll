@@ -422,9 +422,124 @@ fn comb_gains(c: &Comb) -> ([i32; 3], [i32; 3]) {
     (g0, g1)
 }
 
-/// `comb_filter` in place: `buf[off..off + n]` is filtered with its own (already filtered)
-/// history before `off`, as libopus does when input and output alias.
-pub fn comb_filter_inplace(
+/// Samples `i0..n` of the cross-fading part of the comb filter on raw pointers, as
+/// [`super::simd::comb_overlap_avx2`] defines it.
+///
+/// # Safety
+///
+/// As [`super::simd::comb_overlap_avx2`].
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn comb_overlap_tail(
+    y: *mut i32,
+    x: *const i32,
+    i0: usize,
+    n: usize,
+    t0: usize,
+    t1: usize,
+    g0: [i32; 3],
+    g1: [i32; 3],
+    window: &[i16],
+) {
+    for i in i0..n {
+        // Safety: per the function contract.
+        unsafe {
+            let r = |t: usize, k: usize| *x.add(i + k).sub(t + 2);
+            let f = mul16_q15(window[i] as i32, window[i] as i32);
+            let xt0 = [r(t0, 0), r(t0, 1), r(t0, 2), r(t0, 3), r(t0, 4)];
+            let xt1 = [r(t1, 0), r(t1, 1), r(t1, 2), r(t1, 3), r(t1, 4)];
+            *y.add(i) = comb_overlap_sample(*x.add(i), xt0, xt1, f, g0, g1);
+        }
+    }
+}
+
+/// `comb_filter` of `n` samples from `x` (history before it) into `y` on raw pointers.
+///
+/// # Safety
+///
+/// `x - max(t0, t1) - 2..x + n` must be readable and `y..y + n` writable; `y` either equals
+/// `x` (in-place filtering, which reads earlier outputs as history) or does not overlap the
+/// reads.
+unsafe fn comb_filter_raw(
+    y: *mut i32,
+    x: *const i32,
+    n: usize,
+    c: Comb,
+    window: &[i16],
+    overlap: usize,
+) {
+    let t0 = c.t0.max(COMBFILTER_MINPERIOD) as usize;
+    let t1 = c.t1.max(COMBFILTER_MINPERIOD) as usize;
+    let (g0, g1) = comb_gains(&c);
+    let overlap = if c.g0 == c.g1 && t0 == t1 && c.tapset0 == c.tapset1 {
+        0
+    } else {
+        overlap.min(n)
+    };
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2; the periods are at least
+        // COMBFILTER_MINPERIOD (15), and the bounds are the caller's.
+        unsafe {
+            super::simd::comb_overlap_avx2(y, x, overlap, t0, t1, g0, g1, window);
+            if c.g1 == 0 {
+                if !std::ptr::eq(y, x) {
+                    std::ptr::copy_nonoverlapping(x.add(overlap), y.add(overlap), n - overlap);
+                }
+                return;
+            }
+            super::simd::comb_const_avx2(y.add(overlap), x.add(overlap), n - overlap, t1, g1);
+        }
+        return;
+    }
+    // Safety: the bounds are the caller's.
+    unsafe { comb_overlap_tail(y, x, 0, overlap, t0, t1, g0, g1, window) };
+    if c.g1 == 0 {
+        if !std::ptr::eq(y, x) {
+            // Safety: the bounds are the caller's and the ranges do not overlap.
+            unsafe { std::ptr::copy_nonoverlapping(x.add(overlap), y.add(overlap), n - overlap) };
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() && g1.iter().all(|&g| g as i16 != i16::MIN) {
+        // Safety: NEON is baseline on aarch64; as above for the rest.
+        unsafe {
+            super::simd::comb_const_neon(y.add(overlap), x.add(overlap), n - overlap, t1, g1)
+        };
+        return;
+    }
+    // Safety: the bounds are the caller's.
+    unsafe { comb_const_scalar(y.add(overlap), x.add(overlap), n - overlap, t1, g1) };
+}
+
+/// Scalar reference of [`super::simd::comb_const_avx2`].
+///
+/// # Safety
+///
+/// As [`super::simd::comb_const_avx2`].
+pub(super) unsafe fn comb_const_scalar(
+    y: *mut i32,
+    x: *const i32,
+    n: usize,
+    t: usize,
+    g: [i32; 3],
+) {
+    for i in 0..n {
+        // Safety: per the function contract.
+        unsafe {
+            let r = |k: usize| *x.add(i + k).sub(t + 2);
+            let v = (*x.add(i))
+                .wrapping_add(mul16_32_q15(g[0], r(2)))
+                .wrapping_add(mul16_32_q15(g[1], r(3).wrapping_add(r(1))))
+                .wrapping_add(mul16_32_q15(g[2], r(4).wrapping_add(r(0))));
+            *y.add(i) = saturate(v, SIG_SAT);
+        }
+    }
+}
+
+/// Scalar reference of [`comb_filter_inplace`].
+#[cfg(test)]
+pub(super) fn comb_filter_inplace_scalar(
     buf: &mut [i32],
     off: usize,
     n: usize,
@@ -441,46 +556,38 @@ pub fn comb_filter_inplace(
     let overlap = if c.g0 == c.g1 && t0 == t1 && c.tapset0 == c.tapset1 {
         0
     } else {
-        overlap
+        overlap.min(n)
     };
-    let mut i = 0usize;
-    while i < overlap {
-        let p = off + i;
-        let f = mul16_q15(window[i] as i32, window[i] as i32);
-        let xt0 = [
-            buf[p - t0 - 2],
-            buf[p - t0 - 1],
-            buf[p - t0],
-            buf[p - t0 + 1],
-            buf[p - t0 + 2],
-        ];
-        let xt1 = [
-            buf[p - t1 - 2],
-            buf[p - t1 - 1],
-            buf[p - t1],
-            buf[p - t1 + 1],
-            buf[p - t1 + 2],
-        ];
-        buf[p] = comb_overlap_sample(buf[p], xt0, xt1, f, g0, g1);
-        i += 1;
+    assert!(off >= t0.max(t1) + 2 && off + n <= buf.len());
+    // Safety: bounded by the assert.
+    unsafe {
+        let p = buf.as_mut_ptr().add(off);
+        comb_overlap_tail(p, p, 0, overlap, t0, t1, g0, g1, window);
+        if c.g1 != 0 {
+            comb_const_scalar(p.add(overlap), p.add(overlap), n - overlap, t1, g1);
+        }
     }
-    if c.g1 == 0 {
+}
+
+/// `comb_filter` in place: `buf[off..off + n]` is filtered with its own (already filtered)
+/// history before `off`, as libopus does when input and output alias.
+pub fn comb_filter_inplace(
+    buf: &mut [i32],
+    off: usize,
+    n: usize,
+    c: Comb,
+    window: &[i16],
+    overlap: usize,
+) {
+    if c.g0 == 0 && c.g1 == 0 {
         return;
     }
-    while i < n {
-        let p = off + i;
-        let y = buf[p]
-            .wrapping_add(mul16_32_q15(g1[0], buf[p - t1]))
-            .wrapping_add(mul16_32_q15(
-                g1[1],
-                buf[p - t1 + 1].wrapping_add(buf[p - t1 - 1]),
-            ))
-            .wrapping_add(mul16_32_q15(
-                g1[2],
-                buf[p - t1 + 2].wrapping_add(buf[p - t1 - 2]),
-            ));
-        buf[p] = saturate(y, SIG_SAT);
-        i += 1;
+    let t = c.t0.max(c.t1).max(COMBFILTER_MINPERIOD) as usize;
+    assert!(off >= t + 2 && off + n <= buf.len() && window.len() >= overlap.min(n));
+    // Safety: the asserts bound every read and write to `buf`.
+    unsafe {
+        let p = buf.as_mut_ptr().add(off);
+        comb_filter_raw(p, p, n, c, window, overlap);
     }
 }
 
@@ -498,52 +605,10 @@ pub fn comb_filter_to(
         y[..n].copy_from_slice(&x[x_off..x_off + n]);
         return;
     }
-    let t0 = c.t0.max(COMBFILTER_MINPERIOD) as usize;
-    let t1 = c.t1.max(COMBFILTER_MINPERIOD) as usize;
-    let (g0, g1) = comb_gains(&c);
-    let overlap = if c.g0 == c.g1 && t0 == t1 && c.tapset0 == c.tapset1 {
-        0
-    } else {
-        overlap
-    };
-    let mut i = 0usize;
-    while i < overlap {
-        let p = x_off + i;
-        let f = mul16_q15(window[i] as i32, window[i] as i32);
-        let xt0 = [
-            x[p - t0 - 2],
-            x[p - t0 - 1],
-            x[p - t0],
-            x[p - t0 + 1],
-            x[p - t0 + 2],
-        ];
-        let xt1 = [
-            x[p - t1 - 2],
-            x[p - t1 - 1],
-            x[p - t1],
-            x[p - t1 + 1],
-            x[p - t1 + 2],
-        ];
-        y[i] = comb_overlap_sample(x[p], xt0, xt1, f, g0, g1);
-        i += 1;
-    }
-    if c.g1 == 0 {
-        y[overlap..n].copy_from_slice(&x[x_off + overlap..x_off + n]);
-        return;
-    }
-    while i < n {
-        let p = x_off + i;
-        let v = x[p]
-            .wrapping_add(mul16_32_q15(g1[0], x[p - t1]))
-            .wrapping_add(mul16_32_q15(
-                g1[1],
-                x[p - t1 + 1].wrapping_add(x[p - t1 - 1]),
-            ))
-            .wrapping_add(mul16_32_q15(
-                g1[2],
-                x[p - t1 + 2].wrapping_add(x[p - t1 - 2]),
-            ));
-        y[i] = saturate(v, SIG_SAT);
-        i += 1;
-    }
+    let t = c.t0.max(c.t1).max(COMBFILTER_MINPERIOD) as usize;
+    assert!(
+        x_off >= t + 2 && x_off + n <= x.len() && y.len() >= n && window.len() >= overlap.min(n)
+    );
+    // Safety: the asserts bound every access; `y` and `x` are distinct borrows.
+    unsafe { comb_filter_raw(y.as_mut_ptr(), x.as_ptr().add(x_off), n, c, window, overlap) };
 }

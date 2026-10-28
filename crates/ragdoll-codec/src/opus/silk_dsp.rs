@@ -222,7 +222,26 @@ pub fn bwexpander_32(ar: &mut [i32], mut chirp_q16: i32) {
 
 /// `silk_LPC_analysis_filter`: the first `d` outputs are zero.
 pub fn lpc_analysis_filter(out: &mut [i16], input: &[i16], b: &[i16], len: usize, d: usize) {
-    for ix in d..len {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && d <= 16 {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::lpc_analysis_filter_avx2(out, input, b, len, d) };
+        return;
+    }
+    lpc_analysis_filter_scalar(out, input, b, len, d, d);
+}
+
+/// Scalar reference of [`lpc_analysis_filter`], computing outputs `ix0..len` (and zeroing the
+/// first `d`).
+pub fn lpc_analysis_filter_scalar(
+    out: &mut [i16],
+    input: &[i16],
+    b: &[i16],
+    len: usize,
+    d: usize,
+    ix0: usize,
+) {
+    for ix in ix0..len {
         let mut acc = smulbb(input[ix - 1] as i32, b[0] as i32);
         for j in 1..d {
             acc = smlabb(acc, input[ix - 1 - j] as i32, b[j] as i32);
@@ -596,7 +615,8 @@ impl Resampler {
     }
 
     fn iir_fir(&mut self, out: &mut [i16], mut input: &[i16]) {
-        let mut buf = vec![0i16; 2 * self.batch_size + RESAMPLER_ORDER_FIR_12];
+        // batch_size is at most 10 ms at 16 kHz in the decoder.
+        let mut buf = [0i16; 2 * 160 + RESAMPLER_ORDER_FIR_12];
         buf[..RESAMPLER_ORDER_FIR_12].copy_from_slice(&self.s_fir_i16);
         let inc = self.inv_ratio_q16;
         let mut o = 0usize;
@@ -605,27 +625,16 @@ impl Resampler {
             n_in = input.len().min(self.batch_size);
             up2_hq(
                 &mut self.s_iir,
-                &mut buf[RESAMPLER_ORDER_FIR_12..],
+                &mut buf[RESAMPLER_ORDER_FIR_12..RESAMPLER_ORDER_FIR_12 + 2 * n_in],
                 &input[..n_in],
             );
             let max_index_q16 = (n_in as i32) << (16 + 1);
-            let mut index_q16 = 0i32;
-            while index_q16 < max_index_q16 {
-                let ti = smulwb(index_q16 & 0xffff, 12) as usize;
-                let bp = &buf[(index_q16 >> 16) as usize..];
-                let f = |r: usize, c: usize| RESAMPLER_FRAC_FIR_12[r * 4 + c] as i32;
-                let mut res = smulbb(bp[0] as i32, f(ti, 0));
-                res = smlabb(res, bp[1] as i32, f(ti, 1));
-                res = smlabb(res, bp[2] as i32, f(ti, 2));
-                res = smlabb(res, bp[3] as i32, f(ti, 3));
-                res = smlabb(res, bp[4] as i32, f(11 - ti, 3));
-                res = smlabb(res, bp[5] as i32, f(11 - ti, 2));
-                res = smlabb(res, bp[6] as i32, f(11 - ti, 1));
-                res = smlabb(res, bp[7] as i32, f(11 - ti, 0));
-                out[o] = sat16(rshift_round(res, 15)) as i16;
-                o += 1;
-                index_q16 += inc;
-            }
+            o += fir_interpol(
+                &mut out[o..],
+                &buf[..2 * n_in + RESAMPLER_ORDER_FIR_12],
+                max_index_q16,
+                inc,
+            );
             input = &input[n_in..];
             if !input.is_empty() {
                 buf.copy_within(n_in << 1..(n_in << 1) + RESAMPLER_ORDER_FIR_12, 0);
@@ -691,40 +700,99 @@ impl Resampler {
     }
 }
 
+/// The eight taps of each of the 12 phases of `silk_resampler_frac_FIR_12`, in the order
+/// they multiply `buf[idx..idx + 8]`: phase `ti` then the mirrored phase `11 - ti`.
+pub const FIR_12_TAPS: [[i16; 8]; 12] = {
+    let mut t = [[0i16; 8]; 12];
+    let mut ti = 0;
+    while ti < 12 {
+        let mut c = 0;
+        while c < 4 {
+            t[ti][c] = RESAMPLER_FRAC_FIR_12[ti * 4 + c];
+            t[ti][7 - c] = RESAMPLER_FRAC_FIR_12[(11 - ti) * 4 + c];
+            c += 1;
+        }
+        ti += 1;
+    }
+    t
+};
+
+/// The fractional-delay interpolation of `silk_resampler_private_IIR_FIR`: one output per
+/// `inc` step of the Q16 position below `max_index_q16` in the 2x upsampled `buf`. Returns the
+/// number of outputs.
+pub(super) fn fir_interpol(out: &mut [i16], buf: &[i16], max_index_q16: i32, inc: i32) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        let n_in = (max_index_q16 >> 17) as usize;
+        if inc == 43691 && n_in <= 160 && max_index_q16 == (n_in as i32) << 17 {
+            // Safety: avx2() is true only when the CPU supports AVX2.
+            return unsafe { super::simd::fir_interpol_3x_avx2(out, buf, n_in) };
+        }
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd::fir_interpol_avx2(out, buf, max_index_q16, inc) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd::fir_interpol_neon(out, buf, max_index_q16, inc) };
+    }
+    fir_interpol_scalar(out, buf, max_index_q16, inc, 0, 0)
+}
+
+/// Scalar reference of [`fir_interpol`], starting at position `index_q16` and output `o`.
+pub fn fir_interpol_scalar(
+    out: &mut [i16],
+    buf: &[i16],
+    max_index_q16: i32,
+    inc: i32,
+    mut index_q16: i32,
+    mut o: usize,
+) -> usize {
+    while index_q16 < max_index_q16 {
+        let ti = smulwb(index_q16 & 0xffff, 12) as usize;
+        let i0 = (index_q16 >> 16) as usize;
+        let res = buf[i0..i0 + 8]
+            .iter()
+            .zip(&FIR_12_TAPS[ti])
+            .fold(0i32, |acc, (&x, &c)| smlabb(acc, x as i32, c as i32));
+        out[o] = sat16(rshift_round(res, 15)) as i16;
+        o += 1;
+        index_q16 += inc;
+    }
+    o
+}
+
 const UP2_HQ_0: [i32; 3] = [1746, 14986, 39083 - 65536];
 const UP2_HQ_1: [i32; 3] = [6854, 25769, 55542 - 65536];
 
+/// `silk_resampler_private_up2_HQ`: `out` must hold `2 * input.len()` samples.
 fn up2_hq(s: &mut [i32; 6], out: &mut [i16], input: &[i16]) {
-    for (k, &x) in input.iter().enumerate() {
+    let mut st = *s;
+    // One allpass section; the state update is the recursion.
+    let section = |st: &mut i32, x: i32, c: i32, wide: bool| {
+        let y = x - *st;
+        let xx = if wide { smlawb(y, y, c) } else { smulwb(y, c) };
+        let o = *st + xx;
+        *st = x + xx;
+        o
+    };
+    for (o, &x) in out[..2 * input.len()]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(input)
+    {
         let in32 = (x as i32) << 10;
-        let y = in32 - s[0];
-        let xx = smulwb(y, UP2_HQ_0[0]);
-        let out32_1 = s[0] + xx;
-        s[0] = in32 + xx;
-        let y = out32_1 - s[1];
-        let xx = smulwb(y, UP2_HQ_0[1]);
-        let out32_2 = s[1] + xx;
-        s[1] = out32_1 + xx;
-        let y = out32_2 - s[2];
-        let xx = smlawb(y, y, UP2_HQ_0[2]);
-        let out32_1 = s[2] + xx;
-        s[2] = out32_2 + xx;
-        out[2 * k] = sat16(rshift_round(out32_1, 10)) as i16;
-
-        let y = in32 - s[3];
-        let xx = smulwb(y, UP2_HQ_1[0]);
-        let out32_1 = s[3] + xx;
-        s[3] = in32 + xx;
-        let y = out32_1 - s[4];
-        let xx = smulwb(y, UP2_HQ_1[1]);
-        let out32_2 = s[4] + xx;
-        s[4] = out32_1 + xx;
-        let y = out32_2 - s[5];
-        let xx = smlawb(y, y, UP2_HQ_1[2]);
-        let out32_1 = s[5] + xx;
-        s[5] = out32_2 + xx;
-        out[2 * k + 1] = sat16(rshift_round(out32_1, 10)) as i16;
+        let a = section(&mut st[0], in32, UP2_HQ_0[0], false);
+        let a = section(&mut st[1], a, UP2_HQ_0[1], false);
+        let a = section(&mut st[2], a, UP2_HQ_0[2], true);
+        let b = section(&mut st[3], in32, UP2_HQ_1[0], false);
+        let b = section(&mut st[4], b, UP2_HQ_1[1], false);
+        let b = section(&mut st[5], b, UP2_HQ_1[2], true);
+        o[0] = sat16(rshift_round(a, 10)) as i16;
+        o[1] = sat16(rshift_round(b, 10)) as i16;
     }
+    *s = st;
 }
 
 fn ar2(s: &mut [i32; 6], out_q8: &mut [i32], input: &[i16], a_q14: &[i16]) {

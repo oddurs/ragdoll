@@ -66,6 +66,11 @@ pub struct CeltDecoder {
     postfilter_tapset_old: usize,
     preemph_mem: [i32; 2],
     decode_mem: Vec<i32>,
+    /// Per-frame working memory, kept to spare clearing it every frame: the normalised
+    /// coefficients (`2 * 960`) then the folding spectrum (`2 * 8 * 78`).
+    scratch: Vec<i16>,
+    /// The denormalised spectrum of each channel (`2 * 960`).
+    freq_scratch: Vec<i32>,
     lpc: [i16; 2 * LPC_ORDER],
     old_band_e: [i16; 2 * NB_EBANDS],
     old_log_e: [i16; 2 * NB_EBANDS],
@@ -108,6 +113,8 @@ impl CeltDecoder {
             postfilter_tapset_old: 0,
             preemph_mem: [0; 2],
             decode_mem: vec![0; channels * STRIDE],
+            scratch: vec![0; 2 * 960 + 2 * 8 * 78],
+            freq_scratch: vec![0; 2 * 960],
             lpc: [0; 2 * LPC_ORDER],
             old_band_e: [0; 2 * NB_EBANDS],
             old_log_e: [0; 2 * NB_EBANDS],
@@ -309,15 +316,19 @@ impl CeltDecoder {
             self.decode_mem
                 .copy_within(o + n..o + DECODE_BUFFER_SIZE + OVERLAP / 2, o);
         }
-        let mut collapse_masks = vec![0u8; c * NB_EBANDS];
-        let mut x = vec![0i16; c * n];
+        let mut collapse_masks = [0u8; 2 * NB_EBANDS];
+        let collapse_masks = &mut collapse_masks[..c * NB_EBANDS];
+        // Every value read below is written first, so the scratch need not be cleared.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let (x, norm) = scratch.split_at_mut(2 * 960);
+        let x = &mut x[..c * n];
         quant_all_bands(
             AllBands {
                 complexity: 0,
                 encode: false,
                 start,
                 end,
-                collapse_masks: &mut collapse_masks,
+                collapse_masks,
                 band_e: &[],
                 pulses: &pulses,
                 short_blocks,
@@ -330,8 +341,9 @@ impl CeltDecoder {
                 lm,
                 coded_bands: alloc.coded_bands,
                 disable_inv: self.disable_inv,
+                norm,
             },
-            &mut x,
+            x,
             c,
             dec,
             &mut self.rng,
@@ -352,8 +364,8 @@ impl CeltDecoder {
         );
         if anti_collapse_on {
             anti_collapse(
-                &mut x,
-                &collapse_masks,
+                x,
+                collapse_masks,
                 lm,
                 c,
                 n,
@@ -371,7 +383,8 @@ impl CeltDecoder {
                 *v = -(28 << DB_SHIFT);
             }
         }
-        self.synthesis(&x, start, eff_end, c, is_transient, lm, silence);
+        self.synthesis(x, start, eff_end, c, is_transient, lm, silence);
+        self.scratch = scratch;
         for ch in 0..cc {
             self.postfilter_period = self.postfilter_period.max(COMBFILTER_MINPERIOD);
             self.postfilter_period_old = self.postfilter_period_old.max(COMBFILTER_MINPERIOD);
@@ -485,7 +498,9 @@ impl CeltDecoder {
             (1, n, (MAX_LM - lm) as usize)
         };
         let ds = self.downsample;
-        let mut freq = vec![0i32; n];
+        let mut fs = std::mem::take(&mut self.freq_scratch);
+        let (freq, freq2) = fs.split_at_mut(960);
+        let freq = &mut freq[..n];
         let out_base = DECODE_BUFFER_SIZE - n;
         let backward = |mem: &mut [i32], ch: usize, f: &[i32]| {
             for b in 0..b_cnt {
@@ -501,34 +516,15 @@ impl CeltDecoder {
             }
         };
         if cc == 2 && c == 1 {
-            denormalise_bands(
-                x,
-                &mut freq,
-                &self.old_band_e,
-                start,
-                eff_end,
-                m,
-                ds,
-                silence,
-            );
-            let freq2 = freq.clone();
-            backward(&mut self.decode_mem, 0, &freq2);
-            backward(&mut self.decode_mem, 1, &freq);
+            denormalise_bands(x, freq, &self.old_band_e, start, eff_end, m, ds, silence);
+            backward(&mut self.decode_mem, 0, freq);
+            backward(&mut self.decode_mem, 1, freq);
         } else if cc == 1 && c == 2 {
-            let mut freq2 = vec![0i32; n];
-            denormalise_bands(
-                x,
-                &mut freq,
-                &self.old_band_e,
-                start,
-                eff_end,
-                m,
-                ds,
-                silence,
-            );
+            let freq2 = &mut freq2[..n];
+            denormalise_bands(x, freq, &self.old_band_e, start, eff_end, m, ds, silence);
             denormalise_bands(
                 &x[n..],
-                &mut freq2,
+                freq2,
                 &self.old_band_e[NB_EBANDS..],
                 start,
                 eff_end,
@@ -539,12 +535,12 @@ impl CeltDecoder {
             for i in 0..n {
                 freq[i] = (freq[i] >> 1).wrapping_add(freq2[i] >> 1);
             }
-            backward(&mut self.decode_mem, 0, &freq);
+            backward(&mut self.decode_mem, 0, freq);
         } else {
             for ch in 0..cc {
                 denormalise_bands(
                     &x[ch * n..],
-                    &mut freq,
+                    freq,
                     &self.old_band_e[ch * NB_EBANDS..],
                     start,
                     eff_end,
@@ -552,15 +548,14 @@ impl CeltDecoder {
                     ds,
                     silence,
                 );
-                backward(&mut self.decode_mem, ch, &freq);
+                backward(&mut self.decode_mem, ch, freq);
             }
         }
         for ch in 0..cc {
             let o = ch * STRIDE + out_base;
-            for v in self.decode_mem[o..o + n].iter_mut() {
-                *v = saturate(*v, SIG_SAT);
-            }
+            saturate_slice(&mut self.decode_mem[o..o + n]);
         }
+        self.freq_scratch = fs;
     }
 
     /// `deemphasis`: de-emphasis, downsampling and conversion to 16-bit `pcm` of the last `n`
@@ -569,35 +564,70 @@ impl CeltDecoder {
         let cc = self.channels;
         let ds = self.downsample;
         let nd = n / ds;
-        let mut scratch = vec![0i32; n];
+        let mem = &self.decode_mem;
+        let x = |ch: usize| {
+            &mem[ch * STRIDE + DECODE_BUFFER_SIZE - n..ch * STRIDE + DECODE_BUFFER_SIZE]
+        };
+        let step = |mm: &mut i32, v: i32| {
+            let tmp = v.wrapping_add(*mm);
+            *mm = mul16_32_q15(PREEMPH, tmp);
+            tmp
+        };
+        if cc == 2 && ds == 1 && !accum {
+            // The common case: both channels at once so their recurrences overlap, with the
+            // conversion to 16 bits (off the recurrence) done a block at a time.
+            const BLOCK: usize = 64;
+            let [mut m0, mut m1] = self.preemph_mem;
+            let mut tmp = [0i32; 2 * BLOCK];
+            for ((o, a), b) in pcm[..2 * n]
+                .chunks_mut(2 * BLOCK)
+                .zip(x(0).chunks(BLOCK))
+                .zip(x(1).chunks(BLOCK))
+            {
+                let t = &mut tmp[..o.len()];
+                // The sums stay in 32 bits in practice (|x| <= SIG_SAT keeps them below
+                // 2.1e9), so the recurrence runs in 64 bits without the sign extension on its
+                // chain, checking each sum; one that wraps leaves for the exact loop.
+                let (mut f0, mut f1) = (m0 as i64, m1 as i64);
+                let mut k = 0;
+                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b) {
+                    let (s0, s1) = (a as i64 + f0, b as i64 + f1);
+                    if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
+                        break;
+                    }
+                    t[0] = s0 as i32;
+                    t[1] = s1 as i32;
+                    f0 = (PREEMPH as i64 * s0) >> 15;
+                    f1 = (PREEMPH as i64 * s1) >> 15;
+                    k += 1;
+                }
+                (m0, m1) = (f0 as i32, f1 as i32);
+                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b).skip(k) {
+                    t[0] = step(&mut m0, a);
+                    t[1] = step(&mut m1, b);
+                }
+                sig2word16_slice(o, t);
+            }
+            self.preemph_mem = [m0, m1];
+            return;
+        }
         for ch in 0..cc {
-            let x = ch * STRIDE + DECODE_BUFFER_SIZE - n;
             let mut mm = self.preemph_mem[ch];
-            if ds > 1 {
-                for j in 0..n {
-                    let tmp = self.decode_mem[x + j].wrapping_add(mm);
-                    mm = mul16_32_q15(PREEMPH, tmp);
-                    scratch[j] = tmp;
+            let out = pcm[ch..].iter_mut().step_by(cc).take(nd);
+            for (o, xs) in out.zip(x(ch).chunks_exact(ds)) {
+                // Only every ds-th sample is kept, but the filter runs on all of them.
+                let v = sig2word16(step(&mut mm, xs[0]));
+                for &xv in &xs[1..] {
+                    step(&mut mm, xv);
                 }
-                for j in 0..nd {
-                    let v = sig2word16(scratch[j * ds]);
-                    pcm[j * cc + ch] = if accum {
-                        sat16(pcm[j * cc + ch] as i32 + v as i32)
-                    } else {
-                        v
-                    };
-                }
-            } else {
-                for j in 0..n {
-                    let tmp = self.decode_mem[x + j].wrapping_add(mm);
-                    mm = mul16_32_q15(PREEMPH, tmp);
-                    let v = sig2word16(tmp);
-                    pcm[j * cc + ch] = if accum {
-                        sat16(pcm[j * cc + ch] as i32 + v as i32)
-                    } else {
-                        v
-                    };
-                }
+                *o = if accum {
+                    sat16(*o as i32 + v as i32)
+                } else {
+                    v
+                };
+            }
+            for &xv in &x(ch)[nd * ds..] {
+                step(&mut mm, xv);
             }
             self.preemph_mem[ch] = mm;
         }
@@ -825,6 +855,38 @@ impl CeltDecoder {
             }
         }
         self.loss_count = loss_count + 1;
+    }
+}
+
+/// `SATURATE(x, SIG_SAT)` in place.
+pub(super) fn saturate_slice(x: &mut [i32]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::saturate_avx2(x, SIG_SAT) };
+        return;
+    }
+    for v in x.iter_mut() {
+        *v = saturate(*v, SIG_SAT);
+    }
+}
+
+/// `out[i] = SIG2WORD16(x[i])`.
+pub(super) fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::sig2word16_avx2(out, x) };
+        sig2word16_slice_scalar(&mut out[done..], &x[done..]);
+        return;
+    }
+    sig2word16_slice_scalar(out, x);
+}
+
+/// Scalar reference of [`sig2word16_slice`].
+pub fn sig2word16_slice_scalar(out: &mut [i16], x: &[i32]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = sig2word16(v);
     }
 }
 

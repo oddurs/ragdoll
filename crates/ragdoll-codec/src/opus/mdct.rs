@@ -1,5 +1,9 @@
 //! Fixed-point mixed-radix FFT and MDCT of CELT (libopus `kiss_fft.c`, `mdct.c`), for the four
 //! transform sizes of the 48 kHz mode (N = 1920, 960, 480, 240).
+//!
+//! The FFT works in place on interleaved `(r, i)` pairs of `i32`, so the MDCT runs it directly
+//! on its output buffer as libopus does. Its butterflies have AVX2 and NEON versions in
+//! [`super::simd`], bit-exact with the scalar ones here.
 
 use super::celt_tables::{
     FFT_BITREV60, FFT_BITREV120, FFT_BITREV240, FFT_BITREV480, FFT_TWIDDLES, MDCT_TWIDDLES,
@@ -52,9 +56,68 @@ pub static FFT_STATES: [FftState; 4] = [
     },
 ];
 
+/// One radix pass of `opus_fft_impl`: `n` groups `mm` apart of `p` interleaved sub-transforms
+/// of length `m`, with twiddle stride `fstride` into [`FFT_TWIDDLES`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stage {
+    pub p: usize,
+    pub m: usize,
+    pub n: usize,
+    pub mm: usize,
+    pub fstride: usize,
+}
+
+/// The radix passes of `st` in execution order.
+pub fn fft_stages(st: &FftState) -> ([Stage; 5], usize) {
+    let shift = st.shift.max(0) as usize;
+    let mut fstride = [0usize; 8];
+    fstride[0] = 1;
+    let mut l = 0usize;
+    loop {
+        let p = st.factors[2 * l] as usize;
+        let m = st.factors[2 * l + 1];
+        fstride[l + 1] = fstride[l] * p;
+        l += 1;
+        if m == 1 {
+            break;
+        }
+    }
+    let mut stages = [Stage::default(); 5];
+    let mut m = st.factors[2 * l - 1] as usize;
+    for (k, i) in (0..l).rev().enumerate() {
+        let m2 = if i != 0 {
+            st.factors[2 * i - 1] as usize
+        } else {
+            1
+        };
+        stages[k] = Stage {
+            p: st.factors[2 * i] as usize,
+            m,
+            n: fstride[i],
+            mm: m2,
+            fstride: fstride[i] << shift,
+        };
+        m = m2;
+    }
+    (stages, l)
+}
+
 #[inline(always)]
 fn smul(a: i32, b: i32) -> i32 {
     mul16_32_q15(b, a)
+}
+
+#[inline(always)]
+fn ld(f: &[[i32; 2]], k: usize) -> Cpx {
+    Cpx {
+        r: f[k][0],
+        i: f[k][1],
+    }
+}
+
+#[inline(always)]
+fn st(f: &mut [[i32; 2]], k: usize, c: Cpx) {
+    f[k] = [c.r, c.i];
 }
 
 #[inline(always)]
@@ -82,55 +145,72 @@ fn csub(a: Cpx, b: Cpx) -> Cpx {
     }
 }
 
-fn bfly2(f: &mut [Cpx], m: usize, n: usize) {
+pub(super) fn bfly2(f: &mut [[i32; 2]], m: usize, n: usize) {
     debug_assert_eq!(m, 4);
     let tw = 23170; // QCONST16(0.7071067812, 15)
     for i in 0..n {
         let base = i * 8;
         let (a, b) = f[base..base + 8].split_at_mut(4);
-        let t = b[0];
-        b[0] = csub(a[0], t);
-        a[0] = cadd(a[0], t);
+        let t = ld(b, 0);
+        st(b, 0, csub(ld(a, 0), t));
+        st(a, 0, cadd(ld(a, 0), t));
+        let b1 = ld(b, 1);
         let t = Cpx {
-            r: smul(b[1].r.wrapping_add(b[1].i), tw),
-            i: smul(b[1].i.wrapping_sub(b[1].r), tw),
+            r: smul(b1.r.wrapping_add(b1.i), tw),
+            i: smul(b1.i.wrapping_sub(b1.r), tw),
         };
-        b[1] = csub(a[1], t);
-        a[1] = cadd(a[1], t);
+        st(b, 1, csub(ld(a, 1), t));
+        st(a, 1, cadd(ld(a, 1), t));
+        let b2 = ld(b, 2);
         let t = Cpx {
-            r: b[2].i,
-            i: b[2].r.wrapping_neg(),
+            r: b2.i,
+            i: b2.r.wrapping_neg(),
         };
-        b[2] = csub(a[2], t);
-        a[2] = cadd(a[2], t);
+        st(b, 2, csub(ld(a, 2), t));
+        st(a, 2, cadd(ld(a, 2), t));
+        let b3 = ld(b, 3);
         let t = Cpx {
-            r: smul(b[3].i.wrapping_sub(b[3].r), tw),
-            i: smul(b[3].i.wrapping_add(b[3].r).wrapping_neg(), tw),
+            r: smul(b3.i.wrapping_sub(b3.r), tw),
+            i: smul(b3.i.wrapping_add(b3.r).wrapping_neg(), tw),
         };
-        b[3] = csub(a[3], t);
-        a[3] = cadd(a[3], t);
+        st(b, 3, csub(ld(a, 3), t));
+        st(a, 3, cadd(ld(a, 3), t));
     }
 }
 
-fn bfly4(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
-    if m == 1 {
-        for i in 0..n {
-            let o = i * 4;
-            let scratch0 = csub(f[o], f[o + 2]);
-            f[o] = cadd(f[o], f[o + 2]);
-            let mut scratch1 = cadd(f[o + 1], f[o + 3]);
-            f[o + 2] = csub(f[o], scratch1);
-            f[o] = cadd(f[o], scratch1);
-            scratch1 = csub(f[o + 1], f[o + 3]);
-            f[o + 1] = Cpx {
+/// The first radix-4 pass (`m == 1`), which needs no twiddles.
+pub(super) fn bfly4_m1(f: &mut [[i32; 2]], n: usize) {
+    for i in 0..n {
+        let o = i * 4;
+        let (f0, f1, f2, f3) = (ld(f, o), ld(f, o + 1), ld(f, o + 2), ld(f, o + 3));
+        let scratch0 = csub(f0, f2);
+        let f0 = cadd(f0, f2);
+        let scratch1 = cadd(f1, f3);
+        st(f, o + 2, csub(f0, scratch1));
+        st(f, o, cadd(f0, scratch1));
+        let scratch1 = csub(f1, f3);
+        st(
+            f,
+            o + 1,
+            Cpx {
                 r: scratch0.r.wrapping_add(scratch1.i),
                 i: scratch0.i.wrapping_sub(scratch1.r),
-            };
-            f[o + 3] = Cpx {
+            },
+        );
+        st(
+            f,
+            o + 3,
+            Cpx {
                 r: scratch0.r.wrapping_sub(scratch1.i),
                 i: scratch0.i.wrapping_add(scratch1.r),
-            };
-        }
+            },
+        );
+    }
+}
+
+fn bfly4(f: &mut [[i32; 2]], fstride: usize, m: usize, n: usize, mm: usize) {
+    if m == 1 {
+        bfly4_m1(f, n);
         return;
     }
     let (m2, m3) = (2 * m, 3 * m);
@@ -138,60 +218,78 @@ fn bfly4(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
         let base = i * mm;
         for j in 0..m {
             let o = base + j;
-            let s0 = cmul(f[o + m], FFT_TWIDDLES[j * fstride]);
-            let s1 = cmul(f[o + m2], FFT_TWIDDLES[j * fstride * 2]);
-            let s2 = cmul(f[o + m3], FFT_TWIDDLES[j * fstride * 3]);
-            let s5 = csub(f[o], s1);
-            f[o] = cadd(f[o], s1);
+            let s0 = cmul(ld(f, o + m), FFT_TWIDDLES[j * fstride]);
+            let s1 = cmul(ld(f, o + m2), FFT_TWIDDLES[j * fstride * 2]);
+            let s2 = cmul(ld(f, o + m3), FFT_TWIDDLES[j * fstride * 3]);
+            let f0 = ld(f, o);
+            let s5 = csub(f0, s1);
+            let f0 = cadd(f0, s1);
             let s3 = cadd(s0, s2);
             let s4 = csub(s0, s2);
-            f[o + m2] = csub(f[o], s3);
-            f[o] = cadd(f[o], s3);
-            f[o + m] = Cpx {
-                r: s5.r.wrapping_add(s4.i),
-                i: s5.i.wrapping_sub(s4.r),
-            };
-            f[o + m3] = Cpx {
-                r: s5.r.wrapping_sub(s4.i),
-                i: s5.i.wrapping_add(s4.r),
-            };
+            st(f, o + m2, csub(f0, s3));
+            st(f, o, cadd(f0, s3));
+            st(
+                f,
+                o + m,
+                Cpx {
+                    r: s5.r.wrapping_add(s4.i),
+                    i: s5.i.wrapping_sub(s4.r),
+                },
+            );
+            st(
+                f,
+                o + m3,
+                Cpx {
+                    r: s5.r.wrapping_sub(s4.i),
+                    i: s5.i.wrapping_add(s4.r),
+                },
+            );
         }
     }
 }
 
-fn bfly3(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
+fn bfly3(f: &mut [[i32; 2]], fstride: usize, m: usize, n: usize, mm: usize) {
     let m2 = 2 * m;
     let epi3_i: i32 = -28378;
     for i in 0..n {
         let base = i * mm;
         for k in 0..m {
             let o = base + k;
-            let s1 = cmul(f[o + m], FFT_TWIDDLES[k * fstride]);
-            let s2 = cmul(f[o + m2], FFT_TWIDDLES[k * fstride * 2]);
+            let s1 = cmul(ld(f, o + m), FFT_TWIDDLES[k * fstride]);
+            let s2 = cmul(ld(f, o + m2), FFT_TWIDDLES[k * fstride * 2]);
             let s3 = cadd(s1, s2);
-            let mut s0 = csub(s1, s2);
-            f[o + m] = Cpx {
-                r: f[o].r.wrapping_sub(s3.r >> 1),
-                i: f[o].i.wrapping_sub(s3.i >> 1),
+            let s0 = csub(s1, s2);
+            let f0 = ld(f, o);
+            let fm = Cpx {
+                r: f0.r.wrapping_sub(s3.r >> 1),
+                i: f0.i.wrapping_sub(s3.i >> 1),
             };
-            s0 = Cpx {
+            let s0 = Cpx {
                 r: smul(s0.r, epi3_i),
                 i: smul(s0.i, epi3_i),
             };
-            f[o] = cadd(f[o], s3);
-            f[o + m2] = Cpx {
-                r: f[o + m].r.wrapping_add(s0.i),
-                i: f[o + m].i.wrapping_sub(s0.r),
-            };
-            f[o + m] = Cpx {
-                r: f[o + m].r.wrapping_sub(s0.i),
-                i: f[o + m].i.wrapping_add(s0.r),
-            };
+            st(f, o, cadd(f0, s3));
+            st(
+                f,
+                o + m2,
+                Cpx {
+                    r: fm.r.wrapping_add(s0.i),
+                    i: fm.i.wrapping_sub(s0.r),
+                },
+            );
+            st(
+                f,
+                o + m,
+                Cpx {
+                    r: fm.r.wrapping_sub(s0.i),
+                    i: fm.i.wrapping_add(s0.r),
+                },
+            );
         }
     }
 }
 
-fn bfly5(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
+fn bfly5(f: &mut [[i32; 2]], fstride: usize, m: usize, n: usize, mm: usize) {
     let (yar, yai) = (10126i32, -31164i32);
     let (ybr, ybi) = (-26510i32, -19261i32);
     for i in 0..n {
@@ -204,19 +302,23 @@ fn bfly5(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
                 base + u + 3 * m,
                 base + u + 4 * m,
             );
-            let s0 = f[o0];
-            let s1 = cmul(f[o1], FFT_TWIDDLES[u * fstride]);
-            let s2 = cmul(f[o2], FFT_TWIDDLES[2 * u * fstride]);
-            let s3 = cmul(f[o3], FFT_TWIDDLES[3 * u * fstride]);
-            let s4 = cmul(f[o4], FFT_TWIDDLES[4 * u * fstride]);
+            let s0 = ld(f, o0);
+            let s1 = cmul(ld(f, o1), FFT_TWIDDLES[u * fstride]);
+            let s2 = cmul(ld(f, o2), FFT_TWIDDLES[2 * u * fstride]);
+            let s3 = cmul(ld(f, o3), FFT_TWIDDLES[3 * u * fstride]);
+            let s4 = cmul(ld(f, o4), FFT_TWIDDLES[4 * u * fstride]);
             let s7 = cadd(s1, s4);
             let s10 = csub(s1, s4);
             let s8 = cadd(s2, s3);
             let s9 = csub(s2, s3);
-            f[o0] = Cpx {
-                r: f[o0].r.wrapping_add(s7.r.wrapping_add(s8.r)),
-                i: f[o0].i.wrapping_add(s7.i.wrapping_add(s8.i)),
-            };
+            st(
+                f,
+                o0,
+                Cpx {
+                    r: s0.r.wrapping_add(s7.r.wrapping_add(s8.r)),
+                    i: s0.i.wrapping_add(s7.i.wrapping_add(s8.i)),
+                },
+            );
             let s5 = Cpx {
                 r: s0
                     .r
@@ -231,8 +333,8 @@ fn bfly5(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
                     .wrapping_add(smul(s9.r, ybi))
                     .wrapping_neg(),
             };
-            f[o1] = csub(s5, s6);
-            f[o4] = cadd(s5, s6);
+            st(f, o1, csub(s5, s6));
+            st(f, o4, cadd(s5, s6));
             let s11 = Cpx {
                 r: s0
                     .r
@@ -245,42 +347,43 @@ fn bfly5(f: &mut [Cpx], fstride: usize, m: usize, n: usize, mm: usize) {
                 r: smul(s9.i, yai).wrapping_sub(smul(s10.i, ybi)),
                 i: smul(s10.r, ybi).wrapping_sub(smul(s9.r, yai)),
             };
-            f[o2] = cadd(s11, s12);
-            f[o3] = csub(s11, s12);
+            st(f, o2, cadd(s11, s12));
+            st(f, o3, csub(s11, s12));
         }
     }
 }
 
-/// `opus_fft_impl`: in-place FFT of bit-reversed input.
-pub fn fft_impl(st: &FftState, f: &mut [Cpx]) {
-    let shift = st.shift.max(0) as usize;
-    let mut fstride = [0usize; 8];
-    fstride[0] = 1;
-    let mut l = 0usize;
-    loop {
-        let p = st.factors[2 * l] as usize;
-        let m = st.factors[2 * l + 1];
-        fstride[l + 1] = fstride[l] * p;
-        l += 1;
-        if m == 1 {
-            break;
-        }
+/// `opus_fft_impl`: in-place FFT of the bit-reversed interleaved `(r, i)` pairs in
+/// `f[..2 * nfft]`.
+pub fn fft_impl(st: &FftState, f: &mut [i32]) {
+    let f = &mut f[..2 * st.bitrev.len()];
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::fft_avx2(st, f) };
+        return;
     }
-    let mut m = st.factors[2 * l - 1] as usize;
-    for i in (0..l).rev() {
-        let m2 = if i != 0 {
-            st.factors[2 * i - 1] as usize
-        } else {
-            1
-        };
-        match st.factors[2 * i] {
-            2 => bfly2(f, m, fstride[i]),
-            4 => bfly4(f, fstride[i] << shift, m, fstride[i], m2),
-            3 => bfly3(f, fstride[i] << shift, m, fstride[i], m2),
-            5 => bfly5(f, fstride[i] << shift, m, fstride[i], m2),
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        unsafe { super::simd::fft_neon(st, f) };
+        return;
+    }
+    fft_impl_scalar(st, f);
+}
+
+/// Scalar reference of [`fft_impl`].
+pub fn fft_impl_scalar(st: &FftState, f: &mut [i32]) {
+    let f = f[..2 * st.bitrev.len()].as_chunks_mut::<2>().0;
+    let (stages, l) = fft_stages(st);
+    for s in &stages[..l] {
+        match s.p {
+            2 => bfly2(f, s.m, s.n),
+            4 => bfly4(f, s.fstride, s.m, s.n, s.mm),
+            3 => bfly3(f, s.fstride, s.m, s.n, s.mm),
+            5 => bfly5(f, s.fstride, s.m, s.n, s.mm),
             _ => unreachable!(),
         }
-        m = m2;
     }
 }
 
@@ -307,67 +410,119 @@ pub fn mdct_backward(
 ) {
     let (t, n) = trig(shift);
     let n2 = n >> 1;
-    let n4 = n >> 2;
     let st = &FFT_STATES[shift];
     let yo = overlap >> 1;
-    {
-        // Pre-rotation, writing bit-reversed complex values into out[yo..].
-        let mut xp1 = 0usize;
-        let mut xp2 = stride * (n2 - 1);
-        for i in 0..n4 {
-            let rev = st.bitrev[i] as usize;
-            let (x1, x2) = (input[xp1], input[xp2]);
-            let yr = smul(x2, t[i] as i32).wrapping_add(smul(x1, t[n4 + i] as i32));
-            let yi = smul(x1, t[i] as i32).wrapping_sub(smul(x2, t[n4 + i] as i32));
-            out[yo + 2 * rev + 1] = yr;
-            out[yo + 2 * rev] = yi;
-            xp1 += 2 * stride;
-            xp2 = xp2.wrapping_sub(2 * stride);
-        }
+    let t = &t[..n2];
+    pre_rotate(
+        &input[..stride * (n2 - 1) + 1],
+        &mut out[yo..yo + n2],
+        t,
+        st.bitrev,
+        stride,
+    );
+    fft_impl(st, &mut out[yo..yo + n2]);
+    post_rotate(&mut out[yo..yo + n2], t);
+    tdac_mirror(&mut out[..overlap], &window[..overlap]);
+}
+
+/// The TDAC mirroring at the start of the inverse MDCT output: `out` and `window` hold
+/// `overlap` values, folded about the middle.
+pub(super) fn tdac_mirror(out: &mut [i32], window: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::tdac_mirror_avx2(out, window) };
+        tdac_mirror_scalar(out, window, done);
+        return;
     }
-    {
-        let mut buf: Vec<Cpx> = (0..n4)
-            .map(|k| Cpx {
-                r: out[yo + 2 * k],
-                i: out[yo + 2 * k + 1],
-            })
-            .collect();
-        fft_impl(st, &mut buf);
-        for (k, c) in buf.iter().enumerate() {
-            out[yo + 2 * k] = c.r;
-            out[yo + 2 * k + 1] = c.i;
-        }
+    tdac_mirror_scalar(out, window, 0);
+}
+
+/// Scalar reference of [`tdac_mirror`], from pair `i0` on.
+pub fn tdac_mirror_scalar(out: &mut [i32], window: &[i16], i0: usize) {
+    let overlap = out.len();
+    let (lo, hi) = out.split_at_mut(overlap / 2);
+    let (wlo, whi) = window[..overlap].split_at(overlap / 2);
+    for (i, (x2, x1)) in lo.iter_mut().zip(hi.iter_mut().rev()).enumerate().skip(i0) {
+        let (w1, w2) = (wlo[i] as i32, whi[overlap / 2 - 1 - i] as i32);
+        let (v1, v2) = (*x1, *x2);
+        *x2 = mul16_32_q15(w2, v2).wrapping_sub(mul16_32_q15(w1, v1));
+        *x1 = mul16_32_q15(w1, v2).wrapping_add(mul16_32_q15(w2, v1));
     }
-    {
-        // Post-rotation and de-shuffling, in place from both ends.
-        let mut yp0 = yo;
-        let mut yp1 = yo + n2 - 2;
-        for i in 0..(n4 + 1) >> 1 {
-            let (re, im) = (out[yp0 + 1], out[yp0]);
-            let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
-            let yr = smul(re, t0).wrapping_add(smul(im, t1));
-            let yi = smul(re, t1).wrapping_sub(smul(im, t0));
-            let (re, im) = (out[yp1 + 1], out[yp1]);
-            out[yp0] = yr;
-            out[yp1 + 1] = yi;
-            let (t0, t1) = (t[n4 - i - 1] as i32, t[n2 - i - 1] as i32);
-            let yr = smul(re, t0).wrapping_add(smul(im, t1));
-            let yi = smul(re, t1).wrapping_sub(smul(im, t0));
-            out[yp1] = yr;
-            out[yp0 + 1] = yi;
-            yp0 += 2;
-            yp1 = yp1.wrapping_sub(2);
-        }
+}
+
+/// Pre-rotation of the inverse MDCT: the `stride`-interleaved coefficients `x` (`n2` of them)
+/// rotated into the bit-reversed complex values `y` (`n2` values) the FFT takes.
+pub(super) fn pre_rotate(x: &[i32], y: &mut [i32], t: &[i16], bitrev: &[i16], stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::pre_rotate_avx2(x, y, t, bitrev, stride) };
+        return;
     }
-    // Mirror on both sides for TDAC.
-    for i in 0..overlap / 2 {
-        let xp1 = overlap - 1 - i;
-        let (w1, w2) = (window[i] as i32, window[overlap - 1 - i] as i32);
-        let x1 = out[xp1];
-        let x2 = out[i];
-        out[i] = mul16_32_q15(w2, x2).wrapping_sub(mul16_32_q15(w1, x1));
-        out[xp1] = mul16_32_q15(w1, x2).wrapping_add(mul16_32_q15(w2, x1));
+    pre_rotate_scalar(x, y, t, bitrev, stride, 0);
+}
+
+/// Scalar reference of [`pre_rotate`], from step `i0` on.
+pub fn pre_rotate_scalar(
+    x: &[i32],
+    y: &mut [i32],
+    t: &[i16],
+    bitrev: &[i16],
+    stride: usize,
+    i0: usize,
+) {
+    let n2 = y.len();
+    let n4 = n2 >> 1;
+    let (t0, t1) = t[..n2].split_at(n4);
+    for (i, &rev) in bitrev[..n4].iter().enumerate().skip(i0) {
+        let rev = rev as usize;
+        let (x1, x2) = (x[2 * stride * i], x[stride * (n2 - 1 - 2 * i)]);
+        let yr = smul(x2, t0[i] as i32).wrapping_add(smul(x1, t1[i] as i32));
+        let yi = smul(x1, t0[i] as i32).wrapping_sub(smul(x2, t1[i] as i32));
+        // Real and imaginary parts swap because an FFT stands in for the IFFT.
+        y[2 * rev + 1] = yr;
+        y[2 * rev] = yi;
     }
+}
+
+/// Post-rotation and de-shuffling of the FFT output `y` (`n2` values), in place from both ends.
+pub(super) fn post_rotate(y: &mut [i32], t: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { super::simd::post_rotate_avx2(y, t) };
+        return;
+    }
+    post_rotate_scalar(y, t);
+}
+
+/// Scalar reference of the MDCT post-rotation.
+pub fn post_rotate_scalar(y: &mut [i32], t: &[i16]) {
+    for i in 0..(y.len() / 2 + 1) >> 1 {
+        post_rotate_one(y, t, i);
+    }
+}
+
+/// Step `i` of the post-rotation: the pairs `i` from the front and from the back.
+#[inline(always)]
+pub(super) fn post_rotate_one(y: &mut [i32], t: &[i16], i: usize) {
+    let n2 = y.len();
+    let n4 = n2 >> 1;
+    let yp0 = 2 * i;
+    let yp1 = n2 - 2 - 2 * i;
+    let (re, im) = (y[yp0 + 1], y[yp0]);
+    let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
+    let yr = smul(re, t0).wrapping_add(smul(im, t1));
+    let yi = smul(re, t1).wrapping_sub(smul(im, t0));
+    let (re, im) = (y[yp1 + 1], y[yp1]);
+    y[yp0] = yr;
+    y[yp1 + 1] = yi;
+    let (t0, t1) = (t[n4 - i - 1] as i32, t[n2 - i - 1] as i32);
+    let yr = smul(re, t0).wrapping_add(smul(im, t1));
+    let yi = smul(re, t1).wrapping_sub(smul(im, t0));
+    y[yp1] = yr;
+    y[yp0 + 1] = yi;
 }
 
 /// `clt_mdct_forward`: forward MDCT of `input` (`N/2 + overlap` samples) into `stride`-interleaved
@@ -386,7 +541,8 @@ pub fn mdct_forward(
     let scale_shift = st.scale_shift - 1;
     let n2 = n >> 1;
     let n4 = n >> 2;
-    let mut f = vec![0i32; n2];
+    let mut fbuf = [0i32; 960];
+    let f = &mut fbuf[..n2];
     {
         // Window, shuffle and fold.
         let mut xp1 = overlap >> 1;
@@ -430,24 +586,24 @@ pub fn mdct_forward(
             i += 1;
         }
     }
-    let mut f2 = vec![Cpx::default(); n4];
+    let mut f2buf = [0i32; 960];
+    let f2 = &mut f2buf[..n2];
     for i in 0..n4 {
         let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
         let (re, im) = (f[2 * i], f[2 * i + 1]);
         let yr = smul(re, t0).wrapping_sub(smul(im, t1));
         let yi = smul(im, t0).wrapping_add(smul(re, t1));
-        f2[st.bitrev[i] as usize] = Cpx {
-            r: pshr32(mul16_32_q16(scale, yr), scale_shift),
-            i: pshr32(mul16_32_q16(scale, yi), scale_shift),
-        };
+        let rev = st.bitrev[i] as usize;
+        f2[2 * rev] = pshr32(mul16_32_q16(scale, yr), scale_shift);
+        f2[2 * rev + 1] = pshr32(mul16_32_q16(scale, yi), scale_shift);
     }
-    fft_impl(st, &mut f2);
+    fft_impl(st, f2);
     let mut yp1 = 0usize;
     let mut yp2 = stride * (n2 - 1);
-    for (i, fp) in f2.iter().enumerate() {
+    for (i, fp) in f2.as_chunks::<2>().0.iter().enumerate() {
         let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
-        let yr = smul(fp.i, t1).wrapping_sub(smul(fp.r, t0));
-        let yi = smul(fp.r, t1).wrapping_add(smul(fp.i, t0));
+        let yr = smul(fp[1], t1).wrapping_sub(smul(fp[0], t0));
+        let yi = smul(fp[0], t1).wrapping_add(smul(fp[1], t0));
         out[yp1] = yr;
         out[yp2] = yi;
         yp1 += 2 * stride;

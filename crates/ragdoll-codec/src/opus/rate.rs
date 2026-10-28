@@ -33,6 +33,21 @@ fn cache(band: usize, lm: i32) -> &'static [u8] {
 
 /// `bits2pulses`.
 pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd::bits2pulses_avx2(cache(band, lm), bits) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd::bits2pulses_neon(cache(band, lm), bits) };
+    }
+    bits2pulses_scalar(band, lm, bits)
+}
+
+/// Scalar reference of [`bits2pulses`]: a binary search of the band's pulse cache.
+pub fn bits2pulses_scalar(band: usize, lm: i32, bits: i32) -> i32 {
     let c = cache(band, lm);
     let mut lo = 0i32;
     let mut hi = c[0] as i32;
@@ -45,6 +60,21 @@ pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
             lo = mid;
         }
     }
+    let lo_bits = if lo == 0 { -1 } else { c[lo as usize] as i32 };
+    if bits - lo_bits <= c[hi as usize] as i32 - bits {
+        lo
+    } else {
+        hi
+    }
+}
+
+/// The end of [`bits2pulses`] once the search has found `lo`, the number of cache entries
+/// (`c[1..=c[0]]`, non-decreasing) below `bits - 1`.
+#[inline]
+pub(super) fn bits2pulses_pick(c: &[u8], bits: i32, lo: i32) -> i32 {
+    let bits = bits - 1;
+    let max = c[0] as i32;
+    let (lo, hi) = if lo == max { (max, max) } else { (lo, lo + 1) };
     let lo_bits = if lo == 0 { -1 } else { c[lo as usize] as i32 };
     if bits - lo_bits <= c[hi as usize] as i32 - bits {
         lo
@@ -76,6 +106,48 @@ pub struct Allocation {
     pub intensity: i32,
     pub dual_stereo: bool,
     pub balance: i32,
+}
+
+/// The bit total of an allocation candidate `tmp` in the searches of `clt_compute_allocation`
+/// and `interp_bits2pulses`: scanning down from the top band, every band from the first one
+/// reaching its threshold on gets its bits (capped), and those above it get the floor if they
+/// reach it.
+fn alloc_psum(
+    tmp: &[i32; NB_EBANDS],
+    thresh: &[i32],
+    cap: &[i32],
+    start: usize,
+    end: usize,
+    floor: i32,
+) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd::alloc_psum_avx2(tmp, thresh, cap, start, end, floor) };
+    }
+    alloc_psum_scalar(tmp, thresh, cap, start, end, floor)
+}
+
+/// Scalar reference of [`alloc_psum`].
+pub fn alloc_psum_scalar(
+    tmp: &[i32; NB_EBANDS],
+    thresh: &[i32],
+    cap: &[i32],
+    start: usize,
+    end: usize,
+    floor: i32,
+) -> i32 {
+    let mut psum = 0i32;
+    let mut done = false;
+    for j in (start..end).rev() {
+        if tmp[j] >= thresh[j] || done {
+            done = true;
+            psum += tmp[j].min(cap[j]);
+        } else if tmp[j] >= floor {
+            psum += floor;
+        }
+    }
+    psum
 }
 
 /// `interp_bits2pulses`.
@@ -110,19 +182,13 @@ fn interp_bits2pulses(
     let log_m = lm << BITRES;
     let mut lo = 0i32;
     let mut hi = 1i32 << ALLOC_STEPS;
+    let mut tmp = [0i32; NB_EBANDS];
     for _ in 0..ALLOC_STEPS {
         let mid = (lo + hi) >> 1;
-        let mut psum = 0i32;
-        let mut done = false;
-        for j in (start..end).rev() {
-            let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
-            if tmp >= thresh[j] || done {
-                done = true;
-                psum += tmp.min(cap[j]);
-            } else if tmp >= alloc_floor {
-                psum += alloc_floor;
-            }
+        for j in start..end {
+            tmp[j] = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
         }
+        let psum = alloc_psum(&tmp, thresh, cap, start, end, alloc_floor);
         if psum > total {
             hi = mid;
         } else {
@@ -336,24 +402,18 @@ pub fn compute_allocation(
     }
     let mut lo = 1i32;
     let mut hi = NB_ALLOC_VECTORS as i32 - 1;
+    let mut tmp = [0i32; NB_EBANDS];
     loop {
-        let mut done = false;
-        let mut psum = 0i32;
         let mid = (lo + hi) >> 1;
-        for j in (start..end).rev() {
+        for j in start..end {
             let n = eb(j + 1) - eb(j);
             let mut bitsj = (c * n * BAND_ALLOCATION[mid as usize * len + j] as i32) << lm >> 2;
             if bitsj > 0 {
                 bitsj = (bitsj + trim_offset[j]).max(0);
             }
-            bitsj += offsets[j];
-            if bitsj >= thresh[j] || done {
-                done = true;
-                psum += bitsj.min(cap[j]);
-            } else if bitsj >= c << BITRES {
-                psum += c << BITRES;
-            }
+            tmp[j] = bitsj + offsets[j];
         }
+        let psum = alloc_psum(&tmp, &thresh, cap, start, end, c << BITRES);
         if psum > total {
             hi = mid - 1;
         } else {
