@@ -2,13 +2,19 @@
 //! `raw_data_block` syntax (SCE, CPE, LFE, DSE, PCE, FIL, END), noiseless decoding, inverse
 //! quantisation, pulse data, M/S and intensity stereo, perceptual noise substitution, temporal
 //! noise shaping, and the filterbank with all four window sequences and both window shapes.
-//! Arithmetic is `f64`; output is `F32le`, scaled to ±1.0 like FFmpeg's float decoder.
+//! Arithmetic is `f32` like FFmpeg's float decoder, and output is `F32le` scaled to ±1.0.
+//!
+//! Everything that does not depend on the stream is computed once ([`tables`]): two-level Huffman
+//! lookup tables whose codewords carry their sign bits and yield rows of dequantised values,
+//! `x^(4/3)` and `2^(sf/4)` tables, the windows, and the DCT-IV plans of the IMDCT
+//! ([`Dct4Plan`] and [`imdct_window`], with AVX2 and NEON paths). The spectral data loop reads
+//! through a register bit cache ([`Cache`]).
 
-use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
-use ragdoll_core::{AudioFrame, BitReader, ChannelLayout, RagdollError, Result, SampleFormat};
+use ragdoll_core::{AudioFrame, ChannelLayout, RagdollError, Result, SampleFormat};
+use ragdoll_simd::{Dct4Plan, imdct_window};
 
 use super::*;
 
@@ -69,61 +75,437 @@ fn swb_short(sr_idx: u8) -> &'static [u16] {
     }
 }
 
-/// A Huffman codebook as a `(length, code) -> symbol` map.
-struct Codebook {
-    map: HashMap<u32, u16>,
-    max_len: u32,
-}
-
-impl Codebook {
-    fn new(codes: &[u32], bits: &[u8]) -> Self {
-        let mut map = HashMap::with_capacity(codes.len());
-        let mut max_len = 0;
-        for (i, (&c, &b)) in codes.iter().zip(bits).enumerate() {
-            map.insert(((b as u32) << 24) | c, i as u16);
-            max_len = max_len.max(b as u32);
-        }
-        Codebook { map, max_len }
-    }
-
-    fn decode(&self, br: &mut BitReader) -> Result<usize> {
-        let mut code = 0u32;
-        for len in 1..=self.max_len {
-            code = (code << 1) | br.read_bits(1)? as u32;
-            if let Some(&s) = self.map.get(&((len << 24) | code)) {
-                return Ok(s as usize);
-            }
-        }
-        Err(RagdollError::InvalidData(
-            "invalid AAC Huffman codeword".into(),
-        ))
-    }
-}
-
-/// Codebook 0 is the scale-factor codebook; 1 to 11 the spectral codebooks.
-fn codebooks() -> &'static [Codebook; 12] {
-    static BOOKS: OnceLock<[Codebook; 12]> = OnceLock::new();
-    BOOKS.get_or_init(|| {
-        let w = |c: &[u16]| c.iter().map(|&v| v as u32).collect::<Vec<u32>>();
-        [
-            Codebook::new(&HCB_SF_CODES, &HCB_SF_BITS),
-            Codebook::new(&w(&HCB_1_CODES), &HCB_1_BITS),
-            Codebook::new(&w(&HCB_2_CODES), &HCB_2_BITS),
-            Codebook::new(&w(&HCB_3_CODES), &HCB_3_BITS),
-            Codebook::new(&w(&HCB_4_CODES), &HCB_4_BITS),
-            Codebook::new(&w(&HCB_5_CODES), &HCB_5_BITS),
-            Codebook::new(&w(&HCB_6_CODES), &HCB_6_BITS),
-            Codebook::new(&w(&HCB_7_CODES), &HCB_7_BITS),
-            Codebook::new(&w(&HCB_8_CODES), &HCB_8_BITS),
-            Codebook::new(&w(&HCB_9_CODES), &HCB_9_BITS),
-            Codebook::new(&w(&HCB_10_CODES), &HCB_10_BITS),
-            Codebook::new(&w(&HCB_11_CODES), &HCB_11_BITS),
-        ]
-    })
-}
-
 fn bad(msg: &str) -> RagdollError {
     RagdollError::InvalidData(format!("AAC: {msg}"))
+}
+
+/// Size of the payload buffer: a power of two above the largest AAC access unit (6144 bits per
+/// channel), so that reads can wrap around it instead of being bounds-checked.
+const BUF_LEN: usize = 1 << 14;
+
+/// A payload copied to the start of a [`BUF_LEN`] buffer, followed by zeros and 8 more bytes for
+/// the last load.
+type Buf = [u8; BUF_LEN + 8];
+
+/// MSB-first reader over a [`Buf`]. A read never fails: past the end of the payload it returns
+/// padding (or, far past it, stale bytes), and the decoder checks [`Bits::check`] after every
+/// element and in the one loop a corrupt stream could otherwise keep spinning (section data).
+#[derive(Clone, Copy)]
+struct Bits<'a> {
+    buf: &'a Buf,
+    pos: usize,
+    end: usize,
+}
+
+impl<'a> Bits<'a> {
+    fn new(buf: &'a Buf, len: usize) -> Self {
+        Bits {
+            buf,
+            pos: 0,
+            end: len * 8,
+        }
+    }
+
+    /// The next 64 bits, left-aligned; at least 57 of them are stream bits (or padding).
+    #[inline(always)]
+    fn peek(&self) -> u64 {
+        let i = (self.pos >> 3) & (BUF_LEN - 1);
+        let w = u64::from_be_bytes(self.buf[i..i + 8].try_into().unwrap());
+        w << (self.pos & 7)
+    }
+
+    /// Reads `n` bits, `1 <= n <= 32`.
+    #[inline(always)]
+    fn read(&mut self, n: u32) -> u32 {
+        debug_assert!((1..=32).contains(&n));
+        let v = (self.peek() >> (64 - n)) as u32;
+        self.pos += n as usize;
+        v
+    }
+
+    #[inline(always)]
+    fn bit(&mut self) -> bool {
+        self.read(1) != 0
+    }
+
+    fn skip(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n);
+    }
+
+    fn align(&mut self) {
+        self.pos = (self.pos + 7) & !7;
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.pos > self.end {
+            Err(RagdollError::BitstreamEndOfData)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// What [`Vlc::decode`] and [`escape`] read: a window on the next bits, and consuming them.
+trait BitSource {
+    /// The next bits, left-aligned; at least 32 of them are valid.
+    fn peek(&self) -> u64;
+    /// Consumes `n <= 32` bits.
+    fn consume(&mut self, n: u32);
+}
+
+impl BitSource for Bits<'_> {
+    #[inline(always)]
+    fn peek(&self) -> u64 {
+        Bits::peek(self)
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.pos += n as usize;
+    }
+}
+
+/// The spectral data reader: [`Bits`] with its next 32 to 64 bits held in a register. Each
+/// codeword then costs a shift instead of a dependent load, and the 32-bit refills read from an
+/// address that does not depend on the codewords.
+struct Cache<'a> {
+    buf: &'a Buf,
+    /// `avail` unread bits, left-aligned.
+    word: u64,
+    avail: u32,
+    /// Byte offset of the next refill.
+    next: usize,
+}
+
+impl<'a> Cache<'a> {
+    fn new(br: &Bits<'a>) -> Self {
+        Cache {
+            buf: br.buf,
+            word: br.peek(),
+            avail: 64 - (br.pos & 7) as u32,
+            next: (br.pos >> 3) + 8,
+        }
+    }
+
+    /// The bit position reached, for [`Bits`].
+    fn pos(&self) -> usize {
+        self.next * 8 - self.avail as usize
+    }
+}
+
+impl BitSource for Cache<'_> {
+    #[inline(always)]
+    fn peek(&self) -> u64 {
+        self.word
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.word <<= n;
+        self.avail -= n;
+        if self.avail < 32 {
+            let i = self.next & (BUF_LEN - 1);
+            let w = u32::from_be_bytes(self.buf[i..i + 4].try_into().unwrap());
+            self.word |= (w as u64) << (32 - self.avail);
+            self.avail += 32;
+            self.next += 4;
+        }
+    }
+}
+
+/// Index bits of a Huffman table's first level.
+const VLC_BITS: u32 = 9;
+
+/// A two-level Huffman lookup table. An entry is `payload << 8 | length` for a codeword, or
+/// `offset << 8 | 0x80 | bits` for a second-level table of `bits` index bits at `offset` in
+/// `second`, where a codeword's length counts only the bits after the first [`VLC_BITS`].
+struct Vlc {
+    first: Box<[u32; 1 << VLC_BITS]>,
+    second: Vec<u32>,
+}
+
+impl Vlc {
+    /// Builds the table from `(code, length, payload)` triples of a complete prefix code.
+    ///
+    /// # Panics
+    ///
+    /// When the code is not complete, so that no bit pattern can miss the table.
+    fn new(codes: &[(u32, u32, u32)]) -> Self {
+        let kraft: u64 = codes.iter().map(|&(_, len, _)| 1u64 << (32 - len)).sum();
+        assert_eq!(kraft, 1 << 32, "incomplete Huffman code");
+        let mut first = Box::new([0u32; 1 << VLC_BITS]);
+        let mut second = Vec::new();
+        // Codewords longer than the first level, by their first VLC_BITS bits.
+        let mut long: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 1 << VLC_BITS];
+        for &(code, len, payload) in codes {
+            if len <= VLC_BITS {
+                let start = (code << (VLC_BITS - len)) as usize;
+                first[start..start + (1 << (VLC_BITS - len))].fill(payload << 8 | len);
+            } else {
+                long[(code >> (len - VLC_BITS)) as usize].push((code, len - VLC_BITS, payload));
+            }
+        }
+        for (prefix, codes) in long.iter().enumerate() {
+            let Some(bits) = codes.iter().map(|&(_, rest, _)| rest).max() else {
+                continue;
+            };
+            let offset = second.len();
+            second.resize(offset + (1 << bits), 0);
+            first[prefix] = (offset as u32) << 8 | 0x80 | bits;
+            for &(code, rest, payload) in codes {
+                let low = (code & ((1 << rest) - 1)) as usize;
+                let start = offset + (low << (bits - rest));
+                second[start..start + (1 << (bits - rest))].fill(payload << 8 | rest);
+            }
+        }
+        Vlc { first, second }
+    }
+
+    /// Decodes one codeword and returns its payload. Every codebook is complete, so every bit
+    /// pattern is some codeword.
+    #[inline(always)]
+    fn decode(&self, br: &mut impl BitSource) -> u32 {
+        let p = br.peek();
+        let mut e = self.first[(p >> (64 - VLC_BITS)) as usize];
+        let mut used = 0;
+        if e & 0x80 != 0 {
+            let bits = e & 0x1F;
+            e = self.second[(e >> 8) as usize + ((p << VLC_BITS) >> (64 - bits)) as usize];
+            used = VLC_BITS;
+        }
+        br.consume(used + (e & 0x1F));
+        e >> 8
+    }
+}
+
+/// Largest `|q|` the `x^(4/3)` table covers: an escape value (8191) plus four pulses of 15.
+const POW43_LEN: usize = 8192 + 64;
+
+/// Payload flag of an escape-codebook codeword with a value of magnitude 16.
+const ESC_FLAG: u32 = 1 << 12;
+
+/// Payload of a 4-tuple: its row in [`Tables::quads`], `sum (v[i] + 2) 5^(3 - i)`.
+fn quad_row(v: [i32; 4]) -> u32 {
+    v.iter().fold(0, |row, &x| row * 5 + (x + 2) as u32)
+}
+
+/// Payload of a pair: its row in [`Tables::pairs`], `(v[0] + 16) 33 + v[1] + 16`.
+fn pair_row(v: [i32; 2]) -> u32 {
+    (v[0] + 16) as u32 * 33 + (v[1] + 16) as u32
+}
+
+/// The codewords of spectral codebook `cb` as `(code, length, payload)`, ready for [`Vlc::new`].
+///
+/// The sign bits that follow a codeword of the unsigned codebooks (3, 4 and 7 to 11, one per
+/// nonzero value) become part of it, so that one lookup yields signed values. The payload is the
+/// row of the values in [`Tables::quads`] (codebooks 1 to 4) or [`Tables::pairs`], plus
+/// [`ESC_FLAG`] in the escape codebook.
+fn spectral_codewords(cb: usize, codes: &[u16], bits: &[u8]) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    for (s, (&code, &len)) in codes.iter().zip(bits).enumerate() {
+        let s = s as i32;
+        let (values, dim, signed) = match cb {
+            1 | 2 => (
+                [s / 27 - 1, s / 9 % 3 - 1, s / 3 % 3 - 1, s % 3 - 1],
+                4,
+                true,
+            ),
+            3 | 4 => ([s / 27, s / 9 % 3, s / 3 % 3, s % 3], 4, false),
+            5 | 6 => ([s / 9 - 4, s % 9 - 4, 0, 0], 2, true),
+            7 | 8 => ([s / 8, s % 8, 0, 0], 2, false),
+            9 | 10 => ([s / 13, s % 13, 0, 0], 2, false),
+            _ => ([s / 17, s % 17, 0, 0], 2, false),
+        };
+        let nz = if signed {
+            0
+        } else {
+            values.iter().filter(|&&x| x != 0).count() as u32
+        };
+        for signs in 0..1u32 << nz {
+            let mut bit = nz;
+            let mut v = values;
+            for x in v.iter_mut().filter(|x| !signed && **x != 0) {
+                bit -= 1;
+                if signs >> bit & 1 != 0 {
+                    *x = -*x;
+                }
+            }
+            let payload = if dim == 4 {
+                quad_row(v)
+            } else if v[0].abs() == 16 || v[1].abs() == 16 {
+                pair_row([v[0], v[1]]) | ESC_FLAG
+            } else {
+                pair_row([v[0], v[1]])
+            };
+            out.push(((code as u32) << nz | signs, len as u32 + nz, payload));
+        }
+    }
+    out
+}
+
+/// Window halves of one window shape over a whole long-window half, so that every long window
+/// sequence is a multiply: the rising half for `ONLY_LONG`/`LONG_START` and for `LONG_STOP`, and
+/// the falling half for `ONLY_LONG`/`LONG_STOP` and for `LONG_START`.
+struct Shape {
+    long_rise: [f32; 1024],
+    stop_rise: [f32; 1024],
+    long_fall: [f32; 1024],
+    start_fall: [f32; 1024],
+    short_rise: [f32; 128],
+    short_fall: [f32; 128],
+}
+
+struct Tables {
+    /// Codebook 0 is the scale-factor codebook (payload: index); 1 to 11 the spectral codebooks
+    /// (payload: signed values, see [`spectral_codewords`]).
+    books: [Vlc; 12],
+    pow43: Vec<f32>,
+    /// `sign(v) |v|^(4/3)` of every 4-tuple with `|v| <= 2` (rows of [`quad_row`]) and of every
+    /// pair with `|v| <= 16` (rows of [`pair_row`]).
+    quads: Box<[[f32; 4]; 1024]>,
+    pairs: Box<[[f32; 2]; 2048]>,
+    /// `2^((sf - 100) / 4)` for `sf` in `0..=255`.
+    gain: [f32; 256],
+    shapes: [Shape; 2],
+    long: Dct4Plan,
+    short: Dct4Plan,
+}
+
+impl Tables {
+    /// `sign(x) |x|^(4/3) gain`.
+    #[inline(always)]
+    fn dequantise(&self, x: i32, gain: f32) -> f32 {
+        let m = self.pow43[(x.unsigned_abs() as usize).min(POW43_LEN - 1)];
+        f32::from_bits(m.to_bits() | (x as u32 & 0x8000_0000)) * gain
+    }
+
+    /// Adds a pulse of amplitude `amp` to the quantised value `q` behind `x = dequantise(q,
+    /// gain)`: `q + amp` if `q > 0`, else `q - amp`. `q` comes back from `x`, exactly: `|q|` is at
+    /// most 8251, and the two roundings to `f32` move `(|x| / gain)^(3/4)` by less than 0.002.
+    fn add_pulse(&self, x: f32, amp: i32, gain: f32) -> f32 {
+        let mag = (x.abs() as f64 / gain as f64).powf(0.75).round() as i32;
+        let q = if x > 0.0 { mag + amp } else { -mag - amp };
+        self.dequantise(q, gain)
+    }
+}
+
+fn bessel_i0(x: f64) -> f64 {
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    let q = x * x / 4.0;
+    for k in 1..100 {
+        term *= q / (k * k) as f64;
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
+}
+
+/// Rising half (`n / 2` samples) of the sine window of length `n`.
+fn sine_half(n: usize) -> Vec<f64> {
+    (0..n / 2)
+        .map(|i| (PI / n as f64 * (i as f64 + 0.5)).sin())
+        .collect()
+}
+
+/// Rising half (`n / 2` samples) of the Kaiser-Bessel-derived window of length `n`.
+fn kbd_half(n: usize, alpha: f64) -> Vec<f64> {
+    let half = n / 2;
+    let w: Vec<f64> = (0..=half)
+        .map(|k| {
+            let r = (k as f64 - half as f64 / 2.0) / (half as f64 / 2.0);
+            bessel_i0(PI * alpha * (1.0 - r * r).max(0.0).sqrt())
+        })
+        .collect();
+    let total: f64 = w.iter().sum();
+    let mut acc = 0.0;
+    (0..half)
+        .map(|k| {
+            acc += w[k];
+            (acc / total).sqrt()
+        })
+        .collect()
+}
+
+fn shape(long: &[f64], short: &[f64]) -> Shape {
+    let mut s = Shape {
+        long_rise: [0.0; 1024],
+        stop_rise: [0.0; 1024],
+        long_fall: [0.0; 1024],
+        start_fall: [0.0; 1024],
+        short_rise: [0.0; 128],
+        short_fall: [0.0; 128],
+    };
+    for n in 0..1024 {
+        s.long_rise[n] = long[n] as f32;
+        s.long_fall[n] = long[1023 - n] as f32;
+        s.stop_rise[n] = match n {
+            0..448 => 0.0,
+            448..576 => short[n - 448] as f32,
+            _ => 1.0,
+        };
+        s.start_fall[n] = match n {
+            0..448 => 1.0,
+            448..576 => short[127 - (n - 448)] as f32,
+            _ => 0.0,
+        };
+    }
+    for n in 0..128 {
+        s.short_rise[n] = short[n] as f32;
+        s.short_fall[n] = short[127 - n] as f32;
+    }
+    s
+}
+
+fn tables() -> &'static Tables {
+    static T: OnceLock<Tables> = OnceLock::new();
+    T.get_or_init(|| {
+        let sf: Vec<(u32, u32, u32)> = (0..HCB_SF_CODES.len())
+            .map(|i| (HCB_SF_CODES[i], HCB_SF_BITS[i] as u32, i as u32))
+            .collect();
+        let spectral = |cb, codes: &[u16], bits| Vlc::new(&spectral_codewords(cb, codes, bits));
+        let pow43: Vec<f32> = (0..POW43_LEN)
+            .map(|i| (i as f64).powf(4.0 / 3.0) as f32)
+            .collect();
+        let signed = |v: i32| pow43[v.unsigned_abs() as usize].copysign(v as f32);
+        let mut quads = Box::new([[0.0; 4]; 1024]);
+        for (r, q) in quads.iter_mut().enumerate().take(625) {
+            *q = [125, 25, 5, 1].map(|d| signed(r as i32 / d % 5 - 2));
+        }
+        let mut pairs = Box::new([[0.0; 2]; 2048]);
+        for (r, p) in pairs.iter_mut().enumerate().take(33 * 33) {
+            *p = [signed(r as i32 / 33 - 16), signed(r as i32 % 33 - 16)];
+        }
+        // 32768 maps the 16-bit scale of the spectrum to ±1.0; 1/M is the IMDCT's own gain.
+        Tables {
+            books: [
+                Vlc::new(&sf),
+                spectral(1, &HCB_1_CODES, &HCB_1_BITS),
+                spectral(2, &HCB_2_CODES, &HCB_2_BITS),
+                spectral(3, &HCB_3_CODES, &HCB_3_BITS),
+                spectral(4, &HCB_4_CODES, &HCB_4_BITS),
+                spectral(5, &HCB_5_CODES, &HCB_5_BITS),
+                spectral(6, &HCB_6_CODES, &HCB_6_BITS),
+                spectral(7, &HCB_7_CODES, &HCB_7_BITS),
+                spectral(8, &HCB_8_CODES, &HCB_8_BITS),
+                spectral(9, &HCB_9_CODES, &HCB_9_BITS),
+                spectral(10, &HCB_10_CODES, &HCB_10_BITS),
+                spectral(11, &HCB_11_CODES, &HCB_11_BITS),
+            ],
+            pow43,
+            quads,
+            pairs,
+            gain: std::array::from_fn(|sf| (0.25 * (sf as f64 - 100.0)).exp2() as f32),
+            shapes: [
+                shape(&sine_half(2048), &sine_half(256)),
+                shape(&kbd_half(2048, 4.0), &kbd_half(256, 6.0)),
+            ],
+            long: Dct4Plan::new(1024, 1.0 / (1024.0 * 32768.0)),
+            short: Dct4Plan::new(128, 1.0 / (128.0 * 32768.0)),
+        }
+    })
 }
 
 #[derive(Clone, Default)]
@@ -137,20 +519,20 @@ struct IcsInfo {
 }
 
 impl IcsInfo {
-    fn parse(br: &mut BitReader, sr_idx: u8) -> Result<Self> {
-        if br.read_bits(1)? != 0 {
+    fn parse(br: &mut Bits, sr_idx: u8) -> Result<Self> {
+        if br.bit() {
             return Err(bad("ics_reserved_bit set"));
         }
-        let window_sequence = br.read_bits(2)? as u8;
-        let window_shape = br.read_bits(1)? as u8;
+        let window_sequence = br.read(2) as u8;
+        let window_shape = br.read(1) as u8;
         let mut ics = IcsInfo {
             window_sequence,
             window_shape,
             ..Default::default()
         };
         if window_sequence == EIGHT_SHORT {
-            ics.max_sfb = br.read_bits(4)? as usize;
-            let grouping = br.read_bits(7)? as u32;
+            ics.max_sfb = br.read(4) as usize;
+            let grouping = br.read(7);
             ics.num_windows = 8;
             ics.num_window_groups = 1;
             ics.group_len[0] = 1;
@@ -166,11 +548,11 @@ impl IcsInfo {
                 return Err(bad("max_sfb too large"));
             }
         } else {
-            ics.max_sfb = br.read_bits(6)? as usize;
+            ics.max_sfb = br.read(6) as usize;
             ics.num_windows = 1;
             ics.num_window_groups = 1;
             ics.group_len[0] = 1;
-            if br.read_bits(1)? != 0 {
+            if br.bit() {
                 return Err(RagdollError::Unsupported(
                     "AAC prediction (Main/LTP profile) is not supported".into(),
                 ));
@@ -191,12 +573,12 @@ impl IcsInfo {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct TnsFilter {
     length: usize,
     order: usize,
     direction: bool,
-    coef: [f64; 32],
+    coef: [f32; 32],
 }
 
 #[derive(Clone)]
@@ -204,9 +586,11 @@ struct Channel {
     ics: IcsInfo,
     band_type: [[u8; 64]; 8],
     sf: [[i32; 64]; 8],
-    tns: Vec<Vec<TnsFilter>>,
+    /// TNS filters per window (at most three in a long window, one in a short one).
+    tns: [[TnsFilter; 3]; 8],
+    tns_count: [usize; 8],
     /// Dequantised spectrum in window order (`window * 128 + bin` for short windows).
-    spec: [f64; 1024],
+    spec: [f32; 1024],
 }
 
 impl Default for Channel {
@@ -215,7 +599,8 @@ impl Default for Channel {
             ics: IcsInfo::default(),
             band_type: [[0; 64]; 8],
             sf: [[0; 64]; 8],
-            tns: Vec::new(),
+            tns: [[TnsFilter::default(); 3]; 8],
+            tns_count: [0; 8],
             spec: [0.0; 1024],
         }
     }
@@ -224,7 +609,7 @@ impl Default for Channel {
 /// Per-output-channel filterbank state.
 #[derive(Clone)]
 struct Synth {
-    overlap: [f64; 1024],
+    overlap: [f32; 1024],
     prev_shape: u8,
 }
 
@@ -237,143 +622,18 @@ impl Default for Synth {
     }
 }
 
-/// Window halves (rising part, `N/2` samples) for the long and short sine and KBD windows.
-struct Windows {
-    long: [Vec<f64>; 2],
-    short: [Vec<f64>; 2],
-}
-
-fn bessel_i0(x: f64) -> f64 {
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    let q = x * x / 4.0;
-    for k in 1..100 {
-        term *= q / (k * k) as f64;
-        sum += term;
-        if term < sum * 1e-17 {
-            break;
-        }
-    }
-    sum
-}
-
-fn sine_half(n: usize) -> Vec<f64> {
-    (0..n / 2)
-        .map(|i| (PI / n as f64 * (i as f64 + 0.5)).sin())
-        .collect()
-}
-
-fn kbd_half(n: usize, alpha: f64) -> Vec<f64> {
-    let half = n / 2;
-    let w: Vec<f64> = (0..=half)
-        .map(|k| {
-            let r = (k as f64 - half as f64 / 2.0) / (half as f64 / 2.0);
-            bessel_i0(PI * alpha * (1.0 - r * r).max(0.0).sqrt())
-        })
-        .collect();
-    let total: f64 = w.iter().sum();
-    let mut acc = 0.0;
-    (0..half)
-        .map(|k| {
-            acc += w[k];
-            (acc / total).sqrt()
-        })
-        .collect()
-}
-
-fn windows() -> &'static Windows {
-    static W: OnceLock<Windows> = OnceLock::new();
-    W.get_or_init(|| Windows {
-        long: [sine_half(2048), kbd_half(2048, 4.0)],
-        short: [sine_half(256), kbd_half(256, 6.0)],
-    })
-}
-
-/// IMDCT of `m` coefficients into `2m` samples:
-/// `x[n] = 2/N * sum_k X[k] cos(2*pi/N * (n + n0) * (k + 1/2))`, `N = 2m`, `n0 = (m + 1) / 2`.
-fn imdct(spec: &[f64], out: &mut [f64]) {
-    let m = spec.len();
-    let y = dct4(spec);
-    let scale = 1.0 / m as f64;
-    let h = m / 2;
-    for n in 0..h {
-        out[n] = y[n + h] * scale;
-    }
-    for n in h..3 * h {
-        out[n] = -y[3 * h - 1 - n] * scale;
-    }
-    for n in 3 * h..2 * m {
-        out[n] = -y[n - 3 * h] * scale;
-    }
-}
-
-/// `y[n] = sum_k x[k] cos(pi/M (n + 1/2)(k + 1/2))` through an `M/2`-point complex FFT.
-fn dct4(x: &[f64]) -> Vec<f64> {
-    let m = x.len();
-    let h = m / 2;
-    let mut re = vec![0.0; h];
-    let mut im = vec![0.0; h];
-    for k in 0..h {
-        let (a, b) = (x[2 * k], x[m - 1 - 2 * k]);
-        let t = -PI * (4 * k + 1) as f64 / (4 * m) as f64;
-        let (s, c) = t.sin_cos();
-        re[k] = a * c - b * s;
-        im[k] = a * s + b * c;
-    }
-    fft(&mut re, &mut im);
-    let mut y = vec![0.0; m];
-    for j in 0..h {
-        let t = -PI * j as f64 / m as f64;
-        let (s, c) = t.sin_cos();
-        let ur = re[j] * c - im[j] * s;
-        let ui = re[j] * s + im[j] * c;
-        y[2 * j] = ur;
-        y[m - 1 - 2 * j] = -ui;
-    }
-    y
-}
-
-/// In-place radix-2 forward FFT (`exp(-2*pi*i*jk/n)`).
-fn fft(re: &mut [f64], im: &mut [f64]) {
-    let n = re.len();
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let mut len = 2;
-    while len <= n {
-        let ang = -2.0 * PI / len as f64;
-        for start in (0..n).step_by(len) {
-            for k in 0..len / 2 {
-                let (s, c) = (ang * k as f64).sin_cos();
-                let (a, b) = (start + k, start + k + len / 2);
-                let tr = re[b] * c - im[b] * s;
-                let ti = re[b] * s + im[b] * c;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-        }
-        len <<= 1;
-    }
-}
-
 /// ISO/IEC 14496-3 AAC-LC decoder (1024 samples per frame, up to 8 channels).
 #[derive(Clone)]
 pub struct AacDecoder {
     pub asc: AudioSpecificConfig,
     synth: Vec<Synth>,
     noise_state: u32,
+    /// Scratch: the two channels of an element, a DCT-IV output, the padded payload and the
+    /// output channels.
+    chans: Box<[Channel; 2]>,
+    y: Box<[f32; 1024]>,
+    buf: Option<Box<Buf>>,
+    pcm: Vec<[f32; 1024]>,
 }
 
 impl std::fmt::Debug for AacDecoder {
@@ -397,6 +657,10 @@ impl AacDecoder {
             asc,
             synth: Vec::new(),
             noise_state: 0x1f2e_3d4c,
+            chans: Box::default(),
+            y: Box::new([0.0; 1024]),
+            buf: None,
+            pcm: Vec::new(),
         }
     }
 
@@ -432,66 +696,102 @@ impl AacDecoder {
         if self.asc.sampling_frequency_index as usize >= AAC_SAMPLE_RATES.len() {
             return Err(bad("bad sampling frequency index"));
         }
-        let (channels, elements) = self.decode_raw(payload)?;
-        let n = channels.len();
+        if payload.len() > BUF_LEN - 8 {
+            return Err(bad("access unit too large"));
+        }
+        let mut buf = self
+            .buf
+            .take()
+            .unwrap_or_else(|| Box::new([0; BUF_LEN + 8]));
+        buf[..payload.len()].copy_from_slice(payload);
+        buf[payload.len()..payload.len() + 8].fill(0);
+        let decoded = self.decode_raw(&buf, payload.len());
+        self.buf = Some(buf);
+        let (elements, count, channels) = decoded?;
         // The default arrangements of channel configurations 3 to 7, reordered from bitstream
         // order (C, L, R, ...) to FL, FR, FC, LFE, BL, BR, SL, SR as FFmpeg and WAV use.
-        let order: Vec<usize> = match elements.as_str() {
-            "SC" => vec![1, 2, 0],
-            "SCS" => vec![1, 2, 0, 3],
-            "SCC" => vec![1, 2, 0, 3, 4],
-            "SCCL" => vec![1, 2, 0, 5, 3, 4],
-            "SCCCL" => vec![1, 2, 0, 7, 5, 6, 3, 4],
-            _ => (0..n).collect(),
+        let order: &[usize] = match &elements[..count] {
+            b"SC" => &[1, 2, 0],
+            b"SCS" => &[1, 2, 0, 3],
+            b"SCC" => &[1, 2, 0, 3, 4],
+            b"SCCL" => &[1, 2, 0, 5, 3, 4],
+            b"SCCCL" => &[1, 2, 0, 7, 5, 6, 3, 4],
+            _ => &[0, 1, 2, 3, 4, 5, 6, 7][..channels],
         };
+        let n = order.len();
         let mut frame = AudioFrame::new(self.asc.sample_rate, n as u8, SampleFormat::F32le, 1024);
         frame.layout = ChannelLayout::from_channels(n as u8);
         let dst = frame.as_f32_mut_slice();
-        for (o, &src) in order.iter().enumerate() {
-            for i in 0..1024 {
-                dst[i * n + o] = (channels[src][i] / 32768.0) as f32;
+        if n == 2 {
+            let (l, r) = (&self.pcm[0], &self.pcm[1]);
+            for (i, d) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                *d = [l[i], r[i]];
+            }
+        } else {
+            for (o, &src) in order.iter().enumerate() {
+                for (i, &v) in self.pcm[src].iter().enumerate() {
+                    dst[i * n + o] = v;
+                }
             }
         }
         Ok(frame)
     }
+}
 
-    /// Decodes a `raw_data_block` into PCM channels in bitstream order (16-bit scale), with the
-    /// sequence of audio elements (`S`CE, `C`PE, `L`FE).
-    fn decode_raw(&mut self, payload: &[u8]) -> Result<(Vec<Vec<f64>>, String)> {
+impl AacDecoder {
+    /// Decodes a `raw_data_block` from `buf` (`len` payload bytes, then zero padding) into
+    /// `self.pcm` in bitstream order. Returns the sequence of audio elements (`S`CE, `C`PE, `L`FE),
+    /// its length and the number of channels.
+    fn decode_raw(&mut self, buf: &Buf, len: usize) -> Result<([u8; 8], usize, usize)> {
         let sr_idx = self.asc.sampling_frequency_index;
-        let mut br = BitReader::new(payload);
-        let mut out: Vec<Vec<f64>> = Vec::new();
-        let mut elements = String::new();
+        let t = tables();
+        let mut br = Bits::new(buf, len);
+        let mut elements = [0u8; 8];
+        let (mut count, mut channels) = (0, 0);
         loop {
-            let id = br.read_bits(3)? as u8;
+            br.check()?;
+            let id = br.read(3) as u8;
+            let needed = match id {
+                0 | 3 => 1,
+                1 => 2,
+                _ => 0,
+            };
+            if channels + needed > 8 {
+                return Err(bad("too many channels"));
+            }
+            if self.pcm.len() < channels + needed {
+                self.pcm.resize(channels + needed, [0.0; 1024]);
+                self.synth.resize(channels + needed, Synth::default());
+            }
             match id {
                 0 | 3 => {
                     // SCE, LFE
-                    let _tag = br.read_bits(4)?;
-                    let mut ch = Channel::default();
-                    self.decode_ics(&mut br, &mut ch, None, sr_idx)?;
-                    apply_tns(&mut ch, sr_idx, self.asc.audio_object_type);
-                    let idx = out.len();
-                    out.push(self.synthesize(idx, &ch));
-                    elements.push(if id == 0 { 'S' } else { 'L' });
+                    let _tag = br.read(4);
+                    let ch = &mut self.chans[0];
+                    decode_ics(&mut br, ch, None, sr_idx, &mut self.noise_state, t)?;
+                    br.check()?;
+                    apply_tns(ch, sr_idx);
+                    let (st, out) = (&mut self.synth[channels], &mut self.pcm[channels]);
+                    synthesize(t, st, ch, out, &mut self.y);
+                    elements[count] = if id == 0 { b'S' } else { b'L' };
                 }
                 1 => {
                     // CPE
-                    let _tag = br.read_bits(4)?;
-                    let common_window = br.read_bits(1)? != 0;
-                    let mut l = Channel::default();
-                    let mut r = Channel::default();
+                    let _tag = br.read(4);
+                    let common_window = br.bit();
                     let mut ms_used = [[false; 64]; 8];
+                    let [l, r] = &mut *self.chans;
+                    let mut shared = None;
                     if common_window {
                         let ics = IcsInfo::parse(&mut br, sr_idx)?;
-                        let ms_mask_present = br.read_bits(2)?;
+                        let ms_mask_present = br.read(2);
                         if ms_mask_present == 3 {
                             return Err(bad("reserved ms_mask_present"));
                         }
                         if ms_mask_present == 1 {
                             for g in 0..ics.num_window_groups {
                                 for sfb in 0..ics.max_sfb {
-                                    ms_used[g][sfb] = br.read_bits(1)? != 0;
+                                    ms_used[g][sfb] = br.bit();
                                 }
                             }
                         } else if ms_mask_present == 2 {
@@ -499,21 +799,22 @@ impl AacDecoder {
                                 row.fill(true);
                             }
                         }
-                        l.ics = ics.clone();
-                        r.ics = ics;
+                        shared = Some(ics);
                     }
-                    let shared = common_window.then(|| l.ics.clone());
-                    self.decode_ics(&mut br, &mut l, shared.as_ref(), sr_idx)?;
-                    self.decode_ics(&mut br, &mut r, shared.as_ref(), sr_idx)?;
+                    let noise = &mut self.noise_state;
+                    decode_ics(&mut br, l, shared.as_ref(), sr_idx, noise, t)?;
+                    decode_ics(&mut br, r, shared.as_ref(), sr_idx, noise, t)?;
+                    br.check()?;
                     if common_window {
-                        stereo_tools(&mut l, &mut r, &ms_used, sr_idx);
+                        stereo_tools(l, r, &ms_used, sr_idx);
                     }
-                    apply_tns(&mut l, sr_idx, self.asc.audio_object_type);
-                    apply_tns(&mut r, sr_idx, self.asc.audio_object_type);
-                    let idx = out.len();
-                    out.push(self.synthesize(idx, &l));
-                    out.push(self.synthesize(idx + 1, &r));
-                    elements.push('C');
+                    apply_tns(l, sr_idx);
+                    apply_tns(r, sr_idx);
+                    let (sl, sr) = self.synth[channels..].split_at_mut(1);
+                    let (pl, pr) = self.pcm[channels..].split_at_mut(1);
+                    synthesize(t, &mut sl[0], l, &mut pl[0], &mut self.y);
+                    synthesize(t, &mut sr[0], r, &mut pr[0], &mut self.y);
+                    elements[count] = b'C';
                 }
                 2 => {
                     return Err(RagdollError::Unsupported(
@@ -522,383 +823,312 @@ impl AacDecoder {
                 }
                 4 => {
                     // DSE
-                    let _tag = br.read_bits(4)?;
-                    let align = br.read_bits(1)? != 0;
-                    let mut count = br.read_bits(8)? as usize;
+                    let _tag = br.read(4);
+                    let align = br.bit();
+                    let mut count = br.read(8) as usize;
                     if count == 255 {
-                        count += br.read_bits(8)? as usize;
+                        count += br.read(8) as usize;
                     }
                     if align {
-                        br.align_to_byte();
+                        br.align();
                     }
-                    br.skip_bits(8 * count)?;
+                    br.skip(8 * count);
                 }
-                5 => skip_pce(&mut br)?,
+                5 => skip_pce(&mut br),
                 6 => {
                     // FIL: extension payloads (SBR, DRC, fill) are skipped.
-                    let mut count = br.read_bits(4)? as usize;
+                    let mut count = br.read(4) as usize;
                     if count == 15 {
-                        count += br.read_bits(8)? as usize;
+                        count += br.read(8) as usize;
                         count -= 1;
                     }
-                    br.skip_bits(8 * count)?;
+                    br.skip(8 * count);
                 }
                 _ => break,
             }
-            if out.len() > 8 {
-                return Err(bad("too many channels"));
+            if needed > 0 {
+                channels += needed;
+                count += 1;
             }
         }
-        if out.is_empty() {
+        if channels == 0 {
             return Err(bad("no audio channel elements"));
         }
-        Ok((out, elements))
+        Ok((elements, count, channels))
+    }
+}
+
+/// Reads the escape sequence of an escape-codebook value of magnitude 16.
+#[inline]
+fn escape(br: &mut impl BitSource, x: i32) -> Result<i32> {
+    let p = br.peek();
+    let ones = (!p).leading_zeros();
+    if ones > 8 {
+        return Err(bad("escape sequence too long"));
+    }
+    let n = 4 + ones;
+    let mag = (1 << n) + ((p << (ones + 1)) >> (64 - n)) as i32;
+    br.consume(2 * ones + 5);
+    Ok(if x < 0 { -mag } else { mag })
+}
+
+/// Parses an `individual_channel_stream` into the dequantised spectrum `ch.spec` (noise
+/// substitution included, drawing from `noise_state`).
+fn decode_ics(
+    br: &mut Bits,
+    ch: &mut Channel,
+    common: Option<&IcsInfo>,
+    sr_idx: u8,
+    noise_state: &mut u32,
+    t: &Tables,
+) -> Result<()> {
+    let global_gain = br.read(8) as i32;
+    ch.ics = match common {
+        Some(ics) => ics.clone(),
+        None => IcsInfo::parse(br, sr_idx)?,
+    };
+    let ics = ch.ics.clone();
+    let short = ics.window_sequence == EIGHT_SHORT;
+    let swb = ics.swb(sr_idx);
+
+    // section_data
+    let (sect_bits, sect_esc) = if short { (3, 7) } else { (5, 31) };
+    for g in 0..ics.num_window_groups {
+        let mut k = 0;
+        while k < ics.max_sfb {
+            br.check()?;
+            let cb = br.read(4) as u8;
+            if cb == 12 {
+                return Err(bad("reserved codebook 12"));
+            }
+            let mut len = 0usize;
+            loop {
+                let incr = br.read(sect_bits) as usize;
+                len += incr;
+                if incr != sect_esc {
+                    break;
+                }
+                br.check()?;
+            }
+            if k + len > ics.max_sfb {
+                return Err(bad("section past max_sfb"));
+            }
+            ch.band_type[g][k..k + len].fill(cb);
+            k += len;
+        }
     }
 
-    fn decode_ics(
-        &mut self,
-        br: &mut BitReader,
-        ch: &mut Channel,
-        common: Option<&IcsInfo>,
-        sr_idx: u8,
-    ) -> Result<()> {
-        let global_gain = br.read_bits(8)? as i32;
-        ch.ics = match common {
-            Some(ics) => ics.clone(),
-            None => IcsInfo::parse(br, sr_idx)?,
-        };
-        let ics = ch.ics.clone();
-        let short = ics.window_sequence == EIGHT_SHORT;
-        let swb = ics.swb(sr_idx);
-        let books = codebooks();
-
-        // section_data
-        let (sect_bits, sect_esc) = if short { (3, 7) } else { (5, 31) };
-        for g in 0..ics.num_window_groups {
-            let mut k = 0;
-            while k < ics.max_sfb {
-                let cb = br.read_bits(4)? as u8;
-                if cb == 12 {
-                    return Err(bad("reserved codebook 12"));
+    // scale_factor_data
+    let sf_book = &t.books[0];
+    let mut sf = global_gain;
+    let mut is_pos = 0i32;
+    let mut noise_nrg = global_gain - 90;
+    let mut noise_first = true;
+    for g in 0..ics.num_window_groups {
+        for sfb in 0..ics.max_sfb {
+            ch.sf[g][sfb] = match ch.band_type[g][sfb] {
+                ZERO_HCB => 0,
+                INTENSITY_HCB | INTENSITY_HCB2 => {
+                    is_pos += sf_book.decode(br) as i32 - 60;
+                    is_pos
                 }
-                let mut len = 0usize;
-                loop {
-                    let incr = br.read_bits(sect_bits)? as usize;
-                    len += incr;
-                    if incr != sect_esc {
-                        break;
+                NOISE_HCB => {
+                    if noise_first {
+                        noise_first = false;
+                        noise_nrg += br.read(9) as i32 - 256;
+                    } else {
+                        noise_nrg += sf_book.decode(br) as i32 - 60;
                     }
+                    noise_nrg
                 }
-                if k + len > ics.max_sfb {
-                    return Err(bad("section past max_sfb"));
-                }
-                for sfb in k..k + len {
-                    ch.band_type[g][sfb] = cb;
-                }
-                k += len;
-            }
-        }
-
-        // scale_factor_data
-        let mut sf = global_gain;
-        let mut is_pos = 0i32;
-        let mut noise_nrg = global_gain - 90;
-        let mut noise_first = true;
-        for g in 0..ics.num_window_groups {
-            for sfb in 0..ics.max_sfb {
-                match ch.band_type[g][sfb] {
-                    ZERO_HCB => ch.sf[g][sfb] = 0,
-                    INTENSITY_HCB | INTENSITY_HCB2 => {
-                        is_pos += books[0].decode(br)? as i32 - 60;
-                        ch.sf[g][sfb] = is_pos;
+                _ => {
+                    sf += sf_book.decode(br) as i32 - 60;
+                    if !(0..=255).contains(&sf) {
+                        return Err(bad("scalefactor out of range"));
                     }
-                    NOISE_HCB => {
-                        if noise_first {
-                            noise_first = false;
-                            noise_nrg += br.read_bits(9)? as i32 - 256;
-                        } else {
-                            noise_nrg += books[0].decode(br)? as i32 - 60;
-                        }
-                        ch.sf[g][sfb] = noise_nrg;
+                    sf
+                }
+            };
+        }
+    }
+
+    // pulse_data
+    let mut pulses = [(0usize, 0i32); 4];
+    let mut num_pulse = 0;
+    if br.bit() {
+        if short {
+            return Err(bad("pulse data in a short block"));
+        }
+        num_pulse = br.read(2) as usize + 1;
+        let start_sfb = br.read(6) as usize;
+        if start_sfb >= swb.len() - 1 {
+            return Err(bad("pulse_start_sfb out of range"));
+        }
+        let mut k = swb[start_sfb] as usize;
+        for p in pulses.iter_mut().take(num_pulse) {
+            k += br.read(5) as usize;
+            let amp = br.read(4) as i32;
+            if k >= 1024 {
+                return Err(bad("pulse position out of range"));
+            }
+            *p = (k, amp);
+        }
+    }
+
+    // tns_data
+    ch.tns_count = [0; 8];
+    if br.bit() {
+        let (nf_bits, len_bits, ord_bits) = if short { (1, 4, 3) } else { (2, 6, 5) };
+        for w in 0..ics.num_windows {
+            let n_filt = br.read(nf_bits) as usize;
+            ch.tns_count[w] = n_filt;
+            if n_filt == 0 {
+                continue;
+            }
+            let coef_res = br.read(1) + 3;
+            for f in ch.tns[w].iter_mut().take(n_filt) {
+                f.length = br.read(len_bits) as usize;
+                f.order = br.read(ord_bits) as usize;
+                if f.order > 0 {
+                    f.direction = br.bit();
+                    let compress = br.read(1);
+                    let bits = coef_res - compress;
+                    let iqfac = ((1 << (coef_res - 1)) as f64 - 0.5) / (PI / 2.0);
+                    let iqfac_m = ((1 << (coef_res - 1)) as f64 + 0.5) / (PI / 2.0);
+                    let mut refl = [0.0f32; 32];
+                    for r in refl.iter_mut().take(f.order) {
+                        let raw = br.read(bits) as i32;
+                        let v = (raw << (32 - bits)) >> (32 - bits);
+                        *r = (v as f64 / if v >= 0 { iqfac } else { iqfac_m }).sin() as f32;
                     }
-                    _ => {
-                        sf += books[0].decode(br)? as i32 - 60;
-                        if !(0..=255).contains(&sf) {
-                            return Err(bad("scalefactor out of range"));
+                    // Reflection coefficients to an LPC polynomial, in `f32` as FFmpeg does.
+                    let a = &mut f.coef;
+                    for mm in 0..f.order {
+                        let prev = *a;
+                        for i in 0..mm {
+                            a[i] = prev[i] + refl[mm] * prev[mm - 1 - i];
                         }
-                        ch.sf[g][sfb] = sf;
-                    }
-                }
-            }
-        }
-
-        // pulse_data
-        let mut pulses: Vec<(usize, i32)> = Vec::new();
-        if br.read_bits(1)? != 0 {
-            if short {
-                return Err(bad("pulse data in a short block"));
-            }
-            let num_pulse = br.read_bits(2)? as usize + 1;
-            let start_sfb = br.read_bits(6)? as usize;
-            if start_sfb >= swb.len() - 1 {
-                return Err(bad("pulse_start_sfb out of range"));
-            }
-            let mut k = swb[start_sfb] as usize;
-            for _ in 0..num_pulse {
-                k += br.read_bits(5)? as usize;
-                let amp = br.read_bits(4)? as i32;
-                if k >= 1024 {
-                    return Err(bad("pulse position out of range"));
-                }
-                pulses.push((k, amp));
-            }
-        }
-
-        // tns_data
-        ch.tns = vec![Vec::new(); ics.num_windows];
-        if br.read_bits(1)? != 0 {
-            let (nf_bits, len_bits, ord_bits) = if short { (1, 4, 3) } else { (2, 6, 5) };
-            for w in 0..ics.num_windows {
-                let n_filt = br.read_bits(nf_bits)? as usize;
-                if n_filt == 0 {
-                    continue;
-                }
-                let coef_res = br.read_bits(1)? as u32 + 3;
-                for _ in 0..n_filt {
-                    let mut f = TnsFilter {
-                        length: br.read_bits(len_bits)? as usize,
-                        order: br.read_bits(ord_bits)? as usize,
-                        ..Default::default()
-                    };
-                    if f.order > 0 {
-                        f.direction = br.read_bits(1)? != 0;
-                        let compress = br.read_bits(1)? as u32;
-                        let bits = coef_res - compress;
-                        let iqfac = ((1 << (coef_res - 1)) as f64 - 0.5) / (PI / 2.0);
-                        let iqfac_m = ((1 << (coef_res - 1)) as f64 + 0.5) / (PI / 2.0);
-                        let mut refl = [0.0f64; 32];
-                        for r in refl.iter_mut().take(f.order) {
-                            let raw = br.read_bits(bits)? as i32;
-                            let v = (raw << (32 - bits)) >> (32 - bits);
-                            *r = (v as f64 / if v >= 0 { iqfac } else { iqfac_m }).sin();
-                        }
-                        // Reflection coefficients to an LPC polynomial.
-                        let mut a = [0.0f64; 33];
-                        a[0] = 1.0;
-                        for mm in 1..=f.order {
-                            let mut b = a;
-                            for i in 1..mm {
-                                b[i] = a[i] + refl[mm - 1] * a[mm - i];
-                            }
-                            a[1..mm].copy_from_slice(&b[1..mm]);
-                            a[mm] = refl[mm - 1];
-                        }
-                        f.coef[..f.order].copy_from_slice(&a[1..=f.order]);
-                    }
-                    ch.tns[w].push(f);
-                }
-            }
-        }
-
-        // gain_control_data
-        if br.read_bits(1)? != 0 {
-            return Err(RagdollError::Unsupported(
-                "AAC SSR gain control is not supported".into(),
-            ));
-        }
-
-        // spectral_data, into the grouped (interleaved) order, then dequantised per window.
-        let mut q = [0i32; 1024];
-        let mut win = 0usize;
-        for g in 0..ics.num_window_groups {
-            let glen = ics.group_len[g];
-            for sfb in 0..ics.max_sfb {
-                let cb = ch.band_type[g][sfb];
-                let (lo, hi) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-                if cb == ZERO_HCB || cb >= NOISE_HCB {
-                    continue;
-                }
-                let book = &books[cb as usize];
-                for w in 0..glen {
-                    let base = (win + w) * 128;
-                    let mut k = lo;
-                    while k < hi {
-                        let s = book.decode(br)? as i32;
-                        let vals: [i32; 4];
-                        let dim;
-                        match cb {
-                            1 | 2 => {
-                                vals = [s / 27 - 1, (s / 9) % 3 - 1, (s / 3) % 3 - 1, s % 3 - 1];
-                                dim = 4;
-                            }
-                            3 | 4 => {
-                                vals = [s / 27, (s / 9) % 3, (s / 3) % 3, s % 3];
-                                dim = 4;
-                            }
-                            5 | 6 => {
-                                vals = [s / 9 - 4, s % 9 - 4, 0, 0];
-                                dim = 2;
-                            }
-                            7 | 8 => {
-                                vals = [s / 8, s % 8, 0, 0];
-                                dim = 2;
-                            }
-                            9 | 10 => {
-                                vals = [s / 13, s % 13, 0, 0];
-                                dim = 2;
-                            }
-                            _ => {
-                                vals = [s / 17, s % 17, 0, 0];
-                                dim = 2;
-                            }
-                        }
-                        let mut v = vals;
-                        let unsigned = matches!(cb, 3 | 4 | 7..=11);
-                        if unsigned {
-                            for x in v.iter_mut().take(dim) {
-                                if *x != 0 && br.read_bits(1)? != 0 {
-                                    *x = -*x;
-                                }
-                            }
-                        }
-                        if cb == ESC_HCB {
-                            for x in v.iter_mut().take(2) {
-                                if x.abs() == 16 {
-                                    let mut n = 4;
-                                    while br.read_bits(1)? != 0 {
-                                        n += 1;
-                                        if n > 12 {
-                                            return Err(bad("escape sequence too long"));
-                                        }
-                                    }
-                                    let mag = (1 << n) + br.read_bits(n)? as i32;
-                                    *x = if *x < 0 { -mag } else { mag };
-                                }
-                            }
-                        }
-                        let off = if short { base + k } else { k };
-                        q[off..off + dim].copy_from_slice(&v[..dim]);
-                        k += dim;
+                        a[mm] = refl[mm];
                     }
                 }
             }
-            win += glen;
         }
-        for &(k, amp) in &pulses {
-            q[k] = if q[k] > 0 { q[k] + amp } else { q[k] - amp };
-        }
+    }
 
-        // Inverse quantisation and noise substitution.
-        ch.spec = [0.0; 1024];
+    // gain_control_data
+    if br.bit() {
+        return Err(RagdollError::Unsupported(
+            "AAC SSR gain control is not supported".into(),
+        ));
+    }
+
+    // spectral_data, from the grouped (interleaved) order into window order, dequantised on the
+    // way: `sign(q) |q|^(4/3) 2^((sf - 100) / 4)`. Noise bands are filled afterwards.
+    let spec = &mut ch.spec;
+    let mut noise = false;
+    let mut bits = Cache::new(br);
+    let mut win = 0usize;
+    for g in 0..ics.num_window_groups {
+        let glen = ics.group_len[g];
+        for sfb in 0..ics.max_sfb {
+            let cb = ch.band_type[g][sfb];
+            let (lo, hi) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+            if cb == ZERO_HCB || cb >= NOISE_HCB {
+                noise |= cb == NOISE_HCB;
+                for w in win..win + glen {
+                    let base = if short { w * 128 } else { 0 };
+                    spec[base + lo..base + hi].fill(0.0);
+                }
+                continue;
+            }
+            let book = &t.books[cb as usize];
+            let gain = t.gain[ch.sf[g][sfb] as usize];
+            for w in win..win + glen {
+                let base = if short { w * 128 } else { 0 };
+                let band = &mut spec[base + lo..base + hi];
+                // Payloads index the value tables; the masks only spare the bounds checks.
+                if cb <= 4 {
+                    for s in band.as_chunks_mut::<4>().0 {
+                        *s = t.quads[book.decode(&mut bits) as usize & 1023].map(|x| x * gain);
+                    }
+                } else if cb < ESC_HCB {
+                    for s in band.as_chunks_mut::<2>().0 {
+                        *s = t.pairs[book.decode(&mut bits) as usize & 2047].map(|x| x * gain);
+                    }
+                } else {
+                    for s in band.as_chunks_mut::<2>().0 {
+                        let p = book.decode(&mut bits);
+                        if p & ESC_FLAG == 0 {
+                            *s = t.pairs[p as usize & 2047].map(|x| x * gain);
+                            continue;
+                        }
+                        let p = (p & !ESC_FLAG) as i32;
+                        for (s, v) in s.iter_mut().zip([p / 33 - 16, p % 33 - 16]) {
+                            let v = if v.abs() == 16 {
+                                escape(&mut bits, v)?
+                            } else {
+                                v
+                            };
+                            *s = t.dequantise(v, gain);
+                        }
+                    }
+                }
+            }
+        }
+        win += glen;
+    }
+    br.pos = bits.pos();
+    let top = swb[ics.max_sfb] as usize;
+    for w in 0..ics.num_windows {
+        let base = if short { w * 128 } else { 0 };
+        let len = if short { 128 } else { 1024 };
+        spec[base + top..base + len].fill(0.0);
+    }
+
+    // Pulses (long windows only) amend coefficients of spectrally coded bands.
+    for &(k, amp) in &pulses[..num_pulse] {
+        let sfb = swb.partition_point(|&o| o as usize <= k) - 1;
+        if sfb < ics.max_sfb && matches!(ch.band_type[0][sfb], 1..=ESC_HCB) {
+            spec[k] = t.add_pulse(spec[k], amp, t.gain[ch.sf[0][sfb] as usize]);
+        }
+    }
+
+    // Noise substitution.
+    if noise {
         let mut win = 0usize;
         for g in 0..ics.num_window_groups {
             for w in win..win + ics.group_len[g] {
                 let base = if short { w * 128 } else { 0 };
                 for sfb in 0..ics.max_sfb {
+                    if ch.band_type[g][sfb] != NOISE_HCB {
+                        continue;
+                    }
                     let (lo, hi) = (base + swb[sfb] as usize, base + swb[sfb + 1] as usize);
-                    match ch.band_type[g][sfb] {
-                        ZERO_HCB | INTENSITY_HCB | INTENSITY_HCB2 => {}
-                        NOISE_HCB => {
-                            let mut energy = 0.0;
-                            for k in lo..hi {
-                                self.noise_state = self
-                                    .noise_state
-                                    .wrapping_mul(1_664_525)
-                                    .wrapping_add(1_013_904_223);
-                                let r = self.noise_state as i32 as f64;
-                                ch.spec[k] = r;
-                                energy += r * r;
-                            }
-                            let scale = 2f64.powf(0.25 * ch.sf[g][sfb] as f64) / energy.sqrt();
-                            for v in &mut ch.spec[lo..hi] {
-                                *v *= scale;
-                            }
-                        }
-                        _ => {
-                            let gain = 2f64.powf(0.25 * (ch.sf[g][sfb] - 100) as f64);
-                            for k in lo..hi {
-                                let x = q[k];
-                                if x != 0 {
-                                    let m = (x.unsigned_abs() as f64).powf(4.0 / 3.0) * gain;
-                                    ch.spec[k] = if x < 0 { -m } else { m };
-                                }
-                            }
-                        }
+                    let mut rand = [0.0f64; 128];
+                    let rand = &mut rand[..hi - lo];
+                    let mut energy = 0.0;
+                    for r in rand.iter_mut() {
+                        *noise_state = noise_state
+                            .wrapping_mul(1_664_525)
+                            .wrapping_add(1_013_904_223);
+                        *r = *noise_state as i32 as f64;
+                        energy += *r * *r;
+                    }
+                    let scale = (0.25 * ch.sf[g][sfb] as f64).exp2() / energy.sqrt();
+                    for (s, &r) in spec[lo..hi].iter_mut().zip(rand.iter()) {
+                        *s = (r * scale) as f32;
                     }
                 }
             }
             win += ics.group_len[g];
         }
-        Ok(())
     }
-
-    /// Filterbank: IMDCT, windowing and overlap-add for output channel `idx`.
-    fn synthesize(&mut self, idx: usize, ch: &Channel) -> Vec<f64> {
-        if self.synth.len() <= idx {
-            self.synth.resize(idx + 1, Synth::default());
-        }
-        let w = windows();
-        let st = &mut self.synth[idx];
-        let cur = ch.ics.window_shape as usize;
-        let prev = st.prev_shape as usize;
-        let mut z = [0.0f64; 2048];
-        match ch.ics.window_sequence {
-            EIGHT_SHORT => {
-                let mut x = [0.0f64; 256];
-                for win in 0..8 {
-                    imdct(&ch.spec[win * 128..win * 128 + 128], &mut x);
-                    let left = if win == 0 {
-                        &w.short[prev]
-                    } else {
-                        &w.short[cur]
-                    };
-                    let right = &w.short[cur];
-                    let base = 448 + 128 * win;
-                    for n in 0..128 {
-                        z[base + n] += x[n] * left[n];
-                        z[base + 128 + n] += x[128 + n] * right[127 - n];
-                    }
-                }
-            }
-            seq => {
-                let mut x = [0.0f64; 2048];
-                imdct(&ch.spec, &mut x);
-                if seq == LONG_STOP {
-                    for n in 448..576 {
-                        z[n] = x[n] * w.short[prev][n - 448];
-                    }
-                    z[576..1024].copy_from_slice(&x[576..1024]);
-                } else {
-                    for n in 0..1024 {
-                        z[n] = x[n] * w.long[prev][n];
-                    }
-                }
-                if seq == LONG_START {
-                    z[1024..1472].copy_from_slice(&x[1024..1472]);
-                    for n in 1472..1600 {
-                        z[n] = x[n] * w.short[cur][127 - (n - 1472)];
-                    }
-                } else {
-                    for n in 1024..2048 {
-                        z[n] = x[n] * w.long[cur][2047 - n];
-                    }
-                }
-                debug_assert!(seq == ONLY_LONG || seq == LONG_START || seq == LONG_STOP);
-            }
-        }
-        let mut out = vec![0.0f64; 1024];
-        for n in 0..1024 {
-            out[n] = z[n] + st.overlap[n];
-        }
-        st.overlap.copy_from_slice(&z[1024..]);
-        st.prev_shape = ch.ics.window_shape;
-        out
-    }
+    Ok(())
 }
 
 /// M/S and intensity stereo for a common-window channel pair.
 fn stereo_tools(l: &mut Channel, r: &mut Channel, ms_used: &[[bool; 64]; 8], sr_idx: u8) {
-    let ics = l.ics.clone();
+    let ics = &l.ics;
     let short = ics.window_sequence == EIGHT_SHORT;
     let swb = ics.swb(sr_idx);
     let mut win = 0usize;
@@ -916,15 +1146,15 @@ fn stereo_tools(l: &mut Channel, r: &mut Channel, ms_used: &[[bool; 64]; 8], sr_
                     if ms_used[g][sfb] {
                         sign = -sign;
                     }
-                    let scale = sign * 0.5f64.powf(0.25 * r.sf[g][sfb] as f64);
-                    for k in lo..hi {
-                        r.spec[k] = l.spec[k] * scale;
+                    let scale = (sign * (-0.25 * r.sf[g][sfb] as f64).exp2()) as f32;
+                    for (d, &s) in r.spec[lo..hi].iter_mut().zip(&l.spec[lo..hi]) {
+                        *d = s * scale;
                     }
                 } else if ms_used[g][sfb] && bl < NOISE_HCB && brt < NOISE_HCB {
-                    for k in lo..hi {
-                        let (m, s) = (l.spec[k], r.spec[k]);
-                        l.spec[k] = m + s;
-                        r.spec[k] = m - s;
+                    for (a, b) in l.spec[lo..hi].iter_mut().zip(&mut r.spec[lo..hi]) {
+                        let (m, s) = (*a, *b);
+                        *a = m + s;
+                        *b = m - s;
                     }
                 }
             }
@@ -934,7 +1164,7 @@ fn stereo_tools(l: &mut Channel, r: &mut Channel, ms_used: &[[bool; 64]; 8], sr_
 }
 
 /// Temporal noise shaping: all-pole filtering of the spectrum per window.
-fn apply_tns(ch: &mut Channel, sr_idx: u8, _aot: u8) {
+fn apply_tns(ch: &mut Channel, sr_idx: u8) {
     let short = ch.ics.window_sequence == EIGHT_SHORT;
     let swb = ch.ics.swb(sr_idx);
     let num_swb = swb.len() - 1;
@@ -944,10 +1174,10 @@ fn apply_tns(ch: &mut Channel, sr_idx: u8, _aot: u8) {
         (TNS_MAX_BANDS_LONG[sr_idx as usize], 12)
     };
     let limit = max_bands.min(ch.ics.max_sfb);
-    for w in 0..ch.tns.len() {
+    for w in 0..ch.ics.num_windows {
         let base = if short { w * 128 } else { 0 };
         let mut bottom = num_swb;
-        for f in &ch.tns[w] {
+        for f in &ch.tns[w][..ch.tns_count[w]] {
             let top = bottom;
             bottom = top.saturating_sub(f.length);
             let order = f.order.min(max_order);
@@ -959,18 +1189,15 @@ fn apply_tns(ch: &mut Channel, sr_idx: u8, _aot: u8) {
             if end <= start {
                 continue;
             }
-            let x = &mut ch.spec[base..base + 1024.min(if short { 128 } else { 1024 })];
-            let mut state = [0.0f64; 32];
-            let n = end - start;
-            for i in 0..n {
+            let x = &mut ch.spec[base..];
+            let mut state = [0.0f32; 32];
+            for i in 0..end - start {
                 let k = if f.direction { end - 1 - i } else { start + i };
                 let mut y = x[k];
                 for j in 0..order {
                     y -= f.coef[j] * state[j];
                 }
-                for j in (1..order).rev() {
-                    state[j] = state[j - 1];
-                }
+                state.copy_within(0..order - 1, 1);
                 state[0] = y;
                 x[k] = y;
             }
@@ -978,56 +1205,208 @@ fn apply_tns(ch: &mut Channel, sr_idx: u8, _aot: u8) {
     }
 }
 
+/// Filterbank: IMDCT, windowing and overlap-add of one channel into `out`.
+fn synthesize(
+    t: &Tables,
+    st: &mut Synth,
+    ch: &Channel,
+    out: &mut [f32; 1024],
+    y: &mut [f32; 1024],
+) {
+    let cur = &t.shapes[ch.ics.window_shape as usize];
+    let prev = &t.shapes[st.prev_shape as usize];
+    let ov = &mut st.overlap;
+    if ch.ics.window_sequence == EIGHT_SHORT {
+        // The eight short blocks overlap one another at 448 + 128 w within the frame's 2048
+        // samples, chained through `tail`.
+        let mut z = [0.0f32; 2048];
+        let mut tail = [0.0f32; 128];
+        let y = &mut y[..128];
+        for w in 0..8 {
+            t.short.dct4(&ch.spec[w * 128..w * 128 + 128], y);
+            let left = if w == 0 {
+                &prev.short_rise
+            } else {
+                &cur.short_rise
+            };
+            let z = &mut z[448 + 128 * w..576 + 128 * w];
+            imdct_window(y, left, &cur.short_fall, &mut tail, z);
+        }
+        z[1472..1600].copy_from_slice(&tail);
+        for n in 0..1024 {
+            out[n] = z[n] + ov[n];
+        }
+        ov.copy_from_slice(&z[1024..]);
+    } else {
+        t.long.dct4(&ch.spec, y);
+        let rise = if ch.ics.window_sequence == LONG_STOP {
+            &prev.stop_rise
+        } else {
+            &prev.long_rise
+        };
+        let fall = if ch.ics.window_sequence == LONG_START {
+            &cur.start_fall
+        } else {
+            &cur.long_fall
+        };
+        debug_assert!(matches!(
+            ch.ics.window_sequence,
+            ONLY_LONG | LONG_START | LONG_STOP
+        ));
+        imdct_window(y, rise, fall, ov, out);
+    }
+    st.prev_shape = ch.ics.window_shape;
+}
+
 /// Parses (and discards) a `program_config_element`.
-fn skip_pce(br: &mut BitReader) -> Result<()> {
-    let _tag = br.read_bits(4)?;
-    let _object_type = br.read_bits(2)?;
-    let _sf_index = br.read_bits(4)?;
-    let front = br.read_bits(4)? as usize;
-    let side = br.read_bits(4)? as usize;
-    let back = br.read_bits(4)? as usize;
-    let lfe = br.read_bits(2)? as usize;
-    let assoc = br.read_bits(3)? as usize;
-    let cc = br.read_bits(4)? as usize;
-    if br.read_bits(1)? != 0 {
-        br.read_bits(4)?;
+fn skip_pce(br: &mut Bits) {
+    let _tag = br.read(4);
+    let _object_type = br.read(2);
+    let _sf_index = br.read(4);
+    let front = br.read(4) as usize;
+    let side = br.read(4) as usize;
+    let back = br.read(4) as usize;
+    let lfe = br.read(2) as usize;
+    let assoc = br.read(3) as usize;
+    let cc = br.read(4) as usize;
+    if br.bit() {
+        br.read(4);
     }
-    if br.read_bits(1)? != 0 {
-        br.read_bits(4)?;
+    if br.bit() {
+        br.read(4);
     }
-    if br.read_bits(1)? != 0 {
-        br.read_bits(3)?;
+    if br.bit() {
+        br.read(3);
     }
-    br.skip_bits((front + side + back) * 5 + lfe * 4 + assoc * 4 + cc * 5)?;
-    br.align_to_byte();
-    let comment = br.read_bits(8)? as usize;
-    br.skip_bits(8 * comment)?;
-    Ok(())
+    br.skip((front + side + back) * 5 + lfe * 4 + assoc * 4 + cc * 5);
+    br.align();
+    let comment = br.read(8) as usize;
+    br.skip(8 * comment);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SPECTRAL: [(&[u16], &[u8]); 11] = [
+        (&HCB_1_CODES, &HCB_1_BITS),
+        (&HCB_2_CODES, &HCB_2_BITS),
+        (&HCB_3_CODES, &HCB_3_BITS),
+        (&HCB_4_CODES, &HCB_4_BITS),
+        (&HCB_5_CODES, &HCB_5_BITS),
+        (&HCB_6_CODES, &HCB_6_BITS),
+        (&HCB_7_CODES, &HCB_7_BITS),
+        (&HCB_8_CODES, &HCB_8_BITS),
+        (&HCB_9_CODES, &HCB_9_BITS),
+        (&HCB_10_CODES, &HCB_10_BITS),
+        (&HCB_11_CODES, &HCB_11_BITS),
+    ];
+
+    /// A buffer holding `bits` (a string of `0` and `1`), zero padded.
+    fn bitstring(bits: &str) -> Box<Buf> {
+        let mut buf = Box::new([0u8; BUF_LEN + 8]);
+        for (i, c) in bits.bytes().enumerate() {
+            buf[i / 8] |= ((c == b'1') as u8) << (7 - i % 8);
+        }
+        buf
+    }
+
+    /// Every codeword (sign bits included) decodes to its own payload and length, whatever
+    /// follows it.
     #[test]
-    fn imdct_matches_definition() {
-        for m in [64usize, 1024] {
-            let spec: Vec<f64> = (0..m).map(|k| ((k * 7919) % 101) as f64 - 50.0).collect();
-            let mut fast = vec![0.0; 2 * m];
-            imdct(&spec, &mut fast);
-            let n = 2 * m;
-            let n0 = (m as f64 + 1.0) / 2.0;
-            for (i, &v) in fast.iter().enumerate() {
-                let direct: f64 = spec
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &x)| {
-                        x * (2.0 * PI / n as f64 * (i as f64 + n0) * (k as f64 + 0.5)).cos()
-                    })
-                    .sum::<f64>()
-                    * 2.0
-                    / n as f64;
-                assert!((v - direct).abs() < 1e-9, "m={m} n={i}: {v} vs {direct}");
+    fn huffman_tables_decode_every_codeword() {
+        let t = tables();
+        for cb in 0..12 {
+            let codes: Vec<(u32, u32, u32)> = if cb == 0 {
+                (0..HCB_SF_CODES.len())
+                    .map(|i| (HCB_SF_CODES[i], HCB_SF_BITS[i] as u32, i as u32))
+                    .collect()
+            } else {
+                let (c, b) = SPECTRAL[cb - 1];
+                spectral_codewords(cb, c, b)
+            };
+            for &(code, len, payload) in &codes {
+                for tail in [0u64, u64::MAX] {
+                    let word = (code as u64) << (64 - len) | (tail >> len);
+                    let mut buf = Box::new([0xA5; BUF_LEN + 8]);
+                    buf[..8].copy_from_slice(&word.to_be_bytes());
+                    let mut br = Bits::new(&buf, 8);
+                    let p = t.books[cb].decode(&mut br);
+                    assert_eq!(
+                        (p, br.pos),
+                        (payload, len as usize),
+                        "codebook {cb} code {code}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sign_bits_and_escape_sequence() {
+        let t = tables();
+        let code = |cb: usize, s: usize| {
+            let (c, b) = SPECTRAL[cb - 1];
+            format!("{:0w$b}", c[s], w = b[s] as usize)
+        };
+        // Codebook 3, (1, 0, 2, 0): one sign bit per nonzero value, in order (+1, -2).
+        let bits = code(3, 27 + 6) + "01";
+        let buf = bitstring(&bits);
+        let mut br = Bits::new(&buf, bits.len().div_ceil(8));
+        let p = t.books[3].decode(&mut br);
+        assert_eq!((p, br.pos), (quad_row([1, 0, -2, 0]), bits.len()));
+
+        // Codebook 11, (16, 3): signs (-, +), then the escape of the 16: two ones, a zero and
+        // 4 + 2 bits (2^6 + 42).
+        let bits = code(11, 16 * 17 + 3) + "10" + "110" + "101010";
+        let buf = bitstring(&bits);
+        let mut br = Bits::new(&buf, bits.len().div_ceil(8));
+        let p = t.books[11].decode(&mut br);
+        assert_eq!(p, pair_row([-16, 3]) | ESC_FLAG);
+        assert_eq!(escape(&mut br, -16).unwrap(), -(64 + 42));
+        assert_eq!(br.pos, bits.len());
+        br.check().unwrap();
+
+        // Nine ones is one too many.
+        let buf = bitstring("1111111110");
+        let mut br = Bits::new(&buf, 2);
+        assert!(escape(&mut br, 16).is_err());
+    }
+
+    #[test]
+    fn value_tables_match_dequantisation() {
+        let t = tables();
+        let deq = |v: &[i32]| {
+            v.iter()
+                .map(|&x| t.dequantise(x, 0.75).to_bits())
+                .collect::<Vec<_>>()
+        };
+        for a in -16..=16 {
+            for b in -16..=16 {
+                let row = t.pairs[pair_row([a, b]) as usize].map(|x| (x * 0.75).to_bits());
+                assert_eq!(row.to_vec(), deq(&[a, b]));
+                if a.abs() <= 2 && b.abs() <= 2 {
+                    let v = [a, b, b, a];
+                    let row = t.quads[quad_row(v) as usize].map(|x| (x * 0.75).to_bits());
+                    assert_eq!(row.to_vec(), deq(&v));
+                }
+            }
+        }
+    }
+
+    /// Pulses amend the quantised value as if it were still at hand, for every value an escape
+    /// and up to three earlier pulses can reach, at the extreme scale factors.
+    #[test]
+    fn pulses_amend_the_quantised_value() {
+        let t = tables();
+        for sf in [0, 1, 2, 3, 99, 100, 101, 252, 253, 254, 255] {
+            let gain = t.gain[sf];
+            for q in -(8191 + 45)..=8191 + 45 {
+                for amp in [0, 1, 15] {
+                    let want = t.dequantise(if q > 0 { q + amp } else { q - amp }, gain);
+                    let got = t.add_pulse(t.dequantise(q, gain), amp, gain);
+                    assert_eq!(got.to_bits(), want.to_bits(), "sf {sf} q {q} amp {amp}");
+                }
             }
         }
     }
