@@ -29,6 +29,7 @@ mod range;
 mod rate;
 mod silk;
 mod silk_dsp;
+mod simd;
 mod silk_tables;
 mod vq;
 

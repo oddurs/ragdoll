@@ -309,15 +309,17 @@ impl CeltDecoder {
             self.decode_mem
                 .copy_within(o + n..o + DECODE_BUFFER_SIZE + OVERLAP / 2, o);
         }
-        let mut collapse_masks = vec![0u8; c * NB_EBANDS];
-        let mut x = vec![0i16; c * n];
+        let mut collapse_masks = [0u8; 2 * NB_EBANDS];
+        let collapse_masks = &mut collapse_masks[..c * NB_EBANDS];
+        let mut x = [0i16; 2 * 960];
+        let x = &mut x[..c * n];
         quant_all_bands(
             AllBands {
                 complexity: 0,
                 encode: false,
                 start,
                 end,
-                collapse_masks: &mut collapse_masks,
+                collapse_masks,
                 band_e: &[],
                 pulses: &pulses,
                 short_blocks,
@@ -331,7 +333,7 @@ impl CeltDecoder {
                 coded_bands: alloc.coded_bands,
                 disable_inv: self.disable_inv,
             },
-            &mut x,
+            x,
             c,
             dec,
             &mut self.rng,
@@ -352,8 +354,8 @@ impl CeltDecoder {
         );
         if anti_collapse_on {
             anti_collapse(
-                &mut x,
-                &collapse_masks,
+                x,
+                collapse_masks,
                 lm,
                 c,
                 n,
@@ -371,7 +373,7 @@ impl CeltDecoder {
                 *v = -(28 << DB_SHIFT);
             }
         }
-        self.synthesis(&x, start, eff_end, c, is_transient, lm, silence);
+        self.synthesis(x, start, eff_end, c, is_transient, lm, silence);
         for ch in 0..cc {
             self.postfilter_period = self.postfilter_period.max(COMBFILTER_MINPERIOD);
             self.postfilter_period_old = self.postfilter_period_old.max(COMBFILTER_MINPERIOD);
@@ -485,7 +487,8 @@ impl CeltDecoder {
             (1, n, (MAX_LM - lm) as usize)
         };
         let ds = self.downsample;
-        let mut freq = vec![0i32; n];
+        let mut freq = [0i32; 960];
+        let freq = &mut freq[..n];
         let out_base = DECODE_BUFFER_SIZE - n;
         let backward = |mem: &mut [i32], ch: usize, f: &[i32]| {
             for b in 0..b_cnt {
@@ -503,7 +506,7 @@ impl CeltDecoder {
         if cc == 2 && c == 1 {
             denormalise_bands(
                 x,
-                &mut freq,
+                freq,
                 &self.old_band_e,
                 start,
                 eff_end,
@@ -511,14 +514,14 @@ impl CeltDecoder {
                 ds,
                 silence,
             );
-            let freq2 = freq.clone();
-            backward(&mut self.decode_mem, 0, &freq2);
-            backward(&mut self.decode_mem, 1, &freq);
+            backward(&mut self.decode_mem, 0, freq);
+            backward(&mut self.decode_mem, 1, freq);
         } else if cc == 1 && c == 2 {
-            let mut freq2 = vec![0i32; n];
+            let mut freq2 = [0i32; 960];
+            let freq2 = &mut freq2[..n];
             denormalise_bands(
                 x,
-                &mut freq,
+                freq,
                 &self.old_band_e,
                 start,
                 eff_end,
@@ -528,7 +531,7 @@ impl CeltDecoder {
             );
             denormalise_bands(
                 &x[n..],
-                &mut freq2,
+                freq2,
                 &self.old_band_e[NB_EBANDS..],
                 start,
                 eff_end,
@@ -539,12 +542,12 @@ impl CeltDecoder {
             for i in 0..n {
                 freq[i] = (freq[i] >> 1).wrapping_add(freq2[i] >> 1);
             }
-            backward(&mut self.decode_mem, 0, &freq);
+            backward(&mut self.decode_mem, 0, freq);
         } else {
             for ch in 0..cc {
                 denormalise_bands(
                     &x[ch * n..],
-                    &mut freq,
+                    freq,
                     &self.old_band_e[ch * NB_EBANDS..],
                     start,
                     eff_end,
@@ -552,7 +555,7 @@ impl CeltDecoder {
                     ds,
                     silence,
                 );
-                backward(&mut self.decode_mem, ch, &freq);
+                backward(&mut self.decode_mem, ch, freq);
             }
         }
         for ch in 0..cc {
@@ -569,35 +572,36 @@ impl CeltDecoder {
         let cc = self.channels;
         let ds = self.downsample;
         let nd = n / ds;
-        let mut scratch = vec![0i32; n];
+        let mem = &self.decode_mem;
+        let x = |ch: usize| &mem[ch * STRIDE + DECODE_BUFFER_SIZE - n..ch * STRIDE + DECODE_BUFFER_SIZE];
+        let step = |mm: &mut i32, v: i32| {
+            let tmp = v.wrapping_add(*mm);
+            *mm = mul16_32_q15(PREEMPH, tmp);
+            tmp
+        };
+        if cc == 2 && ds == 1 && !accum {
+            // The common case, both channels at once so their recurrences overlap.
+            let [mut m0, mut m1] = self.preemph_mem;
+            for ((o, &a), &b) in pcm[..2 * n].chunks_exact_mut(2).zip(x(0)).zip(x(1)) {
+                o[0] = sig2word16(step(&mut m0, a));
+                o[1] = sig2word16(step(&mut m1, b));
+            }
+            self.preemph_mem = [m0, m1];
+            return;
+        }
         for ch in 0..cc {
-            let x = ch * STRIDE + DECODE_BUFFER_SIZE - n;
             let mut mm = self.preemph_mem[ch];
-            if ds > 1 {
-                for j in 0..n {
-                    let tmp = self.decode_mem[x + j].wrapping_add(mm);
-                    mm = mul16_32_q15(PREEMPH, tmp);
-                    scratch[j] = tmp;
+            let out = pcm[ch..].iter_mut().step_by(cc).take(nd);
+            for (o, xs) in out.zip(x(ch).chunks_exact(ds)) {
+                // Only every ds-th sample is kept, but the filter runs on all of them.
+                let v = sig2word16(step(&mut mm, xs[0]));
+                for &xv in &xs[1..] {
+                    step(&mut mm, xv);
                 }
-                for j in 0..nd {
-                    let v = sig2word16(scratch[j * ds]);
-                    pcm[j * cc + ch] = if accum {
-                        sat16(pcm[j * cc + ch] as i32 + v as i32)
-                    } else {
-                        v
-                    };
-                }
-            } else {
-                for j in 0..n {
-                    let tmp = self.decode_mem[x + j].wrapping_add(mm);
-                    mm = mul16_32_q15(PREEMPH, tmp);
-                    let v = sig2word16(tmp);
-                    pcm[j * cc + ch] = if accum {
-                        sat16(pcm[j * cc + ch] as i32 + v as i32)
-                    } else {
-                        v
-                    };
-                }
+                *o = if accum { sat16(*o as i32 + v as i32) } else { v };
+            }
+            for &xv in &x(ch)[nd * ds..] {
+                step(&mut mm, xv);
             }
             self.preemph_mem[ch] = mm;
         }

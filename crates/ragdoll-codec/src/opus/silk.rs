@@ -10,6 +10,7 @@ const MAX_LPC_ORDER: usize = 16;
 const MAX_NB_SUBFR: usize = 4;
 const MAX_FRAME_LENGTH: usize = 320;
 const LTP_ORDER: usize = 5;
+const MAX_SUBFR_LENGTH: usize = 80;
 const TYPE_NO_VOICE_ACTIVITY: i32 = 0;
 const TYPE_VOICED: i32 = 2;
 const CODE_INDEPENDENTLY: i32 = 0;
@@ -393,10 +394,14 @@ impl ChannelState {
 
     fn decode_core(&mut self, ctrl: &mut Ctrl, xq: &mut [i16], pulses: &[i16]) {
         let ltp_mem = self.ltp_mem_length;
-        let mut s_ltp = vec![0i16; ltp_mem];
-        let mut s_ltp_q15 = vec![0i32; ltp_mem + self.frame_length];
-        let mut res_q14 = vec![0i32; self.subfr_length];
-        let mut s_lpc_q14 = vec![0i32; self.subfr_length + MAX_LPC_ORDER];
+        let mut s_ltp = [0i16; MAX_FRAME_LENGTH];
+        let s_ltp = &mut s_ltp[..ltp_mem];
+        let mut s_ltp_q15 = [0i32; 2 * MAX_FRAME_LENGTH];
+        let s_ltp_q15 = &mut s_ltp_q15[..ltp_mem + self.frame_length];
+        let mut res_q14 = [0i32; MAX_SUBFR_LENGTH];
+        let res_q14 = &mut res_q14[..self.subfr_length];
+        let mut s_lpc_q14 = [0i32; MAX_SUBFR_LENGTH + MAX_LPC_ORDER];
+        let s_lpc_q14 = &mut s_lpc_q14[..self.subfr_length + MAX_LPC_ORDER];
         let st = self.indices.signal_type;
         let offset_q10 = QUANTIZATION_OFFSETS_Q10
             [((st >> 1) * 2 + self.indices.quant_offset_type) as usize]
@@ -484,30 +489,28 @@ impl ChannelState {
                 let b = &ctrl.ltp_coef_q14[k * LTP_ORDER..k * LTP_ORDER + LTP_ORDER];
                 let pl0 = s_ltp_buf_idx + LTP_ORDER / 2 - lag as usize;
                 for (i, pl) in (pl0..pl0 + sub).enumerate() {
+                    let h = &s_ltp_q15[pl - 4..=pl];
                     let mut p = 2;
-                    p = smlawb(p, s_ltp_q15[pl], b[0] as i32);
-                    p = smlawb(p, s_ltp_q15[pl - 1], b[1] as i32);
-                    p = smlawb(p, s_ltp_q15[pl - 2], b[2] as i32);
-                    p = smlawb(p, s_ltp_q15[pl - 3], b[3] as i32);
-                    p = smlawb(p, s_ltp_q15[pl - 4], b[4] as i32);
+                    p = smlawb(p, h[4], b[0] as i32);
+                    p = smlawb(p, h[3], b[1] as i32);
+                    p = smlawb(p, h[2], b[2] as i32);
+                    p = smlawb(p, h[1], b[3] as i32);
+                    p = smlawb(p, h[0], b[4] as i32);
                     res_q14[i] = self.exc_q14[pexc + i].wrapping_add(p << 1);
                     s_ltp_q15[s_ltp_buf_idx] = res_q14[i] << 1;
                     s_ltp_buf_idx += 1;
                 }
             }
-            for i in 0..sub {
-                let mut p = (order >> 1) as i32;
-                for j in 0..order {
-                    p = smlawb(p, s_lpc_q14[MAX_LPC_ORDER + i - j - 1], a_q12[j] as i32);
-                }
-                let r = if use_res {
-                    res_q14[i]
-                } else {
-                    self.exc_q14[pexc + i]
-                };
-                let v = r.saturating_add(lshift_sat32(p, 4));
-                s_lpc_q14[MAX_LPC_ORDER + i] = v;
-                xq[pxq + i] = sat16(rshift_round(smulww(v, gain_q10), 8)) as i16;
+            let r: &[i32] = if use_res {
+                res_q14
+            } else {
+                &self.exc_q14[pexc..pexc + sub]
+            };
+            let xo = &mut xq[pxq..pxq + sub];
+            if order == 16 {
+                lpc_synthesis::<16>(s_lpc_q14, &a_q12, r, xo, gain_q10);
+            } else {
+                lpc_synthesis::<10>(s_lpc_q14, &a_q12, r, xo, gain_q10);
             }
             s_lpc_q14.copy_within(sub..sub + MAX_LPC_ORDER, 0);
             pexc += sub;
@@ -876,6 +879,55 @@ impl ChannelState {
         self.plc_glue_frames(&mut out[..l]);
         self.lag_prev = ctrl.pitch_l[self.nb_subfr - 1];
         l
+    }
+}
+
+/// The short-term synthesis of `silk_decode_core` for one subframe: `s_lpc` holds the
+/// `MAX_LPC_ORDER` previous outputs (Q14) followed by room for the `r.len()` new ones.
+#[inline(always)]
+fn lpc_synthesis<const ORDER: usize>(
+    s_lpc: &mut [i32],
+    a_q12: &[i16; MAX_LPC_ORDER],
+    r: &[i32],
+    xq: &mut [i16],
+    gain_q10: i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd::lpc_synthesis_avx2(s_lpc, a_q12, ORDER, r, xq, gain_q10) };
+        lpc_synthesis_scalar::<ORDER>(s_lpc, a_q12, r, xq, gain_q10, done);
+        return;
+    }
+    lpc_synthesis_scalar::<ORDER>(s_lpc, a_q12, r, xq, gain_q10, 0);
+}
+
+/// Scalar reference of [`lpc_synthesis`], from output `i0` on.
+fn lpc_synthesis_scalar<const ORDER: usize>(
+    s_lpc: &mut [i32],
+    a_q12: &[i16; MAX_LPC_ORDER],
+    r: &[i32],
+    xq: &mut [i16],
+    gain_q10: i32,
+    i0: usize,
+) {
+    let n = r.len();
+    let s_lpc = &mut s_lpc[..MAX_LPC_ORDER + n];
+    let xq = &mut xq[..n];
+    // SMLAWB terms wrap like 32-bit adds, so the sum can take the newest output last: it is
+    // the only term on the sample-to-sample dependency chain, and kept in a register.
+    let mut prev = s_lpc[MAX_LPC_ORDER - 1 + i0];
+    for i in i0..n {
+        let h: &[i32; MAX_LPC_ORDER] = s_lpc[i..i + MAX_LPC_ORDER].try_into().unwrap();
+        let mut p = (ORDER >> 1) as i32;
+        for j in 1..ORDER {
+            p = smlawb(p, h[MAX_LPC_ORDER - 1 - j], a_q12[j] as i32);
+        }
+        p = smlawb(p, prev, a_q12[0] as i32);
+        let v = r[i].saturating_add(lshift_sat32(p, 4));
+        s_lpc[MAX_LPC_ORDER + i] = v;
+        prev = v;
+        xq[i] = sat16(rshift_round(smulww(v, gain_q10), 8)) as i16;
     }
 }
 
@@ -1309,8 +1361,7 @@ impl SilkDecoder {
             c.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
             c.first_frame_after_reset = true;
         }
-        let fl = self.ch[0].frame_length;
-        let mut tmp = [vec![0i16; fl + 2], vec![0i16; fl + 2]];
+        let mut tmp = [[0i16; MAX_FRAME_LENGTH + 2]; 2];
         let has_side = if lost_flag == FLAG_DECODE_NORMAL {
             !decode_only_middle
         } else {
@@ -1361,30 +1412,31 @@ impl SilkDecoder {
         let n_out =
             n_samples_out_dec * ctl.api_sample_rate as usize / (self.ch[0].fs_khz as usize * 1000);
         let api2 = ctl.n_channels_api == 2;
-        let mut rs_out = vec![0i16; n_out];
+        // 20 ms at 48 kHz.
+        let mut rs_buf = [0i16; 960];
+        let rs_out = &mut rs_buf[..n_out];
         for n in 0..(ctl.n_channels_api as usize).min(nci) {
-            self.ch[n]
-                .resampler
-                .process(&mut rs_out, &tmp[n][1..1 + n_samples_out_dec]);
+            let input = &tmp[n][1..1 + n_samples_out_dec];
             if api2 {
-                for i in 0..n_out {
-                    out[n + 2 * i] = rs_out[i];
+                self.ch[n].resampler.process(rs_out, input);
+                for (o, &v) in out[n..].iter_mut().step_by(2).zip(rs_out.iter()) {
+                    *o = v;
                 }
             } else {
-                out[..n_out].copy_from_slice(&rs_out);
+                self.ch[n].resampler.process(&mut out[..n_out], input);
             }
         }
         if api2 && nci == 1 {
             if stereo_to_mono {
                 self.ch[1]
                     .resampler
-                    .process(&mut rs_out, &tmp[0][1..1 + n_samples_out_dec]);
-                for i in 0..n_out {
-                    out[1 + 2 * i] = rs_out[i];
+                    .process(rs_out, &tmp[0][1..1 + n_samples_out_dec]);
+                for (o, &v) in out[1..].iter_mut().step_by(2).zip(rs_out.iter()) {
+                    *o = v;
                 }
             } else {
-                for i in 0..n_out {
-                    out[1 + 2 * i] = out[2 * i];
+                for o in out[..2 * n_out].chunks_exact_mut(2) {
+                    o[1] = o[0];
                 }
             }
         }

@@ -7,6 +7,7 @@ use super::math::{
     add16, atan2p, cos_norm, div, ilog2, inner_prod, mac16, mul16, mul16_32_q16, mul16_p15,
     mul16_q15, pshr32, rcp, rsqrt_norm, sqrt, vshr32,
 };
+use super::bands::MAX_BAND;
 use super::range::Ec;
 
 pub const SPREAD_NONE: i32 = 0;
@@ -79,7 +80,7 @@ pub fn encode_pulses(y: &[i32], n: usize, k: usize, enc: &mut Ec) {
 }
 
 /// `cwrsi`: codeword of index `i`; returns its squared norm.
-fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> i32 {
+fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
     let rows = u_table();
     let mut yy = 0i32;
     let mut yi = 0usize;
@@ -109,7 +110,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> i32 {
             }
             i -= p;
             let val = ((k0 as i32 - k as i32 + s) ^ s) as i16;
-            y[yi] = val as i32;
+            y[yi] = val;
             yi += 1;
             yy = mac16(yy, val as i32, val as i32);
         } else {
@@ -133,7 +134,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> i32 {
                 }
                 i -= p;
                 let val = ((k0 as i32 - k as i32 + s) ^ s) as i16;
-                y[yi] = val as i32;
+                y[yi] = val;
                 yi += 1;
                 yy = mac16(yy, val as i32, val as i32);
             }
@@ -150,34 +151,64 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> i32 {
         i -= 2 * k as u32 - 1;
     }
     let val = ((k0 as i32 - k as i32 + s) ^ s) as i16;
-    y[yi] = val as i32;
+    y[yi] = val;
     yy = mac16(yy, val as i32, val as i32);
     let s = -(i as i32);
     let val = ((k as i32 + s) ^ s) as i16;
-    y[yi + 1] = val as i32;
+    y[yi + 1] = val;
     mac16(yy, val as i32, val as i32)
 }
 
-pub fn decode_pulses(y: &mut [i32], n: usize, k: usize, dec: &mut Ec) -> i32 {
+pub fn decode_pulses(y: &mut [i16], n: usize, k: usize, dec: &mut Ec) -> i32 {
     let v = pvq_v(n, k);
     let i = dec.dec_uint(v);
     cwrsi(n, k, i, y)
 }
 
 fn exp_rotation1(x: &mut [i16], len: usize, stride: usize, c: i32, s: i32) {
+    let x = &mut x[..len];
     let ms = -s;
-    for i in 0..len - stride {
-        let x1 = x[i] as i32;
-        let x2 = x[i + stride] as i32;
-        x[i + stride] = pshr32(mac16(mul16(c, x2), s, x1), 15) as i16;
-        x[i] = pshr32(mac16(mul16(c, x1), ms, x2), 15) as i16;
+    // The rotated pair (x1, x2) -> (x1', x2').
+    let rot = |x1: i32, x2: i32| {
+        (
+            pshr32(mac16(mul16(c, x1), ms, x2), 15) as i16,
+            pshr32(mac16(mul16(c, x2), s, x1), 15) as i16,
+        )
+    };
+    if stride == 1 {
+        // Each step rotates the previous step's output, so carry it in a register rather
+        // than through memory.
+        if len < 2 {
+            return;
+        }
+        let mut x1 = x[0] as i32;
+        for i in 0..len - 1 {
+            let (a, b) = rot(x1, x[i + 1] as i32);
+            x[i] = a;
+            x1 = b as i32;
+        }
+        x[len - 1] = x1 as i16;
+        if len > 2 {
+            let mut x2 = x[len - 2] as i32;
+            for i in (0..len - 2).rev() {
+                let (a, b) = rot(x[i] as i32, x2);
+                x[i + 1] = b;
+                x2 = a as i32;
+            }
+            x[0] = x2 as i16;
+        }
+        return;
+    }
+    for i in 0..len.saturating_sub(stride) {
+        let (a, b) = rot(x[i] as i32, x[i + stride] as i32);
+        x[i + stride] = b;
+        x[i] = a;
     }
     if len > 2 * stride {
         for i in (0..=len - 2 * stride - 1).rev() {
-            let x1 = x[i] as i32;
-            let x2 = x[i + stride] as i32;
-            x[i + stride] = pshr32(mac16(mul16(c, x2), s, x1), 15) as i16;
-            x[i] = pshr32(mac16(mul16(c, x1), ms, x2), 15) as i16;
+            let (a, b) = rot(x[i] as i32, x[i + stride] as i32);
+            x[i + stride] = b;
+            x[i] = a;
         }
     }
 }
@@ -221,19 +252,21 @@ fn normalise_residual(iy: &[i32], x: &mut [i16], n: usize, ryy: i32, gain: i32) 
     let k = ilog2(ryy) >> 1;
     let t = vshr32(ryy, 2 * (k - 7));
     let g = mul16_p15(rsqrt_norm(t), gain);
-    for i in 0..n {
-        x[i] = pshr32(mul16(g, iy[i]), k + 1) as i16;
+    for (o, &v) in x[..n].iter_mut().zip(&iy[..n]) {
+        *o = pshr32(mul16(g, v), k + 1) as i16;
     }
 }
 
-fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
+fn extract_collapse_mask<T: Copy + Into<i32>>(iy: &[T], n: usize, b: usize) -> u32 {
     if b <= 1 {
         return 1;
     }
     let n0 = n / b;
     let mut mask = 0u32;
     for i in 0..b {
-        let tmp = iy[i * n0..(i + 1) * n0].iter().fold(0i32, |a, &v| a | v);
+        let tmp = iy[i * n0..(i + 1) * n0]
+            .iter()
+            .fold(0i32, |a, &v| a | v.into());
         mask |= ((tmp != 0) as u32) << i;
     }
     mask
@@ -241,8 +274,8 @@ fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 
 /// `op_pvq_search`: best `k`-pulse codeword for `x`; `x` is made non-negative in place.
 fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
-    let mut y = vec![0i16; n];
-    let mut signx = vec![0i32; n];
+    let mut y = [0i16; MAX_BAND];
+    let mut signx = [0i32; MAX_BAND];
     for j in 0..n {
         signx[j] = (x[j] < 0) as i32;
         x[j] = x[j].wrapping_abs();
@@ -323,7 +356,7 @@ pub fn alg_quant(
     gain: i32,
     resynth: bool,
 ) -> u32 {
-    let mut iy = vec![0i32; n + 3];
+    let mut iy = [0i32; MAX_BAND + 3];
     exp_rotation(x, n, 1, b, k, spread);
     let yy = pvq_search(x, &mut iy, k as i32, n);
     encode_pulses(&iy, n, k, enc);
@@ -344,11 +377,18 @@ pub fn alg_unquant(
     dec: &mut Ec,
     gain: i32,
 ) -> u32 {
-    let mut iy = vec![0i32; n];
-    let ryy = decode_pulses(&mut iy, n, k, dec);
-    normalise_residual(&iy, x, n, ryy, gain);
+    // The pulses fit 16 bits, so they are decoded straight into `x` and scaled in place.
+    let x = &mut x[..n];
+    let ryy = decode_pulses(x, n, k, dec);
+    let cm = extract_collapse_mask(x, n, b);
+    let kk = ilog2(ryy) >> 1;
+    let t = vshr32(ryy, 2 * (kk - 7));
+    let g = mul16_p15(rsqrt_norm(t), gain);
+    for v in x.iter_mut() {
+        *v = pshr32(mul16(g, *v as i32), kk + 1) as i16;
+    }
     exp_rotation(x, n, -1, b, k, spread);
-    extract_collapse_mask(&iy, n, b)
+    cm
 }
 
 /// `renormalise_vector`.
