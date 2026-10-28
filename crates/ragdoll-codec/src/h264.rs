@@ -2305,7 +2305,37 @@ pub fn decode_cavlc_block(
     is_chroma_dc: bool,
 ) -> Result<usize> {
     dst_scanned.fill(0);
-    let max_coeff = dst_scanned.len();
+    cavlc_block(r, dst_scanned.len(), nc, is_chroma_dc, |pos, lv| {
+        dst_scanned[pos] = lv
+    })
+}
+
+/// [`decode_cavlc_block`] for a luma or chroma AC block of `max_coeff` (`1..=16`) coefficients,
+/// as its nonzero levels and their scan positions in `out` (any order); returns their count.
+pub fn decode_cavlc_coeffs(
+    r: &mut BitReader<'_>,
+    max_coeff: usize,
+    nc: u8,
+    out: &mut crate::cabac::ResidualCoeffs,
+) -> Result<usize> {
+    let mut k = 0;
+    cavlc_block(r, max_coeff.min(16), nc, false, |pos, lv| {
+        out.pos[k & 63] = pos as u8;
+        out.level[k & 63] = lv;
+        k += 1;
+    })
+}
+
+/// The CAVLC residual_block syntax (7.3.5.3.2): calls `put(position, level)` for each nonzero
+/// coefficient, at positions below `max_coeff`.
+#[inline(always)]
+fn cavlc_block(
+    r: &mut BitReader<'_>,
+    max_coeff: usize,
+    nc: u8,
+    is_chroma_dc: bool,
+    mut put: impl FnMut(usize, i16),
+) -> Result<usize> {
     let tbl = nc_to_table_idx(nc);
 
     // Match coeff_token prefix
@@ -2426,7 +2456,7 @@ pub fn decode_cavlc_block(
             "CAVLC coefficient position exceeds block size",
         ));
     }
-    dst_scanned[pos] = levels[0];
+    put(pos, levels[0]);
     for lv in levels.iter().copied().take(total_coeff).skip(1) {
         let run_before = if zeros_left > 0 {
             let vlc_idx = (zeros_left - 1).min(6);
@@ -2442,7 +2472,7 @@ pub fn decode_cavlc_block(
         }
         zeros_left -= run_before;
         pos -= 1 + run_before;
-        dst_scanned[pos] = lv;
+        put(pos, lv);
     }
 
     Ok(total_coeff)

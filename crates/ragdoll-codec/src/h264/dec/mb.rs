@@ -9,7 +9,7 @@ use ragdoll_core::{BitReader, RagdollError, Result};
 use crate::cabac::{
     CabacContext, CabacDecoder, NUM_CABAC_CONTEXTS, ResidualCoeffs, init_cabac_contexts,
 };
-use crate::h264::decode_cavlc_block;
+use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
 use super::intra::{self, Edges};
@@ -1404,13 +1404,10 @@ impl<'a, 'c> Dec<'a, 'c> {
                     dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
                     n
                 } else {
-                    let mut sc = [0i16; 16];
                     let nc = self.nc_luma(bx, by);
                     let r = self.reader();
-                    let n = decode_cavlc_block(r, &mut sc[..max], nc, false)?;
-                    if n > 0 {
-                        dq.scale4_block(lst, qp, &sc[..max], 16 - max, scan4, out);
-                    }
+                    let n = decode_cavlc_coeffs(r, max, nc, &mut coeffs)?;
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
                     n
                 };
                 let j = self.st.b4(x4, y4);
@@ -1468,13 +1465,10 @@ impl<'a, 'c> Dec<'a, 'c> {
                     dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
                     n
                 } else {
-                    let mut sc = [0i16; 15];
                     let nc = self.nc_chroma(p, bx, by);
                     let r = self.reader();
-                    let n = decode_cavlc_block(r, &mut sc, nc, false)?;
-                    if n > 0 {
-                        dq.scale4_block(lst + 1 + p, qpc[p] as i32, &sc, 1, scan4, out);
-                    }
+                    let n = decode_cavlc_coeffs(r, 15, nc, &mut coeffs)?;
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
                     n
                 };
                 let j = self.st.c4(x4, y4);

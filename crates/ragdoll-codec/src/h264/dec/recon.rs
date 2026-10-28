@@ -44,36 +44,8 @@ impl Dequant {
         Self { ls4, ls8 }
     }
 
-    /// Scales scanned 4x4 coefficients `sc[k]` (raster position `scan[k + off]`) into `out`
-    /// (8.5.12.1). Every position is written: a zero coefficient scales to zero, so no branch
-    /// on the (unpredictable) coefficient values is needed.
-    #[inline]
-    pub fn scale4_block(
-        &self,
-        list: usize,
-        qp: i32,
-        sc: &[i16],
-        off: usize,
-        scan: &[usize; 16],
-        out: &mut [i32; 16],
-    ) {
-        let ls = &self.ls4[list][(qp % 6) as usize];
-        let scan = &scan[off..off + sc.len()];
-        if qp >= 24 {
-            let sh = qp / 6 - 4;
-            for (&c, &pos) in sc.iter().zip(scan) {
-                out[pos] = (c as i32 * ls[pos]) << sh;
-            }
-        } else {
-            let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
-            for (&c, &pos) in sc.iter().zip(scan) {
-                out[pos] = (c as i32 * ls[pos] + rnd) >> sh;
-            }
-        }
-    }
-
-    /// [`Dequant::scale4_block`] for the `n` nonzero coefficients of `c`, whose scan positions
-    /// start at `off`; other positions of `out` are left as they are.
+    /// Scales the `n` nonzero 4x4 coefficients of `c` into `out` (8.5.12.1): level `k` goes to
+    /// raster position `scan[c.pos[k] + off]`; other positions of `out` are left as they are.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn scale4_coeffs(
@@ -103,7 +75,7 @@ impl Dequant {
         }
     }
 
-    /// [`Dequant::scale4_coeffs`] for an 8x8 block.
+    /// [`Dequant::scale4_coeffs`] for an 8x8 block (8.5.13.1).
     #[inline]
     pub fn scale8_coeffs(
         &self,
@@ -131,7 +103,7 @@ impl Dequant {
         }
     }
 
-    /// [`Dequant::scale4_block`] for an 8x8 block (8.5.13.1).
+    /// Scales scanned 8x8 coefficients `sc[k]` (raster position `scan[k]`) into `out` (8.5.13.1).
     #[inline]
     pub fn scale8_block(
         &self,
