@@ -41,3 +41,7 @@ bench --json is covered too: an #[ignore] schema test (bench_json_matches_schema
 ## Result
 
 Interop tests fail instead of passing when FFmpeg is missing or fails (opt-out RAGDOLL_ALLOW_MISSING_TOOLS=1, never set in CI); CI installs pinned FFmpeg 6.1.1 and runs the whole suite on aarch64 and x86_64 twice, the second time with RAGDOLL_SIMD=scalar, which every SIMD dispatch site honours; transcode output no longer depends on threads or power mode; ragdoll-cli tests pin text output (snapshots), JSON shape (schemas, bench included) and exit status (0 / 1 runtime / 2 usage).
+
+## 2026-10-28
+
+CI's first run with FFmpeg installed failed simd_0042_polyphase_resampler_kaiser_and_channel_rematrix on both runners (40.9x and 47.4x real time against a 50x floor in debug). Not a regression: alone, the branch measures 119-136x and main 115-119x on x86_64. The interop tests that used to skip now run FFmpeg (including multi-threaded SVT-AV1) in parallel with it. The wall-clock assertion is removed; the test still checks the output and prints the throughput. Performance gating belongs to 0068's instruction-count budgets.

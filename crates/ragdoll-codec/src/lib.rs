@@ -1209,12 +1209,9 @@ mod tests {
         let audio_duration_s = (num_chunks * chunk_in) as f64 / 44_100.0;
         let realtime_x = audio_duration_s / elapsed_s.max(1e-9);
         assert_eq!(total_out_frames, num_chunks * 4800);
-        let min_rt = if cfg!(debug_assertions) { 50.0 } else { 1500.0 };
+        // Reported, not asserted: wall time under a parallel test run on shared CI runners is too
+        // noisy to gate on (0061). Performance gates are instruction-count budgets (0068).
         println!("SIMD-0042 44.1kHz -> 48kHz stereo throughput: {realtime_x:.1}x real-time");
-        assert!(
-            realtime_x > min_rt,
-            "expected >{min_rt}x real-time on 44.1->48 kHz stereo resampling, got {realtime_x:.1}x"
-        );
 
         // 3. Channel Matrix Mixer: 5.1 -> Stereo -> Mono and 7.1 -> 5.1 -> Stereo
         let mut frame_5_1 = AudioFrame::new(48_000, 6, SampleFormat::F32le, 256);
