@@ -96,6 +96,7 @@ mod sys {
     pub const MAP_PRIVATE: c_int = 0x02;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
     pub const MADV_WILLNEED: c_int = 3;
+    pub const MADV_DONTNEED: c_int = 4;
 
     unsafe extern "C" {
         pub fn mmap(
@@ -239,6 +240,37 @@ impl MmapSource {
                         ptr.add(aligned_off) as *mut std::os::raw::c_void,
                         aligned_len,
                         sys::MADV_WILLNEED,
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (offset, len);
+    }
+
+    /// Lets the kernel drop the pages of `[offset..offset + len]` from this process (whole pages
+    /// inside the range only), so streaming a large file does not keep every page read resident
+    /// (BUG-0072). The mapping is read-only and private, so a later read of the range faults the
+    /// same file contents back in. Does nothing for in-memory sources.
+    #[inline]
+    pub fn release_range(&self, offset: usize, len: usize) {
+        #[cfg(unix)]
+        if let MmapInner::Mapped {
+            ptr,
+            len: total_len,
+        } = self.inner
+        {
+            let end = offset.saturating_add(len).min(total_len);
+            let start = offset.div_ceil(4096) * 4096;
+            let end = end & !4095usize;
+            if start < end {
+                // SAFETY: `[start..end)` lies inside the live read-only private file mapping;
+                // MADV_DONTNEED only discards clean pages, which refault with identical content.
+                unsafe {
+                    let _ = sys::madvise(
+                        ptr.add(start) as *mut std::os::raw::c_void,
+                        end - start,
+                        sys::MADV_DONTNEED,
                     );
                 }
             }

@@ -34,6 +34,23 @@ use ragdoll_pipeline::GopRingPipeline;
 let ring = GopRingPipeline::with_budget_bytes(8, 128 * 1024 * 1024);
 ```
 
+`streaming_encoder` returns a `GopRingEncoder` that takes frames a batch at a time with `push` and returns the same GOPs from `finish`, holding only the current wave.
+
+### `VideoFrameStream`
+
+Decodes a container a batch at a time, in presentation order, so a caller holds one batch of frames rather than the whole input. MP4 is decoded a wave of whole GOPs at a time in parallel; Matroska and MPEG-TS through one decoder with a 17-picture reorder window; Y4M frames are copied out of the mapping and their pages released. `transcode`, `metrics`, `extract`, `concat` and `package` all decode this way, so their peak memory follows the memory budget, not the input length.
+
+```rust
+use ragdoll_pipeline::with_video_stream;
+
+with_video_stream("input.mp4", 64 << 20, 0, |mut stream| {
+    while let Some(batch) = stream.next_batch()? {
+        // batch: Vec<VideoFrame>, presentation order
+    }
+    Ok(())
+})?;
+```
+
 ## A/V sync
 
 `AvSyncController` rescales audio, subtitle and video packets into an output timebase with 128-bit arithmetic, carrying rounding remainders between audio packets so long runs do not drift. `interleave_packets_dts` orders packets from every track by decode timestamp, and `compute_av_drift_ms` reports the end-to-end offset between tracks.
@@ -55,4 +72,4 @@ let ring = GopRingPipeline::with_budget_bytes(8, 128 * 1024 * 1024);
 
 Each one except `probe_file_detailed` and `evaluate_media_metrics` returns a `PipelineTelemetry` with frame, GOP, thread and byte counts, elapsed time, frame rate, bandwidth and compression ratio.
 
-Lower-level helpers are public too: `decode_video_file`, `decode_video_bytes`, `parallel_scale_frames`, `extract_auxiliary_tracks` and `synth_video_frame`.
+Lower-level helpers are public too: `decode_video_file` and `decode_video_bytes` (which decode the whole input at once), `parallel_scale_frames`, `extract_auxiliary_tracks` and `synth_video_frame`.

@@ -24,11 +24,20 @@ Decode per GOP inside each wave: partition the demuxed `SampleEntry` index into 
 
 ## Acceptance criteria
 
-- [x] Peak RSS of `transcode` on a long synthesized input stays within the configured budget plus a fixed overhead, independent of input length (test with two lengths).
 - [x] `extract --at` decodes only the GOP containing the target frame.
-- [x] `metrics` processes reference and distorted inputs in bounded waves.
 - [x] Memory-limit callouts removed from the transcode and memory-model docs pages.
+
+## Delivered elsewhere
+
+These were ticked here without a test, and were not true until BUG-0072:
+
+- Peak RSS of `transcode` on a long synthesized input stays within the configured budget plus a fixed overhead, independent of input length (test with two lengths).
+- `metrics` processes reference and distorted inputs in bounded waves.
 
 ## 2026-10-28
 
 Reopened in substance as BUG-0072 on 2026-10-28: peak RSS of transcode grows with input length (113 MB for 2 s, 405 MB for 8 s of 720p) because decode_video_bytes decodes the whole input before GopRingPipeline runs. The first and third criteria were ticked without a test that measures RSS across two lengths. metrics also decodes both inputs in full. extract --at on MP4 is genuinely bounded.
+
+## 2026-10-28
+
+Corrected by BUG-0072: the RSS and metrics criteria moved under "Delivered elsewhere" because this item did not deliver them. It delivered criterion 2 (extract --at on MP4 decodes only the target GOP) and the docs change. Peak RSS independent of input length for transcode, metrics, extract (thumbnails and non-MP4), concat and package came with BUG-0072's VideoFrameStream, with tests/bounded_memory.rs measuring two lengths.

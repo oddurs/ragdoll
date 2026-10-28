@@ -623,7 +623,7 @@ fn make_output(
     f.keyframe = idr;
     f.pict_type = pict_type;
     // Order key within the stream: POC within the current IDR / MMCO5 period. Callers that need
-    // presentation order sort by it (see `ragdoll_pipeline::order_h264_frames`).
+    // presentation order sort by it (see `ragdoll_pipeline::VideoFrameStream`).
     let fps = sps.fps.unwrap_or(Rational64::FPS_30);
     let tb = Rational64::new(fps.den, fps.num * 2);
     f.pts = Timestamp::new(((period as i64) << 32) + store.poc() as i64, tb);

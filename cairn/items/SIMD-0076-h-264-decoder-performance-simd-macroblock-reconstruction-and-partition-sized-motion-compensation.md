@@ -33,3 +33,7 @@ Partition-sized luma and chroma MC kernels with edge emulation only at picture b
 - [ ] 720p x264 `-preset medium` decodes at 300 fps or more single-threaded on x86_64 AVX2 and on Apple M-series NEON, measured by the benchmark suite.
 - [ ] Every SIMD kernel has a differential test against its scalar reference.
 - [ ] The x264 matrix and all supported conformance streams stay byte-identical with JM.
+
+## 2026-10-28
+
+2026-10-28 head-to-head (Xeon 2.1 GHz VM, AVX2, single-threaded, in process; libavcodec 6.1.1 called directly with packets pre-demuxed, best of 3): 1080p x264 medium High/CABAC at 6.2 Mbit/s decodes at 29 fps against FFmpeg's 181 fps (505 fps with 4 frame threads), 6.3x slower; 720p x264 Baseline/CAVLC at 3.1 Mbit/s at 77 fps against 834 fps, 11x slower. 1080p30 is just under real time. Harness: rbench (Ragdoll), avbench (libavcodec) in the session scratchpad; the inputs are testsrc2 with light temporal noise.
