@@ -1311,7 +1311,8 @@ mod tests {
             total_bytes: 0,
         });
         ogg_opus_mux.set_comments(vc.clone());
-        let dummy_opus_pkt = [0xFEu8, 0x00, 0x00, 0x00];
+        // TOC 0xFC: CELT fullband 20 ms, stereo, one frame (960 samples).
+        let dummy_opus_pkt = [0xFCu8, 0x00, 0x00, 0x00];
         for i in 0..10usize {
             let pts = Timestamp::new((i as i64) * 960, Rational64::new(1, 48_000));
             let pkt =

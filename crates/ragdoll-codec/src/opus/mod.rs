@@ -1,18 +1,37 @@
-//! **`0044`**: Pure-Rust RFC 6716 / RFC 7845 Opus Audio Decoder & Encoder (`crates/ragdoll-codec/src/opus.rs`).
+//! Opus (RFC 6716) and its Ogg/Matroska mapping (RFC 7845).
 //!
-//! - **`OpusRangeEncoder` / `OpusRangeDecoder`**: RFC 6716 Section 4.1 arithmetic range coder with carry propagation.
-//! - **CELT Bark-Band Energy Quantizer & Pyramid Vector Quantization (PVQ)**: 21-band coarse + fine energy
-//!   coding and algebraic $L_1$-sphere pulse search ($\sum |y_i| = K$) maximizing $\frac{X \cdot y}{\sqrt{y \cdot y}}$.
-//! - **48 kHz MDCT / IMDCT Synthesis**: Uses `ragdoll_simd::MdctPlan` (`N = 120, 240, 480, 960`) and
-//!   vectorized 50% TDAC Sine window overlap-add (`window_overlap_add_f32`).
-//! - **RFC 7845 `OpusHead` & `OpusTags`**: Header parser and serializer for Matroska/WebM (`CodecPrivate`) and Ogg Opus containers.
+//! - **Decoder** ([`decoder::OpusPacketDecoder`], wrapped by [`OpusDecoder`]): a port of
+//!   fixed-point libopus 1.3.1 (SILK, CELT, hybrid, mode transitions, PLC, in-band FEC, DTX),
+//!   sample-exact with it at every output rate (cairn `0077`). Modules: `range` (entropy coder),
+//!   `celt`/`bands`/`vq`/`rate`/`energy`/`mdct`/`plc` (CELT), `silk`/`silk_dsp` (SILK and its
+//!   resampler), `math` (fixed-point helpers), `*_tables` (tables generated from libopus).
+//!   Being a port, it carries libopus's BSD-3-Clause notice: see `COPYING.libopus`.
+//! - **Encoder** ([`OpusEncoder`], `OpusRangeEncoder`, PVQ helpers): writes packets no other
+//!   decoder can read; being replaced (cairn `BUG-0078`).
+//! - **`OpusHead` and `OpusTags`**: header parser and serializer for Ogg Opus and Matroska/WebM
+//!   `CodecPrivate`.
 
 #![allow(clippy::needless_range_loop)]
+
+mod bands;
+mod celt;
+mod celt_tables;
+pub mod decoder;
+mod energy;
+mod math;
+mod mdct;
+mod plc;
+mod range;
+mod rate;
+mod silk;
+mod silk_dsp;
+mod silk_tables;
+mod vq;
 
 use ragdoll_core::{
     AudioFrame, ChannelLayout, RagdollError, Rational64, Result, SampleFormat, Timestamp,
 };
-use ragdoll_simd::{MdctPlan, sine_window_f32, window_overlap_add_f32};
+use ragdoll_simd::{MdctPlan, sine_window_f32};
 
 use crate::pcm::convert_audio_frame;
 
@@ -199,7 +218,6 @@ const EC_SYM_MAX: u32 = (1 << EC_SYM_BITS) - 1;
 const EC_CODE_SHIFT: u32 = EC_CODE_BITS - EC_SYM_BITS - 1;
 const EC_CODE_TOP: u32 = 1 << (EC_CODE_BITS - 1);
 const EC_CODE_BOT: u32 = EC_CODE_TOP >> EC_SYM_BITS;
-const EC_CODE_EXTRA: u32 = (EC_CODE_BITS - 2) % EC_SYM_BITS + 1;
 
 /// RFC 6716 Section 4.1 Arithmetic Range Encoder (`ec_enc`).
 #[derive(Clone, Debug)]
@@ -301,93 +319,6 @@ impl OpusRangeEncoder {
         self.buf
     }
 }
-
-/// RFC 6716 Section 4.1 Arithmetic Range Decoder (`ec_dec`).
-#[derive(Clone, Debug)]
-pub struct OpusRangeDecoder<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    val: u32,
-    rng: u32,
-    rem: i32,
-}
-
-impl<'a> OpusRangeDecoder<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
-        let mut dec = Self {
-            buf,
-            pos: 0,
-            val: 0,
-            rng: 1 << EC_CODE_EXTRA,
-            rem: 0,
-        };
-        dec.rem = dec.read_byte();
-        dec.val = (dec.rng - 1) - ((dec.rem as u32) >> (EC_SYM_BITS - EC_CODE_EXTRA));
-        dec.normalize();
-        dec
-    }
-
-    #[inline]
-    fn read_byte(&mut self) -> i32 {
-        if self.pos < self.buf.len() {
-            let b = self.buf[self.pos] as i32;
-            self.pos += 1;
-            b
-        } else {
-            0
-        }
-    }
-
-    #[inline]
-    fn normalize(&mut self) {
-        while self.rng <= EC_CODE_BOT {
-            self.rng <<= EC_SYM_BITS;
-            let mut sym = (self.rem << (EC_CODE_EXTRA as i32)) & (EC_SYM_MAX as i32);
-            self.rem = self.read_byte();
-            sym |= self.rem >> (EC_SYM_BITS - EC_CODE_EXTRA);
-            self.val =
-                ((self.val << EC_SYM_BITS) + (EC_SYM_MAX & !(sym as u32))) & (EC_CODE_TOP - 1);
-        }
-    }
-
-    /// Decodes a uniformly distributed integer in `0..ft`.
-    pub fn decode_uint(&mut self, ft: u32) -> u32 {
-        if ft <= 1 {
-            return 0;
-        }
-        let r = self.rng / ft;
-        let s = (self.val / r).min(ft - 1);
-        let sym = ft - 1 - s;
-        let fl = sym;
-        let fh = sym + 1;
-        self.val = self.val.saturating_sub(r * (ft - fh));
-        if fl > 0 {
-            self.rng = r * (fh - fl);
-        } else {
-            self.rng = self.rng.saturating_sub(r * (ft - fh));
-        }
-        self.normalize();
-        sym
-    }
-
-    /// Decodes a binary symbol where $P(\text{bit} = 1) = 2^{-\text{logp}}$.
-    pub fn decode_bit_logp(&mut self, logp: u32) -> bool {
-        let r = self.rng >> logp;
-        let bit = self.val < r;
-        if bit {
-            self.rng = r;
-        } else {
-            self.val = self.val.saturating_sub(r);
-            self.rng = self.rng.saturating_sub(r);
-        }
-        self.normalize();
-        bit
-    }
-}
-
-// ============================================================================
-// CELT PVQ (Pyramid Vector Quantization) Algebraic Pulse Search & Band Coding
-// ============================================================================
 
 /// Greedily projects unit-norm band vector `x` onto the integer $L_1$ pyramid $\sum_i |y_i| = k_pulses$,
 /// maximizing $\frac{x \cdot y}{\sqrt{y \cdot y}}$ per RFC 6716 Section 4.3.4 (`alg_quant`).
@@ -598,115 +529,110 @@ impl OpusEncoder {
     }
 }
 
-/// Pure-Rust Opus Decoder (`48 kHz`, CELT/Hybrid MDCT synthesis + RFC 6716 Range Decoder).
-#[derive(Clone, Debug)]
+/// Opus decoder for one Ogg/Matroska stream (RFC 7845 channel mapping family 0): wraps the
+/// sample-exact [`decoder::OpusPacketDecoder`] at 48 kHz and applies the `OpusHead` output gain
+/// the way libopus `OPUS_SET_GAIN` does. Pre-skip is left to the caller ([`Self::pre_skip`]).
+#[derive(Clone)]
 pub struct OpusDecoder {
     pub head: OpusHead,
-    pub bitrate_bps: u32,
-    mdct_960: MdctPlan,
-    win_960: Vec<f32>,
-    overlap: [[f32; 480]; 2],
+    inner: decoder::OpusPacketDecoder,
+    pcm: Vec<i16>,
 }
+
+impl std::fmt::Debug for OpusDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpusDecoder")
+            .field("head", &self.head)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Largest Opus packet duration (120 ms at 48 kHz), in samples per channel.
+const MAX_FRAME_48K: usize = 5760;
 
 impl OpusDecoder {
     pub fn new(channels: u8) -> Self {
+        let head = OpusHead::new(channels, 48_000);
         Self {
-            head: OpusHead::new(channels, 48_000),
-            bitrate_bps: 128_000,
-            mdct_960: MdctPlan::new(960),
-            win_960: sine_window_f32(960),
-            overlap: [[0.0; 480]; 2],
+            inner: Self::packet_decoder(&head),
+            head,
+            pcm: vec![0; MAX_FRAME_48K * 2],
         }
     }
 
+    fn packet_decoder(head: &OpusHead) -> decoder::OpusPacketDecoder {
+        let mut d = decoder::OpusPacketDecoder::new(48_000, head.channels.clamp(1, 2) as usize)
+            .expect("48 kHz with one or two channels is always valid");
+        d.decode_gain = head.output_gain as i32;
+        d
+    }
+
+    /// Configures the decoder from an `OpusHead` (Ogg BOS packet or Matroska `CodecPrivate`).
     pub fn with_extra_data(mut self, extra_data: &[u8]) -> Result<Self> {
         if extra_data.len() >= 19 && &extra_data[0..8] == b"OpusHead" {
-            self.head = OpusHead::parse(extra_data)?;
+            let head = OpusHead::parse(extra_data)?;
+            if head.mapping_family != 0 || head.channels > 2 {
+                return Err(RagdollError::Unsupported(format!(
+                    "Opus channel mapping family {} with {} channels",
+                    head.mapping_family, head.channels
+                )));
+            }
+            self.inner = Self::packet_decoder(&head);
+            self.head = head;
         }
         Ok(self)
     }
 
-    /// Decodes an RFC 6716 Opus packet into a 48 kHz [`AudioFrame`].
+    /// Samples to drop from the start of the decoded stream (RFC 7845 section 4.2).
+    pub fn pre_skip(&self) -> usize {
+        self.head.pre_skip as usize
+    }
+
+    /// Final range coder state of the last packet (`OPUS_GET_FINAL_RANGE`), equal to the
+    /// encoder's for a correctly decoded packet.
+    pub fn final_range(&self) -> u32 {
+        self.inner.final_range()
+    }
+
+    /// Decodes one packet into interleaved 16-bit samples, sample-exact with fixed-point libopus.
+    /// `None` (or an empty packet) conceals a lost packet of the previous packet's duration.
+    pub fn decode_i16(&mut self, pkt: Option<&[u8]>) -> Result<&[i16]> {
+        let ch = self.head.channels.clamp(1, 2) as usize;
+        let lost = pkt.is_none_or(|p| p.is_empty());
+        let frame_size = if lost {
+            (self.inner.last_packet_duration().max(0) as usize).clamp(120, MAX_FRAME_48K)
+        } else {
+            MAX_FRAME_48K
+        };
+        let n = self
+            .inner
+            .decode(pkt, &mut self.pcm, frame_size, false)
+            .map_err(|e| RagdollError::InvalidData(format!("Opus: {e}")))?;
+        Ok(&self.pcm[..n * ch])
+    }
+
+    /// Decodes one packet into a 48 kHz [`AudioFrame`] of `S16le` samples.
+    pub fn decode_packet_s16(&mut self, pkt: &[u8]) -> Result<AudioFrame> {
+        let ch = self.head.channels.clamp(1, 2);
+        let s = self.decode_i16(Some(pkt))?;
+        let mut frame = AudioFrame::new(48_000, ch, SampleFormat::S16le, s.len() / ch as usize);
+        frame.layout = ChannelLayout::from_channels(ch);
+        frame.as_i16_mut_slice().copy_from_slice(s);
+        Ok(frame)
+    }
+
+    /// Decodes one packet into a 48 kHz [`AudioFrame`] of `F32le` samples (`s16 / 32768`, as
+    /// `opus_decode_float` does in fixed-point builds).
     pub fn decode_packet(&mut self, pkt: &[u8]) -> Result<AudioFrame> {
         if pkt.is_empty() {
             return Err(RagdollError::BitstreamEndOfData);
         }
-        let toc = OpusToc::parse(pkt[0]);
-        let ch_count = (self.head.channels as usize)
-            .max(if toc.stereo { 2 } else { 1 })
-            .clamp(1, 2);
-        let out_samples = toc.frame_samples_48k.clamp(120, 2880);
-
-        if pkt.len() == 1 || (pkt.len() == 2 && pkt[1] == 0xFF) {
-            let mut silent =
-                AudioFrame::new(48_000, ch_count as u8, SampleFormat::F32le, out_samples);
-            silent.layout = ChannelLayout::from_channels(ch_count as u8);
-            return Ok(silent);
-        }
-
-        let mut rd = OpusRangeDecoder::new(&pkt[1..]);
-        let is_silent = rd.decode_bit_logp(15);
-        let _postfilter = rd.decode_bit_logp(1);
-        let _transient = rd.decode_bit_logp(3);
-        let _intra = rd.decode_bit_logp(3);
-
-        if is_silent {
-            let mut silent =
-                AudioFrame::new(48_000, ch_count as u8, SampleFormat::F32le, out_samples);
-            silent.layout = ChannelLayout::from_channels(ch_count as u8);
-            return Ok(silent);
-        }
-
-        let mut pcm_ch = [[0.0f32; 960]; 2];
-        let enc_ch = if toc.stereo { 2usize } else { 1usize };
-
-        for sub in 0..2 {
-            let sub_base = sub * 480;
-            for c in 0..enc_ch {
-                let mut coeffs = [0.0f32; 480];
-                for b in 0..21 {
-                    let start = (CELT_EBAND_BASE[b] as usize) * 4;
-                    let end = (CELT_EBAND_BASE[b + 1] as usize) * 4;
-                    let active = rd.decode_bit_logp(2);
-                    if active {
-                        let q_e = rd.decode_uint(2048);
-                        let norm = 2.0_f32.powf((q_e as f32) / 64.0 - 16.0);
-                        let mut pulses = vec![0i16; end - start];
-                        for p in &mut pulses {
-                            if rd.decode_bit_logp(2) {
-                                let neg = rd.decode_bit_logp(1);
-                                let mag = (rd.decode_uint(63) + 1) as i16;
-                                *p = if neg { -mag } else { mag };
-                            }
-                        }
-                        pvq_reconstruct_band(&pulses, norm, &mut coeffs[start..end]);
-                    }
-                }
-                let mut imdct_out = [0.0f32; 960];
-                self.mdct_960.imdct(&coeffs, &mut imdct_out);
-                window_overlap_add_f32(
-                    &imdct_out,
-                    &self.win_960,
-                    &mut self.overlap[c],
-                    &mut pcm_ch[c][sub_base..sub_base + 480],
-                );
-            }
-        }
-        if enc_ch == 1 && ch_count == 2 {
-            pcm_ch[1] = pcm_ch[0];
-        }
-
-        let mut frame = AudioFrame::new(48_000, ch_count as u8, SampleFormat::F32le, out_samples);
-        frame.layout = ChannelLayout::from_channels(ch_count as u8);
-        let dst = frame.as_f32_mut_slice();
-        for i in 0..out_samples {
-            let src_i = i % 960;
-            if ch_count == 1 {
-                dst[i] = pcm_ch[0][src_i].clamp(-1.0, 1.0);
-            } else {
-                dst[i * 2] = pcm_ch[0][src_i].clamp(-1.0, 1.0);
-                dst[i * 2 + 1] = pcm_ch[1][src_i].clamp(-1.0, 1.0);
-            }
+        let ch = self.head.channels.clamp(1, 2);
+        let s = self.decode_i16(Some(pkt))?;
+        let mut frame = AudioFrame::new(48_000, ch, SampleFormat::F32le, s.len() / ch as usize);
+        frame.layout = ChannelLayout::from_channels(ch);
+        for (d, &v) in frame.as_f32_mut_slice().iter_mut().zip(s) {
+            *d = v as f32 * (1.0 / 32768.0);
         }
         Ok(frame)
     }
