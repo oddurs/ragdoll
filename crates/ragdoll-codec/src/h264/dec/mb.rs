@@ -431,6 +431,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Neighbouring location (6.4.12): the macroblock covering the luma (or, with `chroma`, 4:2:0
     /// chroma) location `(xn, yn)` relative to the current macroblock's top-left sample, and the
     /// location `(xw, yw)` inside it. Availability is not checked.
+    #[inline]
     fn locate(&self, xn: isize, yn: isize, chroma: bool) -> Option<(usize, usize, usize)> {
         // MB size `s = 1 << sh`; positions are non-negative once range-checked, so shifts and
         // masks stand in for division.
@@ -451,6 +452,20 @@ impl<'a, 'c> Dec<'a, 'c> {
             let addr = (py >> sh) as usize * self.st.mb_w + nx;
             return Some((addr, xw, (py & (s - 1)) as usize));
         }
+        self.locate_mbaff(yn, sh, nx, xw)
+    }
+
+    /// [`Self::locate`] in an MBAFF frame, for column `nx` and `xw` already found.
+    #[inline(never)]
+    fn locate_mbaff(
+        &self,
+        yn: isize,
+        sh: u32,
+        nx: usize,
+        xw: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let s: isize = 1 << sh;
+        let h = self.st.mb_h as isize;
         // MBAFF: the location is geometric in the frame; a field MB of parity p covers the
         // frame lines `pair_top + p + 2k`.
         let my = self.mb.y as isize;

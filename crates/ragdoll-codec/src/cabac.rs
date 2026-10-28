@@ -967,29 +967,39 @@ impl<'a> CabacDecoder<'a> {
     }
 
     /// Decodes a single binary decision (`0` or `1`) using `ctx` (ITU-T H.264 9.3.3.2.1).
+    ///
+    /// Branch-free on the decoded value, which is hard to predict: the LPS case is selected
+    /// with masks and the renormalisation shift may be zero.
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut CabacContext) -> u8 {
-        let q_idx = ((self.range >> 6) & 3) as usize;
+        const TRANS: [[u8; 64]; 2] = [CABAC_TRANS_IDX_MPS, CABAC_TRANS_IDX_LPS];
         let st = (ctx.state & 63) as usize;
-        let r_lps = CABAC_RANGE_TAB_LPS[st][q_idx] as u32;
-        self.range -= r_lps;
-
-        let bin = if self.offset >= self.range {
-            self.offset -= self.range;
-            self.range = r_lps;
-            let b = ctx.mps ^ 1;
-            if st == 0 {
-                ctx.mps ^= 1;
-            }
-            ctx.state = CABAC_TRANS_IDX_LPS[st];
-            b
-        } else {
-            let b = ctx.mps;
-            ctx.state = CABAC_TRANS_IDX_MPS[st];
-            b
-        };
-        self.renormalize();
+        let r_lps = CABAC_RANGE_TAB_LPS[st][((self.range >> 6) & 3) as usize] as u32;
+        let range = self.range - r_lps;
+        let lps = (self.offset >= range) as u32;
+        let mask = lps.wrapping_neg();
+        self.offset -= range & mask;
+        let range = range ^ ((range ^ r_lps) & mask);
+        let bin = ctx.mps ^ lps as u8;
+        ctx.mps ^= (lps & (st == 0) as u32) as u8;
+        ctx.state = TRANS[lps as usize][st];
+        // range is at least 6 here; one shift restores 256..=511.
+        let n = range.leading_zeros() - 23;
+        self.range = range << n;
+        self.offset = (self.offset << n) | self.take_upto(n);
         bin
+    }
+
+    /// The next `n` (`0..=32`) bits of the stream.
+    #[inline(always)]
+    fn take_upto(&mut self, n: u32) -> u32 {
+        if self.bits < n {
+            self.refill();
+        }
+        let v = ((self.cache >> 32) >> (32 - n)) as u32;
+        self.cache <<= n;
+        self.bits -= n;
+        v
     }
 
     /// Decodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
