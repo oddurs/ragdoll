@@ -337,25 +337,16 @@ impl<'a> BitReader<'a> {
 
     /// ITU-T H.264 / HEVC `more_rbsp_data()`: returns `true` if more syntax bits remain
     /// before the terminating `rbsp_stop_one_bit` (`1` followed only by `0` bits to the end of the slice).
+    ///
+    /// The stop bit is the last `1` bit of the payload; trailing zero bytes (`cabac_zero_word`,
+    /// `trailing_zero_8bits`) are ignored.
     #[inline]
     pub fn more_rbsp_data(&self) -> bool {
-        if self.is_empty() {
+        let Some(last) = self.data.iter().rposition(|&b| b != 0) else {
             return false;
-        }
-        // Fast path when all remaining bytes have already been pulled into `bit_buf`
-        if self.byte_pos == self.data.len() {
-            // `bit_buf` is left-justified with trailing zeros beyond `bits_in_buf`.
-            // If `bit_buf` is a power of two (exactly one `1` bit and all remaining bits `0`),
-            // only the RBSP stop bit and alignment zeros remain.
-            return self.bit_buf != 0 && !self.bit_buf.is_power_of_two();
-        }
-        // Check if any non-zero byte remains in the unbuffered slice tail
-        for &b in &self.data[self.byte_pos..self.data.len()] {
-            if b != 0 {
-                return true;
-            }
-        }
-        self.bit_buf != 0 && !self.bit_buf.is_power_of_two()
+        };
+        let stop_bit = last * 8 + 7 - self.data[last].trailing_zeros() as usize;
+        self.bits_read() < stop_bit
     }
 
     /// Counts consecutive `0` bits up to and consuming the terminating `1` stop bit.

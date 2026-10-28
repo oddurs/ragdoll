@@ -1164,7 +1164,11 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
             } else if v_track.codec_id == CodecId::H264 {
                 let mut gops: Vec<Vec<&PacketSlice<'_>>> = Vec::new();
                 for pkt in &pkts {
-                    if pkt.is_keyframe() || gops.is_empty() {
+                    // Each GOP gets its own decoder, so only split where the decoder can start:
+                    // container sync flags on non-IDR pictures would leave it without references.
+                    let starts_gop =
+                        pkt.is_keyframe() && avcc_has_idr(&v_track.extra_data, pkt.data());
+                    if starts_gop || gops.is_empty() {
                         gops.push(vec![pkt]);
                     } else if let Some(last) = gops.last_mut() {
                         last.push(pkt);
@@ -1270,6 +1274,26 @@ pub fn decode_video_bytes(data: &[u8]) -> Result<(Vec<VideoFrame>, Rational64)> 
             "audio/subtitle container has no video stream".into(),
         )),
     }
+}
+
+/// Whether a length-prefixed (`avcC`) H.264 access unit contains an IDR slice.
+fn avcc_has_idr(avcc_extra: &[u8], au: &[u8]) -> bool {
+    let len_size = avcc_extra.get(4).map_or(4, |b| (b & 3) as usize + 1);
+    let mut pos = 0;
+    while pos + len_size <= au.len() {
+        let len = au[pos..pos + len_size]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        pos += len_size;
+        if len == 0 || pos + len > au.len() {
+            return false;
+        }
+        if au[pos] & 0x1F == 5 {
+            return true;
+        }
+        pos += len;
+    }
+    false
 }
 
 /// Puts decode-order `H264Decoder` frames into presentation order. The decoder stamps PTS from

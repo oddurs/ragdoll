@@ -992,7 +992,10 @@ impl<'a> CabacDecoder<'a> {
     /// Reads `dst.len()` raw `I_PCM` sample bytes from the byte-aligned slice payload after `decode_terminate() == 1`
     /// and re-initializes the CABAC arithmetic decoding engine (ITU-T H.264 9.3.1.2).
     pub fn align_for_pcm(&mut self, dst: &mut [u8]) -> Result<()> {
-        let pcm_start = (self.bit_pos + 1).div_ceil(8);
+        // The encoder's flush after the terminating bin writes exactly as many bits as the
+        // decoder has read (its 9-bit initial window plus one per renormalisation shift), so the
+        // PCM alignment bits start at the next unread bit.
+        let pcm_start = self.bit_pos.div_ceil(8);
         let pcm_end = pcm_start + dst.len();
         if pcm_end > self.data.len() {
             return Err(RagdollError::BitstreamEndOfData);
