@@ -459,7 +459,14 @@ impl Pps {
         }
         let weighted_pred = r.read_bit()?;
         let weighted_bipred_idc = r.read_bits(2)? as u32;
-        let pic_init_qp = 26 + r.read_se()? as i32;
+        let pic_init_qp = 26 + r.read_se()?;
+        // pic_init_qp_minus26 is at least -(26 + QpBdOffset) and at most 25 (7.4.2.2).
+        if !(-36..=51).contains(&pic_init_qp) {
+            return Err(RagdollError::InvalidSyntax(
+                "H.264 pic_init_qp out of range",
+            ));
+        }
+        let pic_init_qp = pic_init_qp as i32;
         r.read_se()?; // pic_init_qs_minus26 (SP/SI only)
         let cqp = r.read_se()? as i32;
         if !(-12..=12).contains(&cqp) {

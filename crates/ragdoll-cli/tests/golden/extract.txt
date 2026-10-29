@@ -1,1 +1,1 @@
-[ragdoll extract] v.mp4 -> text_e.ppm | frames=1 gops=1 threads=<n> | in=4115 B out=43214 B (1.00:1) | <n> ms (<n> fps, <n> GB/s)
+[ragdoll extract] v.mp4 -> text_e.ppm | frames=1 gops=1 threads=<n> | in=3779 B out=43214 B (1.00:1) | <n> ms (<n> fps, <n> GB/s)
