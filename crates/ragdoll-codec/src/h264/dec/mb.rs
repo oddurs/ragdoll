@@ -2675,28 +2675,24 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// luma rows, staggered by column so that four macroblocks cover sixteen, and a chroma row).
     #[inline]
     fn prefetch_motion(&self, list: usize) {
-        if !self.simple {
+        let b = &self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
+        let r = b.ref_idx[list];
+        if r < 0 || !self.simple {
             return;
         }
-        let b = &self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
-        let Some(r) = usize::try_from(b.ref_idx[list])
-            .ok()
-            .and_then(|r| self.cx.refs[list].get(r))
-        else {
+        let Some(rp) = self.cx.refs[list].get(r as usize) else {
             return;
         };
-        let w = self.st.width;
-        let mx = (b.mv[list][0] >> 2) as isize + (self.mb.x * 16) as isize + 8;
-        let my = (b.mv[list][1] >> 2) as isize + (self.mb.y * 16) as isize;
-        let row = my + (self.mb.x & 3) as isize * 4;
-        if let Ok(off) = usize::try_from(row * w as isize + mx + 64) {
-            ragdoll_simd::prefetch_rows(&r.planes[0], off, w, 4);
-        }
-        let row = (my >> 1) + (self.mb.x & 7) as isize;
-        if let Ok(off) = usize::try_from(row * (w / 2) as isize + (mx >> 1) + 64) {
-            ragdoll_simd::prefetch_rows(&r.planes[1], off, w / 2, 1);
-            ragdoll_simd::prefetch_rows(&r.planes[2], off, w / 2, 1);
-        }
+        let w = self.st.width as isize;
+        let (x, y) = ((self.mb.x * 16) as isize, (self.mb.y * 16) as isize);
+        let mx = (b.mv[list][0] >> 2) as isize + x + 8;
+        let my = (b.mv[list][1] >> 2) as isize + y;
+        // Negative offsets wrap to huge ones, which the prefetch skips.
+        let luma = (my + (self.mb.x & 3) as isize * 4) * w + mx + 64;
+        ragdoll_simd::prefetch_rows::<4>(&rp.planes[0], luma as usize, w as usize);
+        let chroma = ((my >> 1) + (self.mb.x & 7) as isize) * (w / 2) + (mx >> 1) + 64;
+        ragdoll_simd::prefetch_rows::<1>(&rp.planes[1], chroma as usize, 0);
+        ragdoll_simd::prefetch_rows::<1>(&rp.planes[2], chroma as usize, 0);
     }
 
     fn inter_predict_mb(&mut self) -> Result<()> {
