@@ -1107,8 +1107,9 @@ fn pred_chroma(
 
 /// Picks the intra $16\times16$ mode with the least SATD; returns that SATD and the mode. The
 /// vertical, horizontal and DC costs come from one transform of the source
-/// ([`intra_satd_x3_16x16`]); ties keep DC, then vertical, then horizontal, then plane.
-fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
+/// ([`intra_satd_x3_16x16`]); ties keep DC, then vertical, then horizontal, then plane, which
+/// is only tried when `plane` is set.
+fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc, plane: bool) -> (u32, u8) {
     let (top, left, tl) = i16_edges(&pic.y, mb_x, mb_y);
     let sum = |e: &[u8; 16]| e.iter().map(|&v| v as u32).sum::<u32>();
     let dc = match (&top, &left) {
@@ -1129,7 +1130,7 @@ fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
     if left.is_some() && h < best.0 {
         best = (h, 1);
     }
-    if top.is_some() && left.is_some() {
+    if plane && top.is_some() && left.is_some() {
         let mut pred = [0u8; 256];
         pred16(3, top.as_ref(), left.as_ref(), tl, &mut pred);
         let cost = pixel_satd_16x16(&src.y, 16, &pred, 16);
@@ -2155,7 +2156,7 @@ impl EncState {
 
         // 3. Intra 16x16 when inter prediction is poor.
         if inter_satd > 24 * lambda {
-            let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
+            let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src, !sl.fast);
             if i16_satd + lambda * 8 < inter_cost {
                 self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
                 self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
@@ -2328,7 +2329,7 @@ impl EncState {
         src: &MbSrc,
     ) {
         let lambda = LAMBDA[qp as usize] as u32;
-        let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
+        let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src, !sl.fast);
         if !sl.fast
             && i16_satd > 40 * lambda
             && let Some(i4) = self.analyse_i4(mb_x, mb_y, qp, src, i16_satd + lambda * 4)
