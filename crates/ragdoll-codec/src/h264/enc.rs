@@ -623,11 +623,15 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
                 TOTAL_ZEROS_BITS[n - 1][total_zeros],
             )
         };
-        w.put32(b as u32, l as u32);
-    }
-    if total_zeros != 0 {
+        // The run_before codes follow (empty without zeros); one write while both fit.
         let e = RUN_BEFORE[mask as usize & 0xFFFF];
-        w.put32(e >> 5, e & 31);
+        let (rb, rl) = (e >> 5, e & 31);
+        if l as u32 + rl <= 32 {
+            w.put32(((b as u32) << rl) | rb, l as u32 + rl);
+        } else {
+            w.put32(b as u32, l as u32);
+            w.put32(rb, rl);
+        }
     }
 }
 
@@ -674,23 +678,22 @@ fn write_cavlc_residuals(
 ) {
     let g_stride = mb_w * 4;
     for i8x8 in 0..4 {
-        let coded = cbp_luma & (1 << i8x8) != 0;
-        let group: &[[i16; 16]; 4] = luma_q4[i8x8 * 4..i8x8 * 4 + 4].try_into().unwrap();
-        let (scanned, masks) = if coded {
-            let zz = zigzag_4x4_x4(group);
-            let masks = nonzero_mask_4x4_x4(&zz);
-            (zz, masks)
-        } else {
-            ([[0; 16]; 4], [0; 4])
-        };
-        for (k, (zz, &mask)) in scanned.iter().zip(&masks).enumerate() {
-            let (bx, by) = blk_xy(i8x8 * 4 + k);
-            let g = (mb_y * 4 + by) * g_stride + mb_x * 4 + bx;
-            if coded {
-                let nc = predict_luma_nc(luma_nnz, g_stride, mb_x * 4 + bx, mb_y * 4 + by);
-                write_cavlc_masked::<16>(w, zz, nc, mask);
+        if cbp_luma & (1 << i8x8) == 0 {
+            for k in 0..4 {
+                let (bx, by) = blk_xy(i8x8 * 4 + k);
+                luma_nnz[(mb_y * 4 + by) * g_stride + mb_x * 4 + bx] = 0;
             }
-            luma_nnz[g] = pop16(mask);
+            continue;
+        }
+        let group: &[[i16; 16]; 4] = luma_q4[i8x8 * 4..i8x8 * 4 + 4].try_into().unwrap();
+        let zz = zigzag_4x4_x4(group);
+        let masks = nonzero_mask_4x4_x4(&zz);
+        for (k, (zz, &mask)) in zz.iter().zip(&masks).enumerate() {
+            let (bx, by) = blk_xy(i8x8 * 4 + k);
+            let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
+            let nc = predict_luma_nc(luma_nnz, g_stride, gx, gy);
+            write_cavlc_masked::<16>(w, zz, nc, mask);
+            luma_nnz[gy * g_stride + gx] = pop16(mask);
         }
     }
     write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, chroma, chroma_nnz);
@@ -1558,8 +1561,28 @@ fn quant_chroma(
             out.ac[p] = [[0; 15]; 4];
             out.raster[p] = [[0; 16]; 4];
         }
-        out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
+        out.dc[p] = quant_chroma_dc(&dc_raw, qpc);
     }
+}
+
+/// [`quantize_chroma_dc2x2`] in 32-bit arithmetic: each DC is at most `16 * 255` in magnitude.
+#[inline(always)]
+fn quant_chroma_dc(dc: &[i16; 4], qpc: u8) -> [i16; 4] {
+    let d = dc.map(i32::from);
+    let had = [
+        d[0] + d[1] + d[2] + d[3],
+        d[0] - d[1] + d[2] - d[3],
+        d[0] + d[1] - d[2] - d[3],
+        d[0] - d[1] - d[2] + d[3],
+    ];
+    let qpc = qpc.min(51) as usize;
+    let qbits = 16 + (qpc / 6) as u32;
+    let mf = QUANT4_MF[qpc % 6][0];
+    let f = (1i32 << qbits) / 3;
+    had.map(|c| {
+        let l = (c.abs() * mf + f) >> qbits;
+        (if c < 0 { -l } else { l }) as i16
+    })
 }
 
 /// [`quantize_luma_dc4x4`] in 32-bit arithmetic: the DC of a residual block is at most
