@@ -80,16 +80,30 @@ pub const AVAIL8: [[u8; 16]; 4] = {
 /// Marks an Intra4x4/Intra8x8 prediction mode neighbour as unavailable (8.3.1.1).
 pub const NO_MODE: i8 = i8::MIN;
 
+/// Intra4x4/Intra8x8 prediction modes around and in a macroblock: `[1 + y][1 + x]` holds the
+/// mode of its 4x4 block `(x, y)`, row and column 0 those of the neighbouring macroblocks
+/// ([`NO_MODE`] where unavailable). Padded to 8x8 so that masked indices need no checks.
+pub type ModeGrid = [[i8; 8]; 8];
+
 /// Predicted Intra4x4/Intra8x8 mode (8.3.1.1) of the block whose top-left 4x4 is at MB-relative
-/// `(bx, by)`, from `grid[1 + y][1 + x]` holding the mode of 4x4 block `(x, y)` (row and column 0
-/// the neighbouring macroblocks', [`NO_MODE`] where unavailable).
+/// `(bx, by)`.
 #[inline]
-pub fn predicted_mode(grid: &[[i8; 5]; 5], bx: usize, by: usize) -> u8 {
+pub fn predicted_mode(grid: &ModeGrid, bx: usize, by: usize) -> u8 {
+    let (bx, by) = (bx & 3, by & 3);
     let (a, b) = (grid[1 + by][bx], grid[by][1 + bx]);
     if a == NO_MODE || b == NO_MODE {
         2
     } else {
         a.min(b) as u8
+    }
+}
+
+/// Records `mode` in `grid` for the `n4`x`n4` (1 or 2) 4x4 blocks from MB-relative `(bx, by)`.
+#[inline]
+pub fn set_mode(grid: &mut ModeGrid, bx: usize, by: usize, n4: usize, mode: u8) {
+    let (bx, by) = (bx & 3, by & 3);
+    for row in &mut grid[1 + by..1 + by + (n4 & 3)] {
+        row[1 + bx..1 + bx + (n4 & 3)].fill(mode as i8);
     }
 }
 

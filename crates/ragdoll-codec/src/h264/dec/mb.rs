@@ -948,7 +948,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// [`intra::predicted_mode`], row 0 those of the 4x4 blocks above it and column 0 those left
     /// of it; [`intra::NO_MODE`] where a neighbour is unavailable and 2 where it is not coded in
     /// Intra_4x4 or Intra_8x8 (8.3.1.1).
-    fn intra_mode_grid(&self) -> Option<[[i8; 5]; 5]> {
+    fn intra_mode_grid(&self) -> Option<intra::ModeGrid> {
         if self.st.mbaff {
             return None;
         }
@@ -969,9 +969,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         let left = modes(self.mb_left(), i.wrapping_sub(1), w4);
         let top = modes(self.mb_top(), i.wrapping_sub(w4), 1);
-        let mut g = [[0; 5]; 5];
-        g[0][1..].copy_from_slice(&top);
-        for (row, l) in g[1..].iter_mut().zip(left) {
+        let mut g = [[0; 8]; 8];
+        g[0][1..5].copy_from_slice(&top);
+        for (row, l) in g[1..5].iter_mut().zip(left) {
             row[0] = l;
         }
         Some(g)
@@ -1077,6 +1077,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             self.st.t8x8[a] = t8;
             self.st.mb_type[a] = if t8 { MbType::I8x8 } else { MbType::I4x4 };
             let mut grid = self.intra_mode_grid();
+            let (i0, w4) = (self.st.b4(self.mb.x * 4, self.mb.y * 4), self.st.mb_w * 4);
             if t8 {
                 for b8 in 0..4 {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
@@ -1086,12 +1087,12 @@ impl<'a, 'c> Dec<'a, 'c> {
                     };
                     let m = self.read_pred_mode(pred)?;
                     modes[b8] = m;
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let i = self.st.b4(self.mb.x * 4 + bx + dx, self.mb.y * 4 + by + dy);
-                        self.st.intra_mode[i] = m as i8;
-                        if let Some(g) = &mut grid {
-                            g[1 + by + dy][1 + bx + dx] = m as i8;
-                        }
+                    let i = i0 + by * w4 + bx;
+                    for j in [i, i + 1, i + w4, i + w4 + 1] {
+                        self.st.intra_mode[j] = m as i8;
+                    }
+                    if let Some(g) = &mut grid {
+                        intra::set_mode(g, bx, by, 2, m);
                     }
                 }
             } else {
@@ -1103,10 +1104,9 @@ impl<'a, 'c> Dec<'a, 'c> {
                     };
                     let m = self.read_pred_mode(pred)?;
                     *slot = m;
-                    let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
-                    self.st.intra_mode[i] = m as i8;
+                    self.st.intra_mode[i0 + by * w4 + bx] = m as i8;
                     if let Some(g) = &mut grid {
-                        g[1 + by][1 + bx] = m as i8;
+                        intra::set_mode(g, bx, by, 1, m);
                     }
                 }
             }
