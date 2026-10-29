@@ -2302,7 +2302,12 @@ pub fn decode_cavlc_block(
     nc: u8,
     is_chroma_dc: bool,
 ) -> Result<usize> {
-    dst_scanned.fill(0);
+    // Fixed sizes for the common lengths, so the fill is a few stores rather than a call.
+    match dst_scanned.len() {
+        16 => dst_scanned.copy_from_slice(&[0; 16]),
+        4 => dst_scanned.copy_from_slice(&[0; 4]),
+        _ => dst_scanned.fill(0),
+    }
     let (mut level, mut pos) = ([0i16; 16], [0u8; 32]);
     let max_coeff = dst_scanned.len().min(16);
     let n = r.with_local(|r| cavlc_block(r, max_coeff, nc, is_chroma_dc, &mut level, &mut pos))?;
