@@ -1603,9 +1603,91 @@ fn idct4_butterfly_avx2(c: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_6
     ]
 }
 
+/// Largest coefficient magnitude for which every intermediate value of the inverse transform,
+/// rounding included, fits in 16 bits: `3.5 * 3.5 * C + 32 <= 32767`.
+#[cfg(target_arch = "x86_64")]
+const IDCT16_MAX: i16 = 2672;
+
+/// The H.264 inverse core transform butterfly applied element-wise across four registers of
+/// 16-bit values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn idct4_butterfly_epi16_avx2(
+    c: [std::arch::x86_64::__m256i; 4],
+) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+    let e0 = _mm256_add_epi16(c[0], c[2]);
+    let e1 = _mm256_sub_epi16(c[0], c[2]);
+    let e2 = _mm256_sub_epi16(_mm256_srai_epi16::<1>(c[1]), c[3]);
+    let e3 = _mm256_add_epi16(c[1], _mm256_srai_epi16::<1>(c[3]));
+    [
+        _mm256_add_epi16(e0, e3),
+        _mm256_add_epi16(e1, e2),
+        _mm256_sub_epi16(e1, e2),
+        _mm256_sub_epi16(e0, e3),
+    ]
+}
+
+/// [`add_idct4x4_8x8`] in 16-bit arithmetic, which is exact while no coefficient exceeds
+/// [`IDCT16_MAX`] in magnitude; larger ones take [`idct_add_8x8_wide_avx2`]. Each register holds
+/// one row of all four blocks: blocks 0, 1 in the low lane and 2, 3 in the high lane, so its
+/// result is row `k` of the 8x8 region in the low lane and row `k + 4` in the high lane.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let p = blocks.as_ptr() as *const __m256i;
+        let b: [__m256i; 4] = std::array::from_fn(|j| _mm256_loadu_si256(p.add(j)));
+        // |c| as unsigned 16-bit (|-32768| is 32768) above the limit leaves a non-zero excess.
+        let lim = _mm256_set1_epi16(IDCT16_MAX);
+        let excess = |x: __m256i| _mm256_subs_epu16(_mm256_abs_epi16(x), lim);
+        let over = _mm256_or_si256(
+            _mm256_or_si256(excess(b[0]), excess(b[1])),
+            _mm256_or_si256(excess(b[2]), excess(b[3])),
+        );
+        if _mm256_testz_si256(over, over) == 0 {
+            idct_add_8x8_wide_avx2(dst, ds, blocks);
+            return;
+        }
+        // Block j holds rows 0, 1 in its low lane and 2, 3 in its high lane (64 bits each).
+        let (lo01, hi01) = (
+            _mm256_unpacklo_epi64(b[0], b[1]),
+            _mm256_unpackhi_epi64(b[0], b[1]),
+        );
+        let (lo23, hi23) = (
+            _mm256_unpacklo_epi64(b[2], b[3]),
+            _mm256_unpackhi_epi64(b[2], b[3]),
+        );
+        let rows = [
+            _mm256_permute2x128_si256::<0x20>(lo01, lo23),
+            _mm256_permute2x128_si256::<0x20>(hi01, hi23),
+            _mm256_permute2x128_si256::<0x31>(lo01, lo23),
+            _mm256_permute2x128_si256::<0x31>(hi01, hi23),
+        ];
+        // Rows first (on coefficient columns), then columns, as in ITU-T H.264 8.5.12.2.
+        let h = idct4_butterfly_epi16_avx2(transpose_4x4_epi16_avx2(rows));
+        let v = idct4_butterfly_epi16_avx2(transpose_4x4_epi16_avx2(h));
+        let r32 = _mm256_set1_epi16(32);
+        for (k, o) in v.iter().enumerate() {
+            let res = _mm256_srai_epi16::<6>(_mm256_add_epi16(*o, r32));
+            let (p0, p1) = (dst.add(k * ds), dst.add((k + 4) * ds));
+            let px = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
+                _mm_loadl_epi64(p0 as *const __m128i),
+                _mm_loadl_epi64(p1 as *const __m128i),
+            ));
+            let sum = _mm256_add_epi16(px, res);
+            let packed = _mm256_packus_epi16(sum, sum);
+            _mm_storel_epi64(p0 as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm_storel_epi64(p1 as *mut __m128i, _mm256_extracti128_si256::<1>(packed));
+        }
+    }
+}
+
+/// [`add_idct4x4_8x8`] in 32-bit arithmetic, for any coefficients.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn idct_add_8x8_wide_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
     use std::arch::x86_64::*;
     unsafe {
         let round = _mm256_set1_epi32(32);
@@ -2754,6 +2836,30 @@ mod tests {
             add_idct4x4_8x8(&mut p, ds, &a);
             add_idct4x4_8x8_scalar(&mut q, ds, &a);
             assert_eq!(p, q, "round {round}");
+
+            // Levels around the limit of the 16-bit vector path, all of one sign in a block or
+            // of alternating signs, reach the largest intermediate values on both sides of it.
+            let lim = 2672 + (round as i16 % 3) - 1;
+            for (j, blk) in a.iter_mut().enumerate() {
+                for (i, c) in blk.iter_mut().enumerate() {
+                    let r = next();
+                    let mag = if r >> 31 == 0 {
+                        lim
+                    } else {
+                        (r >> 20) as i16 % (lim + 1)
+                    };
+                    let neg = match (round + j) % 3 {
+                        0 => false,
+                        1 => true,
+                        _ => (i ^ (i >> 2)) & 1 == 1,
+                    };
+                    *c = if neg { -mag } else { mag };
+                }
+            }
+            let mut q = p.clone();
+            add_idct4x4_8x8(&mut p, ds, &a);
+            add_idct4x4_8x8_scalar(&mut q, ds, &a);
+            assert_eq!(p, q, "round {round} near the limit");
         }
     }
 
