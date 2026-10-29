@@ -577,15 +577,21 @@ pub const HPEL_COLS: usize = 24;
 /// Rows of the planes of a [`HpelWindow`].
 pub const HPEL_WIN_H: usize = 18;
 
+/// Rows of unrounded horizontal taps a [`HpelWindow`] keeps for its centre plane.
+const HPEL_HR_ROWS: usize = HPEL_WIN_H + 5;
+
 /// The three half-sample planes of ITU-T H.264 8.4.2.2.1 over a `HPEL_COLS` x `HPEL_WIN_H`
 /// window, row-major with stride `HPEL_WIN_W`. With `(x, y)` the window's top-left integer sample:
 /// `h` holds `b` at `(x + c + 1/2, y + r)`, `v` holds `h` at `(x + c, y + r + 1/2)` and `c` holds
-/// `j` at `(x + c + 1/2, y + r + 1/2)`.
+/// `j` at `(x + c + 1/2, y + r + 1/2)`. [`hpel_window`] fills `h` and `v`, and `c` only once
+/// [`hpel_window_centre`] derives it from the unrounded taps kept alongside.
 #[derive(Clone, Debug)]
 pub struct HpelWindow {
     pub h: [u8; HPEL_WIN_W * HPEL_WIN_H],
     pub v: [u8; HPEL_WIN_W * HPEL_WIN_H],
     pub c: [u8; HPEL_WIN_W * HPEL_WIN_H],
+    /// Unrounded horizontal 6-tap sums of rows `-2..HPEL_WIN_H + 3`, stride `HPEL_COLS`.
+    hr: [i16; HPEL_HR_ROWS * HPEL_COLS],
 }
 
 impl Default for HpelWindow {
@@ -594,11 +600,12 @@ impl Default for HpelWindow {
             h: [0; HPEL_WIN_W * HPEL_WIN_H],
             v: [0; HPEL_WIN_W * HPEL_WIN_H],
             c: [0; HPEL_WIN_W * HPEL_WIN_H],
+            hr: [0; HPEL_HR_ROWS * HPEL_COLS],
         }
     }
 }
 
-/// Interpolates the half-sample planes of the window whose top-left integer sample is `src[off]`
+/// Interpolates the `h` and `v` planes of the window whose top-left integer sample is `src[off]`
 /// (stride `ss`), columns `0..HPEL_COLS` of each row; the others are left as they are. Reads rows
 /// `-2..=HPEL_WIN_H + 2` and columns `-2..=HPEL_WIN_W + 2` around it.
 ///
@@ -628,39 +635,62 @@ pub fn hpel_window_scalar(src: &[u8], off: usize, ss: usize, out: &mut HpelWindo
     let at = |r: isize, c: isize| src[(off as isize + r * ss as isize + c) as usize] as i32;
     let tap6 =
         |a: i32, b: i32, c: i32, d: i32, e: i32, f: i32| a - 5 * b + 20 * c + 20 * d - 5 * e + f;
-    let h_raw = |r: isize, c: isize| {
-        tap6(
-            at(r, c - 2),
-            at(r, c - 1),
-            at(r, c),
-            at(r, c + 1),
-            at(r, c + 2),
-            at(r, c + 3),
-        )
-    };
     let clip = |v: i32| v.clamp(0, 255) as u8;
-    for r in 0..HPEL_WIN_H as isize {
+    for k in 0..HPEL_HR_ROWS {
+        let r = k as isize - 2;
         for c in 0..HPEL_COLS as isize {
-            let i = r as usize * HPEL_WIN_W + c as usize;
-            out.h[i] = clip((h_raw(r, c) + 16) >> 5);
-            let v = tap6(
-                at(r - 2, c),
-                at(r - 1, c),
+            let h = tap6(
+                at(r, c - 2),
+                at(r, c - 1),
                 at(r, c),
-                at(r + 1, c),
-                at(r + 2, c),
-                at(r + 3, c),
+                at(r, c + 1),
+                at(r, c + 2),
+                at(r, c + 3),
             );
-            out.v[i] = clip((v + 16) >> 5);
-            let j = tap6(
-                h_raw(r - 2, c),
-                h_raw(r - 1, c),
-                h_raw(r, c),
-                h_raw(r + 1, c),
-                h_raw(r + 2, c),
-                h_raw(r + 3, c),
-            );
-            out.c[i] = clip((j + 512) >> 10);
+            out.hr[k * HPEL_COLS + c as usize] = h as i16;
+            if (0..HPEL_WIN_H as isize).contains(&r) {
+                let i = r as usize * HPEL_WIN_W + c as usize;
+                out.h[i] = clip((h + 16) >> 5);
+                let v = tap6(
+                    at(r - 2, c),
+                    at(r - 1, c),
+                    at(r, c),
+                    at(r + 1, c),
+                    at(r + 2, c),
+                    at(r + 3, c),
+                );
+                out.v[i] = clip((v + 16) >> 5);
+            }
+        }
+    }
+}
+
+/// Interpolates the `c` plane of a window that [`hpel_window`] has filled, from the horizontal
+/// taps it kept, columns `0..HPEL_COLS` of each row.
+#[inline]
+pub fn hpel_window_centre(out: &mut HpelWindow) {
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        unsafe { hpel_centre_neon(out) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        unsafe { hpel_centre_avx2(out) };
+        return;
+    }
+    hpel_window_centre_scalar(out);
+}
+
+/// Scalar reference for [`hpel_window_centre`].
+pub fn hpel_window_centre_scalar(out: &mut HpelWindow) {
+    for r in 0..HPEL_WIN_H {
+        for c in 0..HPEL_COLS {
+            let t = |k: usize| out.hr[(r + k) * HPEL_COLS + c] as i32;
+            let j = t(0) - 5 * t(1) + 20 * t(2) + 20 * t(3) - 5 * t(4) + t(5);
+            out.c[r * HPEL_WIN_W + c] = ((j + 512) >> 10).clamp(0, 255) as u8;
         }
     }
 }
@@ -1402,60 +1432,42 @@ fn tap6_epi16(t: [std::arch::x86_64::__m256i; 6]) -> std::arch::x86_64::__m256i 
     _mm256_add_epi16(s0, _mm256_add_epi16(k, _mm256_slli_epi16::<2>(k)))
 }
 
+/// Rows of the second (packed) half of an AVX2 window pass.
+#[cfg(target_arch = "x86_64")]
+const HPEL_HALF: usize = HPEL_WIN_H / 2;
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
     use std::arch::x86_64::*;
     unsafe {
-        let (r16, r512) = (_mm256_set1_epi16(16), _mm256_set1_epi32(512));
-        let (one, m5, p20) = (
-            _mm256_set1_epi16(1),
-            _mm256_set1_epi16(-5),
-            _mm256_set1_epi16(20),
-        );
-        // The three planes of `OUT` register rows from `ld(row, column)` (16 widened samples),
-        // handing each to `st(plane, row, values)`; rows -2..OUT + 3 are read.
+        let r16 = _mm256_set1_epi16(16);
+        // The `h` and `v` planes of `OUT` register rows from `ld(row, column)` (16 widened
+        // samples): `st(plane, row, values)` stores a plane row and `keep(k, taps)` the
+        // horizontal taps of row k - 2; rows -2..OUT + 3 are read.
         macro_rules! pass {
-            ($out:expr, $c0:expr, $ld:expr, $st:expr) => {{
+            ($out:expr, $c0:expr, $ld:expr, $st:expr, $keep:expr) => {{
                 const ROWS: usize = $out + 5;
-                let (ld, st) = ($ld, $st);
-                // Unrounded horizontal taps and widened samples of the rows.
-                let mut hr = [_mm256_setzero_si256(); ROWS];
+                let (ld, st, keep) = ($ld, $st, $keep);
                 let mut sr = [_mm256_setzero_si256(); ROWS];
-                for k in 0..ROWS {
+                for (k, s) in sr.iter_mut().enumerate() {
                     let r = k as isize - 2;
-                    hr[k] = tap6_epi16(std::array::from_fn(|t| ld(r, $c0 - 2 + t as isize)));
-                    sr[k] = ld(r, $c0);
+                    let h = tap6_epi16(std::array::from_fn(|t| ld(r, $c0 - 2 + t as isize)));
+                    keep(k, h);
+                    if (2..$out + 2).contains(&k) {
+                        st(0, k - 2, _mm256_srai_epi16::<5>(_mm256_add_epi16(h, r16)));
+                    }
+                    *s = ld(r, $c0);
                 }
                 for r in 0..$out {
-                    st(
-                        0,
-                        r,
-                        _mm256_srai_epi16::<5>(_mm256_add_epi16(hr[r + 2], r16)),
-                    );
                     let v =
                         tap6_epi16([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
                     st(1, r, _mm256_srai_epi16::<5>(_mm256_add_epi16(v, r16)));
-                    // The centre tap on the unrounded intermediates needs 32 bits: multiply-add
-                    // the symmetric pairs, interleaved per 128-bit lane (packs restores the order).
-                    let pairs = [
-                        (hr[r], hr[r + 5], one),
-                        (hr[r + 1], hr[r + 4], m5),
-                        (hr[r + 2], hr[r + 3], p20),
-                    ];
-                    let (mut lo, mut hi) = (r512, r512);
-                    for (a, b, k) in pairs {
-                        lo =
-                            _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), k));
-                        hi =
-                            _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
-                    }
-                    let (lo, hi) = (_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
-                    st(2, r, _mm256_packs_epi32(lo, hi));
                 }
             }};
         }
-        let planes = [out.h.as_mut_ptr(), out.v.as_mut_ptr(), out.c.as_mut_ptr()];
+        let planes = [out.h.as_mut_ptr(), out.v.as_mut_ptr()];
+        let hr = out.hr.as_mut_ptr();
         let row = |r: isize, c: isize| p.offset(r * ss as isize + c);
         // Columns 0..16, one row per register.
         pass!(
@@ -1466,16 +1478,18 @@ unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
                 let dst = planes[plane].add(r * HPEL_WIN_W) as *mut __m128i;
                 _mm_storeu_si128(dst, _mm256_castsi256_si128(packed));
+            },
+            |k: usize, h: __m256i| {
+                _mm256_storeu_si256(hr.add(k * HPEL_COLS) as *mut __m256i, h);
             }
         );
-        // Columns 16..24: rows r and r + HPEL_WIN_H / 2 side by side in the two 128-bit lanes.
-        const HALF: usize = HPEL_WIN_H / 2;
+        // Columns 16..24: rows r and r + HPEL_HALF side by side in the two 128-bit lanes.
         pass!(
-            HALF,
+            HPEL_HALF,
             16,
             |r: isize, c: isize| {
                 let lo = _mm_loadl_epi64(row(r, c) as *const __m128i);
-                let hi = _mm_loadl_epi64(row(r + HALF as isize, c) as *const __m128i);
+                let hi = _mm_loadl_epi64(row(r + HPEL_HALF as isize, c) as *const __m128i);
                 _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(lo, hi))
             },
             |plane: usize, r: usize, x: __m256i| {
@@ -1483,11 +1497,74 @@ unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 let dst = planes[plane].add(r * HPEL_WIN_W + 16);
                 _mm_storel_epi64(dst as *mut __m128i, _mm256_castsi256_si128(packed));
                 _mm_storel_epi64(
-                    dst.add(HALF * HPEL_WIN_W) as *mut __m128i,
+                    dst.add(HPEL_HALF * HPEL_WIN_W) as *mut __m128i,
                     _mm256_extracti128_si256::<1>(packed),
+                );
+            },
+            |k: usize, h: __m256i| {
+                let dst = hr.add(k * HPEL_COLS + 16);
+                _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(h));
+                _mm_storeu_si128(
+                    dst.add(HPEL_HALF * HPEL_COLS) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(h),
                 );
             }
         );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hpel_centre_avx2(out: &mut HpelWindow) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let r512 = _mm256_set1_epi32(512);
+        let (one, m5, p20) = (
+            _mm256_set1_epi16(1),
+            _mm256_set1_epi16(-5),
+            _mm256_set1_epi16(20),
+        );
+        // The vertical tap on the unrounded intermediates needs 32 bits: multiply-add the
+        // symmetric pairs, interleaved per 128-bit lane (packs restores the order).
+        let centre = |t: [__m256i; 6]| {
+            let pairs = [(t[0], t[5], one), (t[1], t[4], m5), (t[2], t[3], p20)];
+            let (mut lo, mut hi) = (r512, r512);
+            for (a, b, k) in pairs {
+                lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), k));
+                hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
+            }
+            let (lo, hi) = (_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
+            let j = _mm256_packs_epi32(lo, hi);
+            _mm256_packus_epi16(j, j)
+        };
+        let hr = out.hr.as_ptr();
+        let c = out.c.as_mut_ptr();
+        let full: [__m256i; HPEL_HR_ROWS] =
+            std::array::from_fn(|k| _mm256_loadu_si256(hr.add(k * HPEL_COLS) as *const __m256i));
+        for r in 0..HPEL_WIN_H {
+            let packed =
+                _mm256_permute4x64_epi64::<0b00_00_10_00>(centre(std::array::from_fn(|t| {
+                    full[r + t]
+                })));
+            _mm_storeu_si128(
+                c.add(r * HPEL_WIN_W) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
+        }
+        let half: [__m256i; HPEL_HALF + 5] = std::array::from_fn(|k| {
+            let lo = _mm_loadu_si128(hr.add(k * HPEL_COLS + 16) as *const __m128i);
+            let hi = _mm_loadu_si128(hr.add((k + HPEL_HALF) * HPEL_COLS + 16) as *const __m128i);
+            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi)
+        });
+        for r in 0..HPEL_HALF {
+            let packed = centre(std::array::from_fn(|t| half[r + t]));
+            let dst = c.add(r * HPEL_WIN_W + 16);
+            _mm_storel_epi64(dst as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm_storel_epi64(
+                dst.add(HPEL_HALF * HPEL_WIN_W) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(packed),
+            );
+        }
     }
 }
 
@@ -1495,7 +1572,6 @@ unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
 #[target_feature(enable = "neon")]
 unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
     use std::arch::aarch64::*;
-    const ROWS: usize = HPEL_WIN_H + 5;
     fn tap6(t: [int16x8_t; 6]) -> int16x8_t {
         // Safety: NEON is baseline on aarch64.
         unsafe {
@@ -1512,18 +1588,35 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
         };
         for chunk in 0..HPEL_COLS / 8 {
             let c0 = (chunk * 8) as isize;
-            let mut hr = [vdupq_n_s16(0); ROWS];
-            let mut sr = [vdupq_n_s16(0); ROWS];
-            for k in 0..ROWS {
+            let mut sr = [vdupq_n_s16(0); HPEL_HR_ROWS];
+            for (k, s) in sr.iter_mut().enumerate() {
                 let r = k as isize - 2;
-                hr[k] = tap6(std::array::from_fn(|t| ld(r, c0 - 2 + t as isize)));
-                sr[k] = ld(r, c0);
+                let h = tap6(std::array::from_fn(|t| ld(r, c0 - 2 + t as isize)));
+                vst1q_s16(out.hr.as_mut_ptr().add(k * HPEL_COLS + chunk * 8), h);
+                if (2..HPEL_WIN_H + 2).contains(&k) {
+                    let o = (k - 2) * HPEL_WIN_W + chunk * 8;
+                    vst1_u8(out.h.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(h));
+                }
+                *s = ld(r, c0);
             }
             for r in 0..HPEL_WIN_H {
                 let o = r * HPEL_WIN_W + chunk * 8;
-                vst1_u8(out.h.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(hr[r + 2]));
                 let v = tap6([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
                 vst1_u8(out.v.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(v));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hpel_centre_neon(out: &mut HpelWindow) {
+    use std::arch::aarch64::*;
+    unsafe {
+        for chunk in 0..HPEL_COLS / 8 {
+            let hr: [int16x8_t; HPEL_HR_ROWS] =
+                std::array::from_fn(|k| vld1q_s16(out.hr.as_ptr().add(k * HPEL_COLS + chunk * 8)));
+            for r in 0..HPEL_WIN_H {
                 let j = |lo: bool| {
                     let half = |x: int16x8_t| {
                         if lo {
@@ -1539,6 +1632,7 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
                     vqrshrn_n_s32::<10>(sum)
                 };
                 let jc = vcombine_s16(j(true), j(false));
+                let o = r * HPEL_WIN_W + chunk * 8;
                 vst1_u8(out.c.as_mut_ptr().add(o), vqmovun_s16(jc));
             }
         }
@@ -2010,6 +2104,9 @@ mod tests {
                 let (mut a, mut b) = (HpelWindow::default(), HpelWindow::default());
                 hpel_window(&src, off, pw, &mut a);
                 hpel_window_scalar(&src, off, pw, &mut b);
+                assert_eq!(a.hr, b.hr);
+                hpel_window_centre(&mut a);
+                hpel_window_centre_scalar(&mut b);
                 assert_eq!(a.h, b.h);
                 assert_eq!(a.v, b.v);
                 assert_eq!(a.c, b.c, "seed {seed} off {off}");

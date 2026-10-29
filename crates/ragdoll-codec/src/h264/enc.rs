@@ -12,9 +12,9 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hpel_window, intra_satd_x3_16x16, nonzero_mask_4x4_x4, pixel_avg_16x16,
-    pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
-    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    h264_luma_mc, hpel_window, hpel_window_centre, intra_satd_x3_16x16, nonzero_mask_4x4_x4,
+    pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
+    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -857,6 +857,7 @@ impl MotionSearch<'_> {
         let mut best_cost = full_cost;
         let mut cand = [0u8; 256];
         let mut have_pred = false;
+        let mut have_centre = false;
         for (step, iters) in [(2i32, 1), (1, 2)] {
             for _ in 0..iters {
                 let from = best;
@@ -867,6 +868,15 @@ impl MotionSearch<'_> {
                         || self.bounds.clamp(mv) != mv
                     {
                         continue;
+                    }
+                    // The centre plane is interpolated only once a candidate reads it.
+                    if !have_centre
+                        && (mv[0] & 3 == 2 && mv[1] & 1 == 1
+                            || mv[1] & 3 == 2 && mv[0] & 1 == 1
+                            || (mv[0] & 3, mv[1] & 3) == (2, 2))
+                    {
+                        hpel_window_centre(win);
+                        have_centre = true;
                     }
                     self.window_pred(win, bx, by, mv, &mut cand);
                     let cost = pixel_sad_16x16(self.src, 16, &cand, 16) + self.mv_cost(mv);
@@ -1031,9 +1041,11 @@ fn analyse_chroma_intra(
 #[inline(always)]
 fn plane_pred<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
     let c0 = (N / 2 - 1) as i32;
-    let bx: [i32; N] = std::array::from_fn(|x| b * (x as i32 - c0));
+    // Every sum fits in 16 bits (|a| <= 16 * 510, |b (x - c0)|, |c (y - c0)| < 6000 for 8-bit
+    // edges), so rows vectorize as 16-bit lanes.
+    let bx: [i16; N] = std::array::from_fn(|x| (b * (x as i32 - c0)) as i16);
     for (y, row) in dst.as_chunks_mut::<N>().0.iter_mut().take(N).enumerate() {
-        let base = a + c * (y as i32 - c0) + 16;
+        let base = (a + c * (y as i32 - c0) + 16) as i16;
         for (p, &o) in row.iter_mut().zip(&bx) {
             *p = ((base + o) >> 5).clamp(0, 255) as u8;
         }
@@ -2969,6 +2981,7 @@ mod tests {
                     y0 as isize + full[1] as isize,
                 );
                 hpel_window(&p.buf, p.at(bx - 1, by - 1), p.stride, &mut win);
+                hpel_window_centre(&mut win);
                 for dy in -3..=3 {
                     for dx in -3..=3 {
                         let mv = [full[0] * 4 + dx, full[1] * 4 + dy];
