@@ -499,8 +499,8 @@ const LEVEL_TAB_MAX: i32 = 32;
 /// Level codes by `suffixLength` and `level + LEVEL_TAB_MAX` for the levels that need no
 /// `levelCode` adjustment, packed as `bits << 16 | next suffixLength << 8 | length`
 /// (`x264_level_token`).
-static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
-    let mut t = [[0u32; 2 * LEVEL_TAB_MAX as usize]; 7];
+static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 8] = {
+    let mut t = [[0u32; 2 * LEVEL_TAB_MAX as usize]; 8];
     let mut s = 0;
     while s < 7 {
         let mut i = 0;
@@ -542,8 +542,8 @@ static COEFF_TOKEN: [[u32; 68]; 5] = {
 
 /// `total_zeros` codes of $4\times4$ blocks, then of chroma DC, by `TotalCoeff - 1` and
 /// `total_zeros`, packed as `bits << 8 | length`.
-static TOTAL_ZEROS: [[[u32; 16]; 15]; 2] = {
-    let mut t = [[[0u32; 16]; 15]; 2];
+static TOTAL_ZEROS: [[[u32; 16]; 16]; 2] = {
+    let mut t = [[[0u32; 16]; 16]; 2];
     let mut n = 0;
     while n < 15 {
         let mut z = 0;
@@ -647,6 +647,10 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         w.put32(tokens[0] >> 8, tokens[0] & 0xFF);
         return;
     }
+    // Every level the mask names lies in `coeffs`, so the walks below index it unchecked.
+    assert!(coeffs.len() >= N && mask >> N == 0);
+    // Safety: by the assertion, every position `p` of a set bit of `mask` is below `N`.
+    let level = |p: u32| unsafe { *coeffs.get_unchecked(p as usize) };
     let n = pop16(mask) as usize;
     let top = 31 - mask.leading_zeros();
     let total_zeros = top as usize + 1 - n;
@@ -657,7 +661,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     let mut signs = 0u32;
     while trailing_ones < 3 && m != 0 {
         let p = 31 - m.leading_zeros();
-        let c = coeffs[p as usize];
+        let c = level(p);
         if c.unsigned_abs() != 1 {
             break;
         }
@@ -677,7 +681,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         // taken, so its `levelCode` is lowered by 2.
         let p = 31 - m.leading_zeros();
         m ^= 1 << p;
-        let lv = coeffs[p as usize] as i32;
+        let lv = level(p) as i32;
         let mut code = if lv > 0 { 2 * lv - 2 } else { -2 * lv - 1 } as u32;
         if trailing_ones < 3 {
             code -= 2;
@@ -693,10 +697,10 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         while m != 0 {
             let p = 31 - m.leading_zeros();
             m ^= 1 << p;
-            let lv = coeffs[p as usize] as i32;
+            let lv = level(p) as i32;
             let i = lv + LEVEL_TAB_MAX;
             if (i as u32) < 2 * LEVEL_TAB_MAX as u32 {
-                let e = LEVEL_TAB[suffix_len as usize][i as usize];
+                let e = LEVEL_TAB[suffix_len as usize & 7][i as usize];
                 w.put32(e >> 16, e & 0xFF);
                 suffix_len = (e >> 8) & 0xFF;
             } else {
@@ -709,7 +713,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     }
 
     if n < N {
-        let tz = TOTAL_ZEROS[usize::from(N == 4)][n - 1][total_zeros & 15];
+        let tz = TOTAL_ZEROS[usize::from(N == 4)][(n - 1) & 15][total_zeros & 15];
         let (l, b) = (tz & 0xFF, tz >> 8);
         // The run_before codes follow (empty without zeros); one write while both fit.
         let e = RUN_BEFORE[mask as usize & 0xFFFF];
