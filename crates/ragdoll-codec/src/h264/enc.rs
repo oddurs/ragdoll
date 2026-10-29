@@ -600,20 +600,36 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         };
         w.put32(b as u32, l as u32);
     }
-    // run_before of each level from the highest down while zeros remain, except the last.
-    let mut zeros_left = total_zeros as u32;
-    let mut m = mask ^ (1 << top);
-    let mut p = top;
-    while zeros_left != 0 && m != 0 {
-        let below = 31 - m.leading_zeros();
-        m ^= 1 << below;
-        let run = (p - below - 1) as usize;
-        let k = (zeros_left - 1).min(6) as usize;
-        w.put32(RUN_BITS[k][run] as u32, RUN_LEN[k][run] as u32);
-        zeros_left -= run as u32;
-        p = below;
+    if total_zeros != 0 {
+        let e = RUN_BEFORE[mask as usize & 0xFFFF];
+        w.put32(e >> 5, e & 31);
     }
 }
+
+/// The `run_before` codes of a block's levels, from the highest frequency down while zeros
+/// remain, concatenated (at most 25 bits) and packed as `bits << 5 | length`, by the mask of the
+/// non-zero levels (bit `i` for scan position `i`; `x264_run_before`).
+///
+/// After the first code the zeros left are the total zeros of the mask without its top level,
+/// so each entry is its first code followed by that smaller mask's entry.
+static RUN_BEFORE: [u32; 1 << 16] = {
+    let mut t = [0u32; 1 << 16];
+    let mut mask = 1u32;
+    while mask < 1 << 16 {
+        let top = 31 - mask.leading_zeros();
+        let rest = mask ^ (1 << top);
+        let zeros = top + 1 - mask.count_ones();
+        if zeros != 0 && rest != 0 {
+            let run = (top - (31 - rest.leading_zeros()) - 1) as usize;
+            let k = if zeros > 7 { 6 } else { zeros as usize - 1 };
+            let (len, bits) = (RUN_LEN[k][run] as u32, RUN_BITS[k][run] as u32);
+            let tail = t[rest as usize];
+            t[mask as usize] = ((bits << (tail & 31)) | (tail >> 5)) << 5 | (len + (tail & 31));
+        }
+        mask += 1;
+    }
+    t
+};
 
 /// Writes the CAVLC luma $4\times4$ blocks of the coded $8\times8$ quadrants of `cbp_luma` and
 /// the chroma residual, updating the non-zero counts that predict `nC`.
