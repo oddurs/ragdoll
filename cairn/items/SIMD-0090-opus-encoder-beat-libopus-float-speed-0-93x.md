@@ -3,12 +3,12 @@ id: 90
 uid: 2daf4b98-4751-4006-9057-6e961986664a
 title: 'Opus encoder: beat libopus float speed (0.93x)'
 type: kernel
-status: doing
+status: done
 milestone: m11-validation
 assignee: Claude
-claimed: 2026-10-29
 created: 2026-10-28
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p1
 ---
 
@@ -18,7 +18,7 @@ priority: p1
 
 ## Acceptance criteria
 
-- [ ] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
+- [x] Scalar reference and NEON/AVX2 SIMD implementations pass differential bit-exactness tests across odd dimensions.
 - [x] Zero heap allocations in the hot loop.
 
 ## 2026-10-29
@@ -28,3 +28,7 @@ Opus encoder (96k stereo restricted-lowdelay, complexity 9, 60 s music48, best o
 ## 2026-10-29
 
 Criterion 2: tests/opus_no_alloc.rs encoding_allocates_nothing_per_frame encodes mono and stereo, 2.5-20 ms frames, VBR/CBR, complexity 5-10 with a counting allocator and asserts zero allocations after the first frame. Criterion 1 is true for AVX2 (simd_enc tests: odd sizes, tails, extreme values, wrap-around); the NEON kernels (xcorr, dot, shifted dot) only compile-check here and run in ARM CI.
+
+## 2026-10-29
+
+Criterion 1: the NEON kernels' differential tests passed in ARM CI on PR #38 (aarch64 NEON job). Merged as a99cad7: 1.42-1.59x libopus 1.4 float, 1.66x libopus 1.3.1 fixed, byte-identical output.
