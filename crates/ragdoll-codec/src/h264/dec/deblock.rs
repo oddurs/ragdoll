@@ -75,31 +75,48 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
 fn filter_mb_dir<const DIR: usize>(
     st: &mut PicState,
     local: &EdgeCtx,
-    (mb_x, mb_y, addr): (usize, usize, usize),
+    at: (usize, usize, usize),
     todo: u8,
     sl: SliceDeblock,
     has_chroma: bool,
 ) {
-    for edge in 0..4 {
-        if todo & (1 << edge) == 0 {
-            continue;
-        }
-        let bs = local.strengths(st, DIR, edge);
-        if u32::from_ne_bytes(bs) == 0 {
-            continue;
-        }
-        let p_addr = match (edge, DIR) {
-            (0, 0) => addr - 1,
-            (0, _) => addr - st.mb_w,
-            _ => addr,
-        };
-        let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
-        filter_luma_edge::<DIR>(st, mb_x, mb_y, edge, bs, qp, sl);
-        if has_chroma && edge % 2 == 0 {
-            for c in 0..2 {
-                let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
-                filter_chroma_edge::<DIR>(st, c, mb_x, mb_y, edge / 2, bs, qp, sl);
-            }
+    // The macroblock edge, then the inner edges present: most inter macroblocks have none.
+    if todo & 1 != 0 {
+        filter_edge::<DIR>(st, local, at, 0, sl, has_chroma);
+    }
+    let mut inner = todo & 0xE;
+    while inner != 0 {
+        let edge = inner.trailing_zeros() as usize;
+        inner &= inner - 1;
+        filter_edge::<DIR>(st, local, at, edge, sl, has_chroma);
+    }
+}
+
+/// Filters edge `edge` (0..4) in direction `DIR` of the macroblock at `(mb_x, mb_y, addr)`.
+#[inline(always)]
+fn filter_edge<const DIR: usize>(
+    st: &mut PicState,
+    local: &EdgeCtx,
+    (mb_x, mb_y, addr): (usize, usize, usize),
+    edge: usize,
+    sl: SliceDeblock,
+    has_chroma: bool,
+) {
+    let bs = local.strengths(st, DIR, edge);
+    if u32::from_ne_bytes(bs) == 0 {
+        return;
+    }
+    let p_addr = match (edge, DIR) {
+        (0, 0) => addr - 1,
+        (0, _) => addr - st.mb_w,
+        _ => addr,
+    };
+    let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
+    filter_luma_edge::<DIR>(st, mb_x, mb_y, edge, bs, qp, sl);
+    if has_chroma && edge % 2 == 0 {
+        for c in 0..2 {
+            let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
+            filter_chroma_edge::<DIR>(st, c, mb_x, mb_y, edge / 2, bs, qp, sl);
         }
     }
 }
@@ -184,11 +201,25 @@ impl EdgeCtx {
                 _ => NO_PIC,
             })
         };
+        // The blocks on both sides of each segment, bounds-checked once per edge (a row of
+        // each side) or per segment (an adjacent pair).
+        let blocks = &st.blocks[q0 - step..];
+        let rows = (dir == 1).then(|| -> (&[BlockInfo; 4], &[BlockInfo; 4]) {
+            let p = blocks[..4].try_into().expect("4 blocks");
+            let q = blocks[step..step + 4].try_into().expect("4 blocks");
+            (p, q)
+        });
         let mut bs = [0u8; 4];
         for (k, slot) in bs.iter_mut().enumerate() {
-            let qi = q0 + k * along;
-            let pi = qi - step;
-            let (bp, bq) = (&st.blocks[pi], &st.blocks[qi]);
+            let (bp, bq) = match rows {
+                Some((p, q)) => (&p[k], &q[k]),
+                None => {
+                    let pair: &[BlockInfo; 2] = blocks[k * along..k * along + 2]
+                        .try_into()
+                        .expect("2 blocks");
+                    (&pair[0], &pair[1])
+                }
+            };
             let nz = bp.nz | bq.nz;
             *slot = 2 * nz as u8;
             if check_motion && !nz {
