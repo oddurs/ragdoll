@@ -449,7 +449,11 @@ pub fn dequant_4x4_x4(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
 #[inline(always)]
 fn check_scale(scale: &[i32; 16]) {
     // Keeps |c * scale| below 2^31 for every 16-bit level.
-    assert!(scale.iter().all(|s| s.unsigned_abs() <= u16::MAX as u32));
+    // A fold rather than `all`, so the check vectorizes instead of exiting early.
+    let ok = scale
+        .iter()
+        .fold(true, |ok, s| ok & (s.unsigned_abs() <= u16::MAX as u32));
+    assert!(ok);
 }
 
 /// Scalar reference for [`dequant_4x4_x4`].
