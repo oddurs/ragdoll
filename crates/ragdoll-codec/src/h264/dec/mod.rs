@@ -23,7 +23,7 @@ use deblock::SliceDeblock;
 use dpb::{Dpb, PocState, RefSel, compute_poc};
 use mb::{RefPic, SliceCtx};
 use picture::{FrameStore, LiveMotion, Motion, PicPlanes, PicState, PicSync, RefKind, Structure};
-use ps::{Pps, Sps};
+use ps::{BASELINE, Pps, Sps};
 use recon::Dequant;
 use slice::{Mmco, SliceHeader, SliceType};
 use threads::{JobDone, PicJob, SliceJob, Workers};
@@ -701,7 +701,9 @@ impl Core {
             (Some(job), Some(done), Some(_)) => {
                 self.throttle();
                 let mt = self.mt.as_mut().expect("frame threading");
-                if is_ref {
+                // Baseline has no B slices: no direct prediction reads the motion (see
+                // `Dec::colocated_mb`), which then stays in the worker's own buffers.
+                if is_ref && cur.sps.profile_idc != BASELINE {
                     // Its motion, filled as rows are decoded, for direct prediction in later
                     // pictures; slice `i`'s macroblocks use reference table `i`.
                     let n = mb_w * mb_h * 16;

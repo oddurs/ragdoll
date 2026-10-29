@@ -3,10 +3,11 @@ id: 88
 uid: 710fa766-054b-445c-9255-77f43e949829
 title: 'H.264 decoder: multithreaded decoding to beat FFmpeg''s frame-threaded throughput'
 type: feature
-status: doing
+status: done
 milestone: m11-validation
 created: 2026-10-28
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p1
 ---
 
@@ -38,9 +39,9 @@ Frame threading, as FFmpeg does it, with the decoder's output unchanged for any 
 
 ## Acceptance criteria
 
-- [ ] Decoding with `with_threads(n)` gives byte-identical output to single-threaded decoding for every supported stream (x264 reference set, 166 JVT conformance streams) at 2 and 4 threads.
-- [ ] At 4 threads the decoder is faster than FFmpeg's 4-thread frame threading on the benchmark suite's 1080p High CABAC and 720p Baseline CAVLC streams.
-- [ ] The CLI and pipeline decode H.264 with frame threads by default.
+- [x] Decoding with `with_threads(n)` gives byte-identical output to single-threaded decoding for every supported stream (x264 reference set, 166 JVT conformance streams) at 2 and 4 threads.
+- [x] At 4 threads the decoder is faster than FFmpeg's 4-thread frame threading on the benchmark suite's 1080p High CABAC and 720p Baseline CAVLC streams.
+- [x] The CLI and pipeline decode H.264 with frame threads by default.
 
 ## 2026-10-29
 
@@ -49,3 +50,7 @@ Workers take reference pictures before non-reference ones (earliest first). Each
 ## 2026-10-29
 
 Round 10 (2026-10-29): a picture's sleepers are woken only once the progress they wait for is published (was: every row woke every sleeper, ~4.5 wakeups per wait; now ~1.5); futex time fell from 9.4% to 6.3% of CPU at 720p 4T. With the single-thread gains, 4 threads vs FFmpeg 4 frame threads (11 interleaved rounds, median ratio): 1080p High 0.89x, 720p Baseline 0.98x. Output identical to one thread on all 166 conformance streams at 1, 2 and 4 threads.
+
+## 2026-10-29
+
+Baseline streams (no B slices) keep no per-picture motion under frame threads: the worker's block buffer stays its own, hot in its core's cache, instead of being copied row by row into a shared buffer that nothing reads. 720p Baseline 4T 7% faster (15 interleaved rounds, median ratio 0.929); now 0.94x FFmpeg's 4-thread time. A B slice in a Baseline-labelled (non-conforming) stream predicts direct blocks from a co-located picture without motion, at any thread count, so one and four threads still agree. Tried first: moving the motion over once at the end instead of copying rows; no gain, because the worker then writes into a cold buffer every picture. CLI/pipeline: the sequential H.264 path (Matroska, MPEG-TS, and MP4 GOPs longer than a batch) and single-frame extraction decode with frame threads (up to 8, flushing at the end); MP4 GOP batches already decode GOPs in parallel, one thread each; the cut path's boundary GOP stays on one thread, pairing each packet with its picture. Test: tests/frame_threads.rs (fails without the flush).

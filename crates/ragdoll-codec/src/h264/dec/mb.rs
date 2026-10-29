@@ -17,7 +17,7 @@ use super::picture::{
     BlockInfo, MbType, Motion, MotionView, NO_BLOCK, NO_PIC, PicState, PicSync, RefIds, Structure,
     fill_block_rect,
 };
-use super::ps::{Pps, Sps};
+use super::ps::{BASELINE, Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
 use super::tables::{
@@ -2602,6 +2602,9 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn colocated_mb(&self) -> ColMb<'c> {
         let col = &self.refs(1)[0];
         let m = match (&col.motion, &col.sync) {
+            // A B slice in a Baseline stream (which has none) predicts from a co-located picture
+            // without motion: frame threads keep none for Baseline (see `Core`).
+            _ if self.cx.sps.profile_idc == BASELINE => None,
             (Some(m), _) => Some(MotionView::of(m)),
             // A frame still decoding on another thread (frames only): its co-located row.
             (None, Some(sync)) => sync.live().map(|live| {

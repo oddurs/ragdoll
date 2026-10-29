@@ -68,9 +68,9 @@ enum Step {
 
 type AuSource<'a> = Box<dyn FnMut() -> Result<Option<Vec<u8>>> + 'a>;
 
-/// One H.264 decoder fed access units in decoding order. Pictures leave in presentation order:
-/// sorted by POC within each run that starts at a keyframe, as [`sort_keyframe_runs`] sorts a
-/// whole decoded GOP.
+/// One H.264 decoder fed access units in decoding order, decoding frames on `threads` threads.
+/// Pictures leave in presentation order: sorted by POC within each run that starts at a
+/// keyframe, as [`sort_keyframe_runs`] sorts a whole decoded GOP.
 struct SeqH264<'a> {
     next_au: AuSource<'a>,
     dec: H264Decoder,
@@ -79,8 +79,8 @@ struct SeqH264<'a> {
 }
 
 impl<'a> SeqH264<'a> {
-    fn new(hdr: Option<&[u8]>, next_au: AuSource<'a>) -> Self {
-        let mut dec = H264Decoder::new();
+    fn new(hdr: Option<&[u8]>, next_au: AuSource<'a>, threads: usize) -> Self {
+        let mut dec = H264Decoder::new().with_threads(crate::h264_frame_threads(threads));
         if let Some(h) = hdr {
             let _ = dec.set_extradata(h);
         }
@@ -99,28 +99,39 @@ impl<'a> SeqH264<'a> {
             match (self.next_au)()? {
                 Some(au) => {
                     if let Some(f) = self.dec.decode_annex_b_packet(&au)? {
-                        if f.keyframe {
-                            release_sorted(&mut self.window, &mut out);
-                        }
-                        self.window.push(f);
-                        if self.window.len() >= H264_REORDER_WINDOW {
-                            let mut best = 0;
-                            for (i, w) in self.window.iter().enumerate() {
-                                if w.pts.ticks < self.window[best].pts.ticks {
-                                    best = i;
-                                }
-                            }
-                            out.push(self.window.remove(best));
-                        }
+                        self.take(f, &mut out);
                     }
                 }
                 None => {
+                    // Frame threads still hold the last pictures.
+                    for f in self.dec.flush()? {
+                        self.take(f, &mut out);
+                    }
                     self.ended = true;
                     release_sorted(&mut self.window, &mut out);
                 }
             }
         }
         Ok(out)
+    }
+}
+
+impl SeqH264<'_> {
+    /// Adds decoded picture `f` (in decoding order) to the reorder window, releasing to `out`.
+    fn take(&mut self, f: VideoFrame, out: &mut Vec<VideoFrame>) {
+        if f.keyframe {
+            release_sorted(&mut self.window, out);
+        }
+        self.window.push(f);
+        if self.window.len() >= H264_REORDER_WINDOW {
+            let mut best = 0;
+            for (i, w) in self.window.iter().enumerate() {
+                if w.pts.ticks < self.window[best].pts.ticks {
+                    best = i;
+                }
+            }
+            out.push(self.window.remove(best));
+        }
     }
 }
 
@@ -339,7 +350,11 @@ impl<'a> VideoFrameStream<'a> {
             }
             Ok(None)
         });
-        self.src = Source::Seq(Box::new(SeqH264::new(hdr.as_deref(), next_au)));
+        self.src = Source::Seq(Box::new(SeqH264::new(
+            hdr.as_deref(),
+            next_au,
+            self.threads,
+        )));
         Ok(())
     }
 
@@ -366,7 +381,7 @@ impl<'a> VideoFrameStream<'a> {
         let mut demux = MpegTsDemuxer::open(data)?;
         let next_au: AuSource<'a> =
             Box::new(move || Ok(demux.next_packet()?.map(|p| p.data().to_vec())));
-        self.src = Source::Seq(Box::new(SeqH264::new(None, next_au)));
+        self.src = Source::Seq(Box::new(SeqH264::new(None, next_au, self.threads)));
         Ok(())
     }
 
@@ -517,7 +532,7 @@ fn step<'a>(
                         .next()
                         .map(|p| h264_avcc_to_annex_b_au(&extra, p.data(), p.is_keyframe())))
                 });
-                *large = Some(Box::new(SeqH264::new(hdr.as_deref(), next_au)));
+                *large = Some(Box::new(SeqH264::new(hdr.as_deref(), next_au, threads)));
                 return Ok(Step::H264(Vec::new()));
             }
             // As many whole GOPs as fit the batch budget, at least one.
