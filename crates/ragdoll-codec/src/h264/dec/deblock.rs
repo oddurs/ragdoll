@@ -126,8 +126,9 @@ impl EdgeCtx {
         // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and
         // vertical vectors are compared in field units (4 quarter frame samples = 2 quarter
         // field samples).
-        let p_intra = edge == 0 && self.intra[1 + dir];
-        if self.intra[0] || p_intra {
+        // Without short-circuits: one branch on the outcome rather than one per operand.
+        let p_intra = (edge == 0) & self.intra[1 + dir];
+        if self.intra[0] | p_intra {
             return [if edge == 0 && !(self.field && dir == 1) {
                 4
             } else {
@@ -138,7 +139,7 @@ impl EdgeCtx {
         let (step, along) = if dir == 0 { (1, self.s) } else { (self.s, 1) };
         let q0 = self.b0 + edge * step;
         // Inside a partition of one motion only coefficients count.
-        let check_motion = edge == 0 || self.motion_edges & (1 << (4 * dir + edge)) != 0;
+        let check_motion = (edge == 0) | (self.motion_edges & (1 << (4 * dir + edge)) != 0);
         let mut bs = [0u8; 4];
         for (k, slot) in bs.iter_mut().enumerate() {
             let qi = q0 + k * along;
