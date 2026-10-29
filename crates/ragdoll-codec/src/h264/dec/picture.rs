@@ -483,7 +483,8 @@ impl PicState {
         self.motion_edges[addr] = ANY_INNER_EDGE;
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
-        fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
+        // `intra_mode` needs no reset: it is read only for Intra_4x4 and Intra_8x8 macroblocks,
+        // which write all of it before reading their own.
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);
