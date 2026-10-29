@@ -3,7 +3,9 @@
 //! input. The analysis-driven paths of libopus (tonality analysis, surround masking, LFE, hybrid
 //! mode) are not used by the Opus layer here and are left out.
 
-use super::bands::{AllBands, compute_band_energies, haar1, normalise_bands, quant_all_bands};
+use super::bands::{
+    AllBands, MAX_BAND, compute_band_energies, haar1, normalise_bands, quant_all_bands,
+};
 use super::celt::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF};
 use super::celt_tables::{E_MEANS, EBANDS, LOG_N, WINDOW};
 use super::energy::{DB_SHIFT, amp2log2, quant_coarse, quant_finalise, quant_fine};
@@ -74,6 +76,31 @@ pub struct CeltEncoder {
     old_log_e: [i16; 2 * NB_EBANDS],
     old_log_e2: [i16; 2 * NB_EBANDS],
     energy_error: [i16; 2 * NB_EBANDS],
+    scratch: Scratch,
+}
+
+/// Per-frame working buffers, kept between frames to reuse their allocations. Every value a
+/// frame reads is written by that frame first (but for `x`, cleared each frame).
+#[derive(Clone, Default)]
+struct Scratch {
+    /// Pre-emphasised, pre-filtered input with the overlap history (`cc * (n + OVERLAP)`).
+    inb: Vec<i32>,
+    /// MDCT coefficients (`cc * n`).
+    freq: Vec<i32>,
+    /// Normalised bands (`c * n`).
+    x: Vec<i16>,
+    /// Pre-filter input with the pitch history (`cc * (n + MAXPERIOD)`).
+    pre: Vec<i32>,
+    /// The 2x-decimated pitch analysis signal.
+    pitch_buf: Vec<i16>,
+    /// Transient analysis signal.
+    tmp: Vec<i16>,
+}
+
+/// `v` resized to `len` values; existing values are kept, not cleared.
+fn sized<T: Copy + Default>(v: &mut Vec<T>, len: usize) -> &mut [T] {
+    v.resize(len, T::default());
+    &mut v[..len]
 }
 
 impl CeltEncoder {
@@ -119,6 +146,7 @@ impl CeltEncoder {
             old_log_e: [0; 2 * NB_EBANDS],
             old_log_e2: [0; 2 * NB_EBANDS],
             energy_error: [0; 2 * NB_EBANDS],
+            scratch: Scratch::default(),
         };
         s.reset();
         s
@@ -177,6 +205,20 @@ impl CeltEncoder {
         nb_compressed_bytes: usize,
         enc: &mut Ec,
     ) -> Result<usize, ()> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let r = self.encode_frame(pcm, frame_size, nb_compressed_bytes, enc, &mut scratch);
+        self.scratch = scratch;
+        r
+    }
+
+    fn encode_frame(
+        &mut self,
+        pcm: &[i16],
+        frame_size: usize,
+        nb_compressed_bytes: usize,
+        enc: &mut Ec,
+        scratch: &mut Scratch,
+    ) -> Result<usize, ()> {
         let cc = self.channels;
         let c = self.stream_channels;
         let start = self.start;
@@ -229,7 +271,7 @@ impl CeltEncoder {
         }
         let mut total_bits = nb_compressed_bytes * 8;
         let eff_end = end.min(NB_EBANDS);
-        let mut inb = vec![0i32; cc * (n + OVERLAP)];
+        let inb = sized(&mut scratch.inb, cc * (n + OVERLAP));
         let mut sample_max = self.overlap_max.max(maxabs16(&pcm[..c * (n - OVERLAP)]));
         self.overlap_max = maxabs16(&pcm[c * (n - OVERLAP)..c * n]);
         sample_max = sample_max.max(self.overlap_max);
@@ -273,7 +315,9 @@ impl CeltEncoder {
             prefilter_tapset = self.tapset_decision;
             let mut qg = 0;
             pf_on = self.run_prefilter(
-                &mut inb,
+                inb,
+                &mut scratch.pre,
+                &mut scratch.pitch_buf,
                 n,
                 prefilter_tapset,
                 &mut pitch_index,
@@ -301,8 +345,14 @@ impl CeltEncoder {
         let mut short_blocks = 0usize;
         let mut tf_chan = 0usize;
         if self.complexity >= 1 {
-            is_transient =
-                transient_analysis(&inb, n + OVERLAP, cc, &mut tf_estimate, &mut tf_chan);
+            is_transient = transient_analysis(
+                inb,
+                n + OVERLAP,
+                cc,
+                &mut tf_estimate,
+                &mut tf_chan,
+                &mut scratch.tmp,
+            );
         }
         let mut transient_got_disabled = false;
         if lm > 0 && enc.tell() + 3 <= total_bits {
@@ -313,24 +363,24 @@ impl CeltEncoder {
             is_transient = false;
             transient_got_disabled = true;
         }
-        let mut freq = vec![0i32; cc * n];
+        let freq = sized(&mut scratch.freq, cc * n);
         let mut band_e = [0i32; 2 * NB_EBANDS];
         let mut band_log_e = [0i16; 2 * NB_EBANDS];
         let mut band_log_e2 = [0i16; 2 * NB_EBANDS];
         let second_mdct = short_blocks != 0 && self.complexity >= 8;
         if second_mdct {
-            compute_mdcts(0, &inb, &mut freq, c, cc, lm);
-            compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+            compute_mdcts(0, inb, freq, c, cc, lm);
+            compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e2, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
                 *v = add16(*v as i32, shl16(lm, DB_SHIFT) >> 1) as i16;
             }
         }
-        compute_mdcts(short_blocks, &inb, &mut freq, c, cc, lm);
+        compute_mdcts(short_blocks, inb, freq, c, cc, lm);
         if cc == 2 && c == 1 {
             tf_chan = 0;
         }
-        compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+        compute_band_energies(freq, &mut band_e, eff_end, c, lm);
         amp2log2(eff_end, end, &band_e, &mut band_log_e, c);
         let temporal_vbr;
         {
@@ -365,8 +415,8 @@ impl CeltEncoder {
         {
             is_transient = true;
             short_blocks = m;
-            compute_mdcts(short_blocks, &inb, &mut freq, c, cc, lm);
-            compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+            compute_mdcts(short_blocks, inb, freq, c, cc, lm);
+            compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
                 *v = add16(*v as i32, shl16(lm, DB_SHIFT) >> 1) as i16;
@@ -376,8 +426,9 @@ impl CeltEncoder {
         if lm > 0 && enc.tell() + 3 <= total_bits {
             enc.enc_bit_logp(is_transient, 3);
         }
-        let mut x = vec![0i16; c * n];
-        normalise_bands(&freq, &mut x, &band_e, eff_end, c, m);
+        let x = sized(&mut scratch.x, c * n);
+        x.fill(0);
+        normalise_bands(freq, x, &band_e, eff_end, c, m);
         let enable_tf_analysis = effective_bytes >= 15 * ci && self.complexity >= 2;
         let mut offsets = [0i32; NB_EBANDS];
         let mut importance = [0i32; NB_EBANDS];
@@ -409,7 +460,7 @@ impl CeltEncoder {
                 is_transient,
                 &mut tf_res,
                 lambda,
-                &x,
+                x,
                 n,
                 lm,
                 tf_estimate,
@@ -463,7 +514,7 @@ impl CeltEncoder {
                 };
             } else {
                 self.spread_decision = spreading_decision(
-                    &x,
+                    x,
                     &mut self.tonal_average,
                     self.spread_decision,
                     &mut self.hf_average,
@@ -515,7 +566,7 @@ impl CeltEncoder {
                 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4, 5, 6, 8, 8,
             ];
             if lm != 0 {
-                dual_stereo = stereo_analysis(&x, lm, n);
+                dual_stereo = stereo_analysis(x, lm, n);
             }
             self.intensity = hysteresis_decision(
                 (equiv_rate / 1000) as i16 as i32,
@@ -528,7 +579,7 @@ impl CeltEncoder {
         let mut alloc_trim = 5;
         if tellf + (6 << BITRES) <= total_bits - total_boost {
             alloc_trim = alloc_trim_analysis(
-                &x,
+                x,
                 &band_log_e,
                 end,
                 lm,
@@ -670,7 +721,7 @@ impl CeltEncoder {
                 complexity: self.complexity,
                 norm: &mut [0; 2 * 8 * 78],
             },
-            &mut x,
+            x,
             c,
             enc,
             &mut seed,
@@ -744,6 +795,8 @@ impl CeltEncoder {
     fn run_prefilter(
         &mut self,
         inb: &mut [i32],
+        pre_buf: &mut Vec<i32>,
+        pitch_buf: &mut Vec<i16>,
         n: usize,
         prefilter_tapset: i32,
         pitch: &mut i32,
@@ -753,8 +806,8 @@ impl CeltEncoder {
         nb_available_bytes: i32,
     ) -> bool {
         let cc = self.channels;
-        let mut pre = vec![vec![0i32; n + MAXPERIOD]; cc];
-        for (ch, p) in pre.iter_mut().enumerate() {
+        let pre = sized(pre_buf, cc * (n + MAXPERIOD));
+        for (ch, p) in pre.chunks_exact_mut(n + MAXPERIOD).enumerate() {
             p[..MAXPERIOD]
                 .copy_from_slice(&self.prefilter_mem[ch * MAXPERIOD..(ch + 1) * MAXPERIOD]);
             let base = ch * (n + OVERLAP) + OVERLAP;
@@ -763,18 +816,19 @@ impl CeltEncoder {
         let mut pitch_index;
         let mut gain1;
         if enabled {
-            let mut pitch_buf = vec![0i16; (MAXPERIOD + n) >> 1];
-            let refs: Vec<&[i32]> = pre.iter().map(|p| p.as_slice()).collect();
-            pitch_downsample(&refs, &mut pitch_buf, MAXPERIOD + n);
+            let pitch_buf = sized(pitch_buf, (MAXPERIOD + n) >> 1);
+            let (p0, p1) = pre.split_at(n + MAXPERIOD);
+            let refs: [&[i32]; 2] = [p0, p1];
+            pitch_downsample(&refs[..cc], pitch_buf, MAXPERIOD + n);
             pitch_index = pitch_search(
                 &pitch_buf[MAXPERIOD >> 1..],
-                &pitch_buf,
+                pitch_buf,
                 n,
                 MAXPERIOD - 3 * MINPERIOD,
             ) as i32;
             pitch_index = MAXPERIOD as i32 - pitch_index;
             gain1 = remove_doubling(
-                &pitch_buf,
+                pitch_buf,
                 MAXPERIOD,
                 MINPERIOD,
                 n,
@@ -830,7 +884,7 @@ impl CeltEncoder {
             gain1 = 3072 * (qg + 1);
             pf_on = true;
         }
-        for (ch, p) in pre.iter().enumerate() {
+        for (ch, p) in pre.chunks_exact(n + MAXPERIOD).enumerate() {
             self.prefilter_period = self.prefilter_period.max(COMBFILTER_MINPERIOD);
             let base = ch * (n + OVERLAP);
             inb[base..base + OVERLAP]
@@ -894,6 +948,7 @@ fn transient_analysis(
     c: usize,
     tf_estimate: &mut i32,
     tf_chan: &mut usize,
+    tmp: &mut Vec<i16>,
 ) -> bool {
     const INV_TABLE: [u8; 128] = [
         255, 255, 156, 110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25, 23, 22, 21, 20, 19, 18,
@@ -902,7 +957,7 @@ fn transient_analysis(
         5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
         4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
     ];
-    let mut tmp = vec![0i16; len];
+    let tmp = sized(tmp, len);
     let forward_shift = 4;
     let len2 = len / 2;
     let mut mask_metric = 0i32;
@@ -917,7 +972,7 @@ fn transient_analysis(
             tmp[i] = sround16(y, 2);
         }
         tmp[..12].fill(0);
-        let shift = 14 - ilog2(1.max(maxabs16(&tmp)));
+        let shift = 14 - ilog2(1.max(maxabs16(tmp)));
         if shift != 0 {
             for v in tmp.iter_mut() {
                 *v = shl16(*v as i32, shift) as i16;
@@ -1026,14 +1081,18 @@ fn tf_analysis(
         let n = ((eb(i + 1) - eb(i)) << lm) as usize;
         let narrow = eb(i + 1) - eb(i) == 1;
         let off = tf_chan * n0 + ((eb(i) << lm) as usize);
-        let mut tmp = x[off..off + n].to_vec();
-        let mut l1 = l1_metric(&tmp, if is_transient { lm } else { 0 }, bias);
+        let mut buf = [0i16; MAX_BAND];
+        let tmp = &mut buf[..n];
+        tmp.copy_from_slice(&x[off..off + n]);
+        let mut l1 = l1_metric(tmp, if is_transient { lm } else { 0 }, bias);
         let mut best_l1 = l1;
         let mut best_level = 0;
         if is_transient && !narrow {
-            let mut tmp1 = tmp.clone();
-            haar1(&mut tmp1, n >> lm, 1 << lm);
-            l1 = l1_metric(&tmp1, lm + 1, bias);
+            let mut buf1 = [0i16; MAX_BAND];
+            let tmp1 = &mut buf1[..n];
+            tmp1.copy_from_slice(tmp);
+            haar1(tmp1, n >> lm, 1 << lm);
+            l1 = l1_metric(tmp1, lm + 1, bias);
             if l1 < best_l1 {
                 best_l1 = l1;
                 best_level = -1;
@@ -1042,8 +1101,8 @@ fn tf_analysis(
         let kmax = lm + !(is_transient || narrow) as i32;
         for k in 0..kmax {
             let b = if is_transient { lm - k - 1 } else { k + 1 };
-            haar1(&mut tmp, n >> k, 1 << k);
-            l1 = l1_metric(&tmp, b, bias);
+            haar1(tmp, n >> k, 1 << k);
+            l1 = l1_metric(tmp, b, bias);
             if l1 < best_l1 {
                 best_l1 = l1;
                 best_level = k + 1;

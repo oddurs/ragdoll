@@ -11,7 +11,7 @@ use super::math::{
     mul16, mul16_32_q15, mul16_p15, mul16_q14, mul16_q15, pshr32, rcp, rsqrt_norm, sat16_i32,
     shl16, shl32, sqrt, sub16, vshr32, zlog2,
 };
-use super::range::{BITRES, Ec, ilog};
+use super::range::{BITRES, Ec, EcSave, ilog};
 use super::rate::{
     NB_EBANDS, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE, bits2pulses, get_pulses, pulses2bits,
 };
@@ -1363,10 +1363,13 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                 // Code the band with theta rounded down and up; keep the less distorted.
                 let w = compute_channel_weights(band_e[i], band_e[i + NB_EBANDS]);
                 let cm = (x_cm | y_cm) as i32;
-                let ec_save = ctx.ec.clone();
+                let mut ec_save = EcSave::default();
+                ctx.ec.save(&mut ec_save);
                 let (seed_save, rem_save) = (ctx.seed, ctx.remaining_bits);
-                let x_save = x_buf[xs..xs + n].to_vec();
-                let y_save = y_buf[xs..xs + n].to_vec();
+                let (mut xb, mut yb) = ([0i16; MAX_BAND], [0i16; MAX_BAND]);
+                let (x_save, y_save) = (&mut xb[..n], &mut yb[..n]);
+                x_save.copy_from_slice(&x_buf[xs..xs + n]);
+                y_save.copy_from_slice(&y_buf[xs..xs + n]);
                 ctx.theta_round = -1;
                 x_cm = quant_band_stereo(
                     &mut ctx,
@@ -1380,19 +1383,25 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                     (!last).then(|| &mut norm[out_off..out_off + n]),
                     cm,
                 );
-                let dist0 = mul16_32_q15(w[0], inner_prod(&x_save, &x_buf[xs..xs + n]))
-                    + mul16_32_q15(w[1], inner_prod(&y_save, &y_buf[xs..xs + n]));
+                let dist0 = mul16_32_q15(w[0], inner_prod(x_save, &x_buf[xs..xs + n]))
+                    + mul16_32_q15(w[1], inner_prod(y_save, &y_buf[xs..xs + n]));
                 let cm2 = x_cm;
-                let ec_save2 = ctx.ec.clone();
+                let mut ec_save2 = EcSave::default();
+                ctx.ec.save(&mut ec_save2);
                 let (seed_save2, rem_save2) = (ctx.seed, ctx.remaining_bits);
-                let x_save2 = x_buf[xs..xs + n].to_vec();
-                let y_save2 = y_buf[xs..xs + n].to_vec();
-                let norm_save2 = (!last).then(|| norm[out_off..out_off + n].to_vec());
-                *ctx.ec = ec_save;
+                let (mut xb2, mut yb2, mut nb2) =
+                    ([0i16; MAX_BAND], [0i16; MAX_BAND], [0i16; MAX_BAND]);
+                let (x_save2, y_save2) = (&mut xb2[..n], &mut yb2[..n]);
+                x_save2.copy_from_slice(&x_buf[xs..xs + n]);
+                y_save2.copy_from_slice(&y_buf[xs..xs + n]);
+                if !last {
+                    nb2[..n].copy_from_slice(&norm[out_off..out_off + n]);
+                }
+                ctx.ec.restore(&ec_save);
                 ctx.seed = seed_save;
                 ctx.remaining_bits = rem_save;
-                x_buf[xs..xs + n].copy_from_slice(&x_save);
-                y_buf[xs..xs + n].copy_from_slice(&y_save);
+                x_buf[xs..xs + n].copy_from_slice(x_save);
+                y_buf[xs..xs + n].copy_from_slice(y_save);
                 if i == start + 1 {
                     special_hybrid_folding(norm, norm2_off, start, m, dual_stereo);
                 }
@@ -1409,18 +1418,18 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
                     (!last).then(|| &mut norm[out_off..out_off + n]),
                     cm,
                 );
-                let dist1 = mul16_32_q15(w[0], inner_prod(&x_save, &x_buf[xs..xs + n]))
-                    + mul16_32_q15(w[1], inner_prod(&y_save, &y_buf[xs..xs + n]));
+                let dist1 = mul16_32_q15(w[0], inner_prod(x_save, &x_buf[xs..xs + n]))
+                    + mul16_32_q15(w[1], inner_prod(y_save, &y_buf[xs..xs + n]));
                 if dist0 >= dist1 {
                     x_cm = cm2;
-                    *ctx.ec = ec_save2;
+                    ctx.ec.restore(&ec_save2);
                     ctx.seed = seed_save2;
                     ctx.remaining_bits = rem_save2;
                     ctx.theta_round = -1;
-                    x_buf[xs..xs + n].copy_from_slice(&x_save2);
-                    y_buf[xs..xs + n].copy_from_slice(&y_save2);
-                    if let Some(s) = norm_save2 {
-                        norm[out_off..out_off + n].copy_from_slice(&s);
+                    x_buf[xs..xs + n].copy_from_slice(x_save2);
+                    y_buf[xs..xs + n].copy_from_slice(y_save2);
+                    if !last {
+                        norm[out_off..out_off + n].copy_from_slice(&nb2[..n]);
                     }
                 }
             } else if c == 2 {

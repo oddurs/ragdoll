@@ -1,10 +1,12 @@
-//! The Opus decoder allocates nothing per packet once it has seen a stream's modes.
+//! The Opus decoder allocates nothing per packet once it has seen a stream's modes, and the
+//! encoder nothing per frame.
 //!
 //! Every stream in `tests/data/opus` (SILK, CELT and hybrid, all bandwidths and packet
 //! durations, with and without lost packets) is decoded twice by one decoder; the second pass
 //! must not touch the heap.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ragdoll_codec::opus::decoder::OpusPacketDecoder;
@@ -13,6 +15,8 @@ struct Counting;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+/// Held by each test while it counts, as the counter is shared.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 // Safety: forwards to the system allocator, only counting calls.
 unsafe impl GlobalAlloc for Counting {
@@ -52,6 +56,7 @@ fn read_bit(data: &[u8]) -> Vec<&[u8]> {
 
 #[test]
 fn decoding_allocates_nothing_per_packet() {
+    let _serial = SERIAL.lock().unwrap();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/opus");
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
@@ -84,6 +89,44 @@ fn decoding_allocates_nothing_per_packet() {
                 "{} at {rate} Hz, {ch} ch: {n} allocations",
                 path.display()
             );
+        }
+    }
+}
+
+/// The encoder allocates nothing per frame either, once it has coded a frame of the size:
+/// mono and stereo, tonal input with clicks (so transients), several rates and complexities.
+#[test]
+fn encoding_allocates_nothing_per_frame() {
+    let _serial = SERIAL.lock().unwrap();
+    use ragdoll_codec::opus::encoder::OpusPacketEncoder;
+    let mut seed = 1u32;
+    let pcm: Vec<i16> = (0..48000 * 2)
+        .map(|n: i32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let tone = ((n % 97) - 48) * 400;
+            let click = if n % 9600 < 4 { 24000 } else { 0 };
+            (tone + ((seed >> 20) as i32 - 2048) + click).clamp(-32768, 32767) as i16
+        })
+        .collect();
+    let mut out = vec![0u8; 1500];
+    for ch in [1usize, 2] {
+        for (bps, vbr, complexity) in [(96000, true, 9), (32000, false, 5), (256000, true, 10)] {
+            for frame in [120usize, 240, 480, 960] {
+                let mut enc = OpusPacketEncoder::new(ch).unwrap();
+                enc.set_bitrate(bps);
+                enc.set_vbr(vbr);
+                enc.set_complexity(complexity);
+                let chunks: Vec<&[i16]> = pcm.chunks_exact(frame * ch).collect();
+                enc.encode(chunks[0], frame, &mut out).unwrap();
+                ALLOCS.store(0, Ordering::Relaxed);
+                COUNTING.store(true, Ordering::Relaxed);
+                for c in &chunks[1..] {
+                    enc.encode(c, frame, &mut out).unwrap();
+                }
+                COUNTING.store(false, Ordering::Relaxed);
+                let n = ALLOCS.load(Ordering::Relaxed);
+                assert_eq!(n, 0, "{ch} ch {bps} bit/s {frame} samples: {n} allocations");
+            }
         }
     }
 }
