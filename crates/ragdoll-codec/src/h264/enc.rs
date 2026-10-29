@@ -12,9 +12,10 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hpel_window, hpel_window_centre, intra_satd_x3_16x16, nonzero_mask_4x4_x4,
-    pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
-    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    h264_luma_mc, hpel_window, hpel_window_centre, intra_pred_plane, intra_satd_x3_16x16,
+    nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16,
+    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4,
+    zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -935,7 +936,10 @@ fn i16_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 16]>, Option<[
         let o = p.idx(x0, y0 - 1);
         p.buf[o..o + 16].try_into().unwrap()
     });
-    let left = (mb_x > 0).then(|| std::array::from_fn(|r| p.buf[p.idx(x0 - 1, y0 + r)]));
+    let left = (mb_x > 0).then(|| {
+        let col = &p.buf[p.idx(x0 - 1, y0)..][..15 * p.stride + 1];
+        std::array::from_fn(|r| col[r * p.stride])
+    });
     let tl = if mb_x > 0 && mb_y > 0 {
         p.buf[p.idx(x0 - 1, y0 - 1)]
     } else {
@@ -1024,23 +1028,6 @@ fn analyse_chroma_intra(
     (best.1, best.2, best.3)
 }
 
-/// Plane prediction `clip((a + b (x - c0) + c (y - c0) + 16) >> 5)` of an `N`x`N` block whose
-/// edge gradients `(h, v)` scale by `mul / 2^shift` (ITU-T H.264 8.3.3.4 and 8.3.4.4), written
-/// row by row so the compiler vectorizes it.
-#[inline(always)]
-fn plane_pred<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
-    let c0 = (N / 2 - 1) as i32;
-    // Every sum fits in 16 bits (|a| <= 16 * 510, |b (x - c0)|, |c (y - c0)| < 6000 for 8-bit
-    // edges), so rows vectorize as 16-bit lanes.
-    let bx: [i16; N] = std::array::from_fn(|x| (b * (x as i32 - c0)) as i16);
-    for (y, row) in dst.as_chunks_mut::<N>().0.iter_mut().take(N).enumerate() {
-        let base = (a + c * (y as i32 - c0) + 16) as i16;
-        for (p, &o) in row.iter_mut().zip(&bx) {
-            *p = ((base + o) >> 5).clamp(0, 255) as u8;
-        }
-    }
-}
-
 /// Intra $16\times16$ prediction into a 16-stride block, as [`predict_intra_16x16`].
 fn pred16(mode: u8, top: Option<&[u8; 16]>, left: Option<&[u8; 16]>, tl: u8, dst: &mut [u8; 256]) {
     if mode != 3 {
@@ -1062,7 +1049,7 @@ fn pred16(mode: u8, top: Option<&[u8; 16]>, left: Option<&[u8; 16]>, tl: u8, dst
         v += (i as i32 + 1) * (l[8 + i] as i32 - pl);
     }
     let a = 16 * (t[15] as i32 + l[15] as i32);
-    plane_pred::<16>(a, (5 * h + 32) >> 6, (5 * v + 32) >> 6, dst);
+    intra_pred_plane::<16>(a, (5 * h + 32) >> 6, (5 * v + 32) >> 6, dst);
 }
 
 /// Intra $8\times8$ chroma prediction into an 8-stride block, as [`predict_intra_chroma_8x8`].
@@ -1092,7 +1079,7 @@ fn pred_chroma(
         v += (i as i32 + 1) * (l[4 + i] as i32 - pl);
     }
     let a = 16 * (t[7] as i32 + l[7] as i32);
-    plane_pred::<8>(a, (17 * h + 16) >> 5, (17 * v + 16) >> 5, dst);
+    intra_pred_plane::<8>(a, (17 * h + 16) >> 5, (17 * v + 16) >> 5, dst);
 }
 
 /// Picks the intra $16\times16$ mode with the least SATD; returns that SATD and the mode. The

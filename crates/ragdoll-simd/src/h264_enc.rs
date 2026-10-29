@@ -569,6 +569,41 @@ fn intra_satd_x3_from(
     sum.map(|s| s >> 1)
 }
 
+/// ITU-T H.264 intra plane prediction of an `N`x`N` block (`N` = 16 luma or 8 chroma) into
+/// `dst` (stride `N`): `clip((a + b (x - c0) + c (y - c0) + 16) >> 5)` with `c0 = N / 2 - 1`.
+/// The sums must fit in 16 bits, as they do for 8-bit edges.
+///
+/// # Panics
+/// If `N` is not 8 or 16, or `dst` is shorter than `N * N`.
+#[inline]
+pub fn intra_pred_plane<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
+    assert!((N == 8 || N == 16) && dst.len() >= N * N);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe { plane_neon::<N>(a, b, c, dst) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe { plane_avx2::<N>(a, b, c, dst) };
+        return;
+    }
+    intra_pred_plane_scalar::<N>(a, b, c, dst);
+}
+
+/// Scalar reference for [`intra_pred_plane`].
+pub fn intra_pred_plane_scalar<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
+    let c0 = (N / 2 - 1) as i32;
+    for y in 0..N {
+        for x in 0..N {
+            let v = (a + b * (x as i32 - c0) + c * (y as i32 - c0) + 16) >> 5;
+            dst[y * N + x] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// Row stride and width of the planes of a [`HpelWindow`].
 pub const HPEL_WIN_W: usize = 32;
 /// Columns of each row of a [`HpelWindow`] that [`hpel_window`] interpolates: a $16\times16$
@@ -1432,6 +1467,56 @@ fn tap6_epi16(t: [std::arch::x86_64::__m256i; 6]) -> std::arch::x86_64::__m256i 
     _mm256_add_epi16(s0, _mm256_add_epi16(k, _mm256_slli_epi16::<2>(k)))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn plane_avx2<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c0 = (N / 2 - 1) as i32;
+        // Lane x holds b (x - c0) for N = 16; for N = 8 the two 128-bit lanes hold two rows.
+        let bx: [i16; 16] = std::array::from_fn(|i| (b * ((i % N) as i32 - c0)) as i16);
+        let bx = _mm256_loadu_si256(bx.as_ptr() as *const __m256i);
+        let row_base = |y: usize| (a + c * (y as i32 - c0) + 16) as i16;
+        let out = dst.as_mut_ptr();
+        if N == 16 {
+            for y in 0..16 {
+                let v =
+                    _mm256_srai_epi16::<5>(_mm256_add_epi16(bx, _mm256_set1_epi16(row_base(y))));
+                // packus saturates to 0..=255; the permute restores the lane order.
+                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(v, v));
+                _mm_storeu_si128(out.add(y * 16) as *mut __m128i, _mm256_castsi256_si128(p));
+            }
+        } else {
+            for y in (0..8).step_by(2) {
+                let base =
+                    _mm256_setr_m128i(_mm_set1_epi16(row_base(y)), _mm_set1_epi16(row_base(y + 1)));
+                let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(bx, base));
+                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(v, v));
+                _mm_storeu_si128(out.add(y * 8) as *mut __m128i, _mm256_castsi256_si128(p));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn plane_neon<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let c0 = (N / 2 - 1) as i32;
+        let bx: [i16; 16] = std::array::from_fn(|i| (b * (i as i32 - c0)) as i16);
+        let (lo, hi) = (vld1q_s16(bx.as_ptr()), vld1q_s16(bx.as_ptr().add(8)));
+        for y in 0..N {
+            let base = vdupq_n_s16((a + c * (y as i32 - c0) + 16) as i16);
+            let out = dst.as_mut_ptr().add(y * N);
+            vst1_u8(out, vqshrun_n_s16::<5>(vaddq_s16(lo, base)));
+            if N == 16 {
+                vst1_u8(out.add(8), vqshrun_n_s16::<5>(vaddq_s16(hi, base)));
+            }
+        }
+    }
+}
+
 /// Rows of the second (packed) half of an AVX2 window pass.
 #[cfg(target_arch = "x86_64")]
 const HPEL_HALF: usize = HPEL_WIN_H / 2;
@@ -1929,6 +2014,30 @@ mod tests {
             pixel_satd_16x16(&ones, 16, &checker, 16),
             pixel_satd_16x16_scalar(&ones, 16, &checker, 16)
         );
+    }
+
+    #[test]
+    fn plane_prediction_matches_scalar_at_the_16_bit_extremes() {
+        for (a, b, c) in [
+            (16 * 510, 717i32, 717),
+            (16 * 510, -717, -717),
+            (0, 717, -717),
+            (0, -717, 717),
+            (4000, 3, -5),
+            (16 * 510, 1355, 1355),
+            (0, -1355, -1355),
+        ] {
+            let (mut s16, mut r16) = ([0u8; 256], [0u8; 256]);
+            if b.abs() <= 717 {
+                intra_pred_plane::<16>(a, b, c, &mut s16);
+                intra_pred_plane_scalar::<16>(a, b, c, &mut r16);
+                assert_eq!(s16, r16, "16x16 {a} {b} {c}");
+            }
+            let (mut s8, mut r8) = ([0u8; 64], [0u8; 64]);
+            intra_pred_plane::<8>(a, b, c, &mut s8);
+            intra_pred_plane_scalar::<8>(a, b, c, &mut r8);
+            assert_eq!(s8, r8, "8x8 {a} {b} {c}");
+        }
     }
 
     #[test]
