@@ -1,6 +1,6 @@
 //! Deblocking filter (ITU-T H.264 8.7).
 
-use super::picture::{BlockInfo, MbType, NO_PIC, PicState, RefIds, Structure};
+use super::picture::{BlockInfo, MbInfo, MbType, NO_PIC, PicState, RefIds, Structure};
 use super::tables::{ALPHA, BETA, TC0};
 
 /// [`TC0`] by indexA and bS `0..=3`, `-1` for bS 0 (no filtering of the segment).
@@ -49,25 +49,25 @@ pub fn deblock_rows(
     for mb_y in rows {
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
-            if st.mb_type[addr] == MbType::None {
+            let mb = st.mbs[addr];
+            if mb.mb_type == MbType::None {
                 continue;
             }
-            let Some(sl) = slices.get(st.slice_num[addr] as usize).copied() else {
+            let Some(sl) = slices.get(mb.slice_num as usize).copied() else {
                 continue;
             };
             if sl.idc == 1 {
                 continue;
             }
-            let neighbour_ok = |n: usize| {
-                st.mb_type[n] != MbType::None
-                    && !(sl.idc == 2 && st.slice_num[n] != st.slice_num[addr])
+            let neighbour_ok = |n: &MbInfo| {
+                n.mb_type != MbType::None && !(sl.idc == 2 && n.slice_num != mb.slice_num)
             };
-            let left = mb_x > 0 && neighbour_ok(addr - 1);
-            let top = mb_y > 0 && neighbour_ok(addr - mb_w);
-            let t8 = st.t8x8[addr];
-            let local = EdgeCtx::new(st, mb_x, mb_y);
+            let left = mb_x > 0 && neighbour_ok(&st.mbs[addr - 1]);
+            let top = mb_y > 0 && neighbour_ok(&st.mbs[addr - mb_w]);
+            let t8 = mb.t8x8;
+            let local = EdgeCtx::new(st, &mb, mb_x, mb_y);
             // An inter MB with one motion and no luma coefficients has bS 0 on every inner edge.
-            let no_inner = !local.intra[0] && st.motion_edges[addr] == 0 && st.cbp[addr] & 0xF == 0;
+            let no_inner = !local.intra[0] && mb.motion_edges == 0 && mb.cbp & 0xF == 0;
             // Edges to visit, bit `4 * dir + edge`; odd edges only exist in luma, which has none
             // inside 8x8 transform blocks.
             let mut todo: u8 = if no_inner { 0x11 } else { 0xFF };
@@ -116,19 +116,21 @@ fn filter_edge<const DIR: usize>(
     has_chroma: bool,
 ) {
     let bs = local.strengths(st, DIR, edge);
-    if u32::from_ne_bytes(bs) == 0 {
+    if bs == 0 {
         return;
     }
+    let bs = bs.to_le_bytes();
     let p_addr = match (edge, DIR) {
         (0, 0) => addr - 1,
         (0, _) => addr - st.mb_w,
         _ => addr,
     };
-    let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
+    let (p, q) = (&st.mbs[p_addr], &st.mbs[addr]);
+    let qp = (p.qp as i32 + q.qp as i32 + 1) >> 1;
+    let qpc = [0, 1].map(|c| (p.qpc[c] as i32 + q.qpc[c] as i32 + 1) >> 1);
     filter_luma_edge::<DIR>(st, mb_x, mb_y, edge, bs, qp, sl);
     if has_chroma && edge.is_multiple_of(2) {
-        for c in 0..2 {
-            let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
+        for (c, qp) in qpc.into_iter().enumerate() {
             filter_chroma_edge::<DIR>(st, c, mb_x, mb_y, edge / 2, bs, qp, sl);
         }
     }
@@ -150,7 +152,7 @@ struct EdgeCtx {
 }
 
 impl EdgeCtx {
-    fn new(st: &PicState, mb_x: usize, mb_y: usize) -> Self {
+    fn new(st: &PicState, mb: &MbInfo, mb_x: usize, mb_y: usize) -> Self {
         let addr = mb_y * st.mb_w + mb_x;
         let s = st.mb_w * 4;
         Self {
@@ -158,30 +160,31 @@ impl EdgeCtx {
             s,
             mb: [addr, addr.wrapping_sub(1), addr.wrapping_sub(st.mb_w)],
             intra: [
-                st.mb_type[addr].is_intra(),
-                mb_x > 0 && st.mb_type[addr - 1].is_intra(),
-                mb_y > 0 && st.mb_type[addr - st.mb_w].is_intra(),
+                mb.mb_type.is_intra(),
+                mb_x > 0 && st.mbs[addr - 1].mb_type.is_intra(),
+                mb_y > 0 && st.mbs[addr - st.mb_w].mb_type.is_intra(),
             ],
             field: matches!(st.structure, Structure::Field(_)),
-            motion_edges: st.motion_edges[addr],
+            motion_edges: mb.motion_edges,
         }
     }
 
     /// Boundary strengths of the four 4-sample segments of `edge` (0..4) in direction `dir`
-    /// (0 vertical, 1 horizontal).
+    /// (0 vertical, 1 horizontal), segment `k` in byte `k` (little-endian): built in a register,
+    /// as four byte stores read back as one word would stall the load.
     #[inline(always)]
-    fn strengths(&self, st: &PicState, dir: usize, edge: usize) -> [u8; 4] {
+    fn strengths(&self, st: &PicState, dir: usize, edge: usize) -> u32 {
         // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and
         // vertical vectors are compared in field units (4 quarter frame samples = 2 quarter
         // field samples).
         // Without short-circuits: one branch on the outcome rather than one per operand.
         let p_intra = (edge == 0) & self.intra[1 + dir];
         if self.intra[0] | p_intra {
-            return [if edge == 0 && !(self.field && dir == 1) {
-                4
+            return if edge == 0 && !(self.field && dir == 1) {
+                0x0404_0404
             } else {
-                3
-            }; 4];
+                0x0303_0303
+            };
         }
         let ylim = if self.field { 2 } else { 4 };
         let (step, along) = if dir == 0 { (1, self.s) } else { (self.s, 1) };
@@ -197,8 +200,8 @@ impl EdgeCtx {
             },
         );
         // Blocks under one reference table with equal indices refer to the same pictures.
-        let tq = st.mb_table[qm] as usize;
-        let one_table = pm == qm || st.mb_table[pm] as usize == tq;
+        let tq = st.mbs[qm].mb_table as usize;
+        let one_table = pm == qm || st.mbs[pm].mb_table as usize == tq;
         // Within a table without repeated pictures, (list, index) pairs stand in for pictures.
         let by_index = one_table && st.ref_unique.get(tq).copied().unwrap_or(false);
         let index_ids = |b: &BlockInfo| -> [u32; 2] {
@@ -207,7 +210,7 @@ impl EdgeCtx {
                 _ => NO_PIC,
             })
         };
-        let table = |m: usize| st.ref_tables.get(st.mb_table[m] as usize);
+        let table = |m: usize| st.ref_tables.get(st.mbs[m].mb_table as usize);
         let pics = |t: Option<&RefIds>, b: &BlockInfo| -> [u32; 2] {
             [0, 1].map(|l| match (t, b.ref_idx[l]) {
                 (Some(t), r) if r >= 0 => t[l][r as usize & 31],
@@ -222,8 +225,8 @@ impl EdgeCtx {
             let q = blocks[step..step + 4].try_into().expect("4 blocks");
             (p, q)
         });
-        let mut bs = [0u8; 4];
-        for (k, slot) in bs.iter_mut().enumerate() {
+        let mut bs = 0;
+        for k in 0..4 {
             let (bp, bq) = match rows {
                 Some((p, q)) => (&p[k], &q[k]),
                 None => {
@@ -234,21 +237,20 @@ impl EdgeCtx {
                 }
             };
             let nz = bp.nz | bq.nz;
-            *slot = 2 * nz as u8;
-            if check_motion && !nz {
-                // Evaluated without short-circuits: one branch on the outcome.
-                let (mp, mq) = (bp.mv, bq.mv);
-                let same =
-                    one_table & (bp.ref_idx == bq.ref_idx) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
-                if !same {
-                    let (rp, rq) = if by_index {
-                        (index_ids(bp), index_ids(bq))
-                    } else {
-                        (pics(table(pm), bp), pics(table(qm), bq))
-                    };
-                    *slot = motion_differs(rp, mp, rq, mq, ylim) as u8;
-                }
+            let mut b = 2 * nz as u32;
+            // Evaluated without short-circuits, so that the only branch is on motion that
+            // differs (rare): whether a block has coefficients is too random to predict.
+            let (mp, mq) = (bp.mv, bq.mv);
+            let same = one_table & (bp.ref_idx == bq.ref_idx) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
+            if check_motion & !nz & !same {
+                let (rp, rq) = if by_index {
+                    (index_ids(bp), index_ids(bq))
+                } else {
+                    (pics(table(pm), bp), pics(table(qm), bq))
+                };
+                b = motion_differs(rp, mp, rq, mq, ylim) as u32;
             }
+            bs |= b << (8 * k);
         }
         bs
     }
@@ -532,7 +534,7 @@ fn filter_at(
 fn mbaff_line_mb(st: &PicState, mbx: usize, line: usize) -> (usize, usize) {
     let top = 2 * (line / 32) * st.mb_w + mbx;
     let l = line % 32;
-    if st.mb_field[top] {
+    if st.mbs[top].mb_field {
         (top + (l % 2) * st.mb_w, l / 2)
     } else {
         (top + (l / 16) * st.mb_w, l % 16)
@@ -550,8 +552,8 @@ fn mbaff_bs(
     mb_edge: bool,
     vertical: bool,
 ) -> u8 {
-    let (pf, qf) = (st.mb_field[pm], st.mb_field[qm]);
-    if st.mb_type[pm].is_intra() || st.mb_type[qm].is_intra() {
+    let (pf, qf) = (st.mbs[pm].mb_field, st.mbs[qm].mb_field);
+    if st.mbs[pm].mb_type.is_intra() || st.mbs[qm].mb_type.is_intra() {
         return if mb_edge && (vertical || (!pf && !qf)) {
             4
         } else {
@@ -577,20 +579,20 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
         for bot in 0..2 {
             let (mx, my) = (pair % mb_w, 2 * (pair / mb_w) + bot);
             let m = my * mb_w + mx;
-            if st.mb_type[m] == MbType::None {
+            if st.mbs[m].mb_type == MbType::None {
                 continue;
             }
-            let Some(sl) = slices.get(st.slice_num[m] as usize).copied() else {
+            let Some(sl) = slices.get(st.mbs[m].slice_num as usize).copied() else {
                 continue;
             };
             if sl.idc == 1 {
                 continue;
             }
             let ok = |st: &PicState, n: usize| {
-                st.mb_type[n] != MbType::None
-                    && !(sl.idc == 2 && st.slice_num[n] != st.slice_num[m])
+                st.mbs[n].mb_type != MbType::None
+                    && !(sl.idc == 2 && st.mbs[n].slice_num != st.mbs[m].slice_num)
             };
-            let f = st.mb_field[m];
+            let f = st.mbs[m].mb_field;
             let (y0, cy0, ls) = if f {
                 ((my & !1) * 16 + (my & 1), (my & !1) * 8 + (my & 1), 2)
             } else {
@@ -601,9 +603,10 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
                 st.b4((pm % mb_w) * 4 + x4, (pm / mb_w) * 4 + row / 4)
             };
             let qpc = |st: &PicState, pm: usize, c: usize| {
-                (st.qpc[pm][c] as i32 + st.qpc[m][c] as i32 + 1) >> 1
+                (st.mbs[pm].qpc[c] as i32 + st.mbs[m].qpc[c] as i32 + 1) >> 1
             };
-            let qpy = |st: &PicState, pm: usize| (st.qp[pm] as i32 + st.qp[m] as i32 + 1) >> 1;
+            let qpy =
+                |st: &PicState, pm: usize| (st.mbs[pm].qp as i32 + st.mbs[m].qp as i32 + 1) >> 1;
 
             // Left MB edge: per line, the p samples lie in the left pair at the same frame line.
             if mx > 0 {
@@ -629,7 +632,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
                     );
                 }
                 if has_chroma {
-                    let mixed = pms[0] != usize::MAX && st.mb_field[pms[0]] != f;
+                    let mixed = pms[0] != usize::MAX && st.mbs[pms[0]].mb_field != f;
                     for k in 0..8 {
                         let lr = if mixed && f {
                             2 * k
@@ -657,7 +660,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
             }
             // Internal vertical edges.
             for e in 1..4 {
-                if st.t8x8[m] && e % 2 == 1 {
+                if st.mbs[m].t8x8 && e % 2 == 1 {
                     continue;
                 }
                 let mut bs = [0u8; 4];
@@ -665,7 +668,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
                     let qi = qblk(st, e, seg * 4);
                     *b = mbaff_bs(st, m, qi - 1, m, qi, false, true);
                 }
-                let qp = st.qp[m] as i32;
+                let qp = st.mbs[m].qp as i32;
                 for r in 0..16 {
                     let q0 = (y0 + r * ls) * w + mx * 16 + 4 * e;
                     filter_at(&mut st.planes[0], q0, 1, bs[r / 4], qp, sl, false);
@@ -674,7 +677,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
                     for k in 0..8 {
                         let q0 = (cy0 + k * ls) * cw + mx * 8 + 4;
                         for c in 0..2 {
-                            let qp = st.qpc[m][c] as i32;
+                            let qp = st.mbs[m].qpc[c] as i32;
                             filter_at(&mut st.planes[1 + c], q0, 1, bs[k / 2], qp, sl, true);
                         }
                     }
@@ -691,7 +694,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
             } else if my % 2 == 1 {
                 passes.push((m - mb_w, 15, 0));
             } else if my >= 2 {
-                if st.mb_field[(my - 2) * mb_w + mx] {
+                if st.mbs[(my - 2) * mb_w + mx].mb_field {
                     // A frame MB below a field pair is filtered once per field (8.7.1).
                     passes.push(((my - 2) * mb_w + mx, 15, 0));
                     passes.push(((my - 1) * mb_w + mx, 15, 1));
@@ -746,7 +749,7 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
             }
             // Internal horizontal edges.
             for e in 1..4 {
-                if st.t8x8[m] && e % 2 == 1 {
+                if st.mbs[m].t8x8 && e % 2 == 1 {
                     continue;
                 }
                 let mut bs = [0u8; 4];
@@ -754,14 +757,14 @@ fn deblock_mbaff(st: &mut PicState, slices: &[SliceDeblock], has_chroma: bool) {
                     let qi = qblk(st, k, e * 4);
                     *b = mbaff_bs(st, m, qi - mb_w * 4, m, qi, false, false);
                 }
-                let qp = st.qp[m] as i32;
+                let qp = st.mbs[m].qp as i32;
                 for x in 0..16 {
                     let q0 = (y0 + 4 * e * ls) * w + mx * 16 + x;
                     filter_at(&mut st.planes[0], q0, ls * w, bs[x / 4], qp, sl, false);
                 }
                 if has_chroma && e == 2 {
                     for c in 0..2 {
-                        let qp = st.qpc[m][c] as i32;
+                        let qp = st.mbs[m].qpc[c] as i32;
                         for x in 0..8 {
                             let q0 = (cy0 + 4 * ls) * cw + mx * 8 + x;
                             filter_at(&mut st.planes[1 + c], q0, ls * cw, bs[x / 2], qp, sl, true);

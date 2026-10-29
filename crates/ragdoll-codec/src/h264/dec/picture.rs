@@ -107,20 +107,13 @@ pub type RefIds = [[u32; 32]; 2];
 
 /// [`Motion::ref_pic`] over the parts of a picture's state.
 #[inline]
-fn ref_pic_in(
-    tables: &[RefIds],
-    mb_table: &[u16],
-    blocks: &[BlockInfo],
-    mb: usize,
-    blk: usize,
-    list: usize,
-) -> u32 {
+fn ref_pic_in(tables: &[RefIds], table: u16, blocks: &[BlockInfo], blk: usize, list: usize) -> u32 {
     let r = blocks[blk].ref_idx[list];
     if r < 0 {
         return NO_PIC;
     }
     tables
-        .get(mb_table[mb] as usize)
+        .get(table as usize)
         .map_or(NO_PIC, |t| t[list][r as usize & 31])
 }
 
@@ -130,6 +123,7 @@ fn ref_pic_in(
 /// transform block has nonzero coefficients (deblocking, CABAC cbf) and whether it was
 /// direct-predicted (CABAC ref_idx).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct BlockInfo {
     pub mv: [[i16; 2]; 2],
     pub ref_idx: [i8; 2],
@@ -137,6 +131,8 @@ pub struct BlockInfo {
     pub nz: bool,
     pub direct: bool,
 }
+
+const _: () = assert!(size_of::<BlockInfo>() == 16);
 
 /// [`BlockInfo`] of a block with no prediction (intra, or not yet decoded).
 pub const NO_BLOCK: BlockInfo = BlockInfo {
@@ -156,8 +152,10 @@ static NO_BLOCK_ROW: [BlockInfo; 4] = [NO_BLOCK; 4];
 pub fn fill_rect<T: Copy, const W: usize>(v: &mut [T], i: usize, stride: usize, h: usize, val: T) {
     let s = &mut v[i..i + (h - 1) * stride + W];
     if size_of::<T>() <= 8 {
+        let p = s.as_mut_ptr();
         for r in 0..h {
-            s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+            // Safety: row `r` ends at `r * stride + W <= (h - 1) * stride + W`, inside `s`.
+            unsafe { p.add(r * stride).cast::<[T; W]>().write_unaligned([val; W]) };
         }
         return;
     }
@@ -166,6 +164,39 @@ pub fn fill_rect<T: Copy, const W: usize>(v: &mut [T], i: usize, stride: usize, 
     first.copy_from_slice(&[val; W]);
     for r in 1..h {
         rest[r * stride - W..r * stride].copy_from_slice(first);
+    }
+}
+
+/// [`fill_rect`] for [`BlockInfo`]: the 16-byte record is stored whole from a register into
+/// each block rather than field by field.
+#[inline(always)]
+pub fn fill_block_rect<const W: usize>(
+    v: &mut [BlockInfo],
+    i: usize,
+    stride: usize,
+    h: usize,
+    val: BlockInfo,
+) {
+    let s = &mut v[i..i + (h - 1) * stride + W];
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+        // Safety: `BlockInfo` is 16 bytes of plain data (`repr(C)`, no padding); the stores
+        // stay inside `s`, which spans the rectangle (bounds-checked above). SSE2 is baseline
+        // on x86_64.
+        unsafe {
+            let x = _mm_loadu_si128((&val as *const BlockInfo).cast::<__m128i>());
+            let p = s.as_mut_ptr().cast::<__m128i>();
+            for r in 0..h {
+                for c in 0..W {
+                    _mm_storeu_si128(p.add(r * stride + c), x);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for r in 0..h {
+        s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
     }
 }
 
@@ -296,8 +327,10 @@ pub struct PicSync {
     live: OnceLock<LiveMotion>,
     /// The picture's motion, set when it is complete.
     motion: OnceLock<Arc<Motion>>,
-    /// Threads sleeping on `cv`: progress wakes them only when there are any.
-    sleepers: AtomicUsize,
+    /// The lowest value of `lines` and of `mv_rows` a thread sleeping on `cv` waits for, or 0
+    /// for none: progress short of it wakes no one. Written only under `lock`.
+    wake_lines: AtomicUsize,
+    wake_mv: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
 }
@@ -305,33 +338,41 @@ pub struct PicSync {
 impl PicSync {
     pub const DONE: usize = usize::MAX;
 
-    fn bump(&self, counter: &AtomicUsize, to: usize) {
+    fn bump(&self, counter: &AtomicUsize, wake: &AtomicUsize, to: usize) {
         if to > counter.load(Ordering::Relaxed) {
-            // SeqCst with the sleeper count: a sleeper either sees the new value or is seen.
+            // SeqCst with the wake mark: a sleeper either sees the new value or is seen.
             counter.store(to, Ordering::SeqCst);
-            if self.sleepers.load(Ordering::SeqCst) > 0 {
-                // Taking the lock orders the wake after a sleeper's last check.
-                drop(self.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let at = wake.load(Ordering::SeqCst);
+            if at != 0 && to >= at {
+                // Taking the lock orders the wake after a sleeper's last check. Every sleeper
+                // wakes and marks again what it still waits for.
+                let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+                wake.store(0, Ordering::SeqCst);
                 self.cv.notify_all();
             }
         }
     }
 
-    fn wait_for(&self, counter: &AtomicUsize, above: usize) {
+    fn wait_for(&self, counter: &AtomicUsize, wake: &AtomicUsize, above: usize) {
         if counter.load(Ordering::Acquire) > above {
             return;
         }
         let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.sleepers.fetch_add(1, Ordering::SeqCst);
-        while counter.load(Ordering::SeqCst) <= above {
+        loop {
+            let at = wake.load(Ordering::Relaxed);
+            if at == 0 || at > above + 1 {
+                wake.store(above + 1, Ordering::SeqCst);
+            }
+            if counter.load(Ordering::SeqCst) > above {
+                return;
+            }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
-        self.sleepers.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Publishes luma lines `..lines` as final.
     pub fn publish(&self, lines: usize) {
-        self.bump(&self.lines, lines);
+        self.bump(&self.lines, &self.wake_lines, lines);
     }
 
     /// Gives a reference picture the motion its worker fills (before the worker starts).
@@ -347,7 +388,7 @@ impl PicSync {
 
     /// Publishes the motion of macroblock rows `..rows` (written to [`PicSync::live`]) as final.
     pub fn publish_motion(&self, rows: usize) {
-        self.bump(&self.mv_rows, rows);
+        self.bump(&self.mv_rows, &self.wake_mv, rows);
     }
 
     /// Waits until the motion of macroblock row `row` is final, and if it was not, for `slack`
@@ -359,6 +400,7 @@ impl PicSync {
                 .map_or(0, |l| l.motion.mb_intra.len() / l.mb_w.max(1));
             self.wait_for(
                 &self.mv_rows,
+                &self.wake_mv,
                 (row + slack).min(rows.saturating_sub(1)).max(row),
             );
         }
@@ -370,7 +412,7 @@ impl PicSync {
         if let Some(live) = self.live.get() {
             let _ = self.motion.set(live.motion.clone());
         }
-        self.bump(&self.mv_rows, Self::DONE);
+        self.bump(&self.mv_rows, &self.wake_mv, Self::DONE);
         self.publish(Self::DONE);
     }
 
@@ -382,7 +424,7 @@ impl PicSync {
 
     /// Waits until luma line `line` is final.
     pub fn wait(&self, line: usize) {
-        self.wait_for(&self.lines, line);
+        self.wait_for(&self.lines, &self.wake_lines, line);
     }
 
     /// The picture's motion if it is complete.
@@ -478,7 +520,7 @@ impl<'a> MotionView<'a> {
     /// Id of the picture block `blk` of macroblock `mb` refers to in `list`, or [`NO_PIC`].
     #[inline]
     pub fn ref_pic(&self, mb: usize, blk: usize, list: usize) -> u32 {
-        ref_pic_in(self.ref_tables, self.mb_table, self.blocks, mb, blk, list)
+        ref_pic_in(self.ref_tables, self.mb_table[mb], self.blocks, blk, list)
     }
 }
 
@@ -681,6 +723,46 @@ impl FrameStore {
 
 /// Per-picture decoding state, indexed by macroblock address or by 4x4 block in raster order.
 /// For a field picture the geometry is that of the field.
+/// The state of one macroblock of the picture being decoded, kept together so that a
+/// macroblock's fields are reached with one bounds check.
+#[derive(Clone, Copy, Debug)]
+pub struct MbInfo {
+    pub slice_num: u32,
+    /// Its entry of [`PicState::ref_tables`].
+    pub mb_table: u16,
+    pub mb_type: MbType,
+    /// Field macroblock (field picture, or field pair of an MBAFF frame).
+    pub mb_field: bool,
+    /// Luma CBP in bits 0..3, chroma CBP in bits 4..5.
+    pub cbp: u8,
+    pub qp: u8,
+    pub qpc: [u8; 2],
+    pub t8x8: bool,
+    pub chroma_pred_mode: u8,
+    /// CABAC DC coded_block_flags: bit 0 luma DC, bit 1 Cb DC, bit 2 Cr DC.
+    pub cbf_dc: u8,
+    /// The inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which motion may
+    /// differ; `0` when inter prediction used one motion for all 16 blocks.
+    pub motion_edges: u8,
+}
+
+impl MbInfo {
+    /// A macroblock no slice has decoded.
+    const NONE: Self = Self {
+        slice_num: u32::MAX,
+        mb_table: 0,
+        mb_type: MbType::None,
+        mb_field: false,
+        cbp: 0,
+        qp: 0,
+        qpc: [0; 2],
+        t8x8: false,
+        chroma_pred_mode: 0,
+        cbf_dc: 0,
+        motion_edges: ANY_INNER_EDGE,
+    };
+}
+
 pub struct PicState {
     pub structure: Structure,
     /// Macroblock-adaptive frame/field frame: macroblocks are decoded in vertical pairs and
@@ -692,18 +774,8 @@ pub struct PicState {
     pub height: usize,
     pub planes: PicPlanes,
 
-    pub slice_num: Vec<u32>,
-    pub mb_type: Vec<MbType>,
-    /// Field macroblock (field picture, or field pair of an MBAFF frame).
-    pub mb_field: Vec<bool>,
-    /// Luma CBP in bits 0..3, chroma CBP in bits 4..5.
-    pub cbp: Vec<u8>,
-    pub qp: Vec<u8>,
-    pub qpc: Vec<[u8; 2]>,
-    pub t8x8: Vec<bool>,
-    pub chroma_pred_mode: Vec<u8>,
-    /// CABAC DC coded_block_flags: bit 0 luma DC, bit 1 Cb DC, bit 2 Cr DC.
-    pub cbf_dc: Vec<u8>,
+    /// Per macroblock.
+    pub mbs: Vec<MbInfo>,
 
     /// Per 4x4 luma block: total_coeff (CAVLC nC) / coefficient count.
     pub nnz: Vec<u8>,
@@ -715,11 +787,6 @@ pub struct PicState {
     /// Per table: no picture appears in it twice, so that within it equal pictures are equal
     /// (list, index) pairs.
     pub ref_unique: Vec<bool>,
-    /// Per macroblock: its entry of [`PicState::ref_tables`].
-    pub mb_table: Vec<u16>,
-    /// Per macroblock: the inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which
-    /// motion may differ; `0` when inter prediction used one motion for all 16 blocks.
-    pub motion_edges: Vec<u8>,
     /// Per 4x4 chroma block of each plane: total_coeff of the AC block.
     pub nnz_c: [Vec<u8>; 2],
     /// The buffers were reused from an earlier picture: each macroblock's state is restored by
@@ -806,9 +873,10 @@ impl PicState {
             let blocks = std::slice::from_raw_parts_mut(live.blocks.add(b4.start), b4.len());
             blocks.copy_from_slice(&self.blocks[b4]);
             for a in mbs {
-                *live.mb_intra.add(a) = self.mb_type[a].is_intra();
-                *live.mb_uniform.add(a) = self.motion_edges[a] == 0;
-                *live.mb_table.add(a) = self.mb_table[a];
+                let mb = &self.mbs[a];
+                *live.mb_intra.add(a) = mb.mb_type.is_intra();
+                *live.mb_uniform.add(a) = mb.motion_edges == 0;
+                *live.mb_table.add(a) = mb.mb_table;
             }
         }
         self.rows.mv_done = end;
@@ -881,22 +949,18 @@ impl PicState {
             width: w,
             height: h,
             planes,
-            slice_num: vec![u32::MAX; mbs],
-            mb_type: vec![MbType::None; mbs],
-            mb_field: vec![matches!(structure, Structure::Field(_)); mbs],
-            cbp: vec![0; mbs],
-            qp: vec![0; mbs],
-            qpc: vec![[0; 2]; mbs],
-            t8x8: vec![false; mbs],
-            chroma_pred_mode: vec![0; mbs],
-            cbf_dc: vec![0; mbs],
+            mbs: vec![
+                MbInfo {
+                    mb_field: matches!(structure, Structure::Field(_)),
+                    ..MbInfo::NONE
+                };
+                mbs
+            ],
             nnz: vec![0; b4],
             intra_mode: vec![-1; b4],
             blocks: AlignedVec::from_elem(NO_BLOCK, b4),
             ref_tables: Vec::new(),
             ref_unique: Vec::new(),
-            mb_table: vec![0; mbs],
-            motion_edges: vec![ANY_INNER_EDGE; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
             rows: RowFilter::default(),
@@ -950,9 +1014,12 @@ impl PicState {
     fn reset(&mut self, structure: Structure, mbaff: bool) {
         self.structure = structure;
         self.mbaff = mbaff;
-        self.slice_num.fill(u32::MAX);
-        self.mb_type.fill(MbType::None);
-        self.mb_field.fill(matches!(structure, Structure::Field(_)));
+        let field = matches!(structure, Structure::Field(_));
+        for m in &mut self.mbs {
+            m.slice_num = u32::MAX;
+            m.mb_type = MbType::None;
+            m.mb_field = field;
+        }
         self.ref_tables.clear();
         self.ref_unique.clear();
         self.recycled = true;
@@ -963,9 +1030,8 @@ impl PicState {
     pub fn ref_pic(&self, mb: usize, blk: usize, list: usize) -> u32 {
         ref_pic_in(
             &self.ref_tables,
-            &self.mb_table,
+            self.mbs[mb].mb_table,
             &self.blocks,
-            mb,
             blk,
             list,
         )
@@ -990,13 +1056,14 @@ impl PicState {
     /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
     /// row `y`, to that of a new picture.
     pub fn clear_mb(&mut self, addr: usize, x: usize, y: usize) {
-        self.cbp[addr] = 0;
-        self.qp[addr] = 0;
-        self.qpc[addr] = [0; 2];
-        self.t8x8[addr] = false;
-        self.chroma_pred_mode[addr] = 0;
-        self.cbf_dc[addr] = 0;
-        self.motion_edges[addr] = ANY_INNER_EDGE;
+        let m = &mut self.mbs[addr];
+        *m = MbInfo {
+            slice_num: m.slice_num,
+            mb_table: m.mb_table,
+            mb_type: m.mb_type,
+            mb_field: m.mb_field,
+            ..MbInfo::NONE
+        };
         self.clear_mb_state(x, y);
         self.reset_mb_blocks(x, y);
     }
@@ -1033,7 +1100,7 @@ impl PicState {
         }
         let (w, cw) = (self.width, self.width / 2);
         for addr in 0..self.mb_w * self.mb_h {
-            if self.mb_type[addr] != MbType::None {
+            if self.mbs[addr].mb_type != MbType::None {
                 continue;
             }
             let (x, y) = (addr % self.mb_w, addr / self.mb_w);
@@ -1046,7 +1113,7 @@ impl PicState {
                 } else {
                     addr - self.mb_w
                 };
-                self.mb_type[p] != MbType::None && self.mb_field[p]
+                self.mbs[p].mb_type != MbType::None && self.mbs[p].mb_field
             };
             let lines = |n: usize, top: usize| -> Vec<usize> {
                 if pair_field {
@@ -1088,6 +1155,21 @@ impl PicState {
         let _ = (x, y);
     }
 
+    /// Starts loading the sample rows the macroblocks four to the right of the one at column
+    /// `x`, row `y` write, once per cache line of each plane: the picture's buffer was last
+    /// written frames ago, and the first store to each line otherwise waits for it to arrive.
+    #[inline(always)]
+    pub fn prefetch_mb_samples(&self, x: usize, y: usize) {
+        // A share of the lines per macroblock, rather than all at once: a burst of prefetches
+        // stalls on the few line fill buffers.
+        let (w, j, jc) = (self.width, x % 4, x % 8);
+        let off = (y * 16 + 4 * j) * w + (x - j + 4) * 16;
+        ragdoll_simd::prefetch_rows::<4>(&self.planes[0], off, w);
+        let off = (y * 8 + jc) * (w / 2) + (x - jc + 8) * 8;
+        ragdoll_simd::prefetch_rows::<1>(&self.planes[1], off, w / 2);
+        ragdoll_simd::prefetch_rows::<1>(&self.planes[2], off, w / 2);
+    }
+
     /// Index of the 4x4 block at absolute 4x4 coordinates.
     #[inline]
     pub fn b4(&self, x4: usize, y4: usize) -> usize {
@@ -1106,12 +1188,12 @@ impl PicState {
         m.mbaff = self.mbaff;
         std::mem::swap(&mut m.blocks, &mut self.blocks);
         std::mem::swap(&mut m.ref_tables, &mut self.ref_tables);
-        std::mem::swap(&mut m.mb_table, &mut self.mb_table);
-        for (i, t) in self.mb_type.iter().enumerate() {
-            m.mb_intra[i] = t.is_intra();
-            m.mb_uniform[i] = self.motion_edges[i] == 0;
+        for (i, mb) in self.mbs.iter().enumerate() {
+            m.mb_intra[i] = mb.mb_type.is_intra();
+            m.mb_uniform[i] = mb.motion_edges == 0;
+            m.mb_field[i] = mb.mb_field;
+            m.mb_table[i] = mb.mb_table;
         }
-        m.mb_field.copy_from_slice(&self.mb_field);
     }
 
     /// Moves samples and motion into `store`: a frame picture swaps buffers with it (leaving this
@@ -1167,10 +1249,11 @@ impl PicState {
             for mbx in 0..self.mb_w {
                 let src_mb = mby * self.mb_w + mbx;
                 let dst_mb = fy * self.mb_w + mbx;
-                m.mb_intra[dst_mb] = self.mb_type[src_mb].is_intra();
-                m.mb_uniform[dst_mb] = self.motion_edges[src_mb] == 0;
-                m.mb_field[dst_mb] = self.mb_field[src_mb];
-                m.mb_table[dst_mb] = base + self.mb_table[src_mb];
+                let mb = &self.mbs[src_mb];
+                m.mb_intra[dst_mb] = mb.mb_type.is_intra();
+                m.mb_uniform[dst_mb] = mb.motion_edges == 0;
+                m.mb_field[dst_mb] = mb.mb_field;
+                m.mb_table[dst_mb] = base + mb.mb_table;
                 for r in 0..4 {
                     let s = (mby * 4 + r) * stride + mbx * 4;
                     let d = (fy * 4 + r) * stride + mbx * 4;

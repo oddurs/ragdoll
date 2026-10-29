@@ -45,3 +45,7 @@ Frame threading, as FFmpeg does it, with the decoder's output unchanged for any 
 ## 2026-10-29
 
 Workers take reference pictures before non-reference ones (earliest first). Each reference picture waits only on earlier ones, so this cannot deadlock, and P pictures no longer queue behind the B pictures between them: worker line waits at 4 threads on 1080p High fell from ~1000 to ~670 ms of worker time (wall ~0.97x FFmpeg's 4 threads in paired runs). Running twice as many workers as cores, handing cores off around waits, was tried and dropped: the extra wake-ups and cache churn cost more than the waits.
+
+## 2026-10-29
+
+Round 10 (2026-10-29): a picture's sleepers are woken only once the progress they wait for is published (was: every row woke every sleeper, ~4.5 wakeups per wait; now ~1.5); futex time fell from 9.4% to 6.3% of CPU at 720p 4T. With the single-thread gains, 4 threads vs FFmpeg 4 frame threads (11 interleaved rounds, median ratio): 1080p High 0.89x, 720p Baseline 0.98x. Output identical to one thread on all 166 conformance streams at 1, 2 and 4 threads.
