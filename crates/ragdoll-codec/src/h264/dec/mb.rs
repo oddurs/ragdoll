@@ -13,7 +13,9 @@ use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
 use super::intra;
-use super::picture::{MbType, Motion, NO_BLOCK, NO_PIC, PicState, RefIds, Structure, fill_rect};
+use super::picture::{
+    MbType, Motion, MotionView, NO_BLOCK, NO_PIC, PicState, PicSync, RefIds, Structure, fill_rect,
+};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
@@ -36,6 +38,9 @@ pub struct RefPic {
     pub parity: Option<u8>,
     /// POCs of the store's two fields.
     pub field_poc: [i32; 2],
+    /// Progress of a frame still being decoded on another thread, which prediction from it
+    /// waits on (its `motion` is then `None` until it is complete).
+    pub sync: Option<Arc<PicSync>>,
 }
 
 /// Everything a slice needs besides the picture state.
@@ -97,20 +102,11 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         None => [Vec::new(), Vec::new()],
     };
     let (st_mbaff, st_structure) = (st.mbaff, st.structure);
-    let ids = |lists: &[Vec<RefPic>; 2]| -> RefIds {
-        let mut t = [[NO_PIC; 32]; 2];
-        for (row, list) in t.iter_mut().zip(lists) {
-            for (id, r) in row.iter_mut().zip(list) {
-                *id = r.id;
-            }
-        }
-        t
-    };
     let table_base = st.ref_tables.len() as u16;
-    st.push_ref_table(ids(&cx.refs));
+    st.push_ref_table(ref_ids(&cx.refs));
     if let Some(f) = &cx.field_refs {
-        st.push_ref_table(ids(&f[0]));
-        st.push_ref_table(ids(&f[1]));
+        st.push_ref_table(ref_ids(&f[0]));
+        st.push_ref_table(ref_ids(&f[1]));
     }
     let mut d = Dec {
         cx,
@@ -153,8 +149,25 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         table_base,
         whole: cx.slice_num == 0 && cx.sh.first_mb == 0,
         res: None,
+        waits: cx.refs.iter().flatten().any(|r| r.sync.is_some()),
     };
-    d.run(first, total)
+    let r = d.run(first, total);
+    if r.is_err() {
+        // Filtering resumes after undecoded macroblocks are restored.
+        st.rows.on = false;
+    }
+    r
+}
+
+/// The ids of the pictures in reference lists `lists`, as a table of [`PicState::ref_tables`].
+pub fn ref_ids(lists: &[Vec<RefPic>; 2]) -> RefIds {
+    let mut t = [[NO_PIC; 32]; 2];
+    for (row, list) in t.iter_mut().zip(lists) {
+        for (id, r) in row.iter_mut().zip(list) {
+            *id = r.id;
+        }
+    }
+    t
 }
 
 /// Position of a macroblock: `addr` indexes per-MB state, `(x, y)` its MB column and row
@@ -265,6 +278,9 @@ struct Dec<'a, 'c> {
     /// Residual blocks, kept zeroed between macroblocks: the inverse transforms clear what they
     /// read, so only coded coefficients are ever written.
     res: Option<Box<Residual>>,
+    /// Some reference picture is still being decoded on another thread: inter prediction waits
+    /// for the rows it reads.
+    waits: bool,
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -513,6 +529,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         let (x, y, w, a) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
         self.nb_addr = addr;
+        self.st.row_mb(addr, x, y);
         if self.whole {
             let (l, t, r) = (x > 0, y > 0, x + 1 < w);
             self.nb = (l as u8 * NB_L)
@@ -2529,7 +2546,16 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The co-located macroblock of direct prediction (8.4.1.2.1), for [`ColMb::block`].
     fn colocated_mb(&self) -> ColMb<'c> {
         let col = &self.refs(1)[0];
-        let Some(m) = col.motion.as_deref() else {
+        let m = match (&col.motion, &col.sync) {
+            (Some(m), _) => Some(MotionView::of(m)),
+            // A frame still decoding on another thread (frames only): its co-located row.
+            (None, Some(sync)) => sync.live().map(|live| {
+                sync.wait_motion(self.mb.y, 2);
+                live.view()
+            }),
+            (None, None) => None,
+        };
+        let Some(m) = m else {
             return ColMb {
                 m: None,
                 mb_w: 0,
@@ -2798,7 +2824,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
         let d = co + cy * cs + cx;
-        let [_, pcb, pcr] = &mut self.st.planes;
+        let [pcb, pcr] = self.st.planes.chroma_mut();
         let (dcb, dcr) = (&mut pcb[d..], &mut pcr[d..]);
         fn src(r: &RefPic) -> [&[u8]; 2] {
             [&r.planes[1], &r.planes[2]]
@@ -2914,7 +2940,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (cs, cph) = (pw / 2, ph / 2);
         let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
         let d = cy * cs + cx;
-        let [_, pcb, pcr] = &mut self.st.planes;
+        let [pcb, pcr] = self.st.planes.chroma_mut();
         let (dcb, dcr) = (&mut pcb[d..], &mut pcr[d..]);
         fn src(r: &RefPic) -> [&[u8]; 2] {
             [&r.planes[1], &r.planes[2]]
@@ -2945,6 +2971,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
         if self.simple {
+            if self.waits {
+                self.wait_refs(by, h4, refs, mvs);
+            }
             if self.cx.sh.weights.is_some() {
                 return self.mc_rect_simple_explicit(bx, by, w4, h4, refs, mvs);
             }
@@ -2979,6 +3008,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         self.mc_rect_weighted(rp, refs, wt, o, ls, x, y, w, h, pw, ph, mvs);
         Ok(())
+    }
+
+    /// Waits until the reference samples a `4 * h4` lines high block at block row `by` of the
+    /// current macroblock reads are final: the luma rows its vectors reach, three more for the
+    /// interpolation filter (chroma reaches no further, see [`PicSync`]).
+    #[inline(never)]
+    fn wait_refs(&self, by: usize, h4: usize, refs: [i8; 2], mvs: [[i16; 2]; 2]) {
+        let bottom = (self.mb.y * 16 + (by + h4) * 4) as isize - 1;
+        for list in 0..2 {
+            let Some(sync) = usize::try_from(refs[list])
+                .ok()
+                .and_then(|r| self.cx.refs[list].get(r))
+                .and_then(|r| r.sync.as_deref())
+            else {
+                continue;
+            };
+            let line = bottom + (mvs[list][1] >> 2) as isize + 3;
+            let last = self.st.height as isize - 1;
+            if !sync.has(line.clamp(0, last) as usize) {
+                // Waking costs more than decoding a few macroblocks: wait for some slack too,
+                // rather than again for every next line.
+                sync.wait((line + WAIT_SLACK).clamp(0, last) as usize);
+            }
+        }
     }
 
     /// [`Self::mc_rect`] with explicit or implicit weights, kept out of line: the default path
@@ -3080,7 +3133,7 @@ enum ColLayout {
 /// The co-located macroblock of the current one; `m` is `None` without stored motion.
 #[derive(Clone, Copy)]
 struct ColMb<'r> {
-    m: Option<&'r Motion>,
+    m: Option<MotionView<'r>>,
     mb_w: usize,
     mbx: usize,
     layout: ColLayout,
@@ -3142,6 +3195,9 @@ impl ColMb<'_> {
         (b.ref_idx[l], b.mv[l], m.ref_pic(mb, i, l), vscale)
     }
 }
+
+/// Lines beyond those needed a block waits for in a reference still being decoded.
+const WAIT_SLACK: isize = 16;
 
 /// Reference index of an unavailable neighbour in [`mvp_raw`] form; its vector is zero.
 const UNAV: i8 = i8::MIN;

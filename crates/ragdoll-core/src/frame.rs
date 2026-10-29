@@ -255,6 +255,12 @@ impl<T: Copy> AlignedVec<T> {
         }
         Self { ptr, len }
     }
+
+    /// The allocation's pointer, valid for reads and writes of `len` elements while `self`
+    /// lives (and is not moved out of its heap allocation, which moving `self` does not do).
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
 }
 
 impl<T: Copy> Deref for AlignedVec<T> {
