@@ -47,6 +47,18 @@ impl H264Profile {
     }
 }
 
+/// Encoder effort of [`H264Encoder`] (`SIMD-0089`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum H264Speed {
+    /// Quarter-pel motion, intra $4\times4$ analysis and the in-loop deblocking filter.
+    #[default]
+    Balanced,
+    /// Throughput first, like `x264 --preset ultrafast`: half-pel motion only, intra
+    /// macroblocks coded as $16\times16$ and plane modes skipped, deblocking disabled. Still smaller than `x264`
+    /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
+    Fast,
+}
+
 /// Rate control mode for [`H264Encoder`] (`0041`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RateControlMode {
@@ -2029,26 +2041,6 @@ const fn nc_to_table_idx(nc: u8) -> usize {
 }
 
 #[inline]
-fn predict_luma_nc(luma_nnz: &[u8], g_stride: usize, gx: usize, gy: usize) -> u8 {
-    let left = if gx > 0 {
-        Some(luma_nnz[gy * g_stride + (gx - 1)] as u16)
-    } else {
-        None
-    };
-    let top = if gy > 0 {
-        Some(luma_nnz[(gy - 1) * g_stride + gx] as u16)
-    } else {
-        None
-    };
-    match (left, top) {
-        (Some(l), Some(t)) => ((l + t + 1) >> 1) as u8,
-        (Some(l), None) => l as u8,
-        (None, Some(t)) => t as u8,
-        (None, None) => 0,
-    }
-}
-
-#[inline]
 fn predict_chroma_nc(chroma_nnz: &[u8], cg_stride: usize, cgx: usize, cgy: usize) -> u8 {
     let left = if cgx > 0 {
         Some(chroma_nnz[cgy * cg_stride + (cgx - 1)] as u16)
@@ -2933,6 +2925,7 @@ pub struct H264Encoder {
     pub rate_control: RateControlMode,
     pub qp: u8,
     pub keyint: u32,
+    pub speed: H264Speed,
     frame_count: u32,
     state: enc::EncState,
     vbv_buffer_bits: f64,
@@ -2953,6 +2946,7 @@ impl H264Encoder {
             rate_control: RateControlMode::FixedQp(qp),
             qp,
             keyint: 30,
+            speed: H264Speed::Balanced,
             frame_count: 0,
             state: enc::EncState::default(),
             vbv_buffer_bits: 0.0,
@@ -2969,6 +2963,12 @@ impl H264Encoder {
         self.sps = Sps::new_profile(self.sps.width(), self.sps.height(), fps, profile);
         self.sps.colorimetry = c;
         self.pps = Pps::new_profile(self.qp, profile);
+        self
+    }
+
+    /// Configures the encoder effort ([`H264Speed`]).
+    pub fn with_speed(mut self, speed: H264Speed) -> Self {
+        self.speed = speed;
         self
     }
 
@@ -3493,28 +3493,6 @@ fn pred_motion_partition(
     } else {
         [median3(a[0], b[0], c[0]), median3(a[1], b[1], c[1])]
     }
-}
-
-/// Computes the ITU-T H.264 8.4.1.1 `P_Skip` motion vector predictor on the $4\times4$ grid.
-#[inline]
-fn pred_pskip_motion_grid(
-    ref_grid: &[i8],
-    mv_grid: &[[i16; 2]],
-    g_stride: usize,
-    gx0: usize,
-    gy0: usize,
-) -> [i16; 2] {
-    if gx0 == 0 || gy0 == 0 {
-        return [0, 0];
-    }
-    let left_idx = gy0 * g_stride + (gx0 - 1);
-    let top_idx = (gy0 - 1) * g_stride + gx0;
-    if (ref_grid[left_idx] == 0 && mv_grid[left_idx] == [0, 0])
-        || (ref_grid[top_idx] == 0 && mv_grid[top_idx] == [0, 0])
-    {
-        return [0, 0];
-    }
-    pred_motion_partition(ref_grid, mv_grid, g_stride, gx0, gy0, 4, 0)
 }
 
 #[inline]
@@ -4130,10 +4108,17 @@ mod tests {
     #[test]
     fn encoder_reconstruction_matches_decoder_every_frame() {
         let (w, h) = (64, 48);
-        for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+        for (profile, speed) in [
+            (H264Profile::Baseline, H264Speed::Balanced),
+            (H264Profile::Main, H264Speed::Balanced),
+            (H264Profile::High, H264Speed::Balanced),
+            (H264Profile::Baseline, H264Speed::Fast),
+            (H264Profile::High, H264Speed::Fast),
+        ] {
             for qp in [10u8, 22, 30, 40] {
                 let mut enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, qp)
-                    .with_profile(profile);
+                    .with_profile(profile)
+                    .with_speed(speed);
                 enc.keyint = 4;
                 let mut dec = H264Decoder::new();
                 for t in 0..10 {
@@ -4146,7 +4131,7 @@ mod tests {
                             assert_eq!(
                                 &decoded.plane(p).row(y)[..pw],
                                 &recon.plane(p).row(y)[..pw],
-                                "{profile:?} qp {qp} frame {t} plane {p} row {y}"
+                                "{profile:?} {speed:?} qp {qp} frame {t} plane {p} row {y}"
                             );
                         }
                     }

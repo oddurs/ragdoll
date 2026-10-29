@@ -11,11 +11,11 @@ use super::*;
 use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
-    add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hadamard4x4_16x4, hpel_window, hpel_window_centre, intra_pred_plane,
-    intra_satd_x3_16x16, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16,
-    pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd,
-    quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    add_idct4x4_8x8, chroma_mc_8x8_x2, dequant_4x4_x4, h264_chroma_deblock, h264_luma_deblock,
+    h264_luma_mc, hadamard4x4_16x4, hpel_16x16, hpel_window, hpel_window_centre, intra_pred_plane,
+    intra_sad_x3_16x16, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4,
+    pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16,
+    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -71,6 +71,16 @@ impl Plane {
     #[inline(always)]
     fn idx(&self, x: usize, y: usize) -> usize {
         (y + self.pad) * self.stride + x + self.pad
+    }
+
+    /// The `N` samples of column `x` from row `y` down.
+    #[inline(always)]
+    fn column<const N: usize>(&self, x: usize, y: usize) -> [u8; N] {
+        let (o, s) = (self.idx(x, y), self.stride);
+        let last = s.checked_mul(N - 1).and_then(|d| d.checked_add(o));
+        assert!(last.is_some_and(|l| l < self.buf.len()));
+        // Safety: the assertion bounds the last (largest) index.
+        std::array::from_fn(|r| unsafe { *self.buf.get_unchecked(o + r * s) })
     }
 
     /// Writes the `N`x`N` block `src` (stride `N`) with its top-left sample at `(x0, y0)`.
@@ -137,6 +147,7 @@ impl Pic {
         }
     }
 
+    #[inline(always)]
     fn store_mb(&mut self, mb_x: usize, mb_y: usize, y: &[u8; 256], u: &[u8; 64], v: &[u8; 64]) {
         self.y.store::<16>(mb_x * 16, mb_y * 16, y);
         self.u.store::<8>(mb_x * 8, mb_y * 8, u);
@@ -173,9 +184,27 @@ pub(super) struct EncState {
     mb_vars: Vec<f32>,
     bits_buf: Vec<u8>,
     win: Box<HpelWindow>,
+    /// Motion vector costs by QP (see [`EncState::mv_costs`]), built on first use.
+    mv_cost_tabs: Vec<Vec<u16>>,
 }
 
 impl EncState {
+    /// `LAMBDA[qp]` times the bits of a motion vector difference component `d`, at index
+    /// `d + MV_COST_RANGE`, for `|d| <= MV_COST_RANGE` (`x264` `p_cost_mv`).
+    fn mv_costs(&mut self, qp: u8) -> &[u16] {
+        if self.mv_cost_tabs.len() <= qp as usize {
+            self.mv_cost_tabs.resize(qp as usize + 1, Vec::new());
+        }
+        let t = &mut self.mv_cost_tabs[qp as usize];
+        if t.is_empty() {
+            let lambda = LAMBDA[qp as usize] as u32;
+            *t = (-MV_COST_RANGE..=MV_COST_RANGE)
+                .map(|d| (lambda * se_bits(d)) as u16)
+                .collect();
+        }
+        t
+    }
+
     /// Sizes the pictures and grids and clears the per-frame state. `ref_grid` and `mv_grid` are
     /// left alone: every macroblock writes its own entries before a later one reads them.
     fn prepare(&mut self, mb_w: usize, mb_h: usize, slice_qp: u8, cabac: bool) {
@@ -223,6 +252,7 @@ impl EncState {
     }
 
     /// Marks macroblock `(mb_x, mb_y)` intra in the motion grids: no reference, zero vectors.
+    #[inline(always)]
     fn set_intra_motion(&mut self, mb_x: usize, mb_y: usize) {
         let g_stride = self.mb_w * 4;
         fill_grid_4x4(&mut self.ref_grid, g_stride, mb_x * 4, mb_y * 4, 4, 4, -1);
@@ -258,6 +288,7 @@ struct MbSrc {
 impl MbSrc {
     /// Loads macroblock `(mb_x, mb_y)` of `frame`, replicating the last column and row past the
     /// picture's right and bottom edges.
+    #[inline(always)]
     fn load(&mut self, frame: &VideoFrame, mb_x: usize, mb_y: usize) {
         let (x0, y0) = (mb_x * 16, mb_y * 16);
         if x0 + 16 > frame.width || y0 + 16 > frame.height {
@@ -306,6 +337,8 @@ type Cabac = Option<(CabacEncoder, [CabacContext; NUM_CABAC_CONTEXTS])>;
 /// Slice-level coding state carried from macroblock to macroblock.
 struct SliceState {
     is_idr: bool,
+    /// [`H264Speed::Fast`]: half-pel motion and intra 16x16 only.
+    fast: bool,
     use_cabac: bool,
     t8x8: bool,
     chroma_qp_offset: i32,
@@ -315,9 +348,23 @@ struct SliceState {
     skip_bounds: SkipBounds,
 }
 
+/// Column and row of $4\times4$ block `b` (decoding order) in its macroblock.
 #[inline(always)]
 fn blk_xy(b: usize) -> (usize, usize) {
-    ((b & 1) + ((b >> 1) & 2), ((b >> 1) & 1) + ((b >> 2) & 2))
+    const XY: [(u8, u8); 16] = {
+        let mut t = [(0u8, 0u8); 16];
+        let mut b = 0;
+        while b < 16 {
+            t[b] = (
+                ((b & 1) + ((b >> 1) & 2)) as u8,
+                (((b >> 1) & 1) + ((b >> 2) & 2)) as u8,
+            );
+            b += 1;
+        }
+        t
+    };
+    let (x, y) = XY[b & 15];
+    (x as usize, y as usize)
 }
 
 #[inline(always)]
@@ -332,7 +379,14 @@ fn se_bits(d: i32) -> u32 {
     2 * (32 - (v + 1).leading_zeros()) - 1
 }
 
+/// Set bits of a mask of at most 16 bits (`popcnt` in the x86-64-v3 frame coder).
+#[inline(always)]
+fn pop16(mask: u32) -> u8 {
+    mask.count_ones() as u8
+}
+
 /// `x264_decimate_score`: 9 when a level exceeds 1, else a weight that falls with the zero runs.
+#[inline(always)]
 fn decimate_score(scanned: &[i16]) -> u32 {
     let table: &[u8] = if scanned.len() == 64 {
         &DECIMATE8
@@ -361,7 +415,7 @@ fn decimate_score(scanned: &[i16]) -> u32 {
 
 /// [`decimate_score`] of a scanned $4\times4$ block (16 or 15 levels) given the mask of its
 /// non-zero levels (bit `i` for `scanned[i]`).
-#[inline]
+#[inline(always)]
 fn decimate_masked(scanned: &[i16], mask: u32) -> u32 {
     let mut score = 0u32;
     let mut m = mask;
@@ -445,8 +499,8 @@ const LEVEL_TAB_MAX: i32 = 32;
 /// Level codes by `suffixLength` and `level + LEVEL_TAB_MAX` for the levels that need no
 /// `levelCode` adjustment, packed as `bits << 16 | next suffixLength << 8 | length`
 /// (`x264_level_token`).
-static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
-    let mut t = [[0u32; 2 * LEVEL_TAB_MAX as usize]; 7];
+static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 8] = {
+    let mut t = [[0u32; 2 * LEVEL_TAB_MAX as usize]; 8];
     let mut s = 0;
     while s < 7 {
         let mut i = 0;
@@ -465,9 +519,123 @@ static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
     t
 };
 
+/// `coeff_token` codes by `nC` class (as [`NC_CLASS`], then chroma DC) and `TotalCoeff * 4 +
+/// TrailingOnes`, packed as `bits << 8 | length`.
+static COEFF_TOKEN: [[u32; 68]; 5] = {
+    let mut t = [[0u32; 68]; 5];
+    let mut c = 0;
+    while c < 4 {
+        let mut k = 0;
+        while k < 68 {
+            t[c][k] = (COEFF_TOKEN_BITS[c][k] as u32) << 8 | COEFF_TOKEN_LEN[c][k] as u32;
+            k += 1;
+        }
+        c += 1;
+    }
+    let mut k = 0;
+    while k < 20 {
+        t[4][k] = (CHROMA_DC_COEFF_TOKEN_BITS[k] as u32) << 8 | CHROMA_DC_COEFF_TOKEN_LEN[k] as u32;
+        k += 1;
+    }
+    t
+};
+
+/// `total_zeros` codes of $4\times4$ blocks, then of chroma DC, by `TotalCoeff - 1` and
+/// `total_zeros`, packed as `bits << 8 | length`.
+static TOTAL_ZEROS: [[[u32; 16]; 16]; 2] = {
+    let mut t = [[[0u32; 16]; 16]; 2];
+    let mut n = 0;
+    while n < 15 {
+        let mut z = 0;
+        while z < 16 {
+            t[0][n][z] = (TOTAL_ZEROS_BITS[n][z] as u32) << 8 | TOTAL_ZEROS_LEN[n][z] as u32;
+            if n < 3 && z < 4 {
+                t[1][n][z] = (CHROMA_DC_TOTAL_ZEROS_BITS[n][z] as u32) << 8
+                    | CHROMA_DC_TOTAL_ZEROS_LEN[n][z] as u32;
+            }
+            z += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+/// The non-zero counts of a macroblock's $4\times4$ luma blocks with those of the blocks above
+/// and to the left, `0x80` where unavailable, so `nC` is one sum and a mask
+/// (`x264_mb_predict_non_zero_code` on `non_zero_count` in the macroblock cache).
+struct NnzCache([u8; 32]);
+
+impl NnzCache {
+    /// Cache index of block `b` (decoding order): row-major 5x5 with the neighbours in row and
+    /// column 0.
+    const AT: [u8; 16] = {
+        let mut t = [0u8; 16];
+        let mut b = 0;
+        while b < 16 {
+            let (x, y) = ((b & 1) + ((b >> 1) & 2), ((b >> 1) & 1) + ((b >> 2) & 2));
+            t[b] = ((y + 1) * 5 + x + 1) as u8;
+            b += 1;
+        }
+        t
+    };
+
+    #[inline(always)]
+    fn load(nnz: &[u8], g_stride: usize, mb_x: usize, mb_y: usize) -> Self {
+        let mut c = [0x80u8; 32];
+        let (gx, gy) = (mb_x * 4, mb_y * 4);
+        if mb_y > 0 {
+            c[1..5].copy_from_slice(&nnz[(gy - 1) * g_stride + gx..][..4]);
+        }
+        if mb_x > 0 {
+            for y in 0..4 {
+                c[(y + 1) * 5] = nnz[(gy + y) * g_stride + gx - 1];
+            }
+        }
+        Self(c)
+    }
+
+    /// `nC` of block `b` (ITU-T H.264 9.2.1).
+    #[inline(always)]
+    fn nc(&self, b: usize) -> u8 {
+        // Indices stay below 25: masking them only drops the bound checks.
+        let i = Self::AT[b & 15] as usize;
+        let s = self.0[(i - 1) & 31] as u32 + self.0[(i - 5) & 31] as u32;
+        ((if s < 0x80 { (s + 1) >> 1 } else { s }) & 0x7F) as u8
+    }
+
+    #[inline(always)]
+    fn set(&mut self, b: usize, n: u8) {
+        self.0[Self::AT[b & 15] as usize & 31] = n;
+    }
+
+    /// Writes the macroblock's counts back to the grid.
+    #[inline(always)]
+    fn store(&self, nnz: &mut [u8], g_stride: usize, mb_x: usize, mb_y: usize) {
+        for y in 0..4 {
+            let o = (mb_y * 4 + y) * g_stride + mb_x * 4;
+            nnz[o..o + 4].copy_from_slice(&self.0[(y + 1) * 5 + 1..(y + 1) * 5 + 5]);
+        }
+    }
+}
+
+/// `coeff_token` table of each `nC` below 128, as `nc_to_table_idx`, without the branches.
+const NC_CLASS: [u8; 128] = {
+    let mut t = [3u8; 128];
+    t[0] = 0;
+    t[1] = 0;
+    t[2] = 1;
+    t[3] = 1;
+    t[4] = 2;
+    t[5] = 2;
+    t[6] = 2;
+    t[7] = 2;
+    t
+};
+
 /// CAVLC `residual_block` of a zig-zag scanned block of `N` = 16 or 15 coefficients (`nc` selects
 /// the `coeff_token` table), or of the 4 chroma DC coefficients (`N` = 4); the bits equal
 /// [`encode_cavlc_block`]'s.
+#[inline(always)]
 fn write_cavlc_block<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8) {
     let mut mask = 0u32;
     for (i, &c) in coeffs.iter().enumerate() {
@@ -479,19 +647,22 @@ fn write_cavlc_block<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8) {
 /// [`write_cavlc_block`] of the first `N` levels of `coeffs` given the mask of the non-zero ones
 /// (bit `i` for `coeffs[i]`). Levels and runs are visited from the highest frequency down through
 /// the mask, so the cost follows the number of coded levels.
-#[inline]
+#[inline(always)]
 fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask: u32) {
-    let (token_len, token_bits): (&[u8], &[u8]) = if N == 4 {
-        (&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS)
+    let tokens = &COEFF_TOKEN[if N == 4 {
+        4
     } else {
-        let t = nc_to_table_idx(nc);
-        (&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
-    };
+        NC_CLASS[nc as usize & 127] as usize
+    }];
     if mask == 0 {
-        w.put32(token_bits[0] as u32, token_len[0] as u32);
+        w.put32(tokens[0] >> 8, tokens[0] & 0xFF);
         return;
     }
-    let n = mask.count_ones() as usize;
+    // Every level the mask names lies in `coeffs`, so the walks below index it unchecked.
+    assert!(coeffs.len() >= N && mask >> N == 0);
+    // Safety: by the assertion, every position `p` of a set bit of `mask` is below `N`.
+    let level = |p: u32| unsafe { *coeffs.get_unchecked(p as usize) };
+    let n = pop16(mask) as usize;
     let top = 31 - mask.leading_zeros();
     let total_zeros = top as usize + 1 - n;
 
@@ -501,7 +672,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     let mut signs = 0u32;
     while trailing_ones < 3 && m != 0 {
         let p = 31 - m.leading_zeros();
-        let c = coeffs[p as usize];
+        let c = level(p);
         if c.unsigned_abs() != 1 {
             break;
         }
@@ -509,10 +680,10 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         trailing_ones += 1;
         m ^= 1 << p;
     }
-    let tok = n * 4 + trailing_ones;
+    let e = tokens[n * 4 + trailing_ones];
     w.put32(
-        ((token_bits[tok] as u32) << trailing_ones) | signs,
-        token_len[tok] as u32 + trailing_ones as u32,
+        ((e >> 8) << trailing_ones) | signs,
+        (e & 0xFF) + trailing_ones as u32,
     );
 
     if m != 0 {
@@ -521,7 +692,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         // taken, so its `levelCode` is lowered by 2.
         let p = 31 - m.leading_zeros();
         m ^= 1 << p;
-        let lv = coeffs[p as usize] as i32;
+        let lv = level(p) as i32;
         let mut code = if lv > 0 { 2 * lv - 2 } else { -2 * lv - 1 } as u32;
         if trailing_ones < 3 {
             code -= 2;
@@ -537,10 +708,10 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         while m != 0 {
             let p = 31 - m.leading_zeros();
             m ^= 1 << p;
-            let lv = coeffs[p as usize] as i32;
+            let lv = level(p) as i32;
             let i = lv + LEVEL_TAB_MAX;
             if (i as u32) < 2 * LEVEL_TAB_MAX as u32 {
-                let e = LEVEL_TAB[suffix_len as usize][i as usize];
+                let e = LEVEL_TAB[suffix_len as usize & 7][i as usize];
                 w.put32(e >> 16, e & 0xFF);
                 suffix_len = (e >> 8) & 0xFF;
             } else {
@@ -553,37 +724,49 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     }
 
     if n < N {
-        let (l, b) = if N == 4 {
-            (
-                CHROMA_DC_TOTAL_ZEROS_LEN[n - 1][total_zeros],
-                CHROMA_DC_TOTAL_ZEROS_BITS[n - 1][total_zeros],
-            )
+        let tz = TOTAL_ZEROS[usize::from(N == 4)][(n - 1) & 15][total_zeros & 15];
+        let (l, b) = (tz & 0xFF, tz >> 8);
+        // The run_before codes follow (empty without zeros); one write while both fit.
+        let e = RUN_BEFORE[mask as usize & 0xFFFF];
+        let (rb, rl) = (e >> 5, e & 31);
+        if l + rl <= 32 {
+            w.put32((b << rl) | rb, l + rl);
         } else {
-            (
-                TOTAL_ZEROS_LEN[n - 1][total_zeros],
-                TOTAL_ZEROS_BITS[n - 1][total_zeros],
-            )
-        };
-        w.put32(b as u32, l as u32);
-    }
-    // run_before of each level from the highest down while zeros remain, except the last.
-    let mut zeros_left = total_zeros as u32;
-    let mut m = mask ^ (1 << top);
-    let mut p = top;
-    while zeros_left != 0 && m != 0 {
-        let below = 31 - m.leading_zeros();
-        m ^= 1 << below;
-        let run = (p - below - 1) as usize;
-        let k = (zeros_left - 1).min(6) as usize;
-        w.put32(RUN_BITS[k][run] as u32, RUN_LEN[k][run] as u32);
-        zeros_left -= run as u32;
-        p = below;
+            w.put32(b, l);
+            w.put32(rb, rl);
+        }
     }
 }
+
+/// The `run_before` codes of a block's levels, from the highest frequency down while zeros
+/// remain, concatenated (at most 25 bits) and packed as `bits << 5 | length`, by the mask of the
+/// non-zero levels (bit `i` for scan position `i`; `x264_run_before`).
+///
+/// After the first code the zeros left are the total zeros of the mask without its top level,
+/// so each entry is its first code followed by that smaller mask's entry.
+static RUN_BEFORE: [u32; 1 << 16] = {
+    let mut t = [0u32; 1 << 16];
+    let mut mask = 1u32;
+    while mask < 1 << 16 {
+        let top = 31 - mask.leading_zeros();
+        let rest = mask ^ (1 << top);
+        let zeros = top + 1 - mask.count_ones();
+        if zeros != 0 && rest != 0 {
+            let run = (top - (31 - rest.leading_zeros()) - 1) as usize;
+            let k = if zeros > 7 { 6 } else { zeros as usize - 1 };
+            let (len, bits) = (RUN_LEN[k][run] as u32, RUN_BITS[k][run] as u32);
+            let tail = t[rest as usize];
+            t[mask as usize] = ((bits << (tail & 31)) | (tail >> 5)) << 5 | (len + (tail & 31));
+        }
+        mask += 1;
+    }
+    t
+};
 
 /// Writes the CAVLC luma $4\times4$ blocks of the coded $8\times8$ quadrants of `cbp_luma` and
 /// the chroma residual, updating the non-zero counts that predict `nC`.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn write_cavlc_residuals(
     w: &mut Bits,
     mb_x: usize,
@@ -597,30 +780,29 @@ fn write_cavlc_residuals(
     chroma_nnz: &mut [Vec<u8>; 2],
 ) {
     let g_stride = mb_w * 4;
+    let mut cache = NnzCache::load(luma_nnz, g_stride, mb_x, mb_y);
     for i8x8 in 0..4 {
-        let coded = cbp_luma & (1 << i8x8) != 0;
-        let group: &[[i16; 16]; 4] = luma_q4[i8x8 * 4..i8x8 * 4 + 4].try_into().unwrap();
-        let (scanned, masks) = if coded {
-            let zz = zigzag_4x4_x4(group);
-            let masks = nonzero_mask_4x4_x4(&zz);
-            (zz, masks)
-        } else {
-            ([[0; 16]; 4], [0; 4])
-        };
-        for (k, (zz, &mask)) in scanned.iter().zip(&masks).enumerate() {
-            let (bx, by) = blk_xy(i8x8 * 4 + k);
-            let g = (mb_y * 4 + by) * g_stride + mb_x * 4 + bx;
-            if coded {
-                let nc = predict_luma_nc(luma_nnz, g_stride, mb_x * 4 + bx, mb_y * 4 + by);
-                write_cavlc_masked::<16>(w, zz, nc, mask);
+        if cbp_luma & (1 << i8x8) == 0 {
+            for k in 0..4 {
+                cache.set(i8x8 * 4 + k, 0);
             }
-            luma_nnz[g] = mask.count_ones() as u8;
+            continue;
+        }
+        let group: &[[i16; 16]; 4] = luma_q4[i8x8 * 4..i8x8 * 4 + 4].try_into().unwrap();
+        let zz = zigzag_4x4_x4(group);
+        let masks = nonzero_mask_4x4_x4(&zz);
+        for (k, (zz, &mask)) in zz.iter().zip(&masks).enumerate() {
+            let b = i8x8 * 4 + k;
+            write_cavlc_masked::<16>(w, zz, cache.nc(b), mask);
+            cache.set(b, pop16(mask));
         }
     }
+    cache.store(luma_nnz, g_stride, mb_x, mb_y);
     write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, chroma, chroma_nnz);
 }
 
 /// Writes the CAVLC chroma DC and AC blocks that `cbp_chroma` signals.
+#[inline(always)]
 fn write_cavlc_chroma(
     w: &mut Bits,
     mb_x: usize,
@@ -642,7 +824,7 @@ fn write_cavlc_chroma(
                 let (cgx, cgy) = (mb_x * 2 + (b & 1), mb_y * 2 + (b >> 1));
                 let nc = predict_chroma_nc(nnz, cg_stride, cgx, cgy);
                 write_cavlc_masked::<15>(w, ac, nc, mask);
-                nnz[cgy * cg_stride + cgx] = mask.count_ones() as u8;
+                nnz[cgy * cg_stride + cgx] = pop16(mask);
             }
         }
     }
@@ -685,8 +867,8 @@ fn mc_chroma(p: &Pic, cx0: usize, cy0: usize, mv: [i16; 2], u: &mut [u8; 64], v:
         p.v.load::<8>(off, v);
         return;
     }
-    h264_chroma_mc(u, 8, &p.u.buf, off, p.u.stride, 8, 8, fx, fy);
-    h264_chroma_mc(v, 8, &p.v.buf, off, p.v.stride, 8, 8, fx, fy);
+    // Both planes share one layout.
+    chroma_mc_8x8_x2(&p.u.buf, &p.v.buf, off, p.u.stride, fx, fy, u, v);
 }
 
 /// Quarter-pel motion vector bounds of one macroblock that keep compensation inside the padding.
@@ -724,6 +906,10 @@ impl MvBounds {
     }
 }
 
+/// Largest motion vector difference component [`EncState::mv_costs`] covers; larger ones are
+/// costed directly.
+const MV_COST_RANGE: i32 = 4096;
+
 /// Motion search of one $16\times16$ partition against the reference luma plane.
 struct MotionSearch<'a> {
     r: &'a Plane,
@@ -732,13 +918,26 @@ struct MotionSearch<'a> {
     y0: usize,
     mvp: [i16; 2],
     lambda: u32,
+    /// The [`EncState::mv_costs`] of `lambda`.
+    mv_costs: &'a [u16],
     bounds: MvBounds,
+    /// Quarter-pel refinement iterations after the half-pel step.
+    qpel_iters: u32,
 }
 
 impl MotionSearch<'_> {
+    /// Cost of one component `d` of a motion vector difference.
+    #[inline(always)]
+    fn mvd_cost(&self, d: i32) -> u32 {
+        match self.mv_costs.get((d + MV_COST_RANGE) as usize) {
+            Some(&c) => c as u32,
+            None => self.lambda * se_bits(d),
+        }
+    }
+
     #[inline(always)]
     fn mv_cost(&self, mv: [i32; 2]) -> u32 {
-        self.lambda * (se_bits(mv[0] - self.mvp[0] as i32) + se_bits(mv[1] - self.mvp[1] as i32))
+        self.mvd_cost(mv[0] - self.mvp[0] as i32) + self.mvd_cost(mv[1] - self.mvp[1] as i32)
     }
 
     #[inline(always)]
@@ -749,16 +948,20 @@ impl MotionSearch<'_> {
         )
     }
 
+    /// SAD and motion cost of full-pel vector `m`.
+    #[inline(always)]
+    fn cost_at(&self, m: [i32; 2]) -> u32 {
+        let off = self.full_off(m[0], m[1]);
+        pixel_sad_16x16(self.src, 16, &self.r.buf[off..], self.r.stride)
+            + self.mv_cost([m[0] * 4, m[1] * 4])
+    }
+
     /// Integer-pel diamond search seeded by the best of `cands` (quarter-pel); returns the
     /// full-pel vector and its cost.
-    fn full_pel(&self, cands: &[[i16; 2]]) -> ([i32; 2], u32) {
+    #[inline(always)]
+    fn full_pel(&self, cands: &[[i16; 2]]) -> ([i32; 2], u32, [u32; 4]) {
         let int_min = [(self.bounds.min[0] + 3) >> 2, (self.bounds.min[1] + 3) >> 2];
         let int_max = [self.bounds.max[0] >> 2, self.bounds.max[1] >> 2];
-        let cost_at = |m: [i32; 2]| {
-            let off = self.full_off(m[0], m[1]);
-            pixel_sad_16x16(self.src, 16, &self.r.buf[off..], self.r.stride)
-                + self.mv_cost([m[0] * 4, m[1] * 4])
-        };
         let mut best = [0i32; 2];
         let mut best_cost = u32::MAX;
         let mut seen = [[i32::MAX; 2]; 8];
@@ -771,12 +974,13 @@ impl MotionSearch<'_> {
                 continue;
             }
             seen[k] = m;
-            let cost = cost_at(m);
+            let cost = self.cost_at(m);
             if cost < best_cost {
                 best_cost = cost;
                 best = m;
             }
         }
+        let mut nb = [u32::MAX; 4];
         for _ in 0..16 {
             let pts = [
                 [best[0], best[1] - 1],
@@ -790,25 +994,47 @@ impl MotionSearch<'_> {
             });
             let mut moved = None;
             if inside {
-                let sads = pixel_sad_x4_16x16(
-                    self.src,
-                    &self.r.buf,
-                    pts.map(|p| self.full_off(p[0], p[1])),
-                    self.r.stride,
+                let (o, st) = (self.full_off(best[0], best[1]), self.r.stride);
+                let sads =
+                    pixel_sad_x4_16x16(self.src, &self.r.buf, [o - st, o - 1, o + 1, o + st], st);
+                // Each vector component takes one of three values around the centre.
+                let (dx, dy) = (
+                    best[0] * 4 - self.mvp[0] as i32,
+                    best[1] * 4 - self.mvp[1] as i32,
                 );
-                for (p, sad) in pts.iter().zip(sads) {
-                    let cost = sad + self.mv_cost([p[0] * 4, p[1] * 4]);
-                    if cost < best_cost {
-                        best_cost = cost;
-                        moved = Some(*p);
-                    }
+                let cx = [
+                    self.mvd_cost(dx - 4),
+                    self.mvd_cost(dx),
+                    self.mvd_cost(dx + 4),
+                ];
+                let cy = [
+                    self.mvd_cost(dy - 4),
+                    self.mvd_cost(dy),
+                    self.mvd_cost(dy + 4),
+                ];
+                nb = [
+                    sads[0] + cx[1] + cy[0],
+                    sads[1] + cx[0] + cy[1],
+                    sads[2] + cx[2] + cy[1],
+                    sads[3] + cx[1] + cy[2],
+                ];
+                // The first of the cheapest points, as a sequential strict comparison picks it.
+                let m = (0..4)
+                    .map(|k| nb[k] << 4 | k as u32)
+                    .min()
+                    .unwrap_or(u32::MAX);
+                if m >> 4 < best_cost {
+                    best_cost = m >> 4;
+                    moved = Some(pts[(m & 3) as usize]);
                 }
             } else {
-                for p in pts {
+                nb = [u32::MAX; 4];
+                for (k, p) in pts.into_iter().enumerate() {
                     if (int_min[0]..=int_max[0]).contains(&p[0])
                         && (int_min[1]..=int_max[1]).contains(&p[1])
                     {
-                        let cost = cost_at(p);
+                        let cost = self.cost_at(p);
+                        nb[k] = cost;
                         if cost < best_cost {
                             best_cost = cost;
                             moved = Some(p);
@@ -821,7 +1047,7 @@ impl MotionSearch<'_> {
                 None => break,
             }
         }
-        (best, best_cost)
+        (best, best_cost, nb)
     }
 
     /// Half-pel then quarter-pel refinement around a full-pel vector; leaves the winning
@@ -830,13 +1056,18 @@ impl MotionSearch<'_> {
     /// The half-sample planes of a window around the full-pel position are interpolated once;
     /// every candidate within three quarter samples of it is then a copy or an average of two
     /// of the integer, `b`, `h` and `j` planes (`x264` `get_ref`).
+    #[inline(always)]
     fn sub_pel(
         &self,
         full: [i32; 2],
         full_cost: u32,
+        nb: [u32; 4],
         win: &mut HpelWindow,
         pred: &mut [u8; 256],
     ) -> ([i16; 2], u32) {
+        if self.qpel_iters == 0 {
+            return self.half_pel_toward(full, full_cost, nb, pred);
+        }
         let center = [full[0] * 4, full[1] * 4];
         let (bx, by) = (
             self.x0 as isize + full[0] as isize,
@@ -846,7 +1077,7 @@ impl MotionSearch<'_> {
         let mut best = center;
         let mut best_cost = full_cost;
         let mut have_centre = false;
-        for (step, iters) in [(2i32, 1), (1, 2)] {
+        for (step, iters) in [(2i32, 1), (1, self.qpel_iters)] {
             for _ in 0..iters {
                 let from = best;
                 for d in [[0, -step], [-step, 0], [step, 0], [0, step]] {
@@ -884,9 +1115,60 @@ impl MotionSearch<'_> {
         ([best[0] as i16, best[1] as i16], best_cost)
     }
 
+    /// Half-pel refinement of [`H264Speed::Fast`]: on each axis only the half sample toward the
+    /// cheaper full-pel neighbour (`nb`: costs above, left, right and below the full-pel best) is
+    /// a candidate. Each is first estimated by the SAD against the average of its two integer
+    /// neighbours; only the better estimate, if it beats the full-pel cost, is interpolated and
+    /// measured. Leaves the winner's prediction in `pred`.
+    #[inline(always)]
+    fn half_pel_toward(
+        &self,
+        full: [i32; 2],
+        full_cost: u32,
+        nb: [u32; 4],
+        pred: &mut [u8; 256],
+    ) -> ([i16; 2], u32) {
+        let center = [full[0] * 4, full[1] * 4];
+        let (up, left) = (nb[0] < nb[3], nb[1] < nb[2]);
+        let off = self.full_off(full[0], full[1]);
+        let (r, st) = (&self.r.buf, self.r.stride);
+        let mv_v = [center[0], center[1] + if up { -2 } else { 2 }];
+        let mv_h = [center[0] + if left { -2 } else { 2 }, center[1]];
+        let est_v = self.half_estimate(mv_v, off, if up { off - st } else { off + st });
+        let est_h = self.half_estimate(mv_h, off, if left { off - 1 } else { off + 1 });
+        let (mv, vertical, back, est) = if est_v <= est_h {
+            (mv_v, true, up, est_v)
+        } else {
+            (mv_h, false, left, est_h)
+        };
+        if est < full_cost {
+            let mut block = [0u8; 256];
+            hpel_16x16(r, off, st, vertical, back, &mut block);
+            let cost = pixel_sad_16x16(self.src, 16, &block, 16) + self.mv_cost(mv);
+            if cost < full_cost {
+                *pred = block;
+                return ([mv[0] as i16, mv[1] as i16], cost);
+            }
+        }
+        self.r.load::<16>(off, pred);
+        ([center[0] as i16, center[1] as i16], full_cost)
+    }
+
+    /// Cost of half-pel vector `mv` estimated by the SAD against the average of the integer
+    /// blocks at offsets `a` and `b` (`u32::MAX` outside the bounds).
+    #[inline(always)]
+    fn half_estimate(&self, mv: [i32; 2], a: usize, b: usize) -> u32 {
+        if self.bounds.clamp(mv) != mv {
+            return u32::MAX;
+        }
+        let (r, st) = (&self.r.buf, self.r.stride);
+        pixel_sad_avg_16x16(self.src, &r[a..], st, &r[b..], st) + self.mv_cost(mv)
+    }
+
     /// The block or pair of blocks whose (rounded) average is the prediction at quarter-pel
     /// `mv` from the window interpolated around full-pel `(bx, by)`; `mv` lies within three
     /// quarter samples of that position.
+    #[inline(always)]
     fn window_src<'a>(
         &'a self,
         win: &'a HpelWindow,
@@ -927,6 +1209,7 @@ impl MotionSearch<'_> {
 
     /// The prediction at quarter-pel `mv` from the window interpolated around full-pel
     /// `(bx, by)`; `mv` lies within three quarter samples of that position.
+    #[inline(always)]
     fn window_pred(
         &self,
         win: &HpelWindow,
@@ -949,16 +1232,14 @@ enum WinSrc<'a> {
 }
 
 /// Edge samples for intra $16\times16$ prediction: top row, left column and top-left corner.
+#[inline(always)]
 fn i16_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 16]>, Option<[u8; 16]>, u8) {
     let (x0, y0) = (mb_x * 16, mb_y * 16);
     let top = (mb_y > 0).then(|| {
         let o = p.idx(x0, y0 - 1);
         p.buf[o..o + 16].try_into().unwrap()
     });
-    let left = (mb_x > 0).then(|| {
-        let col = &p.buf[p.idx(x0 - 1, y0)..][..15 * p.stride + 1];
-        std::array::from_fn(|r| col[r * p.stride])
-    });
+    let left = (mb_x > 0).then(|| p.column::<16>(x0 - 1, y0));
     let tl = if mb_x > 0 && mb_y > 0 {
         p.buf[p.idx(x0 - 1, y0 - 1)]
     } else {
@@ -968,13 +1249,14 @@ fn i16_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 16]>, Option<[
 }
 
 /// Edge samples for intra $8\times8$ chroma prediction.
+#[inline(always)]
 fn chroma_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 8]>, Option<[u8; 8]>, u8) {
     let (x0, y0) = (mb_x * 8, mb_y * 8);
     let top = (mb_y > 0).then(|| {
         let o = p.idx(x0, y0 - 1);
         p.buf[o..o + 8].try_into().unwrap()
     });
-    let left = (mb_x > 0).then(|| std::array::from_fn(|r| p.buf[p.idx(x0 - 1, y0 + r)]));
+    let left = (mb_x > 0).then(|| p.column::<8>(x0 - 1, y0));
     let tl = if mb_x > 0 && mb_y > 0 {
         p.buf[p.idx(x0 - 1, y0 - 1)]
     } else {
@@ -984,6 +1266,7 @@ fn chroma_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 8]>, Option
 }
 
 /// Edge samples for intra $4\times4$ block `b` (decoding order) of the macroblock at column `mb_x`.
+#[inline(always)]
 fn i4_edges(
     p: &Plane,
     px: usize,
@@ -1005,7 +1288,7 @@ fn i4_edges(
         }
         t
     });
-    let left = (px > 0).then(|| std::array::from_fn(|r| p.buf[p.idx(px - 1, py + r)]));
+    let left = (px > 0).then(|| p.column::<4>(px - 1, py));
     let tl = if px > 0 && py > 0 {
         p.buf[p.idx(px - 1, py - 1)]
     } else {
@@ -1014,12 +1297,15 @@ fn i4_edges(
     (top, left, tl)
 }
 
-/// Picks the intra chroma mode with the least SAD; returns it with both predictions.
+/// Picks the intra chroma mode with the least SAD (the plane mode only with `plane`); returns it
+/// with both predictions.
+#[inline(always)]
 fn analyse_chroma_intra(
     pic: &Pic,
     mb_x: usize,
     mb_y: usize,
     src: &MbSrc,
+    plane: bool,
 ) -> (u8, [u8; 64], [u8; 64]) {
     let (tu, lu, tlu) = chroma_edges(&pic.u, mb_x, mb_y);
     let (tv, lv, tlv) = chroma_edges(&pic.v, mb_x, mb_y);
@@ -1028,7 +1314,7 @@ fn analyse_chroma_intra(
         let ok = match mode {
             1 => lu.is_some(),
             2 => tu.is_some(),
-            3 => tu.is_some() && lu.is_some(),
+            3 => plane && tu.is_some() && lu.is_some(),
             _ => true,
         };
         if !ok {
@@ -1048,6 +1334,7 @@ fn analyse_chroma_intra(
 }
 
 /// Intra $16\times16$ prediction into a 16-stride block, as [`predict_intra_16x16`].
+#[inline(always)]
 fn pred16(mode: u8, top: Option<&[u8; 16]>, left: Option<&[u8; 16]>, tl: u8, dst: &mut [u8; 256]) {
     if mode != 3 {
         predict_intra_16x16(mode, top, left, tl, dst, 16);
@@ -1072,6 +1359,7 @@ fn pred16(mode: u8, top: Option<&[u8; 16]>, left: Option<&[u8; 16]>, tl: u8, dst
 }
 
 /// Intra $8\times8$ chroma prediction into an 8-stride block, as [`predict_intra_chroma_8x8`].
+#[inline(always)]
 fn pred_chroma(
     mode: u8,
     top: Option<&[u8; 8]>,
@@ -1103,15 +1391,32 @@ fn pred_chroma(
 
 /// Picks the intra $16\times16$ mode with the least SATD; returns that SATD and the mode. The
 /// vertical, horizontal and DC costs come from one transform of the source
-/// ([`intra_satd_x3_16x16`]); ties keep DC, then vertical, then horizontal, then plane.
-fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
-    let (top, left, tl) = i16_edges(&pic.y, mb_x, mb_y);
+/// ([`intra_satd_x3_16x16`]); ties keep DC, then vertical, then horizontal, then plane, which
+/// is only tried when `plane` is set.
+#[inline(always)]
+fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc, plane: bool) -> (u32, u8) {
+    analyse_i16_edges(i16_edges(&pic.y, mb_x, mb_y), src, plane)
+}
+
+/// The intra $16\times16$ DC prediction from the available edges.
+#[inline(always)]
+fn i16_dc(top: Option<&[u8; 16]>, left: Option<&[u8; 16]>) -> u8 {
     let sum = |e: &[u8; 16]| e.iter().map(|&v| v as u32).sum::<u32>();
-    let dc = match (&top, &left) {
+    match (top, left) {
         (Some(t), Some(l)) => ((sum(t) + sum(l) + 16) >> 5) as u8,
         (Some(e), None) | (None, Some(e)) => ((sum(e) + 8) >> 4) as u8,
         (None, None) => 128,
-    };
+    }
+}
+
+/// [`analyse_i16`] from the edges of [`i16_edges`].
+#[inline(always)]
+fn analyse_i16_edges(
+    (top, left, tl): (Option<[u8; 16]>, Option<[u8; 16]>, u8),
+    src: &MbSrc,
+    plane: bool,
+) -> (u32, u8) {
+    let dc = i16_dc(top.as_ref(), left.as_ref());
     let [v, h, d] = intra_satd_x3_16x16(
         &src.y,
         top.as_ref().unwrap_or(&[0; 16]),
@@ -1125,7 +1430,7 @@ fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
     if left.is_some() && h < best.0 {
         best = (h, 1);
     }
-    if top.is_some() && left.is_some() {
+    if plane && top.is_some() && left.is_some() {
         let mut pred = [0u8; 256];
         pred16(3, top.as_ref(), left.as_ref(), tl, &mut pred);
         let cost = pixel_satd_16x16(&src.y, 16, &pred, 16);
@@ -1139,6 +1444,7 @@ fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
 /// SATDs, as [`pixel_satd_4x4`], of a block with Hadamard transform `had` (from
 /// [`hadamard4x4_16x4`]) against its vertical, horizontal and DC intra $4\times4$ predictions;
 /// unavailable edges leave their mode's cost meaningless.
+#[inline(always)]
 fn intra_satd_x3_4x4(had: &[i16; 16], top: Option<&[u8; 8]>, left: Option<&[u8; 4]>) -> [u32; 3] {
     let h1 = |x: [i32; 4]| {
         let (s01, d01, s23, d23) = (x[0] + x[1], x[0] - x[1], x[2] + x[3], x[2] - x[3]);
@@ -1172,7 +1478,7 @@ fn intra_satd_x3_4x4(had: &[i16; 16], top: Option<&[u8; 8]>, left: Option<&[u8; 
 }
 
 /// `quantize_block4x4` with a precomputed quantizer; also reports whether a level is non-zero.
-#[inline]
+#[inline(always)]
 fn quant_one(c: &[i16; 16], q: &Quant4x4) -> ([i16; 16], bool) {
     let mut out = [0i16; 16];
     for i in 0..16 {
@@ -1183,10 +1489,10 @@ fn quant_one(c: &[i16; 16], q: &Quant4x4) -> ([i16; 16], bool) {
 }
 
 /// Residual of an inter-predicted macroblock after quantization and decimation.
-struct InterResidual {
+struct InterResidual<'a> {
     luma_q4: [[i16; 16]; 16],
-    luma_q8: [[i16; 64]; 4],
-    use_8x8: bool,
+    /// The $8\times8$ levels when the macroblock uses the $8\times8$ transform.
+    luma_q8: Option<&'a [[i16; 64]; 4]>,
     cbp_luma: u8,
     chroma: ChromaLevels,
     cbp_chroma: u8,
@@ -1261,13 +1567,12 @@ fn zero_sad_bound(q: &Quant4x4) -> u32 {
 }
 
 /// Forward transforms of the sixteen $4\times4$ residual blocks of a macroblock, decoding order.
+#[inline(always)]
 fn dct_luma(src: &[u8; 256], pred: &[u8; 256], out: &mut [[i16; 16]; 16]) {
-    let mut strip = [[0i16; 16]; 4];
-    for s in 0..4 {
-        sub_dct4x4_16x4(&src[s * 64..], 16, &pred[s * 64..], 16, &mut strip);
-        for (bx, blk) in strip.iter().enumerate() {
-            out[Z_TO_RASTER[s * 4 + bx]] = *blk;
-        }
+    // Each 8x8 quadrant's four blocks come out in raster order, which is decoding order.
+    for (i8x8, group) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
+        sub_dct4x4_8x8(&src[o..], 16, &pred[o..], 16, group);
     }
 }
 
@@ -1278,21 +1583,30 @@ fn group4(blocks: &mut [[i16; 16]; 16], i8x8: usize) -> &mut [[i16; 16]; 4] {
 
 /// Quantizes the luma residual with $4\times4$ transforms and decimates nearly empty $8\times8$
 /// blocks; returns the levels and the coded block pattern.
-fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16]; 16], u8) {
-    let mut q4 = [[0i16; 16]; 16];
-    dct_luma(src, pred, &mut q4);
+#[inline(always)]
+fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8, q4: &mut [[i16; 16]; 16]) -> u8 {
+    dct_luma(src, pred, q4);
     let q = quant4(qp, false);
     let mut cbp = 0u8;
     let mut total = 0u32;
     for i8x8 in 0..4 {
-        let group = group4(&mut q4, i8x8);
+        let group = group4(q4, i8x8);
         let nz = quant_4x4_x4(group, q);
         if nz == 0 {
             continue;
         }
+        // A level above 1 scores 9 for its block, which keeps the quadrant and the macroblock.
+        if nz >> 4 != 0 {
+            cbp |= 1 << i8x8;
+            total += 9;
+            continue;
+        }
         let zz = zigzag_4x4_x4(group);
         let masks = nonzero_mask_4x4_x4(&zz);
-        let score: u32 = (0..4).map(|b| decimate_masked(&zz[b], masks[b])).sum();
+        let mut score = 0;
+        for (z, &m) in zz.iter().zip(&masks) {
+            score += decimate_masked(z, m);
+        }
         if score < 4 {
             *group = [[0; 16]; 4];
         } else {
@@ -1301,10 +1615,10 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16
         total += score;
     }
     if total < 6 && cbp != 0 {
-        q4 = [[0; 16]; 16];
+        *q4 = [[0; 16]; 16];
         cbp = 0;
     }
-    (q4, cbp)
+    cbp
 }
 
 /// Transformed and quantized chroma residual of a macroblock.
@@ -1328,10 +1642,12 @@ impl ChromaLevels {
     };
 
     /// `coded_block_pattern` chroma: 2 with AC levels, 1 with DC levels only, else 0.
+    #[inline(always)]
     fn cbp(&self) -> u8 {
-        if self.ac_masks.iter().flatten().any(|&m| m != 0) {
+        // Folds rather than any(), so the tests vectorize.
+        if self.ac_masks.iter().flatten().fold(0, |a, &m| a | m) != 0 {
             2
-        } else if self.dc.iter().flatten().any(|&c| c != 0) {
+        } else if self.dc.iter().flatten().fold(0, |a, &c| a | c) != 0 {
             1
         } else {
             0
@@ -1339,17 +1655,27 @@ impl ChromaLevels {
     }
 
     /// The decimation score of plane `p`'s AC levels.
+    #[inline(always)]
     fn ac_score(&self, p: usize) -> u32 {
-        (0..4)
-            .map(|b| decimate_masked(&self.ac[p][b], self.ac_masks[p][b]))
-            .sum()
+        let mut score = 0;
+        for (ac, &m) in self.ac[p].iter().zip(&self.ac_masks[p]) {
+            score += decimate_masked(ac, m);
+        }
+        score
     }
 }
 
 /// Transforms and quantizes the chroma residual of both planes.
-fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool) -> ChromaLevels {
+#[inline(always)]
+fn quant_chroma(
+    src: &MbSrc,
+    pu: &[u8; 64],
+    pv: &[u8; 64],
+    qpc: u8,
+    intra: bool,
+    out: &mut ChromaLevels,
+) {
     let q = quant4(qpc, intra);
-    let mut out = ChromaLevels::ZERO;
     for (p, (s, pred)) in [(&src.u, pu), (&src.v, pv)].into_iter().enumerate() {
         let mut c = [[0i16; 16]; 4];
         sub_dct4x4_8x8(s, 8, pred, 8, &mut c);
@@ -1362,10 +1688,48 @@ fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool)
                 a.copy_from_slice(&z[1..]);
             }
             out.raster[p] = c;
+        } else {
+            out.ac_masks[p] = [0; 4];
+            out.ac[p] = [[0; 15]; 4];
+            out.raster[p] = [[0; 16]; 4];
         }
-        out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
+        out.dc[p] = quant_chroma_dc(&dc_raw, qpc);
     }
-    out
+}
+
+/// [`quantize_chroma_dc2x2`] in 32-bit arithmetic: each DC is at most `16 * 255` in magnitude.
+#[inline(always)]
+fn quant_chroma_dc(dc: &[i16; 4], qpc: u8) -> [i16; 4] {
+    let d = dc.map(i32::from);
+    let had = [
+        d[0] + d[1] + d[2] + d[3],
+        d[0] - d[1] + d[2] - d[3],
+        d[0] + d[1] - d[2] - d[3],
+        d[0] - d[1] - d[2] + d[3],
+    ];
+    let qpc = qpc.min(51) as usize;
+    let qbits = 16 + (qpc / 6) as u32;
+    let mf = QUANT4_MF[qpc % 6][0];
+    let f = (1i32 << qbits) / 3;
+    had.map(|c| {
+        let l = (c.abs() * mf + f) >> qbits;
+        (if c < 0 { -l } else { l }) as i16
+    })
+}
+
+/// [`quantize_luma_dc4x4`] in 32-bit arithmetic: the DC of a residual block is at most
+/// `16 * 255` in magnitude, so its Hadamard transform stays within 16 bits and the products
+/// within 31.
+#[inline(always)]
+fn quant_luma_dc(dc: &[i16; 16], qp: u8) -> [i16; 16] {
+    let qp = qp.min(51) as usize;
+    let qbits = 16 + (qp / 6) as u32;
+    let mf = QUANT4_MF[qp % 6][0];
+    let f = (1i32 << qbits) / 3;
+    hadamard4x4(dc).map(|c| {
+        let l = ((c as i32).abs() * mf + f) >> qbits;
+        (if c < 0 { -l } else { l }) as i16
+    })
 }
 
 #[inline(always)]
@@ -1374,6 +1738,7 @@ fn dequant4(qp: u8) -> &'static [i32; 16] {
 }
 
 /// Adds the dequantized $4\times4$ luma residual of the coded $8\times8$ quadrants to `pred`.
+#[inline(always)]
 fn recon_luma_4x4(pred: &mut [u8; 256], q4: &[[i16; 16]; 16], cbp: u8, qp: u8) {
     let scale = dequant4(qp);
     for i8x8 in 0..4 {
@@ -1387,6 +1752,7 @@ fn recon_luma_4x4(pred: &mut [u8; 256], q4: &[[i16; 16]; 16], cbp: u8, qp: u8) {
 }
 
 /// Adds the dequantized chroma residual (DC and, for `cbp_chroma == 2`, AC) to the predictions.
+#[inline(always)]
 fn recon_chroma(
     pu: &mut [u8; 64],
     pv: &mut [u8; 64],
@@ -1439,8 +1805,9 @@ fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64
 
 /// Quantizes the chroma residual of an inter macroblock, dropping a plane's AC levels when they
 /// are nearly empty.
-fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> ChromaLevels {
-    let mut c = quant_chroma(src, pu, pv, qpc, false);
+#[inline(always)]
+fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, c: &mut ChromaLevels) {
+    quant_chroma(src, pu, pv, qpc, false, c);
     for p in 0..2 {
         if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
             c.ac[p] = [[0; 15]; 4];
@@ -1448,7 +1815,6 @@ fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> Chr
             c.raster[p] = [[0; 16]; 4];
         }
     }
-    c
 }
 
 /// SAD thresholds of the skip decision at one QP.
@@ -1510,6 +1876,7 @@ impl SkipBounds {
 
 /// `x264_macroblock_probe_pskip`, luma part: whether the luma residual against the skip
 /// prediction would be decimated to nothing.
+#[inline(always)]
 fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
     let mut c = [[0i16; 16]; 16];
     dct_luma(&src.y, py, &mut c);
@@ -1520,6 +1887,9 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
         let nz = quant_4x4_x4(group, q);
         if nz == 0 {
             continue;
+        }
+        if nz >> 4 != 0 {
+            return false;
         }
         let zz = zigzag_4x4_x4(group);
         for (z, &mask) in zz.iter().zip(&nonzero_mask_4x4_x4(&zz)) {
@@ -1533,8 +1903,10 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
 }
 
 /// `x264_macroblock_probe_pskip`, chroma part: no DC level, and AC levels decimated per plane.
+#[inline(always)]
 fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool {
-    let c = quant_chroma(src, pu, pv, qpc, false);
+    let mut c = ChromaLevels::ZERO;
+    quant_chroma(src, pu, pv, qpc, false, &mut c);
     if c.dc.iter().flatten().any(|&l| l != 0) {
         return false;
     }
@@ -1544,6 +1916,25 @@ fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool
 impl H264Encoder {
     /// Codes one frame; see [`H264Encoder::encode_frame`].
     pub(super) fn encode_frame_impl(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
+        #[cfg(target_arch = "x86_64")]
+        if ragdoll_core::dispatch::avx2() && x86_v3() {
+            // Safety: the CPU supports every feature the copy is compiled for.
+            return unsafe { self.encode_frame_v3(frame) };
+        }
+        self.encode_frame_body(frame)
+    }
+
+    /// [`Self::encode_frame_body`] compiled for x86-64-v3 (`AVX2`, `BMI1/2`, `LZCNT`,
+    /// `POPCNT`): the per-macroblock code is inlined into it, so the scalar parts (bit writer,
+    /// masks, mode decisions) use the newer instructions too. Output is identical.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    unsafe fn encode_frame_v3(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
+        self.encode_frame_body(frame)
+    }
+
+    #[inline(always)]
+    fn encode_frame_body(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
         if frame.format != PixelFormat::Yuv420p {
             return Err(RagdollError::Unsupported(format!(
                 "H264Encoder requires Yuv420p input, got {}",
@@ -1564,6 +1955,7 @@ impl H264Encoder {
             nal_unit_type: nal_type,
         };
         let fps = self.sps.fps.unwrap_or(Rational64::FPS_30).as_f64().max(1.0);
+        let fast = self.speed == H264Speed::Fast;
 
         // Per-MB spatial variance and its geometric mean drive CRF variance-adaptive quantization.
         let mut avg_log_var = 0.0f32;
@@ -1614,7 +2006,7 @@ impl H264Encoder {
             cabac_init_idc: 0,
             slice_qp_delta: slice_qp_delta.clamp(-51, 51) as i8,
             slice_qp,
-            disable_deblocking_filter_idc: if slice_qp == 0 { 1 } else { 0 },
+            disable_deblocking_filter_idc: if slice_qp == 0 || fast { 1 } else { 0 },
             slice_alpha_c0_offset_div2: 0,
             slice_beta_offset_div2: 0,
         };
@@ -1638,6 +2030,7 @@ impl H264Encoder {
         self.state.prepare(mb_w, mb_h, slice_qp, use_cabac);
         let mut sl = SliceState {
             is_idr,
+            fast,
             use_cabac,
             t8x8: self.pps.transform_8x8_mode_flag,
             chroma_qp_offset: self.pps.chroma_qp_index_offset as i32,
@@ -1743,6 +2136,15 @@ impl H264Encoder {
         self.finish_frame_rate_control(&mut out, fps);
         Ok(out)
     }
+}
+
+/// Whether the CPU has the scalar extensions of x86-64-v3 beside `AVX2`.
+#[cfg(target_arch = "x86_64")]
+fn x86_v3() -> bool {
+    std::is_x86_feature_detected!("bmi1")
+        && std::is_x86_feature_detected!("bmi2")
+        && std::is_x86_feature_detected!("lzcnt")
+        && std::is_x86_feature_detected!("popcnt")
 }
 
 /// Appends the Annex-B NAL unit of `rbsp` to `out`, inserting emulation prevention bytes exactly
@@ -1883,6 +2285,7 @@ impl Bits {
 
 impl EncState {
     /// Writes `mb_skip_run` / `mb_skip_flag = 0` ahead of a coded macroblock of a P slice.
+    #[inline(always)]
     fn begin_coded_mb(
         &self,
         sl: &mut SliceState,
@@ -1909,6 +2312,7 @@ impl EncState {
     }
 
     /// Lossless `I_PCM` macroblock (QP 0).
+    #[inline(always)]
     fn code_pcm(
         &mut self,
         sl: &mut SliceState,
@@ -1969,6 +2373,7 @@ impl EncState {
     }
 
     /// Signals a `P_Skip` macroblock and records its state; the caller stores its prediction.
+    #[inline(always)]
     fn code_skip(
         &mut self,
         sl: &mut SliceState,
@@ -1997,6 +2402,7 @@ impl EncState {
 
     /// Analyses and codes one macroblock of a P slice.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn code_p_mb(
         &mut self,
         sl: &mut SliceState,
@@ -2015,17 +2421,42 @@ impl EncState {
         let bounds = MvBounds::new(x0, y0, self.refp.y.w, self.refp.y.h);
         let lambda = LAMBDA[qp as usize] as u32;
 
-        let pskip_mv = pred_pskip_motion_grid(&self.ref_grid, &self.mv_grid, g_stride, gx0, gy0);
         let mvp = pred_motion_partition(&self.ref_grid, &self.mv_grid, g_stride, gx0, gy0, 4, 0);
+        // The P_Skip predictor (8.4.1.1): zero at the picture edge or next to a still neighbour,
+        // else the median predictor.
+        let pskip_mv = {
+            let (r, m) = (&self.ref_grid, &self.mv_grid);
+            let zero = |i: usize| r[i] == 0 && m[i] == [0, 0];
+            if gx0 == 0
+                || gy0 == 0
+                || zero(gy0 * g_stride + gx0 - 1)
+                || zero((gy0 - 1) * g_stride + gx0)
+            {
+                [0, 0]
+            } else {
+                mvp
+            }
+        };
         let mut py = [0u8; 256];
         let mut pu = [0u8; 64];
         let mut pv = [0u8; 64];
 
-        // 1. Skip probe: the skip prediction's residual must decimate to nothing.
+        // 1. Skip probe: the skip prediction's residual must decimate to nothing. The Fast preset
+        // probes only next to a skipped macroblock (`x264` fast P_Skip detection without
+        // sub-pel refinement); elsewhere a vanishing residual at the skip vector is still caught
+        // after the motion search.
         if sl.skip_bounds.qp != qp {
             sl.skip_bounds = SkipBounds::new(qp, qpc);
         }
-        if bounds.contains(pskip_mv) {
+        let probe = !sl.fast || {
+            let (skip, i) = (&self.mb_is_skip, mb_y * mb_w + mb_x);
+            (mb_x > 0 && skip[i - 1])
+                || (mb_y > 0
+                    && (skip[i - mb_w]
+                        || (mb_x > 0 && skip[i - mb_w - 1])
+                        || (mb_x + 1 < mb_w && skip[i - mb_w + 1])))
+        };
+        if probe && bounds.contains(pskip_mv) {
             // Whole-sample vectors are measured on the reference planes in place, and the
             // prediction is copied only when a probe or the reconstruction needs it.
             let int_y = (pskip_mv[0] | pskip_mv[1]) & 3 == 0;
@@ -2109,10 +2540,11 @@ impl EncState {
             }
         }
 
-        // 2. Motion search from the median, skip, zero, neighbouring and co-located vectors.
+        // 2. Motion search from the median, zero, neighbouring and co-located vectors.
         let mb_idx = mb_y * mb_w + mb_x;
-        let mut cands = [mvp, pskip_mv, [0, 0], [0, 0], [0, 0], [0, 0]];
-        let mut n = 3;
+        // The skip vector is the median predictor or zero, both already candidates.
+        let mut cands = [mvp, [0, 0], [0, 0], [0, 0], [0, 0]];
+        let mut n = 2;
         if mb_x > 0 {
             cands[n] = self.mv_grid[gy0 * g_stride + gx0 - 1];
             n += 1;
@@ -2123,6 +2555,7 @@ impl EncState {
         }
         cands[n] = self.prev_mb_mv[mb_idx];
         n += 1;
+        self.mv_costs(qp);
         let ms = MotionSearch {
             r: &self.refp.y,
             src: &src.y,
@@ -2130,26 +2563,54 @@ impl EncState {
             y0,
             mvp,
             lambda,
+            mv_costs: &self.mv_cost_tabs[qp as usize],
             bounds,
+            qpel_iters: if sl.fast { 0 } else { 2 },
         };
-        let (full, full_cost) = ms.full_pel(&cands[..n]);
+        let (full, full_cost, nb) = ms.full_pel(&cands[..n]);
         // A full-pel match whose luma residual already quantizes to nothing needs no refinement.
         let full_mv = [full[0] * 4, full[1] * 4];
-        let mv = if full_cost - ms.mv_cost(full_mv) <= sl.skip_bounds.luma {
+        let (mv, me_cost) = if full_cost - ms.mv_cost(full_mv) <= sl.skip_bounds.luma {
             let r = &self.refp.y;
             r.load::<16>(ms.full_off(full[0], full[1]), &mut py);
-            [full_mv[0] as i16, full_mv[1] as i16]
+            ([full_mv[0] as i16, full_mv[1] as i16], full_cost)
         } else {
-            ms.sub_pel(full, full_cost, &mut self.win, &mut py).0
+            ms.sub_pel(full, full_cost, nb, &mut self.win, &mut py)
         };
-        let inter_satd = pixel_satd_16x16(&src.y, 16, &py, 16);
+
+        // 3. Intra 16x16 when inter prediction is poor. The Fast preset first compares SADs and
+        // analyses intra only when its best SAD is within 1.75 times the inter one.
+        let edges = i16_edges(&self.cur.y, mb_x, mb_y);
+        let try_intra = !sl.fast || {
+            let inter_sad = me_cost - ms.mv_cost([mv[0] as i32, mv[1] as i32]);
+            let (top, left) = (edges.0.as_ref(), edges.1.as_ref());
+            let [v, h, d] = intra_sad_x3_16x16(
+                &src.y,
+                top.unwrap_or(&[0; 16]),
+                left.unwrap_or(&[0; 16]),
+                i16_dc(top, left),
+            );
+            let mut best = d;
+            if top.is_some() {
+                best = best.min(v);
+            }
+            if left.is_some() {
+                best = best.min(h);
+            }
+            4 * best < 7 * inter_sad
+        };
+        let inter_satd = if try_intra {
+            pixel_satd_16x16(&src.y, 16, &py, 16)
+        } else {
+            0
+        };
         let inter_cost = inter_satd
             + lambda * (se_bits((mv[0] - mvp[0]) as i32) + se_bits((mv[1] - mvp[1]) as i32) + 1);
-
-        // 3. Intra 16x16 when inter prediction is poor.
         if inter_satd > 24 * lambda {
-            let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
-            if i16_satd + lambda * 8 < inter_cost {
+            let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, !sl.fast);
+            // The Fast preset asks intra to win by twice the margin.
+            let bias = if sl.fast { 16 } else { 8 };
+            if i16_satd + lambda * bias < inter_cost {
                 self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
                 self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
                 return;
@@ -2158,26 +2619,27 @@ impl EncState {
 
         // 4. P_L0_16x16 (or P_Skip when its residual vanishes at the skip vector).
         mc_chroma(&self.refp, mb_x * 8, mb_y * 8, mv, &mut pu, &mut pv);
-        let (luma_q4, cbp4) = quant_luma_4x4_inter(&src.y, &py, qp);
         let mut res = InterResidual {
-            luma_q4,
-            luma_q8: [[0; 64]; 4],
-            use_8x8: false,
-            cbp_luma: cbp4,
+            luma_q4: [[0; 16]; 16],
+            luma_q8: None,
+            cbp_luma: 0,
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        res.cbp_luma = cbp4;
+        let q8_store;
         if sl.t8x8 && sl.use_cabac && cbp4 != 0 {
             let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
             let nnz4: usize = res.luma_q4.iter().flatten().filter(|&&c| c != 0).count();
             let nnz8: usize = q8.iter().flatten().filter(|&&c| c != 0).count();
             if nnz8 <= nnz4 {
-                res.luma_q8 = q8;
-                res.use_8x8 = true;
+                q8_store = q8;
+                res.luma_q8 = Some(&q8_store);
                 res.cbp_luma = cbp8;
             }
         }
-        res.chroma = quant_chroma_inter(src, &pu, &pv, qpc);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);
@@ -2192,6 +2654,7 @@ impl EncState {
 
     /// Writes and reconstructs a `P_L0_16x16` macroblock.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn code_inter(
         &mut self,
         sl: &mut SliceState,
@@ -2218,7 +2681,7 @@ impl EncState {
         let qp_delta = if cbp != 0 { qp as i32 - sl.cur_qp } else { 0 };
         let eff_qp = (sl.cur_qp + qp_delta).clamp(0, 51) as u8;
         let eff_qpc = chroma_qp(eff_qp as i32, sl.chroma_qp_offset);
-        if res.use_8x8 && cbp_luma != 0 {
+        if res.luma_q8.is_some() && cbp_luma != 0 {
             self.mb_8x8_flag[mb_idx] = true;
         }
         match cabac {
@@ -2242,11 +2705,7 @@ impl EncState {
                     qp_delta,
                     &mut sl.prev_qp_delta_nz,
                     &res.luma_q4,
-                    if res.use_8x8 {
-                        Some(&res.luma_q8)
-                    } else {
-                        None
-                    },
+                    res.luma_q8,
                     &res.chroma.dc,
                     &res.chroma.ac,
                     &mut self.luma_nnz,
@@ -2289,8 +2748,8 @@ impl EncState {
         }
         sl.cur_qp = eff_qp as i32;
         self.mb_qps[mb_idx] = eff_qp;
-        if res.use_8x8 {
-            for (i8x8, q8) in res.luma_q8.iter().enumerate() {
+        if let Some(luma_q8) = res.luma_q8 {
+            for (i8x8, q8) in luma_q8.iter().enumerate() {
                 if cbp_luma & (1 << i8x8) != 0 {
                     let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
                     add8x8_idct_u8(&mut py[o..], 16, &dequantize_block8x8(q8, eff_qp));
@@ -2310,6 +2769,7 @@ impl EncState {
 
     /// Analyses and codes an intra macroblock of an I slice (`I_4x4` or `I_16x16`).
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn code_intra(
         &mut self,
         sl: &mut SliceState,
@@ -2321,8 +2781,9 @@ impl EncState {
         src: &MbSrc,
     ) {
         let lambda = LAMBDA[qp as usize] as u32;
-        let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
-        if i16_satd > 40 * lambda
+        let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src, !sl.fast);
+        if !sl.fast
+            && i16_satd > 40 * lambda
             && let Some(i4) = self.analyse_i4(mb_x, mb_y, qp, src, i16_satd + lambda * 4)
         {
             self.code_i4(sl, w, cabac, mb_x, mb_y, qp, src, i4);
@@ -2333,6 +2794,7 @@ impl EncState {
 
     /// Chooses, codes and reconstructs the sixteen $4\times4$ blocks of an `I_4x4` candidate in
     /// place; returns `None` (restoring the mode grid) when its cost does not beat `budget`.
+    #[inline(always)]
     fn analyse_i4(
         &mut self,
         mb_x: usize,
@@ -2383,18 +2845,29 @@ impl EncState {
                     best = (satd + mode_bits(m), m);
                 }
             }
-            let mut pred = [0u8; 16];
+            // The six directional modes at once; unavailable edges only feed modes skipped here.
+            let dirs = intra4x4_pred_dir(
+                top.as_ref().unwrap_or(&[128; 8]),
+                left.as_ref().unwrap_or(&[128; 4]),
+                tl,
+            );
             for m in 3..=8u8 {
                 if !intra4x4_mode_available(m, top.is_some(), left.is_some()) {
                     continue;
                 }
-                predict_intra_4x4_u8(m, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
-                let cost = pixel_satd_4x4(&src.y[so..], 16, &pred, 4) + mode_bits(m);
+                let cost =
+                    pixel_satd_4x4(&src.y[so..], 16, &dirs[m as usize - 3], 4) + mode_bits(m);
                 if cost < best.0 {
                     best = (cost, m);
                 }
             }
-            predict_intra_4x4_u8(best.1, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
+            let pred = if best.1 >= 3 {
+                dirs[best.1 as usize - 3]
+            } else {
+                let mut pred = [0u8; 16];
+                predict_intra_4x4_u8(best.1, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
+                pred
+            };
             total += best.0;
             if total >= budget {
                 for (b, &m) in saved.iter().enumerate() {
@@ -2427,6 +2900,7 @@ impl EncState {
 
     /// Writes and reconstructs an `I_4x4` macroblock chosen by [`Self::analyse_i4`].
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn code_i4(
         &mut self,
         sl: &mut SliceState,
@@ -2441,9 +2915,11 @@ impl EncState {
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
-        let (chroma_mode, mut pu, mut pv) = analyse_chroma_intra(&self.cur, mb_x, mb_y, src);
+        let (chroma_mode, mut pu, mut pv) =
+            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
-        let c = quant_chroma(src, &pu, &pv, qpc, true);
+        let mut c = ChromaLevels::ZERO;
+        quant_chroma(src, &pu, &pv, qpc, true, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
@@ -2566,6 +3042,7 @@ impl EncState {
 
     /// Writes and reconstructs an `I_16x16` macroblock predicted with `mode`.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn code_i16(
         &mut self,
         sl: &mut SliceState,
@@ -2583,7 +3060,18 @@ impl EncState {
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
-        let (chroma_mode, mut pu, mut pv) = analyse_chroma_intra(&self.cur, mb_x, mb_y, src);
+        // In a P slice the Fast preset predicts chroma in the direction of the luma mode.
+        let (chroma_mode, mut pu, mut pv) = if sl.fast && !sl.is_idr {
+            let cm = [2u8, 1, 0, 3][mode as usize & 3];
+            let (tu, lu, tlu) = chroma_edges(&self.cur.u, mb_x, mb_y);
+            let (tv, lv, tlv) = chroma_edges(&self.cur.v, mb_x, mb_y);
+            let (mut pu, mut pv) = ([0u8; 64], [0u8; 64]);
+            pred_chroma(cm, tu.as_ref(), lu.as_ref(), tlu, &mut pu);
+            pred_chroma(cm, tv.as_ref(), lv.as_ref(), tlv, &mut pv);
+            (cm, pu, pv)
+        } else {
+            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast)
+        };
         self.mb_is_intra[mb_idx] = true;
         self.mb_is_i16x16[mb_idx] = true;
         self.mb_chroma_mode[mb_idx] = chroma_mode;
@@ -2616,11 +3104,12 @@ impl EncState {
                 }
             }
         }
-        let any_ac = ac_masks.iter().any(|&m| m != 0);
-        let dc_q = quantize_luma_dc4x4(&dc_raw, eff_qp);
+        let any_ac = ac_masks.iter().fold(0, |a, &m| a | m) != 0;
+        let dc_q = quant_luma_dc(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
-        let c = quant_chroma(src, &pu, &pv, eff_qpc, true);
+        let mut c = ChromaLevels::ZERO;
+        quant_chroma(src, &pu, &pv, eff_qpc, true, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let mb_type = 1 + mode as u32 + 4 * cbp_chroma as u32 + if cbp_luma != 0 { 12 } else { 0 };
@@ -2679,7 +3168,7 @@ impl EncState {
                         };
                         let inc = cabac_cbf_ctx_inc(nb(true), nb(false), true);
                         ce.encode_residual_block_cat(ctxs, 1, inc, scanned);
-                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
+                        self.luma_nnz[gy * g_stride + gx] = pop16(ac_masks[b]);
                     }
                 }
                 encode_cabac_chroma_residuals(
@@ -2704,16 +3193,14 @@ impl EncState {
                 w.write_ue((if sl.is_idr { 0 } else { 5 }) + mb_type as u64);
                 w.write_ue(chroma_mode as u64);
                 w.write_se(qp_delta as i64);
-                let nc_dc = predict_luma_nc(&self.luma_nnz, g_stride, mb_x * 4, mb_y * 4);
-                write_cavlc_block(w, &dc_scanned, nc_dc);
+                let mut cache = NnzCache::load(&self.luma_nnz, g_stride, mb_x, mb_y);
+                write_cavlc_block(w, &dc_scanned, cache.nc(0));
                 if cbp_luma != 0 {
                     for (b, zz) in ac_zz.iter().enumerate() {
-                        let (bx, by) = blk_xy(b);
-                        let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
-                        let nc = predict_luma_nc(&self.luma_nnz, g_stride, gx, gy);
-                        write_cavlc_masked::<15>(w, &zz[1..], nc, ac_masks[b]);
-                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
+                        write_cavlc_masked::<15>(w, &zz[1..], cache.nc(b), ac_masks[b]);
+                        cache.set(b, pop16(ac_masks[b]));
                     }
+                    cache.store(&mut self.luma_nnz, g_stride, mb_x, mb_y);
                 }
                 write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, &c, &mut self.chroma_nnz);
             }
@@ -2731,7 +3218,7 @@ impl EncState {
             for (k, blk) in group.iter_mut().enumerate() {
                 blk[0] = dc_recon[Z_TO_RASTER[i8x8 * 4 + k]];
             }
-            if group.iter().flatten().any(|&c| c != 0) {
+            if group.iter().flatten().fold(0, |a, &c| a | c) != 0 {
                 let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
                 add_idct4x4_8x8(&mut pred[o..], 16, group);
             }
@@ -3023,7 +3510,9 @@ mod tests {
                 y0,
                 mvp: [0, 0],
                 lambda: 1,
+                mv_costs: &[],
                 bounds,
+                qpel_iters: 2,
             };
             let lo = [(bounds.min[0] + 3) >> 2, (bounds.min[1] + 3) >> 2];
             let hi = [bounds.max[0] >> 2, bounds.max[1] >> 2];

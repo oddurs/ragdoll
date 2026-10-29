@@ -381,14 +381,15 @@ pub struct Quant4x4 {
 }
 
 /// Quantizes the four $4\times4$ blocks of `blocks` in place; bit `b` of the result is set when
-/// block `b` has a non-zero level.
+/// block `b` has a non-zero level, and bit `4 + b` when it has a level of magnitude above 1.
 ///
 /// # Panics
 /// If `q.shift` is not in `1..=31` or `q.bias` is not below `1 << q.shift`.
-#[inline]
+#[inline(always)]
 pub fn quant_4x4_x4(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
     assert!((1..32).contains(&q.shift) && q.bias < 1 << q.shift);
-    assert!(q.mf.iter().all(|&m| m <= i16::MAX as u16));
+    // Every multiplier fits in 15 bits.
+    assert!(q.mf.iter().fold(0, |a, &m| a | m) <= i16::MAX as u16);
     #[cfg(target_arch = "aarch64")]
     if ragdoll_core::dispatch::neon() {
         // Safety: NEON is baseline on aarch64.
@@ -403,6 +404,7 @@ pub fn quant_4x4_x4(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
 }
 
 /// Scalar reference for [`quant_4x4_x4`].
+#[inline(never)]
 pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
     let mut nz = 0;
     for (b, blk) in blocks.iter_mut().enumerate() {
@@ -414,6 +416,9 @@ pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         if blk.iter().any(|&c| c != 0) {
             nz |= 1 << b;
         }
+        if blk.iter().any(|&c| c.unsigned_abs() > 1) {
+            nz |= 0x10 << b;
+        }
     }
     nz
 }
@@ -423,7 +428,7 @@ pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
 ///
 /// # Panics
 /// If a scale exceeds 65535 in magnitude.
-#[inline]
+#[inline(always)]
 pub fn dequant_4x4_x4(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
     check_scale(scale);
     #[cfg(target_arch = "aarch64")]
@@ -444,10 +449,15 @@ pub fn dequant_4x4_x4(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
 #[inline(always)]
 fn check_scale(scale: &[i32; 16]) {
     // Keeps |c * scale| below 2^31 for every 16-bit level.
-    assert!(scale.iter().all(|s| s.unsigned_abs() <= u16::MAX as u32));
+    // A fold rather than `all`, so the check vectorizes instead of exiting early.
+    let ok = scale
+        .iter()
+        .fold(true, |ok, s| ok & (s.unsigned_abs() <= u16::MAX as u32));
+    assert!(ok);
 }
 
 /// Scalar reference for [`dequant_4x4_x4`].
+#[inline(never)]
 pub fn dequant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
     check_scale(scale);
     for blk in blocks.iter_mut() {
@@ -511,7 +521,7 @@ fn hadamard_edge(x: &[u8]) -> [i16; 4] {
 /// `dc`, in that order (`x264_intra_satd_x3_16x16`). One Hadamard transform of the source serves
 /// all three: a prediction with equal rows (columns) transforms to a single non-zero row
 /// (column), and the DC prediction to a single coefficient.
-#[inline]
+#[inline(always)]
 pub fn intra_satd_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
     let tv: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&top[b * 4..]));
     let th: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&left[b * 4..]));
@@ -520,11 +530,56 @@ pub fn intra_satd_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc:
         // Safety: avx2() is true only when the CPU supports AVX2.
         return unsafe { intra_satd_x3_avx2(src, &tv, &th, 16 * dc as i16) };
     }
+    intra_satd_x3_strips(src, &tv, &th, 16 * dc as i16)
+}
+
+/// [`intra_satd_x3_16x16`] through the dispatched $4\times4$ Hadamard of each strip.
+#[inline(never)]
+fn intra_satd_x3_strips(
+    src: &[u8; 256],
+    tv: &[[i16; 4]; 4],
+    th: &[[i16; 4]; 4],
+    dc16: i16,
+) -> [u32; 3] {
     let mut out = [[[0i16; 16]; 4]; 4];
     for (strip, o) in out.iter_mut().enumerate() {
         hadamard4x4_16x4(&src[strip * 64..], 16, o);
     }
-    intra_satd_x3_from(&out, &tv, &th, 16 * dc as i16)
+    intra_satd_x3_from(&out, tv, th, dc16)
+}
+
+/// SADs of the contiguous $16\times16$ block `src` against its vertical, horizontal and DC
+/// intra predictions from the `top` and `left` edge samples and the DC value `dc`
+/// (`x264_intra_sad_x3_16x16`).
+#[inline]
+pub fn intra_sad_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { intra_sad_x3_neon(src, top, left, dc) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { intra_sad_x3_avx2(src, top, left, dc) };
+    }
+    intra_sad_x3_16x16_scalar(src, top, left, dc)
+}
+
+/// Scalar reference for [`intra_sad_x3_16x16`].
+pub fn intra_sad_x3_16x16_scalar(
+    src: &[u8; 256],
+    top: &[u8; 16],
+    left: &[u8; 16],
+    dc: u8,
+) -> [u32; 3] {
+    let mut sum = [0u32; 3];
+    for (i, &s) in src.iter().enumerate() {
+        sum[0] += s.abs_diff(top[i % 16]) as u32;
+        sum[1] += s.abs_diff(left[i / 16]) as u32;
+        sum[2] += s.abs_diff(dc) as u32;
+    }
+    sum
 }
 
 /// Scalar reference for [`intra_satd_x3_16x16`].
@@ -767,6 +822,257 @@ pub fn pixel_avg_16x16_scalar(dst: &mut [u8; 256], a: &[u8], sa: usize, b: &[u8]
     for r in 0..16 {
         for c in 0..16 {
             dst[r * 16 + c] = ((a[r * sa + c] as u16 + b[r * sb + c] as u16 + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// Positions in `[avg2 | avg3]` of the edge `[L, L, K, J, I, M, A, B, C, D, E, F, G, H, H, H]`
+/// (`avg2[i]` of samples `i, i + 1`, `avg3[i]` centred on `i + 1`) of every sample of the six
+/// directional intra $4\times4$ predictions, modes 3 to 8, raster order.
+const PRED4_DIR: [[u8; 16]; 6] = [
+    [
+        22, 23, 24, 25, 23, 24, 25, 26, 24, 25, 26, 27, 25, 26, 27, 28,
+    ],
+    [
+        20, 21, 22, 23, 19, 20, 21, 22, 18, 19, 20, 21, 17, 18, 19, 20,
+    ],
+    [5, 6, 7, 8, 20, 21, 22, 23, 19, 5, 6, 7, 18, 20, 21, 22],
+    [4, 20, 21, 22, 3, 19, 4, 20, 2, 18, 3, 19, 1, 17, 2, 18],
+    [6, 7, 8, 9, 22, 23, 24, 25, 7, 8, 9, 10, 23, 24, 25, 26],
+    [3, 18, 2, 17, 2, 17, 1, 16, 1, 16, 0, 0, 0, 0, 0, 0],
+];
+
+/// The six directional intra $4\times4$ predictions (ITU-T H.264 8.3.1.2.4-9, modes 3 to 8,
+/// 16 raster samples each) from the top and top-right samples `top`, the left column `left`
+/// and the corner `tl`: every sample is a 2- or 3-tap average of neighbouring edge samples,
+/// so all six are byte shuffles of the edge's two filtered versions (`x264` `predict_4x4`).
+#[inline]
+pub fn intra4x4_pred_dir(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 16]; 6] {
+    let [a, b, c, d, e, f, g, h] = *top;
+    let [i, j, k, l] = *left;
+    let edge = [l, l, k, j, i, tl, a, b, c, d, e, f, g, h, h, h];
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { pred4_dir_neon(&edge) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2 (and so SSSE3).
+        return unsafe { pred4_dir_avx2(&edge) };
+    }
+    pred4_dir_from_edge(&edge)
+}
+
+/// [`intra4x4_pred_dir`] through the shuffle table, without SIMD.
+fn pred4_dir_from_edge(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    let mut t = [0u8; 32];
+    for n in 0..15 {
+        t[n] = ((edge[n] as u16 + edge[n + 1] as u16 + 1) >> 1) as u8;
+    }
+    for n in 0..14 {
+        t[16 + n] = ((edge[n] as u16 + 2 * edge[n + 1] as u16 + edge[n + 2] as u16 + 2) >> 2) as u8;
+    }
+    PRED4_DIR.map(|idx| idx.map(|x| t[x as usize]))
+}
+
+/// Scalar reference for [`intra4x4_pred_dir`]: the generic 4x4 predictor, mode by mode.
+pub fn intra4x4_pred_dir_scalar(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 16]; 6] {
+    std::array::from_fn(|n| {
+        let mut out = [0u8; 16];
+        crate::predict_intra_4x4_u8_scalar(n as u8 + 3, Some(top), Some(left), tl, &mut out, 4);
+        out
+    })
+}
+
+/// Chroma motion compensation of the $8\times8$ blocks of both planes (ITU-T H.264 8.4.2.2.2):
+/// `out = (wa A + wb B + wc C + wd D + 32) >> 6` with the bilinear weights of the eighth-sample
+/// fractions `fx`, `fy` (`& 7`), where `A` is `u[off]` / `v[off]` (stride `ss`).
+///
+/// # Panics
+/// If a plane is shorter than `off + 8 * ss + 16` (the vector kernels read 16 samples per row).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_8x8_x2(
+    u: &[u8],
+    v: &[u8],
+    off: usize,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    let end = ss.checked_mul(8).and_then(|d| d.checked_add(off + 16));
+    assert!(end.is_some_and(|e| e <= u.len() && e <= v.len()));
+    let (fx, fy) = (fx & 7, fy & 7);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            chroma_mc_neon(u.as_ptr().add(off), ss, fx, fy, out_u);
+            chroma_mc_neon(v.as_ptr().add(off), ss, fx, fy, out_v);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            chroma_mc_avx2(
+                u.as_ptr().add(off),
+                v.as_ptr().add(off),
+                ss,
+                fx,
+                fy,
+                out_u,
+                out_v,
+            )
+        };
+        return;
+    }
+    chroma_mc_8x8_x2_scalar(u, v, off, ss, fx, fy, out_u, out_v);
+}
+
+/// Scalar reference for [`chroma_mc_8x8_x2`].
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_8x8_x2_scalar(
+    u: &[u8],
+    v: &[u8],
+    off: usize,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    let (fx, fy) = ((fx & 7) as u32, (fy & 7) as u32);
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    for (src, out) in [(u, out_u), (v, out_v)] {
+        for r in 0..8 {
+            let (s0, s1) = (&src[off + r * ss..], &src[off + (r + 1) * ss..]);
+            for c in 0..8 {
+                let x = wa * s0[c] as u32
+                    + wb * s0[c + 1] as u32
+                    + wc * s1[c] as u32
+                    + wd * s1[c + 1] as u32;
+                out[r * 8 + c] = ((x + 32) >> 6) as u8;
+            }
+        }
+    }
+}
+
+/// The two half-sample $16\times16$ predictions next to the block whose top-left integer sample
+/// is `src[off]` (stride `ss`): `out_h` the `b` samples half a sample left (`left`) or right of
+/// it, `out_v` the `h` samples half a sample above (`up`) or below it (ITU-T H.264 8.4.2.2.1).
+/// Reads rows and columns `-3..=18` around the block.
+///
+/// # Panics
+/// If `src` lacks those margins.
+#[inline]
+pub fn hpel_hv_16x16(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    left: bool,
+    up: bool,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    assert!(off >= 3 * ss + 3 && off + 18 * ss + 19 <= src.len());
+    let (h0, v0) = (off - usize::from(left), off - usize::from(up) * ss);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe { hv_neon(src.as_ptr(), h0, v0, ss, Some(out_h), Some(out_v)) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe { hv_avx2(src.as_ptr(), h0, v0, ss, Some(out_h), Some(out_v)) };
+        return;
+    }
+    hpel_hv_16x16_scalar(src, off, ss, left, up, out_h, out_v);
+}
+
+/// One of the two predictions of [`hpel_hv_16x16`]: the `h` samples (`vertical`) or the `b`
+/// samples, half a sample before (`back`: up or left) or after the block at `src[off]`.
+///
+/// # Panics
+/// If `src` lacks the margins of [`hpel_hv_16x16`].
+#[inline]
+pub fn hpel_16x16(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    vertical: bool,
+    back: bool,
+    out: &mut [u8; 256],
+) {
+    assert!(off >= 3 * ss + 3 && off + 18 * ss + 19 <= src.len());
+    let o = off - usize::from(back) * if vertical { ss } else { 1 };
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            match vertical {
+                true => hv_neon(src.as_ptr(), o, o, ss, None, Some(out)),
+                false => hv_neon(src.as_ptr(), o, o, ss, Some(out), None),
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            match vertical {
+                true => hv_avx2(src.as_ptr(), o, o, ss, None, Some(out)),
+                false => hv_avx2(src.as_ptr(), o, o, ss, Some(out), None),
+            }
+        }
+        return;
+    }
+    hpel_16x16_scalar(src, off, ss, vertical, back, out);
+}
+
+/// Scalar reference for [`hpel_16x16`].
+pub fn hpel_16x16_scalar(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    vertical: bool,
+    back: bool,
+    out: &mut [u8; 256],
+) {
+    let mut other = [0u8; 256];
+    match vertical {
+        true => hpel_hv_16x16_scalar(src, off, ss, back, back, &mut other, out),
+        false => hpel_hv_16x16_scalar(src, off, ss, back, back, out, &mut other),
+    }
+}
+
+/// Scalar reference for [`hpel_hv_16x16`].
+pub fn hpel_hv_16x16_scalar(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    left: bool,
+    up: bool,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    let (h0, v0) = (off - usize::from(left), off - usize::from(up) * ss);
+    let tap = |o: usize, step: usize| {
+        let p = |k: usize| src[o + k * step - 2 * step] as i32;
+        let v = p(0) - 5 * p(1) + 20 * p(2) + 20 * p(3) - 5 * p(4) + p(5);
+        ((v + 16) >> 5).clamp(0, 255) as u8
+    };
+    for r in 0..16 {
+        for c in 0..16 {
+            out_h[r * 16 + c] = tap(h0 + r * ss + c, 1);
+            out_v[r * 16 + c] = tap(v0 + r * ss + c, ss);
         }
     }
 }
@@ -1128,6 +1434,55 @@ unsafe fn satd16_avx2(a: *const u8, sa: usize, b: *const u8, sb: usize) -> u32 {
     }
 }
 
+/// Saturating packs written as the bare instructions: `vpackssdw` and `vpackuswb` saturate by
+/// themselves, but LLVM lowers the intrinsics to a clamp of both inputs followed by the pack
+/// whenever it cannot bound them, which costs up to four extra instructions per pack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! pack_asm {
+    ($name:ident, $ty:ty, $reg:ident, $insn:literal) => {
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn $name(a: $ty, b: $ty) -> $ty {
+            let r;
+            // Safety: AVX2 is enabled for this function; the instruction only reads and writes
+            // registers.
+            unsafe {
+                std::arch::asm!(
+                    concat!($insn, " {r}, {a}, {b}"),
+                    r = lateout($reg) r,
+                    a = in($reg) a,
+                    b = in($reg) b,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            r
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+pack_asm!(
+    packs_epi32_avx2,
+    std::arch::x86_64::__m256i,
+    ymm_reg,
+    "vpackssdw"
+);
+#[cfg(target_arch = "x86_64")]
+pack_asm!(
+    packus_epi16_avx2,
+    std::arch::x86_64::__m256i,
+    ymm_reg,
+    "vpackuswb"
+);
+#[cfg(target_arch = "x86_64")]
+pack_asm!(
+    packus_epi16_sse,
+    std::arch::x86_64::__m128i,
+    xmm_reg,
+    "vpackuswb"
+);
+
 /// Transposes the $4\times4$ blocks held one row per register (two blocks per 128-bit lane) into
 /// one column per register, so the same element-wise butterflies serve both dimensions.
 #[cfg(target_arch = "x86_64")]
@@ -1168,6 +1523,34 @@ fn dct4_butterfly_avx2(d: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_64
 /// [`intra_satd_x3_16x16`]: the transform of each strip stays in registers holding one column
 /// of coefficients per block (`o[h]` lane `4 b + v`), so each prediction only replaces a few
 /// lanes.
+/// [`intra_sad_x3_16x16`]: two rows per register; the horizontal prediction of each row is its
+/// left sample broadcast by a byte shuffle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn intra_sad_x3_avx2(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let t = _mm256_broadcastsi128_si256(_mm_loadu_si128(top.as_ptr() as *const __m128i));
+        let l = _mm256_broadcastsi128_si256(_mm_loadu_si128(left.as_ptr() as *const __m128i));
+        let d = _mm256_set1_epi8(dc as i8);
+        let two = _mm256_set1_epi8(2);
+        // Row y in the low lane, y + 1 in the high lane.
+        let mut idx = _mm256_set_m128i(_mm_set1_epi8(1), _mm_setzero_si128());
+        let mut acc = [_mm256_setzero_si256(); 3];
+        for y in (0..16).step_by(2) {
+            let s = _mm256_loadu_si256(src.as_ptr().add(y * 16) as *const __m256i);
+            acc[0] = _mm256_add_epi64(acc[0], _mm256_sad_epu8(s, t));
+            acc[1] = _mm256_add_epi64(acc[1], _mm256_sad_epu8(s, _mm256_shuffle_epi8(l, idx)));
+            acc[2] = _mm256_add_epi64(acc[2], _mm256_sad_epu8(s, d));
+            idx = _mm256_add_epi8(idx, two);
+        }
+        acc.map(|a| {
+            let x = _mm_add_epi64(_mm256_castsi256_si128(a), _mm256_extracti128_si256::<1>(a));
+            (_mm_cvtsi128_si64(x) + _mm_extract_epi64::<1>(x)) as u32
+        })
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn intra_satd_x3_avx2(
@@ -1261,16 +1644,17 @@ unsafe fn dct_strip_avx2<const HAD: bool>(
         // Each register holds one row of all four blocks: blocks 0, 1 in the low lane, 2, 3 in the
         // high lane (an 8x8 block's rows k and k + 4 side by side).
         let row = |k: usize| {
+            // Two 8-byte rows in one register: a low load and a high-half load.
+            let pair = |a: *const u8, b: *const u8| {
+                _mm_castpd_si128(_mm_loadh_pd(
+                    _mm_castsi128_pd(_mm_loadl_epi64(a as *const __m128i)),
+                    b as *const f64,
+                ))
+            };
             let (s, p) = if from_8x8 {
                 (
-                    _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(src.add(k * ss) as *const __m128i),
-                        _mm_loadl_epi64(src.add((k + 4) * ss) as *const __m128i),
-                    ),
-                    _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(pred.add(k * ps) as *const __m128i),
-                        _mm_loadl_epi64(pred.add((k + 4) * ps) as *const __m128i),
-                    ),
+                    pair(src.add(k * ss), src.add((k + 4) * ss)),
+                    pair(pred.add(k * ps), pred.add((k + 4) * ps)),
                 )
             } else {
                 (
@@ -1314,6 +1698,7 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         let mf = _mm256_loadu_si256(q.mf.as_ptr() as *const __m256i);
         let bias = _mm256_set1_epi32(q.bias as i32);
         let shift = _mm_cvtsi32_si128(q.shift as i32);
+        let one = _mm256_set1_epi16(1);
         let mut nz = 0;
         for (b, blk) in blocks.iter_mut().enumerate() {
             let p = blk.as_mut_ptr() as *mut __m256i;
@@ -1323,11 +1708,13 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
             let (lo, hi) = (_mm256_mullo_epi16(a, mf), _mm256_mulhi_epu16(a, mf));
             let p0 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_unpacklo_epi16(lo, hi), bias), shift);
             let p1 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_unpackhi_epi16(lo, hi), bias), shift);
-            let level = _mm256_sign_epi16(_mm256_packs_epi32(p0, p1), c);
+            let mag = packs_epi32_avx2(p0, p1);
+            let level = _mm256_sign_epi16(mag, c);
             _mm256_storeu_si256(p, level);
-            if _mm256_testz_si256(level, level) == 0 {
-                nz |= 1 << b;
-            }
+            // Without branches: which blocks are coded depends on the content.
+            let big = _mm256_cmpgt_epi16(mag, one);
+            nz |= ((_mm256_testz_si256(level, level) ^ 1) as u32) << b;
+            nz |= ((_mm256_testz_si256(big, big) ^ 1) as u32) << (4 + b);
         }
         nz
     }
@@ -1344,7 +1731,7 @@ unsafe fn dequant_avx2(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
             let p = blk.as_mut_ptr();
             let c0 = _mm256_cvtepi16_epi32(_mm_loadu_si128(p as *const __m128i));
             let c1 = _mm256_cvtepi16_epi32(_mm_loadu_si128(p.add(8) as *const __m128i));
-            let d = _mm256_packs_epi32(_mm256_mullo_epi32(c0, s0), _mm256_mullo_epi32(c1, s1));
+            let d = packs_epi32_avx2(_mm256_mullo_epi32(c0, s0), _mm256_mullo_epi32(c1, s1));
             // packs works per 128-bit lane: restore coefficient order.
             let d = _mm256_permute4x64_epi64::<0b11_01_10_00>(d);
             _mm256_storeu_si256(p as *mut __m256i, d);
@@ -1386,9 +1773,95 @@ fn idct4_butterfly_avx2(c: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_6
     ]
 }
 
+/// Largest coefficient magnitude for which every intermediate value of the inverse transform,
+/// rounding included, fits in 16 bits: `3.5 * 3.5 * C + 32 <= 32767`.
+#[cfg(target_arch = "x86_64")]
+const IDCT16_MAX: i16 = 2672;
+
+/// The H.264 inverse core transform butterfly applied element-wise across four registers of
+/// 16-bit values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+fn idct4_butterfly_epi16_avx2(
+    c: [std::arch::x86_64::__m256i; 4],
+) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+    let e0 = _mm256_add_epi16(c[0], c[2]);
+    let e1 = _mm256_sub_epi16(c[0], c[2]);
+    let e2 = _mm256_sub_epi16(_mm256_srai_epi16::<1>(c[1]), c[3]);
+    let e3 = _mm256_add_epi16(c[1], _mm256_srai_epi16::<1>(c[3]));
+    [
+        _mm256_add_epi16(e0, e3),
+        _mm256_add_epi16(e1, e2),
+        _mm256_sub_epi16(e1, e2),
+        _mm256_sub_epi16(e0, e3),
+    ]
+}
+
+/// [`add_idct4x4_8x8`] in 16-bit arithmetic, which is exact while no coefficient exceeds
+/// [`IDCT16_MAX`] in magnitude; larger ones take [`idct_add_8x8_wide_avx2`]. Each register holds
+/// one row of all four blocks: blocks 0, 1 in the low lane and 2, 3 in the high lane, so its
+/// result is row `k` of the 8x8 region in the low lane and row `k + 4` in the high lane.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let p = blocks.as_ptr() as *const __m256i;
+        let b: [__m256i; 4] = std::array::from_fn(|j| _mm256_loadu_si256(p.add(j)));
+        // |c| as unsigned 16-bit (|-32768| is 32768) above the limit leaves a non-zero excess.
+        let lim = _mm256_set1_epi16(IDCT16_MAX);
+        let excess = |x: __m256i| _mm256_subs_epu16(_mm256_abs_epi16(x), lim);
+        let over = _mm256_or_si256(
+            _mm256_or_si256(excess(b[0]), excess(b[1])),
+            _mm256_or_si256(excess(b[2]), excess(b[3])),
+        );
+        if _mm256_testz_si256(over, over) == 0 {
+            idct_add_8x8_wide_avx2(dst, ds, blocks);
+            return;
+        }
+        // Block j holds rows 0, 1 in its low lane and 2, 3 in its high lane (64 bits each).
+        let (lo01, hi01) = (
+            _mm256_unpacklo_epi64(b[0], b[1]),
+            _mm256_unpackhi_epi64(b[0], b[1]),
+        );
+        let (lo23, hi23) = (
+            _mm256_unpacklo_epi64(b[2], b[3]),
+            _mm256_unpackhi_epi64(b[2], b[3]),
+        );
+        let rows = [
+            _mm256_permute2x128_si256::<0x20>(lo01, lo23),
+            _mm256_permute2x128_si256::<0x20>(hi01, hi23),
+            _mm256_permute2x128_si256::<0x31>(lo01, lo23),
+            _mm256_permute2x128_si256::<0x31>(hi01, hi23),
+        ];
+        // Rows first (on coefficient columns), then columns, as in ITU-T H.264 8.5.12.2.
+        let h = idct4_butterfly_epi16_avx2(transpose_4x4_epi16_avx2(rows));
+        let v = idct4_butterfly_epi16_avx2(transpose_4x4_epi16_avx2(h));
+        let r32 = _mm256_set1_epi16(32);
+        for (k, o) in v.iter().enumerate() {
+            let res = _mm256_srai_epi16::<6>(_mm256_add_epi16(*o, r32));
+            let (p0, p1) = (dst.add(k * ds), dst.add((k + 4) * ds));
+            let px = _mm256_cvtepu8_epi16(_mm_castpd_si128(_mm_loadh_pd(
+                _mm_castsi128_pd(_mm_loadl_epi64(p0 as *const __m128i)),
+                p1 as *const f64,
+            )));
+            let sum = _mm256_add_epi16(px, res);
+            let packed = packus_epi16_avx2(sum, sum);
+            _mm_storel_epi64(p0 as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm_storel_epi64(p1 as *mut __m128i, _mm256_extracti128_si256::<1>(packed));
+        }
+    }
+}
+
+/// [`add_idct4x4_8x8`] in 32-bit arithmetic, for any coefficients (kept out of line: it is the
+/// rare path, and the 16-bit kernel stays small enough to inline).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cold]
+#[inline(never)]
+unsafe fn idct_add_8x8_wide_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
     use std::arch::x86_64::*;
     unsafe {
         let round = _mm256_set1_epi32(32);
@@ -1407,11 +1880,11 @@ unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
                 let res = _mm256_srai_epi32::<6>(_mm256_add_epi32(*o, round));
                 // [a row k, b row k] as 8 x i16 (packs pairs the lanes, the permute regroups).
                 let r16 = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b00_00_10_00>(
-                    _mm256_packs_epi32(res, res),
+                    packs_epi32_avx2(res, res),
                 ));
                 let p = dst.add((half * 4 + k) * ds);
                 let px = _mm_cvtepu8_epi16(_mm_loadl_epi64(p as *const __m128i));
-                let sum = _mm_packus_epi16(_mm_add_epi16(px, r16), r16);
+                let sum = packus_epi16_sse(_mm_add_epi16(px, r16), r16);
                 _mm_storel_epi64(p as *mut __m128i, sum);
             }
         }
@@ -1549,7 +2022,7 @@ unsafe fn plane_avx2<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
                 let v =
                     _mm256_srai_epi16::<5>(_mm256_add_epi16(bx, _mm256_set1_epi16(row_base(y))));
                 // packus saturates to 0..=255; the permute restores the lane order.
-                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(v, v));
+                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(v, v));
                 _mm_storeu_si128(out.add(y * 16) as *mut __m128i, _mm256_castsi256_si128(p));
             }
         } else {
@@ -1557,7 +2030,7 @@ unsafe fn plane_avx2<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
                 let base =
                     _mm256_setr_m128i(_mm_set1_epi16(row_base(y)), _mm_set1_epi16(row_base(y + 1)));
                 let v = _mm256_srai_epi16::<5>(_mm256_add_epi16(bx, base));
-                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(v, v));
+                let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(v, v));
                 _mm_storeu_si128(out.add(y * 8) as *mut __m128i, _mm256_castsi256_si128(p));
             }
         }
@@ -1578,6 +2051,162 @@ unsafe fn plane_neon<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
             vst1_u8(out, vqshrun_n_s16::<5>(vaddq_s16(lo, base)));
             if N == 16 {
                 vst1_u8(out.add(8), vqshrun_n_s16::<5>(vaddq_s16(hi, base)));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pred4_dir_avx2(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let e = _mm_loadu_si128(edge.as_ptr() as *const __m128i);
+        let (e1, e2) = (_mm_srli_si128::<1>(e), _mm_srli_si128::<2>(e));
+        let avg2 = _mm_avg_epu8(e, e1);
+        // (x + 2 y + z + 2) >> 2 = avg(avg(x, z) - ((x ^ z) & 1), y), exactly.
+        let xz = _mm_sub_epi8(
+            _mm_avg_epu8(e, e2),
+            _mm_and_si128(_mm_xor_si128(e, e2), _mm_set1_epi8(1)),
+        );
+        let avg3 = _mm_avg_epu8(xz, e1);
+        let mut out = [[0u8; 16]; 6];
+        for (o, idx) in out.iter_mut().zip(&PRED4_DIR) {
+            let idx = _mm_loadu_si128(idx.as_ptr() as *const __m128i);
+            // Indices 16.. select avg3: pshufb zeroes a lane whose index has the top bit set.
+            let lo = _mm_shuffle_epi8(
+                avg2,
+                _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15))),
+            );
+            let hi = _mm_shuffle_epi8(
+                avg3,
+                _mm_or_si128(
+                    _mm_sub_epi8(idx, _mm_set1_epi8(16)),
+                    _mm_cmplt_epi8(idx, _mm_set1_epi8(16)),
+                ),
+            );
+            _mm_storeu_si128(o.as_mut_ptr() as *mut __m128i, _mm_or_si128(lo, hi));
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pred4_dir_neon(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let e = vld1q_u8(edge.as_ptr());
+        let z = vdupq_n_u8(0);
+        let (e1, e2) = (vextq_u8::<1>(e, z), vextq_u8::<2>(e, z));
+        let avg2 = vrhaddq_u8(e, e1);
+        let xz = vsubq_u8(vrhaddq_u8(e, e2), vandq_u8(veorq_u8(e, e2), vdupq_n_u8(1)));
+        let avg3 = vrhaddq_u8(xz, e1);
+        let t = uint8x16x2_t(avg2, avg3);
+        let mut out = [[0u8; 16]; 6];
+        for (o, idx) in out.iter_mut().zip(&PRED4_DIR) {
+            vst1q_u8(o.as_mut_ptr(), vqtbl2q_u8(t, vld1q_u8(idx.as_ptr())));
+        }
+        out
+    }
+}
+
+/// [`chroma_mc_8x8_x2`]: `u` rows in the low lane, `v` rows in the high lane; each row's
+/// sample pairs `(A, B)` meet their weights in one `pmaddubsw`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn chroma_mc_avx2(
+    u: *const u8,
+    v: *const u8,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let (fx, fy) = (fx as i16, fy as i16);
+        let pair = |a: i16, b: i16| _mm256_set1_epi16((b << 8) | a);
+        let top = pair((8 - fx) * (8 - fy), fx * (8 - fy));
+        let bottom = pair((8 - fx) * fy, fx * fy);
+        let r32 = _mm256_set1_epi16(32);
+        // The (A, B) byte pairs of row r of both planes.
+        let pairs = |r: usize| {
+            let x = _mm256_inserti128_si256::<1>(
+                _mm256_castsi128_si256(_mm_loadu_si128(u.add(r * ss) as *const __m128i)),
+                _mm_loadu_si128(v.add(r * ss) as *const __m128i),
+            );
+            _mm256_unpacklo_epi8(x, _mm256_srli_si256::<1>(x))
+        };
+        let mut cur = pairs(0);
+        for r in 0..8 {
+            let next = pairs(r + 1);
+            let sum = _mm256_add_epi16(
+                _mm256_maddubs_epi16(cur, top),
+                _mm256_maddubs_epi16(next, bottom),
+            );
+            let x = _mm256_srli_epi16::<6>(_mm256_add_epi16(sum, r32));
+            let packed = packus_epi16_avx2(x, x);
+            _mm_storel_epi64(
+                out_u.as_mut_ptr().add(r * 8) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
+            _mm_storel_epi64(
+                out_v.as_mut_ptr().add(r * 8) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(packed),
+            );
+            cur = next;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hv_avx2(
+    p: *const u8,
+    h0: usize,
+    v0: usize,
+    ss: usize,
+    out_h: Option<&mut [u8; 256]>,
+    out_v: Option<&mut [u8; 256]>,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let r16 = _mm256_set1_epi16(16);
+        let at = |q: *const u8| _mm256_cvtepu8_epi16(_mm_loadu_si128(q as *const __m128i));
+        let store = |dst: *mut u8, x: __m256i| {
+            let x = _mm256_srai_epi16::<5>(_mm256_add_epi16(x, r16));
+            let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(x, x));
+            _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(packed));
+        };
+        if let Some(out_h) = out_h {
+            for r in 0..16 {
+                let q = p.add(h0 + r * ss);
+                let h = tap6_epi16([
+                    at(q.sub(2)),
+                    at(q.sub(1)),
+                    at(q),
+                    at(q.add(1)),
+                    at(q.add(2)),
+                    at(q.add(3)),
+                ]);
+                store(out_h.as_mut_ptr().add(r * 16), h);
+            }
+        }
+        if let Some(out_v) = out_v {
+            // The vertical taps slide down six rows held in registers.
+            let mut rows: [__m256i; 6] = std::array::from_fn(|k| {
+                if k < 5 {
+                    at(p.add(v0 + k * ss - 2 * ss))
+                } else {
+                    _mm256_setzero_si256()
+                }
+            });
+            for r in 0..16 {
+                rows[5] = at(p.add(v0 + (r + 3) * ss));
+                store(out_v.as_mut_ptr().add(r * 16), tap6_epi16(rows));
+                rows = [rows[1], rows[2], rows[3], rows[4], rows[5], rows[5]];
             }
         }
     }
@@ -1626,7 +2255,7 @@ unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
             0,
             |r: isize, c: isize| _mm256_cvtepu8_epi16(_mm_loadu_si128(row(r, c) as *const __m128i)),
             |plane: usize, r: usize, x: __m256i| {
-                let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
+                let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(x, x));
                 let dst = planes[plane].add(r * HPEL_WIN_W) as *mut __m128i;
                 _mm_storeu_si128(dst, _mm256_castsi256_si128(packed));
             },
@@ -1644,7 +2273,7 @@ unsafe fn hpel_avx2(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(lo, hi))
             },
             |plane: usize, r: usize, x: __m256i| {
-                let packed = _mm256_packus_epi16(x, x);
+                let packed = packus_epi16_avx2(x, x);
                 let dst = planes[plane].add(r * HPEL_WIN_W + 16);
                 _mm_storel_epi64(dst as *mut __m128i, _mm256_castsi256_si128(packed));
                 _mm_storel_epi64(
@@ -1685,8 +2314,8 @@ unsafe fn hpel_centre_avx2(out: &mut HpelWindow) {
                 hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
             }
             let (lo, hi) = (_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
-            let j = _mm256_packs_epi32(lo, hi);
-            _mm256_packus_epi16(j, j)
+            let j = packs_epi32_avx2(lo, hi);
+            packus_epi16_avx2(j, j)
         };
         let hr = out.hr.as_ptr();
         let c = out.c.as_mut_ptr();
@@ -1754,6 +2383,97 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 let o = r * HPEL_WIN_W + chunk * 8;
                 let v = tap6([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
                 vst1_u8(out.v.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(v));
+            }
+        }
+    }
+}
+
+/// One plane of [`chroma_mc_8x8_x2`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn chroma_mc_neon(src: *const u8, ss: usize, fx: u8, fy: u8, out: &mut [u8; 64]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let w = |x: u8| vdup_n_u8(x);
+        let (wa, wb) = (w((8 - fx) * (8 - fy)), w(fx * (8 - fy)));
+        let (wc, wd) = (w((8 - fx) * fy), w(fx * fy));
+        let row = |r: usize| {
+            let x = vld1q_u8(src.add(r * ss));
+            (vget_low_u8(x), vget_low_u8(vextq_u8::<1>(x, x)))
+        };
+        let mut cur = row(0);
+        for r in 0..8 {
+            let next = row(r + 1);
+            let mut acc = vmull_u8(cur.0, wa);
+            acc = vmlal_u8(acc, cur.1, wb);
+            acc = vmlal_u8(acc, next.0, wc);
+            acc = vmlal_u8(acc, next.1, wd);
+            vst1_u8(out.as_mut_ptr().add(r * 8), vrshrn_n_u16::<6>(acc));
+            cur = next;
+        }
+    }
+}
+
+/// [`intra_sad_x3_16x16`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn intra_sad_x3_neon(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let t = vld1q_u8(top.as_ptr());
+        let d = vdupq_n_u8(dc);
+        let mut acc = [vdupq_n_u16(0); 3];
+        for (y, &l) in left.iter().enumerate() {
+            let s = vld1q_u8(src.as_ptr().add(y * 16));
+            acc[0] = vpadalq_u8(acc[0], vabdq_u8(s, t));
+            acc[1] = vpadalq_u8(acc[1], vabdq_u8(s, vdupq_n_u8(l)));
+            acc[2] = vpadalq_u8(acc[2], vabdq_u8(s, d));
+        }
+        acc.map(|a| vaddlvq_u16(a))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hv_neon(
+    p: *const u8,
+    h0: usize,
+    v0: usize,
+    ss: usize,
+    mut out_h: Option<&mut [u8; 256]>,
+    mut out_v: Option<&mut [u8; 256]>,
+) {
+    use std::arch::aarch64::*;
+    fn tap6(t: [int16x8_t; 6]) -> int16x8_t {
+        // Safety: NEON is baseline on aarch64.
+        unsafe {
+            let s0 = vaddq_s16(t[0], t[5]);
+            let s1 = vaddq_s16(t[1], t[4]);
+            let s2 = vaddq_s16(t[2], t[3]);
+            let k = vsubq_s16(vshlq_n_s16::<2>(s2), s1);
+            vaddq_s16(s0, vaddq_s16(k, vshlq_n_s16::<2>(k)))
+        }
+    }
+    unsafe {
+        let at = |q: *const u8| vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q)));
+        for half in 0..2 {
+            for r in 0..16 {
+                if let Some(out_h) = out_h.as_deref_mut() {
+                    let q = p.add(h0 + r * ss + half * 8);
+                    let h = tap6(std::array::from_fn(|k| at(q.add(k).sub(2))));
+                    vst1_u8(
+                        out_h.as_mut_ptr().add(r * 16 + half * 8),
+                        vqrshrun_n_s16::<5>(h),
+                    );
+                }
+                if let Some(out_v) = out_v.as_deref_mut() {
+                    let q = p.add(v0 + r * ss + half * 8);
+                    let v = tap6(std::array::from_fn(|k| at(q.add(k * ss).sub(2 * ss))));
+                    vst1_u8(
+                        out_v.as_mut_ptr().add(r * 16 + half * 8),
+                        vqrshrun_n_s16::<5>(v),
+                    );
+                }
             }
         }
     }
@@ -1921,7 +2641,7 @@ unsafe fn quant_neon(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         let cap = vdupq_n_u32(i16::MAX as u32);
         let mut nz = 0;
         for (b, blk) in blocks.iter_mut().enumerate() {
-            let mut any = vdupq_n_u16(0);
+            let mut max = vdupq_n_u16(0);
             for h in 0..2 {
                 let c = vld1q_s16(blk.as_ptr().add(h * 8));
                 let mf = vld1q_u16(q.mf.as_ptr().add(h * 8));
@@ -1937,10 +2657,12 @@ unsafe fn quant_neon(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
                 ));
                 let level = vbslq_s16(vcltzq_s16(c), vnegq_s16(l), l);
                 vst1q_s16(blk.as_mut_ptr().add(h * 8), level);
-                any = vorrq_u16(any, vreinterpretq_u16_s16(level));
+                max = vmaxq_u16(max, vreinterpretq_u16_s16(l));
             }
-            if vmaxvq_u16(any) != 0 {
-                nz |= 1 << b;
+            match vmaxvq_u16(max) {
+                0 => {}
+                1 => nz |= 1 << b,
+                _ => nz |= 0x11 << b,
             }
         }
         nz
@@ -2107,6 +2829,29 @@ mod tests {
     }
 
     #[test]
+    fn directional_4x4_predictions_match_the_generic_predictor() {
+        let e = plane(13, 40, 51);
+        for n in 0..40 {
+            let r = &e[n * 13..n * 13 + 13];
+            let top: [u8; 8] = r[..8].try_into().unwrap();
+            let left: [u8; 4] = r[8..12].try_into().unwrap();
+            let want = intra4x4_pred_dir_scalar(&top, &left, r[12]);
+            assert_eq!(intra4x4_pred_dir(&top, &left, r[12]), want, "edge {r:?}");
+            let edge = [
+                left[3], left[3], left[2], left[1], left[0], r[12], top[0], top[1], top[2], top[3],
+                top[4], top[5], top[6], top[7], top[7], top[7],
+            ];
+            assert_eq!(pred4_dir_from_edge(&edge), want);
+        }
+        for v in [0u8, 255] {
+            assert_eq!(
+                intra4x4_pred_dir(&[v; 8], &[255 - v; 4], v),
+                intra4x4_pred_dir_scalar(&[v; 8], &[255 - v; 4], v)
+            );
+        }
+    }
+
+    #[test]
     fn intra_satd_x3_matches_explicit_predictions() {
         let a = plane(16, 16, 31);
         let e = plane(40, 1, 32);
@@ -2134,6 +2879,16 @@ mod tests {
             let want = preds.map(|p| pixel_satd_16x16_scalar(&src, 16, &p, 16));
             assert_eq!(intra_satd_x3_16x16_scalar(&src, &top, &left, dc), want);
             assert_eq!(intra_satd_x3_16x16(&src, &top, &left, dc), want);
+            let want = preds.map(|p| pixel_sad_16x16_scalar(&src, 16, &p, 16));
+            assert_eq!(intra_sad_x3_16x16_scalar(&src, &top, &left, dc), want);
+            assert_eq!(intra_sad_x3_16x16(&src, &top, &left, dc), want);
+            for (flat, other) in [([255u8; 256], 0u8), ([0; 256], 255)] {
+                let want = [255 * 256; 3];
+                assert_eq!(
+                    intra_sad_x3_16x16(&flat, &[other; 16], &[other; 16], other),
+                    want
+                );
+            }
             for (flat, other) in [([255u8; 256], 0u8), ([0; 256], 255)] {
                 let want = [
                     pixel_satd_16x16_scalar(&flat, 16, &[other; 256], 16),
@@ -2222,6 +2977,37 @@ mod tests {
                 assert_eq!(a, b, "shift {shift}");
             }
         }
+        // Blocks whose levels are all within +-1, or hold one larger level, set only the
+        // non-zero bits, or both bits, of their block.
+        let q = Quant4x4 {
+            mf: [13107; 16],
+            bias: (1 << 15) / 6,
+            shift: 15,
+        };
+        for round in 0..200u32 {
+            let mut a = [[0i16; 16]; 4];
+            for (i, c) in a.iter_mut().flatten().enumerate() {
+                let r = next();
+                *c = match (r >> 20) % 16 {
+                    0..=5 => 0,
+                    6..=9 => 2,
+                    10..=14 => -3,
+                    _ => (r >> 24) as i16 - 128,
+                };
+                if i == 16 * (round as usize % 4) + (r as usize % 16) && round % 3 == 0 {
+                    *c = -60;
+                }
+            }
+            a[(round as usize + 1) % 4] = [0; 16];
+            let mut b = a;
+            let nz = quant_4x4_x4(&mut a, &q);
+            assert_eq!(nz, quant_4x4_x4_scalar(&mut b, &q), "round {round}");
+            assert_eq!(a, b);
+            for (k, blk) in a.iter().enumerate() {
+                assert_eq!(nz >> k & 1 != 0, blk.iter().any(|&c| c != 0));
+                assert_eq!(nz >> (4 + k) & 1 != 0, blk.iter().any(|&c| c.abs() > 1));
+            }
+        }
     }
 
     #[test]
@@ -2261,6 +3047,92 @@ mod tests {
             add_idct4x4_8x8(&mut p, ds, &a);
             add_idct4x4_8x8_scalar(&mut q, ds, &a);
             assert_eq!(p, q, "round {round}");
+
+            // Levels around the limit of the 16-bit vector path, all of one sign in a block or
+            // of alternating signs, reach the largest intermediate values on both sides of it.
+            let lim = 2672 + (round as i16 % 3) - 1;
+            for (j, blk) in a.iter_mut().enumerate() {
+                for (i, c) in blk.iter_mut().enumerate() {
+                    let r = next();
+                    let mag = if r >> 31 == 0 {
+                        lim
+                    } else {
+                        (r >> 20) as i16 % (lim + 1)
+                    };
+                    let neg = match (round + j) % 3 {
+                        0 => false,
+                        1 => true,
+                        _ => (i ^ (i >> 2)) & 1 == 1,
+                    };
+                    *c = if neg { -mag } else { mag };
+                }
+            }
+            let mut q = p.clone();
+            add_idct4x4_8x8(&mut p, ds, &a);
+            add_idct4x4_8x8_scalar(&mut q, ds, &a);
+            assert_eq!(p, q, "round {round} near the limit");
+        }
+    }
+
+    #[test]
+    fn chroma_mc_matches_scalar_and_the_generic_kernel() {
+        let (pw, ph) = (40usize, 24usize);
+        let (u, v) = (plane(pw, ph, 71), plane(pw, ph, 72));
+        for (x, y) in [(0usize, 0usize), (5, 3), (17, 9), (24, 6)] {
+            let off = y * pw + x;
+            for fx in 0..8u8 {
+                for fy in 0..8u8 {
+                    let (mut a, mut b, mut c, mut d) = ([0u8; 64], [0u8; 64], [0u8; 64], [0u8; 64]);
+                    chroma_mc_8x8_x2(&u, &v, off, pw, fx, fy, &mut a, &mut b);
+                    chroma_mc_8x8_x2_scalar(&u, &v, off, pw, fx, fy, &mut c, &mut d);
+                    assert_eq!((a, b), (c, d), "({x}, {y}) {fx} {fy}");
+                    let mut g = [0u8; 64];
+                    crate::h264_chroma_mc_scalar(&mut g, 8, &u, off, pw, 8, 8, fx, fy);
+                    assert_eq!(a, g);
+                    crate::h264_chroma_mc_scalar(&mut g, 8, &v, off, pw, 8, 8, fx, fy);
+                    assert_eq!(b, g);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_pel_blocks_match_scalar_and_the_window() {
+        let (pw, ph) = (64usize, 48usize);
+        for seed in [61u32, 62] {
+            let mut src = plane(pw, ph, seed);
+            if seed == 62 {
+                for (i, s) in src.iter_mut().enumerate() {
+                    *s = if (i / 2) % 2 == 0 { 0 } else { 255 };
+                }
+            }
+            for (x, y) in [(3usize, 3usize), (7, 5), (26, 21)] {
+                let off = y * pw + x;
+                let mut win = HpelWindow::default();
+                hpel_window_scalar(&src, off - pw - 1, pw, &mut win);
+                for (left, up) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let (mut a, mut b, mut c, mut d) =
+                        ([0u8; 256], [0u8; 256], [0u8; 256], [0u8; 256]);
+                    hpel_hv_16x16(&src, off, pw, left, up, &mut a, &mut b);
+                    hpel_hv_16x16_scalar(&src, off, pw, left, up, &mut c, &mut d);
+                    assert_eq!((a, b), (c, d), "({x}, {y}) {left} {up}");
+                    for (vertical, back, want) in [(false, left, &a), (true, up, &b)] {
+                        let (mut e, mut f) = ([0u8; 256], [0u8; 256]);
+                        hpel_16x16(&src, off, pw, vertical, back, &mut e);
+                        hpel_16x16_scalar(&src, off, pw, vertical, back, &mut f);
+                        assert_eq!((&e, &f), (want, want), "({x}, {y}) {vertical} {back}");
+                    }
+                    // The window starts one sample up and left of the block.
+                    for r in 0..16 {
+                        for k in 0..16 {
+                            let hx = k + usize::from(!left);
+                            assert_eq!(a[r * 16 + k], win.h[(r + 1) * HPEL_WIN_W + hx]);
+                            let vy = r + usize::from(!up);
+                            assert_eq!(b[r * 16 + k], win.v[vy * HPEL_WIN_W + k + 1]);
+                        }
+                    }
+                }
+            }
         }
     }
 
