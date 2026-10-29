@@ -1644,16 +1644,17 @@ unsafe fn dct_strip_avx2<const HAD: bool>(
         // Each register holds one row of all four blocks: blocks 0, 1 in the low lane, 2, 3 in the
         // high lane (an 8x8 block's rows k and k + 4 side by side).
         let row = |k: usize| {
+            // Two 8-byte rows in one register: a low load and a high-half load.
+            let pair = |a: *const u8, b: *const u8| {
+                _mm_castpd_si128(_mm_loadh_pd(
+                    _mm_castsi128_pd(_mm_loadl_epi64(a as *const __m128i)),
+                    b as *const f64,
+                ))
+            };
             let (s, p) = if from_8x8 {
                 (
-                    _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(src.add(k * ss) as *const __m128i),
-                        _mm_loadl_epi64(src.add((k + 4) * ss) as *const __m128i),
-                    ),
-                    _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(pred.add(k * ps) as *const __m128i),
-                        _mm_loadl_epi64(pred.add((k + 4) * ps) as *const __m128i),
-                    ),
+                    pair(src.add(k * ss), src.add((k + 4) * ss)),
+                    pair(pred.add(k * ps), pred.add((k + 4) * ps)),
                 )
             } else {
                 (
@@ -1841,10 +1842,10 @@ unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
         for (k, o) in v.iter().enumerate() {
             let res = _mm256_srai_epi16::<6>(_mm256_add_epi16(*o, r32));
             let (p0, p1) = (dst.add(k * ds), dst.add((k + 4) * ds));
-            let px = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
-                _mm_loadl_epi64(p0 as *const __m128i),
-                _mm_loadl_epi64(p1 as *const __m128i),
-            ));
+            let px = _mm256_cvtepu8_epi16(_mm_castpd_si128(_mm_loadh_pd(
+                _mm_castsi128_pd(_mm_loadl_epi64(p0 as *const __m128i)),
+                p1 as *const f64,
+            )));
             let sum = _mm256_add_epi16(px, res);
             let packed = packus_epi16_avx2(sum, sum);
             _mm_storel_epi64(p0 as *mut __m128i, _mm256_castsi256_si128(packed));
