@@ -453,7 +453,7 @@ impl OpusPacketEncoder {
         let toc = frames[0][0];
         for f in &frames {
             let parsed = parse_packet(f).map_err(|_| OpusError::InternalError)?;
-            for &(o, l) in &parsed.frames {
+            for &(o, l) in parsed.frames() {
                 payloads.push(&f[o..o + l]);
             }
         }
@@ -671,7 +671,7 @@ fn packet_pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), OpusErr
     let packet = data[..len].to_vec();
     let parsed = parse_packet(&packet).map_err(|_| OpusError::InvalidPacket)?;
     let frames: Vec<&[u8]> = parsed
-        .frames
+        .frames()
         .iter()
         .map(|&(o, l)| &packet[o..o + l])
         .collect();

@@ -1131,6 +1131,170 @@ pub unsafe fn denormalise_avx2(out: &mut [i32], x: &[i16], g: i32, shift: i32) -
     n
 }
 
+/// Samples per channel that [`deemph_stereo_avx2`] takes.
+#[cfg(target_arch = "x86_64")]
+pub const DEEMPH_N: usize = 960;
+
+/// AVX2 [`super::celt::deemph_stereo_scalar`] of 960 samples per channel with coefficient `p`.
+///
+/// The filter `m' = (p * (x + m)) >> 15` is a serial chain per channel. Here each channel is
+/// cut into four segments whose chains run side by side in the 64-bit lanes of one vector.
+/// A segment after the first starts from an estimate of its true starting state: without the
+/// floor, the state is a geometric sum of the preceding inputs, and the floors only take it
+/// below that sum by less than `1 / (1 - p / 32768)`. Once the true state is known (the end of
+/// the previous segment), the segment is redone from it one step at a time until it meets
+/// the speculative run, after which the two agree. So the result is exact whatever the
+/// estimate; a close one just makes the redo short.
+///
+/// Returns the new states, or `None` (leaving `t` unspecified) when an input or state is too
+/// large for the sums to be sure to fit 32 bits, for the scalar code to take the frame.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn deemph_stereo_avx2(
+    x0: &[i32],
+    x1: &[i32],
+    mem: [i32; 2],
+    p: i32,
+    t: &mut [i32],
+) -> Option<[i32; 2]> {
+    use std::arch::x86_64::*;
+    const N: usize = DEEMPH_N;
+    const SEG: usize = N / 4;
+    /// Inputs taken into a starting-state estimate.
+    const TAPS: usize = 152;
+    assert!(x0.len() == N && x1.len() == N && t.len() >= 2 * N && (0..32768).contains(&p));
+    // With |x| <= MAX_X and |m| <= MAX_M, every state stays within MAX_M (the floor adds at
+    // most 1 to p/32768 of the sum) and every sum within MAX_X + MAX_M < 2^31.
+    let r = p as f64 / 32768.0;
+    let max_m = ((r * MAX_X as f64 + 1.0) / (1.0 - r)) as i64;
+    if MAX_X as i64 + max_m + 8 >= 1 << 31 || mem.iter().any(|&m| (m as i64).abs() > max_m) {
+        return None;
+    }
+    const MAX_X: u32 = 300_000_000;
+    // Safety (all blocks below): x0 and x1 hold N values and t 2N, which every index stays
+    // within.
+    let max_abs = |x: &[i32]| unsafe {
+        let mut m = _mm256_setzero_si256();
+        for v in x.as_chunks::<8>().0 {
+            let a = _mm256_abs_epi32(_mm256_loadu_si256(v.as_ptr() as *const __m256i));
+            m = _mm256_max_epu32(m, a);
+        }
+        let m = _mm_max_epu32(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
+        let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0x4E>(m));
+        let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0xB1>(m));
+        _mm_cvtsi128_si32(m) as u32
+    };
+    if max_abs(x0) > MAX_X || max_abs(x1) > MAX_X {
+        return None;
+    }
+    // Powers r^1..r^TAPS, for the estimates.
+    let mut pw = [0f64; TAPS];
+    let mut q = 1.0;
+    for v in pw.iter_mut() {
+        q *= r;
+        *v = q;
+    }
+    // The state at `start`: the floorless geometric sum of the previous TAPS inputs, less
+    // half the floors' largest total effect.
+    let estimate = |x: &[i32], start: usize| unsafe {
+        let mut acc = _mm256_setzero_pd();
+        for j in (0..TAPS).step_by(4) {
+            // Inputs x[start - 1 - j - l] for l = 0..3, newest first.
+            let v = _mm_loadu_si128(x.as_ptr().add(start - 4 - j) as *const __m128i);
+            let v = _mm_shuffle_epi32::<0x1B>(v);
+            let w = _mm256_loadu_pd(pw.as_ptr().add(j));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_cvtepi32_pd(v), w));
+        }
+        let h = _mm_add_pd(_mm256_castpd256_pd128(acc), _mm256_extractf128_pd::<1>(acc));
+        let s = _mm_cvtsd_f64(_mm_add_sd(h, _mm_unpackhi_pd(h, h)));
+        (s - 0.5 / (1.0 - r)).round() as i32
+    };
+    let starts = |x: &[i32], m: i32| {
+        [
+            m,
+            estimate(x, SEG),
+            estimate(x, 2 * SEG),
+            estimate(x, 3 * SEG),
+        ]
+    };
+    let (e0, e1) = (starts(x0, mem[0]), starts(x1, mem[1]));
+    unsafe {
+        let pv = _mm256_set1_epi64x(p as i64);
+        let mut f0 = _mm256_setr_epi64x(e0[0] as i64, e0[1] as i64, e0[2] as i64, e0[3] as i64);
+        let mut f1 = _mm256_setr_epi64x(e1[0] as i64, e1[1] as i64, e1[2] as i64, e1[3] as i64);
+        let pick = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        // Four steps of the four segments of channel `x` from states `f`: returns the sums as
+        // four rows (one per segment) of four steps.
+        let block = |x: &[i32], k: usize, f: &mut __m256i| {
+            let row = |j: usize| _mm_loadu_si128(x.as_ptr().add(j * SEG + k) as *const __m128i);
+            let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+            let t0 = _mm_unpacklo_epi32(r0, r1);
+            let t1 = _mm_unpackhi_epi32(r0, r1);
+            let t2 = _mm_unpacklo_epi32(r2, r3);
+            let t3 = _mm_unpackhi_epi32(r2, r3);
+            let cols = [
+                _mm_unpacklo_epi64(t0, t2),
+                _mm_unpackhi_epi64(t0, t2),
+                _mm_unpacklo_epi64(t1, t3),
+                _mm_unpackhi_epi64(t1, t3),
+            ];
+            let mut s = [_mm_setzero_si128(); 4];
+            for (s, &c) in s.iter_mut().zip(&cols) {
+                // The sums are exact in the low 32 bits of each lane, which is all the
+                // multiply reads; the product's bits 15..46 are the new state.
+                let v = _mm256_add_epi32(_mm256_cvtepi32_epi64(c), *f);
+                *f = _mm256_srli_epi64::<15>(_mm256_mul_epi32(v, pv));
+                *s = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(v, pick));
+            }
+            let t0 = _mm_unpacklo_epi32(s[0], s[1]);
+            let t1 = _mm_unpackhi_epi32(s[0], s[1]);
+            let t2 = _mm_unpacklo_epi32(s[2], s[3]);
+            let t3 = _mm_unpackhi_epi32(s[2], s[3]);
+            [
+                _mm_unpacklo_epi64(t0, t2),
+                _mm_unpackhi_epi64(t0, t2),
+                _mm_unpacklo_epi64(t1, t3),
+                _mm_unpackhi_epi64(t1, t3),
+            ]
+        };
+        for k in (0..SEG).step_by(4) {
+            let a = block(x0, k, &mut f0);
+            let b = block(x1, k, &mut f1);
+            for j in 0..4 {
+                let o = t.as_mut_ptr().add(2 * (j * SEG + k));
+                _mm_storeu_si128(o as *mut __m128i, _mm_unpacklo_epi32(a[j], b[j]));
+                _mm_storeu_si128(o.add(4) as *mut __m128i, _mm_unpackhi_epi32(a[j], b[j]));
+            }
+        }
+    }
+    // Redo each later segment from its true starting state until it meets the speculative run.
+    let next = |s: i32| ((p as i64 * s as i64) >> 15) as i32;
+    let mut out = [0i32; 2];
+    for (ch, (x, e)) in [(x0, e0), (x1, e1)].into_iter().enumerate() {
+        for seg in 1..4 {
+            let start = seg * SEG;
+            let mut f = next(t[2 * (start - 1) + ch]);
+            if f == e[seg] {
+                continue;
+            }
+            for k in start..start + SEG {
+                let s = x[k] + f;
+                if s == t[2 * k + ch] {
+                    break;
+                }
+                t[2 * k + ch] = s;
+                f = next(s);
+            }
+        }
+        out[ch] = next(t[2 * (N - 1) + ch]);
+    }
+    Some(out)
+}
+
 /// AVX2 [`super::celt`] `sig2word16_slice_scalar` over the first `n - n % 16` values;
 /// returns how many it did.
 ///
@@ -1926,6 +2090,76 @@ mod tests {
                 haar1(&mut a, n0, stride);
                 haar1_scalar(&mut b, n0, stride, 0);
                 assert_eq!(a, b, "haar1 n0 {n0} stride {stride}");
+            }
+        }
+    }
+
+    #[test]
+    fn deemph_matches_scalar() {
+        use super::super::celt::{deemph_stereo, deemph_stereo_scalar};
+        const N: usize = 960;
+        let mut seed = 5u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as i32
+        };
+        for trial in 0..300 {
+            // Audio-like walks of many sizes, steps at the segment edges, and inputs past the
+            // vector path's limit (which then falls back).
+            let amp: i32 = [
+                1 << 8,
+                1 << 16,
+                1 << 24,
+                299_999_999,
+                300_000_000,
+                400_000_000,
+            ][trial % 6];
+            let mut x = [vec![0i32; N], vec![0i32; N]];
+            for xc in x.iter_mut() {
+                let mut v = 0i64;
+                for (k, o) in xc.iter_mut().enumerate() {
+                    v += (rnd() >> 4) as i64;
+                    v = v.clamp(-(amp as i64), amp as i64);
+                    *o = match trial % 5 {
+                        0 => v as i32,
+                        1 => rnd() % amp,
+                        2 => {
+                            if (k / 240) % 2 == 0 {
+                                amp
+                            } else {
+                                -amp
+                            }
+                        }
+                        3 => {
+                            if k % 240 < 3 {
+                                -amp
+                            } else {
+                                amp / 3
+                            }
+                        }
+                        _ => (v as i32) / 7,
+                    };
+                }
+            }
+            let mem = match trial % 4 {
+                0 => [0, 0],
+                1 => [rnd() % (1 << 30), rnd() % (1 << 20)],
+                2 => [1_700_000_000, -1_700_000_000],
+                _ => [i32::MAX, i32::MIN],
+            };
+            let (mut a, mut b) = (vec![0i32; 2 * N], vec![0i32; 2 * N]);
+            let ma = deemph_stereo(&x[0], &x[1], mem, &mut a);
+            let mb = deemph_stereo_scalar(&x[0], &x[1], mem, &mut b);
+            assert_eq!((ma, &a), (mb, &b), "trial {trial}");
+            #[cfg(target_arch = "x86_64")]
+            if ragdoll_core::dispatch::avx2() {
+                // Safety: AVX2 is available.
+                let mut c = vec![0i32; 2 * N];
+                if let Some(mc) =
+                    unsafe { super::deemph_stereo_avx2(&x[0], &x[1], mem, 27853, &mut c) }
+                {
+                    assert_eq!((mc, &c), (mb, &b), "avx2 trial {trial}");
+                }
             }
         }
     }

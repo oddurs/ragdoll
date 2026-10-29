@@ -28,7 +28,7 @@ fn eb(i: usize) -> i32 {
 }
 
 /// `bitexact_cos`.
-fn bitexact_cos(x: i32) -> i32 {
+const fn bitexact_cos(x: i32) -> i32 {
     let tmp = (4096 + (x as i16 as i32) * (x as i16 as i32)) >> 13;
     let x2 = tmp as i16 as i32;
     let x2 = (32767 - x2) + frac_mul16(x2, -7651 + frac_mul16(x2, 8277 + frac_mul16(-626, x2)));
@@ -36,13 +36,103 @@ fn bitexact_cos(x: i32) -> i32 {
 }
 
 /// `bitexact_log2tan`.
-fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
+const fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
     let lc = ilog(icos as u32);
     let ls = ilog(isin as u32);
     let icos = icos << (15 - lc);
     let isin = isin << (15 - ls);
     (ls - lc) * (1 << 11) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932)
         - frac_mul16(icos, frac_mul16(icos, -2597) + 7932)
+}
+
+/// The bits above which `quant_partition` splits band `i` at `lm` (by `(lm + 1) * 21 + i`):
+/// the most its pulse cache holds, plus 12. Bands with no cache never split.
+static SPLIT_LIMIT: [i32; 105] = {
+    use super::celt_tables::{CACHE_BITS, CACHE_INDEX};
+    let mut t = [i32::MAX; 105];
+    let mut j = 0;
+    while j < t.len() {
+        let idx = CACHE_INDEX[j];
+        if idx >= 0 {
+            let c = idx as usize;
+            t[j] = CACHE_BITS[c + CACHE_BITS[c] as usize] as i32 + 12;
+        }
+        j += 1;
+    }
+    t
+};
+
+/// `isqrt32(8 x + 1)` for every `x` the triangular theta pdf (at most 129 steps a side)
+/// takes it of, so the decoding of a split's angle need not wait on a square root.
+static TRIANGLE_ISQRT: [u16; 8385] = {
+    let mut t = [0u16; 8385];
+    let mut x = 0;
+    let mut r = 1u32;
+    while x < t.len() {
+        let v = 8 * x as u32 + 1;
+        while (r + 1) * (r + 1) <= v {
+            r += 1;
+        }
+        t[x] = r as u16;
+        x += 1;
+    }
+    t
+};
+
+/// `isqrt32(8 x + 1)`.
+#[inline]
+fn triangle_isqrt(x: u32) -> i32 {
+    match TRIANGLE_ISQRT.get(x as usize) {
+        Some(&r) => r as i32,
+        None => super::math::isqrt32(8 * x + 1) as i32,
+    }
+}
+
+/// The split angles strictly between 0 and 16384 that a coded theta can take (`qn <= 256`
+/// steps) lie in `THETA_MIN..=THETA_MAX`, where both cosines stay below 32768.
+const THETA_MIN: usize = 64;
+const THETA_MAX: usize = 16384 - THETA_MIN;
+
+/// `bitexact_cos(t)` for `t` in `THETA_MIN..=THETA_MAX`, at `t - THETA_MIN`.
+static THETA_COS: [i16; THETA_MAX - THETA_MIN + 1] = {
+    let mut c = [0i16; THETA_MAX - THETA_MIN + 1];
+    let mut t = THETA_MIN;
+    while t <= THETA_MAX {
+        c[t - THETA_MIN] = bitexact_cos(t as i32) as i16;
+        t += 1;
+    }
+    c
+};
+
+/// `bitexact_log2tan(bitexact_cos(16384 - t), bitexact_cos(t))` for `t` in
+/// `THETA_MIN..=THETA_MAX`, at `t - THETA_MIN`.
+static THETA_LOG2TAN: [i16; THETA_MAX - THETA_MIN + 1] = {
+    let mut l = [0i16; THETA_MAX - THETA_MIN + 1];
+    let mut t = THETA_MIN;
+    while t <= THETA_MAX {
+        let (imid, iside) = (bitexact_cos(t as i32), bitexact_cos(16384 - t as i32));
+        l[t - THETA_MIN] = bitexact_log2tan(iside, imid) as i16;
+        t += 1;
+    }
+    l
+};
+
+/// The mid and side gains of the split angle `itheta` (strictly between 0 and 16384) and
+/// their `bitexact_log2tan`. Every split's bit division waits on these polynomials, so the
+/// angles a coded theta can take come from tables.
+#[inline]
+fn theta_gains(itheta: i32) -> (i32, i32, i32) {
+    match itheta as usize {
+        t @ THETA_MIN..=THETA_MAX => (
+            THETA_COS[t - THETA_MIN] as i32,
+            THETA_COS[THETA_MAX - t] as i32,
+            THETA_LOG2TAN[t - THETA_MIN] as i32,
+        ),
+        _ => {
+            let (imid, iside) = (bitexact_cos(itheta), bitexact_cos(16384 - itheta));
+            (imid, iside, bitexact_log2tan(iside, imid))
+        }
+    }
 }
 
 /// `compute_band_energies`: Q`SIG_SHIFT`-free band amplitudes of the MDCT output.
@@ -574,13 +664,11 @@ fn compute_theta(
                 let fm = ctx.ec.decode(ft as u32) as i32;
                 let (fs, fl);
                 if fm < (((qn >> 1) * ((qn >> 1) + 1)) >> 1) {
-                    itheta = ((super::math::isqrt32(8 * fm as u32 + 1) as i32) - 1) >> 1;
+                    itheta = (triangle_isqrt(fm as u32) - 1) >> 1;
                     fs = itheta + 1;
                     fl = (itheta * (itheta + 1)) >> 1;
                 } else {
-                    itheta = (2 * (qn + 1)
-                        - super::math::isqrt32(8 * (ft - fm - 1) as u32 + 1) as i32)
-                        >> 1;
+                    itheta = (2 * (qn + 1) - triangle_isqrt((ft - fm - 1) as u32)) >> 1;
                     fs = qn + 1 - itheta;
                     fl = ft - (((qn + 1 - itheta) * (qn + 2 - itheta)) >> 1);
                 }
@@ -633,9 +721,9 @@ fn compute_theta(
         *fill &= ((1 << bb) - 1) << bb;
         delta = 16384;
     } else {
-        imid = bitexact_cos(itheta);
-        iside = bitexact_cos(16384 - itheta);
-        delta = frac_mul16((ni - 1) << 7, bitexact_log2tan(iside, imid));
+        let l2t;
+        (imid, iside, l2t) = theta_gains(itheta);
+        delta = frac_mul16((ni - 1) << 7, l2t);
     }
     Split {
         inv,
@@ -698,10 +786,8 @@ fn quant_partition(
 ) -> u32 {
     let i = ctx.i;
     let b0 = bb;
-    let cache_idx = super::celt_tables::CACHE_INDEX[((lm + 1) as usize) * NB_EBANDS + i];
-    let cache = &super::celt_tables::CACHE_BITS[cache_idx as usize..];
     let mut cm = 0u32;
-    if lm != -1 && b > cache[cache[0] as usize] as i32 + 12 && n > 2 {
+    if lm != -1 && b > SPLIT_LIMIT[((lm + 1) as usize) * NB_EBANDS + i] && n > 2 {
         n >>= 1;
         let (xh, yh) = x.split_at_mut(n);
         lm -= 1;
@@ -1376,4 +1462,45 @@ pub fn quant_all_bands(p: AllBands<'_>, x: &mut [i16], c: usize, ec: &mut Ec, se
         ctx.avoid_split_noise = false;
     }
     *seed = ctx.seed;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_tables_match() {
+        use super::super::celt_tables::{CACHE_BITS, CACHE_INDEX};
+        for (j, &idx) in CACHE_INDEX.iter().enumerate() {
+            if idx >= 0 {
+                let c = &CACHE_BITS[idx as usize..];
+                assert_eq!(SPLIT_LIMIT[j], c[c[0] as usize] as i32 + 12, "{j}");
+            }
+        }
+        for x in 0..TRIANGLE_ISQRT.len() as u32 + 10 {
+            assert_eq!(
+                triangle_isqrt(x),
+                super::super::math::isqrt32(8 * x + 1) as i32
+            );
+        }
+    }
+
+    #[test]
+    fn theta_gains_match_polynomials() {
+        for t in THETA_MIN as i32..=THETA_MAX as i32 {
+            let (imid, iside) = (bitexact_cos(t), bitexact_cos(16384 - t));
+            assert_eq!(
+                theta_gains(t),
+                (imid, iside, bitexact_log2tan(iside, imid)),
+                "{t}"
+            );
+        }
+        // Every angle a coded theta takes is either an edge or in the tables' range.
+        for qn in 2..=256 {
+            for q in 1..qn {
+                let t = (q * 16384 / qn) as usize;
+                assert!((THETA_MIN..=THETA_MAX).contains(&t), "{q} / {qn}");
+            }
+        }
+    }
 }

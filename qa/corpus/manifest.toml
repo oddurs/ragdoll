@@ -38,8 +38,8 @@ sha256 = "0f6947ba80b36fb81b9dd14a562abb47d094933e0f9ddbf1c83646b91ff81ba1"
 name = "tone_48k_stereo.flac"
 tier = 1
 synth = "0x0 30fps 0.5s"
-size = 23010
-sha256 = "133b9a0d1b0f248358c2cc952907f4f8bedf35bb46e1196b7deca095dcc10567"
+size = 14074
+sha256 = "e9da3e2557636acaf212b1b0368cc457ced8bc8f1fe07a00958d6b7a1ccde430"
 
 # --- tier 2: conformance ---
 

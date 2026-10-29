@@ -47,6 +47,9 @@ pub enum CeltError {
 /// CELT decoder state (`OpusCustomDecoder` with the 48000/960 mode).
 #[derive(Clone)]
 pub struct CeltDecoder {
+    /// The range decoder's copy of a packet decoded without the caller's decoder (redundancy
+    /// frames), reused across packets.
+    ec_buf: Vec<u8>,
     pub channels: usize,
     pub stream_channels: usize,
     pub downsample: usize,
@@ -94,6 +97,7 @@ impl CeltDecoder {
     /// `celt_decoder_init` at output rate `rate` (48, 24, 16, 12 or 8 kHz).
     pub fn new(rate: u32, channels: usize) -> Self {
         let mut d = Self {
+            ec_buf: Vec::new(),
             channels,
             stream_channels: channels,
             downsample: resampling_factor(rate).max(1),
@@ -158,6 +162,15 @@ impl CeltDecoder {
         ec: Option<&mut Ec>,
         accum: bool,
     ) -> Result<usize, CeltError> {
+        // Without the caller's range decoder, decode from one over a reused copy of the packet.
+        if ec.is_none()
+            && let Some(d) = data.filter(|d| d.len() > 1 && d.len() <= 1275)
+        {
+            let mut own = Ec::decoder_with(std::mem::take(&mut self.ec_buf), d);
+            let r = self.decode(Some(d), pcm, frame_size, Some(&mut own), accum);
+            self.ec_buf = own.buf;
+            return r;
+        }
         let cc = self.channels;
         let frame_size = frame_size * self.downsample;
         let mut lm = 0i32;
@@ -574,41 +587,12 @@ impl CeltDecoder {
             tmp
         };
         if cc == 2 && ds == 1 && !accum {
-            // The common case: both channels at once so their recurrences overlap, with the
-            // conversion to 16 bits (off the recurrence) done a block at a time.
-            const BLOCK: usize = 64;
-            let [mut m0, mut m1] = self.preemph_mem;
-            let mut tmp = [0i32; 2 * BLOCK];
-            for ((o, a), b) in pcm[..2 * n]
-                .chunks_mut(2 * BLOCK)
-                .zip(x(0).chunks(BLOCK))
-                .zip(x(1).chunks(BLOCK))
-            {
-                let t = &mut tmp[..o.len()];
-                // The sums stay in 32 bits in practice (|x| <= SIG_SAT keeps them below
-                // 2.1e9), so the recurrence runs in 64 bits without the sign extension on its
-                // chain, checking each sum; one that wraps leaves for the exact loop.
-                let (mut f0, mut f1) = (m0 as i64, m1 as i64);
-                let mut k = 0;
-                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b) {
-                    let (s0, s1) = (a as i64 + f0, b as i64 + f1);
-                    if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
-                        break;
-                    }
-                    t[0] = s0 as i32;
-                    t[1] = s1 as i32;
-                    f0 = (PREEMPH as i64 * s0) >> 15;
-                    f1 = (PREEMPH as i64 * s1) >> 15;
-                    k += 1;
-                }
-                (m0, m1) = (f0 as i32, f1 as i32);
-                for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b).skip(k) {
-                    t[0] = step(&mut m0, a);
-                    t[1] = step(&mut m1, b);
-                }
-                sig2word16_slice(o, t);
-            }
-            self.preemph_mem = [m0, m1];
+            // The common case: the filter outputs of both channels, interleaved, then their
+            // conversion to 16 bits.
+            let mut t = [0i32; 2 * 960];
+            let t = &mut t[..2 * n];
+            self.preemph_mem = deemph_stereo(x(0), x(1), self.preemph_mem, t);
+            sig2word16_slice(&mut pcm[..2 * n], t);
             return;
         }
         for ch in 0..cc {
@@ -636,11 +620,10 @@ impl CeltDecoder {
     /// `celt_plc_pitch_search`.
     fn plc_pitch_search(&self) -> usize {
         let c = self.channels;
-        let mut lp = vec![0i16; DECODE_BUFFER_SIZE >> 1];
-        let chans: Vec<&[i32]> = (0..c)
-            .map(|ch| &self.decode_mem[ch * STRIDE..ch * STRIDE + DECODE_BUFFER_SIZE])
-            .collect();
-        pitch_downsample(&chans, &mut lp, DECODE_BUFFER_SIZE);
+        let mut lp = [0i16; DECODE_BUFFER_SIZE >> 1];
+        let chan = |ch: usize| &self.decode_mem[ch * STRIDE..ch * STRIDE + DECODE_BUFFER_SIZE];
+        let chans = [chan(0), chan(c - 1)];
+        pitch_downsample(&chans[..c], &mut lp, DECODE_BUFFER_SIZE);
         let p = pitch_search(
             &lp[PLC_PITCH_LAG_MAX >> 1..],
             &lp,
@@ -659,7 +642,8 @@ impl CeltDecoder {
         if noise_based {
             let end = self.end;
             let eff_end = start.max(end.min(NB_EBANDS));
-            let mut x = vec![0i16; c * n];
+            let mut x = [0i16; 2 * 960];
+            let x = &mut x[..c * n];
             let decay: i32 = if loss_count == 0 { 1536 } else { 512 };
             for ch in 0..c {
                 for i in start..end {
@@ -687,7 +671,7 @@ impl CeltDecoder {
                 self.decode_mem
                     .copy_within(o + n..o + DECODE_BUFFER_SIZE + (OVERLAP >> 1), o);
             }
-            self.synthesis(&x, start, eff_end, c, false, lm, false);
+            self.synthesis(x, start, eff_end, c, false, lm, false);
         } else {
             let mut fade = 32767i32;
             let pitch_index = if loss_count == 0 {
@@ -699,9 +683,10 @@ impl CeltDecoder {
                 self.last_pitch_index
             };
             let exc_length = (2 * pitch_index).min(MAX_PERIOD);
-            let mut etmp = vec![0i32; OVERLAP];
-            let mut exc_buf = vec![0i16; MAX_PERIOD + LPC_ORDER];
-            let mut fir_tmp = vec![0i16; exc_length];
+            let mut etmp = [0i32; OVERLAP];
+            let mut exc_buf = [0i16; MAX_PERIOD + LPC_ORDER];
+            let mut fir_tmp = [0i16; MAX_PERIOD];
+            let fir_tmp = &mut fir_tmp[..exc_length];
             for ch in 0..c {
                 let base = ch * STRIDE;
                 for i in 0..MAX_PERIOD + LPC_ORDER {
@@ -744,8 +729,8 @@ impl CeltDecoder {
                 }
                 {
                     let fo = exc_off + MAX_PERIOD - exc_length;
-                    fir(&exc_buf, fo, lpc, &mut fir_tmp, exc_length, LPC_ORDER);
-                    exc_buf[fo..fo + exc_length].copy_from_slice(&fir_tmp);
+                    fir(&exc_buf, fo, lpc, fir_tmp, exc_length, LPC_ORDER);
+                    exc_buf[fo..fo + exc_length].copy_from_slice(fir_tmp);
                 }
                 let exc = |i: usize| exc_buf[exc_off + i] as i32;
                 let decay;
@@ -881,6 +866,51 @@ pub(super) fn sig2word16_slice(out: &mut [i16], x: &[i32]) {
         return;
     }
     sig2word16_slice_scalar(out, x);
+}
+
+/// The de-emphasis filter of both channels from states `mem`: `t` gets the interleaved outputs
+/// `x[k] + m` (before the conversion to 16 bits); returns the new states.
+pub(super) fn deemph_stereo(x0: &[i32], x1: &[i32], mem: [i32; 2], t: &mut [i32]) -> [i32; 2] {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && x0.len() == super::simd::DEEMPH_N {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        if let Some(m) = unsafe { super::simd::deemph_stereo_avx2(x0, x1, mem, PREEMPH, t) } {
+            return m;
+        }
+    }
+    deemph_stereo_scalar(x0, x1, mem, t)
+}
+
+/// Scalar reference of [`deemph_stereo`].
+pub fn deemph_stereo_scalar(x0: &[i32], x1: &[i32], mem: [i32; 2], t: &mut [i32]) -> [i32; 2] {
+    let t = &mut t[..2 * x0.len()];
+    // The sums stay in 32 bits in practice (|x| <= SIG_SAT keeps them below 2.1e9), so the
+    // two recurrences run in 64 bits without the sign extension on their chains, checking
+    // each sum; one that wraps leaves for the exact loop.
+    let (mut f0, mut f1) = (mem[0] as i64, mem[1] as i64);
+    let mut k = 0;
+    for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(x0).zip(x1) {
+        let (s0, s1) = (a as i64 + f0, b as i64 + f1);
+        if s0 != s0 as i32 as i64 || s1 != s1 as i32 as i64 {
+            break;
+        }
+        t[0] = s0 as i32;
+        t[1] = s1 as i32;
+        f0 = (PREEMPH as i64 * s0) >> 15;
+        f1 = (PREEMPH as i64 * s1) >> 15;
+        k += 1;
+    }
+    let (mut m0, mut m1) = (f0 as i32, f1 as i32);
+    let step = |mm: &mut i32, v: i32| {
+        let tmp = v.wrapping_add(*mm);
+        *mm = mul16_32_q15(PREEMPH, tmp);
+        tmp
+    };
+    for ((t, &a), &b) in t.as_chunks_mut::<2>().0.iter_mut().zip(x0).zip(x1).skip(k) {
+        t[0] = step(&mut m0, a);
+        t[1] = step(&mut m1, b);
+    }
+    [m0, m1]
 }
 
 /// Scalar reference of [`sig2word16_slice`].

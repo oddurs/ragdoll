@@ -149,10 +149,18 @@ pub fn pitch_downsample(x: &[&[i32]], x_lp: &mut [i16], len: usize) {
 /// `pitch_search`: returns the pitch period of `y` against `x_lp`.
 pub fn pitch_search(x_lp: &[i16], y: &[i16], len: usize, max_pitch: usize) -> usize {
     let lag = len + max_pitch;
-    let mut x_lp4: Vec<i16> = (0..len >> 2).map(|j| x_lp[2 * j]).collect();
-    let mut y_lp4: Vec<i16> = (0..lag >> 2).map(|j| y[2 * j]).collect();
-    let xmax = maxabs16(&x_lp4);
-    let ymax = maxabs16(&y_lp4);
+    // Stack buffers: the decoder's and encoder's searches need under 512 entries each.
+    let (mut x4, mut y4) = ([0i16; 1024], [0i16; 1024]);
+    let x_lp4 = &mut x4[..len >> 2];
+    for (j, v) in x_lp4.iter_mut().enumerate() {
+        *v = x_lp[2 * j];
+    }
+    let y_lp4 = &mut y4[..lag >> 2];
+    for (j, v) in y_lp4.iter_mut().enumerate() {
+        *v = y[2 * j];
+    }
+    let xmax = maxabs16(x_lp4);
+    let ymax = maxabs16(y_lp4);
     let mut shift = ilog2(1.max(xmax.max(ymax))) - 11;
     if shift > 0 {
         for v in x_lp4.iter_mut() {
@@ -165,12 +173,13 @@ pub fn pitch_search(x_lp: &[i16], y: &[i16], len: usize, max_pitch: usize) -> us
     } else {
         shift = 0;
     }
-    let mut xcorr = vec![0i32; max_pitch >> 1];
-    let maxcorr = pitch_xcorr(&x_lp4, &y_lp4, &mut xcorr, len >> 2, max_pitch >> 2);
+    let mut xc = [0i32; 1024];
+    let xcorr = &mut xc[..max_pitch >> 1];
+    let maxcorr = pitch_xcorr(x_lp4, y_lp4, xcorr, len >> 2, max_pitch >> 2);
     let mut best = [0usize; 2];
     find_best_pitch(
-        &xcorr,
-        &y_lp4,
+        xcorr,
+        y_lp4,
         len >> 2,
         max_pitch >> 2,
         &mut best,
@@ -191,7 +200,7 @@ pub fn pitch_search(x_lp: &[i16], y: &[i16], len: usize, max_pitch: usize) -> us
         maxcorr = maxcorr.max(sum);
     }
     find_best_pitch(
-        &xcorr,
+        xcorr,
         y,
         len >> 1,
         max_pitch >> 1,
@@ -260,8 +269,14 @@ pub fn fir(x: &[i16], x_off: usize, num: &[i16], y: &mut [i16], n: usize, ord: u
 
 /// `celt_iir` (non-`SMALL_FOOTPRINT` form): all-pole filter, in place on `x[..n]`.
 pub fn iir(x: &mut [i32], den: &[i16], n: usize, ord: usize, mem: &mut [i16]) {
-    let rden: Vec<i32> = (0..ord).map(|i| den[ord - i - 1] as i32).collect();
-    let mut y = vec![0i16; n + ord];
+    let mut rden = [0i32; LPC_ORDER];
+    let rden = &mut rden[..ord];
+    for (i, r) in rden.iter_mut().enumerate() {
+        *r = den[ord - i - 1] as i32;
+    }
+    // The decoder extrapolates at most a frame plus its overlap.
+    let mut y = [0i16; 2048 + LPC_ORDER];
+    let y = &mut y[..n + ord];
     for i in 0..ord {
         y[i] = mem[ord - i - 1].wrapping_neg();
     }
@@ -314,7 +329,9 @@ pub fn autocorr(
     n: usize,
 ) -> i32 {
     let fast_n = n - lag;
-    let mut xx: Vec<i16> = x[..n].to_vec();
+    let mut xx = [0i16; 2048];
+    let xx = &mut xx[..n];
+    xx.copy_from_slice(&x[..n]);
     if let (Some(w), true) = (window, overlap > 0) {
         for i in 0..overlap {
             xx[i] = mul16_q15(x[i] as i32, w[i] as i32) as i16;
@@ -339,7 +356,7 @@ pub fn autocorr(
     } else {
         shift = 0;
     }
-    pitch_xcorr(&xx, &xx, ac, fast_n, lag + 1);
+    pitch_xcorr(xx, xx, ac, fast_n, lag + 1);
     for k in 0..=lag {
         let mut d = 0i32;
         for i in k + fast_n..n {

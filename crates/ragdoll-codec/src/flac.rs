@@ -15,7 +15,10 @@ use ragdoll_core::{
     AlignedBuffer, AudioFrame, BitReader, BitWriter, RagdollError, Result, SampleFormat, crc8_flac,
     crc16_flac,
 };
-use ragdoll_simd::flac_eval_fixed_orders_l1;
+use ragdoll_simd::{
+    FLAC_RICE_ESCAPED, flac_autocorr_f64, flac_eval_fixed_orders_l1, flac_lpc_residual_i32,
+    flac_rice_partition_costs, flac_rice_partition_costs_scalar, flac_rice_partition_sums,
+};
 
 /// 4-byte ASCII stream marker at the start of every native `.flac` file.
 pub const FLAC_STREAM_MARKER: &[u8; 4] = b"fLaC";
@@ -1765,374 +1768,529 @@ pub fn compute_fixed_residuals(order: usize, samples: &[i32], residuals: &mut [i
     }
 }
 
-/// Computes autocorrelation lags `r[0..=max_order]` in a single pass and solves the Yule-Walker
-/// equations via Levinson-Durbin recursion (`libavcodec/lpc.h:compute_lpc_coefs`), returning
-/// quantized 12-bit QLP integer coefficients, shift, forward LPC residuals, and L1 residual sum.
-///
-/// Uses early MSE rejection against `best_fixed_l1` to skip forward residual synthesis whenever
-/// the Fixed predictor is already superior.
-fn try_compute_lpc8_subframe(
-    samples: &[i32],
-    best_fixed_l1: u64,
-) -> Option<(Vec<i32>, i32, Vec<i32>, u64)> {
-    const ORDER: usize = 8;
-    let n = samples.len();
-    if n <= ORDER * 4 || best_fixed_l1 == 0 {
-        return None;
-    }
+/// Default block size: what `libFLAC -5` uses; `libavcodec` level 5 takes 4608.
+const DEFAULT_BLOCK_SIZE: usize = 4096;
+/// Highest LPC order the encoder searches (`libavcodec` level 5 and `libFLAC -5` stop at 8).
+const MAX_LPC_ORDER: usize = 12;
+/// Quantized LPC coefficient precision in bits, the most FLAC allows. Highly predictable material
+/// gains several percent over 12 bits; the extra header bits are negligible at 4096 samples.
+const LPC_PRECISION: u32 = 15;
+/// Highest Rice partition order searched (as `libavcodec` from level 5 up).
+const MAX_PARTITION_ORDER: usize = 8;
+const MAX_PARTITIONS: usize = 1 << MAX_PARTITION_ORDER;
+/// Fixed predictors `0..=4` as LPC taps (newest sample first) with no shift.
+const FIXED_TAPS: [&[i32]; 5] = [&[], &[1], &[2, -1], &[3, -3, 1], &[4, -6, 4, -1]];
+/// The fixed predictor is coded exactly when its single-partition estimate is within this factor of
+/// the best LPC coding's single-partition size: fixed residuals often gain much more from
+/// partitioning (speech with pauses), but rarely 30 %.
+const FIXED_TRY_MARGIN: f64 = 1.3;
+/// Stereo pairs whose estimate is within this factor of the best pair's are planned exactly. Only
+/// the best (and any tie): 1.01 saves another 0.5 % on music for 10 % more time, and planning all
+/// four channels (`libFLAC`'s exhaustive search) 1 % for 40 %.
+const STEREO_TRY_MARGIN: f64 = 1.0;
+/// Taper of the Tukey apodization window, `libFLAC`'s default `tukey(5e-1)`.
+const TUKEY_TAPER: f64 = 0.5;
 
-    // Single-pass autocorrelation R[0..=8]: reads `samples` from L1 cache once instead of 9 times
-    let mut r = [0.0f64; ORDER + 1];
-    for i in 0..ORDER {
-        let si = samples[i] as f64;
-        for lag in 0..=i {
-            r[lag] += si * (samples[i - lag] as f64);
-        }
-    }
-    let mut r0 = r[0];
-    let mut r1 = r[1];
-    let mut r2 = r[2];
-    let mut r3 = r[3];
-    let mut r4 = r[4];
-    let mut r5 = r[5];
-    let mut r6 = r[6];
-    let mut r7 = r[7];
-    let mut r8 = r[8];
-
-    for i in ORDER..n {
-        let s = samples[i] as f64;
-        r0 += s * s;
-        r1 += s * (samples[i - 1] as f64);
-        r2 += s * (samples[i - 2] as f64);
-        r3 += s * (samples[i - 3] as f64);
-        r4 += s * (samples[i - 4] as f64);
-        r5 += s * (samples[i - 5] as f64);
-        r6 += s * (samples[i - 6] as f64);
-        r7 += s * (samples[i - 7] as f64);
-        r8 += s * (samples[i - 8] as f64);
-    }
-    r = [r0, r1, r2, r3, r4, r5, r6, r7, r8];
-
-    if r[0] <= 1.0 {
-        return None;
-    }
-
-    // Levinson-Durbin recursion
-    let mut lpc = [0.0f64; ORDER];
-    let mut prev = [0.0f64; ORDER];
-    let mut err = r[0];
-    for m in 0..ORDER {
-        let mut num = r[m + 1];
-        for j in 0..m {
-            num -= prev[j] * r[m - j];
-        }
-        let k = num / err;
-        if !k.is_finite() || k.abs() >= 0.9999 {
-            return None;
-        }
-        lpc[m] = k;
-        for j in 0..m {
-            lpc[j] = prev[j] - k * prev[m - 1 - j];
-        }
-        prev[..=m].copy_from_slice(&lpc[..=m]);
-        err *= 1.0 - k * k;
-        if err <= 1e-9 {
-            break;
-        }
-    }
-
-    // Early rejection: if theoretical LPC L1 lower bound exceeds `best_fixed_l1`, skip residual pass
-    let est_l1 = (err.max(0.0) * (n as f64) * 0.60).sqrt();
-    if est_l1 >= (best_fixed_l1 as f64) {
-        return None;
-    }
-
-    // Quantize floating-point LPC coefficients to 12-bit signed QLP integers (`qlp_prec = 12`, max mag = 2047)
-    let max_abs = lpc.iter().fold(0.0f64, |acc, &c| acc.max(c.abs()));
-    if max_abs <= 1e-6 || max_abs > 16.0 {
-        return None;
-    }
-    let mut qlp_shift = 10i32;
-    while qlp_shift > 0 && (max_abs * ((1 << qlp_shift) as f64)) > 1800.0 {
-        qlp_shift -= 1;
-    }
-    let scale = (1 << qlp_shift) as f64;
-    let mut q_coeffs = [0i32; ORDER];
-    for i in 0..ORDER {
-        q_coeffs[i] = (lpc[i] * scale).round().clamp(-2048.0, 2047.0) as i32;
-    }
-    if q_coeffs.iter().all(|&c| c == 0) {
-        return None;
-    }
-
-    // Unrolled 8-tap forward residual synthesis with fused L1 accumulation
-    let c0 = q_coeffs[0] as i64;
-    let c1 = q_coeffs[1] as i64;
-    let c2 = q_coeffs[2] as i64;
-    let c3 = q_coeffs[3] as i64;
-    let c4 = q_coeffs[4] as i64;
-    let c5 = q_coeffs[5] as i64;
-    let c6 = q_coeffs[6] as i64;
-    let c7 = q_coeffs[7] as i64;
-
-    let mut residuals = vec![0i32; n];
-    residuals[..ORDER].copy_from_slice(&samples[..ORDER]);
-    let mut l1_sum = 0u64;
-
-    for i in ORDER..n {
-        let sum = c0 * (samples[i - 1] as i64)
-            + c1 * (samples[i - 2] as i64)
-            + c2 * (samples[i - 3] as i64)
-            + c3 * (samples[i - 4] as i64)
-            + c4 * (samples[i - 5] as i64)
-            + c5 * (samples[i - 6] as i64)
-            + c6 * (samples[i - 7] as i64)
-            + c7 * (samples[i - 8] as i64);
-        let pred = sum >> qlp_shift;
-        let diff = (samples[i] as i64) - pred;
-        if diff < (i32::MIN as i64 / 2) || diff > (i32::MAX as i64 / 2) {
-            return None;
-        }
-        residuals[i] = diff as i32;
-        l1_sum += diff.unsigned_abs();
-    }
-
-    Some((q_coeffs.to_vec(), qlp_shift, residuals, l1_sum))
+/// How a subframe predicts its samples.
+#[derive(Clone, Copy, Debug)]
+enum Predictor {
+    Constant(i32),
+    Verbatim,
+    Fixed(usize),
+    Lpc {
+        order: usize,
+        precision: u32,
+        shift: u32,
+        coeffs: [i32; MAX_LPC_ORDER],
+    },
 }
 
-/// Solves for optimal Rice parameter `k` (`0..=14`) given folded unsigned residual sum `sum` and `n` samples
-/// (`libavcodec/flacenc.c:find_optimal_param`).
-#[inline]
-fn find_optimal_rice_param(sum: u64, n: usize) -> u32 {
-    let half_n = (n >> 1) as u64;
-    if sum <= half_n || n == 0 {
-        return 0;
-    }
-    let mean = (sum - half_n) / (n as u64);
-    if mean == 0 {
-        0
-    } else {
-        (63 - mean.leading_zeros()).min(14)
+/// Partitioned Rice coding of one residual.
+#[derive(Clone, Copy, Debug)]
+struct RicePlan {
+    porder: usize,
+    /// 5-bit parameters (`PARTITIONED_EXP_GOLOMB2`) instead of 4-bit ones.
+    wide: bool,
+    /// Rice parameter of each partition, or `FLAC_RICE_ESCAPED`.
+    params: [u8; MAX_PARTITIONS],
+    /// Raw two's-complement width of each escaped partition's residuals.
+    raw_bits: [u8; MAX_PARTITIONS],
+}
+
+impl Default for RicePlan {
+    fn default() -> Self {
+        Self {
+            porder: 0,
+            wide: false,
+            params: [0; MAX_PARTITIONS],
+            raw_bits: [0; MAX_PARTITIONS],
+        }
     }
 }
 
-/// Analytical bit count for a Rice partition (`libavcodec/flacenc.c:rice_encode_count`).
-#[inline]
-fn rice_encode_count(sum: u64, n: usize, k: u32) -> usize {
-    let half_n = (n >> 1) as u64;
-    n * ((k as usize) + 1) + ((sum.saturating_sub(half_n) >> k) as usize)
+/// The cheapest coding found for one subframe, and its size in bits (exact but for the Rice
+/// estimate of each partition, see [`flac_rice_partition_costs`]).
+#[derive(Clone, Copy, Debug)]
+struct SubframePlan {
+    predictor: Predictor,
+    wasted: u32,
+    bits: usize,
+    rice: RicePlan,
 }
 
-/// Evaluates adaptive multi-partition Rice coding (`partition_order = 0..=4`, up to 16 partitions)
-/// in a single leaf pass + binary tree reduction (`libavcodec/flacenc.c:calc_rice_params`).
-///
-/// Returns `(best_porder, rice_params[0..16], total_residual_bits)`.
-fn find_best_rice_partitions(order: usize, residuals: &[i32]) -> (usize, [u32; 16], usize) {
-    let n = residuals.len();
-    // Determine highest valid partition order `pmax <= 4` such that `n % (1 << pmax) == 0`
-    // and `(n >> pmax) > order` and `(n >> pmax) >= 16`.
-    let mut pmax = (n.trailing_zeros() as usize).min(4);
-    while pmax > 0 && ((n >> pmax) <= order || (n >> pmax) < 16) {
+/// Estimated Rice bits for `cnt` residuals whose folded values sum to `sum`, at the best parameter
+/// (see [`flac_rice_partition_costs`]).
+fn rice_bits_estimate(sum: u64, cnt: usize) -> usize {
+    let (mut bits, mut param) = ([0u32], [0u8]);
+    let cnt = cnt.min(u16::MAX as usize) as u32;
+    flac_rice_partition_costs_scalar(&[sum], &[u32::MAX], cnt, cnt, &mut bits, &mut param);
+    bits[0] as usize
+}
+
+/// Partition tree of one residual: node `2^p - 1 + i` is partition `i` at partition order `p`.
+struct RiceTree {
+    sums: [u64; 2 * MAX_PARTITIONS],
+    ors: [u32; 2 * MAX_PARTITIONS],
+    bits: [u32; 2 * MAX_PARTITIONS],
+    params: [u8; 2 * MAX_PARTITIONS],
+}
+
+impl Default for RiceTree {
+    fn default() -> Self {
+        Self {
+            sums: [0; 2 * MAX_PARTITIONS],
+            ors: [0; 2 * MAX_PARTITIONS],
+            bits: [0; 2 * MAX_PARTITIONS],
+            params: [0; 2 * MAX_PARTITIONS],
+        }
+    }
+}
+
+/// Finds the partition order and parameters that code `res[order..]` in the fewest bits, and
+/// returns that count (the residual coding header included) with the bits at partition order 0.
+#[inline(always)]
+fn plan_rice(res: &[i32], order: usize, tree: &mut RiceTree) -> (usize, usize, RicePlan) {
+    let n = res.len();
+    let mut pmax = (n.trailing_zeros() as usize).min(MAX_PARTITION_ORDER);
+    while pmax > 0 && (n >> pmax) <= order {
         pmax -= 1;
     }
-
-    // 1. Single pass over `residuals[order..n]` to populate leaf sums at level `pmax`
-    let mut sums = [[0u64; 16]; 5];
-    let top_parts = 1usize << pmax;
-    let top_psize = n >> pmax;
-    let mut idx = order;
-    for (p, sum_slot) in sums[pmax].iter_mut().enumerate().take(top_parts) {
-        let part_end = (p + 1) * top_psize;
-        let mut s = 0u64;
-        for &r in &residuals[idx..part_end] {
-            let v = r as i64;
-            s += ((v << 1) ^ (v >> 63)) as u64;
-        }
-        *sum_slot = s;
-        idx = part_end;
-    }
-
-    // 2. Binary tree reduction from `pmax` down to `0` (at most 15 additions total)
-    for level in (0..pmax).rev() {
-        let parts = 1usize << level;
-        for i in 0..parts {
-            sums[level][i] = sums[level + 1][2 * i] + sums[level + 1][2 * i + 1];
+    let leaves = 1usize << pmax;
+    let RiceTree {
+        sums,
+        ors,
+        bits,
+        params,
+    } = tree;
+    flac_rice_partition_sums(
+        res,
+        order,
+        n >> pmax,
+        &mut sums[leaves - 1..2 * leaves - 1],
+        &mut ors[leaves - 1..2 * leaves - 1],
+    );
+    for p in (0..pmax).rev() {
+        let (b, c) = ((1usize << p) - 1, (2usize << p) - 1);
+        for i in 0..1usize << p {
+            sums[b + i] = sums[c + 2 * i] + sums[c + 2 * i + 1];
+            ors[b + i] = ors[c + 2 * i] | ors[c + 2 * i + 1];
         }
     }
 
-    // 3. Evaluate bit cost for each partition order `porder in 0..=pmax`
-    let mut best_porder = 0usize;
-    let mut best_params = [0u32; 16];
-    let mut best_bits = usize::MAX;
-
-    for (porder, level_sums) in sums.iter().enumerate().take(pmax + 1) {
-        let parts = 1usize << porder;
-        let psize = n >> porder;
-        let mut total_bits = 2 + 4 + 4 * parts; // coding_method (2) + porder (4) + 4 bits per partition param
-        let mut cand_params = [0u32; 16];
-
-        for p in 0..parts {
-            let cnt = if p == 0 { psize - order } else { psize };
-            let sum = level_sums[p];
-            let k = find_optimal_rice_param(sum, cnt);
-            cand_params[p] = k;
-            total_bits += rice_encode_count(sum, cnt, k);
+    // Every partition is costed once; a partition order then costs the sum of its level.
+    let mut best = (usize::MAX, 0, false);
+    let mut level0 = 0;
+    for p in 0..=pmax {
+        let (b, parts, psize) = ((1usize << p) - 1, 1usize << p, (n >> p) as u32);
+        let level = b..b + parts;
+        flac_rice_partition_costs(
+            &sums[level.clone()],
+            &ors[level.clone()],
+            psize,
+            psize - order as u32,
+            &mut bits[level.clone()],
+            &mut params[level.clone()],
+        );
+        let wide = params[level.clone()]
+            .iter()
+            .any(|&k| k != FLAC_RICE_ESCAPED && k > 14);
+        let total = 2
+            + 4
+            + parts * if wide { 5 } else { 4 }
+            + bits[level].iter().map(|&b| b as usize).sum::<usize>();
+        if p == 0 {
+            level0 = total;
         }
-
-        if total_bits < best_bits {
-            best_bits = total_bits;
-            best_porder = porder;
-            best_params = cand_params;
+        if total < best.0 {
+            best = (total, p, wide);
         }
     }
 
-    (best_porder, best_params, best_bits)
+    let (total, porder, wide) = best;
+    let mut plan = RicePlan {
+        porder,
+        wide,
+        ..RicePlan::default()
+    };
+    let b = (1usize << porder) - 1;
+    plan.params[..1 << porder].copy_from_slice(&params[b..2 * b + 1]);
+    for (raw, &or) in plan.raw_bits.iter_mut().zip(&ors[b..2 * b + 1]) {
+        *raw = (32 - or.leading_zeros()) as u8;
+    }
+    (total, level0, plan)
 }
 
-/// Writes multi-partition Rice-coded residuals (`partition_order = 0..=4`) into `w`.
-#[inline]
-fn write_residual_partitions(
-    w: &mut BitWriter,
-    order: usize,
-    porder: usize,
-    params: &[u32; 16],
-    residuals: &[i32],
-) {
-    let n = residuals.len();
-    let parts = 1usize << porder;
-    let psize = n >> porder;
-
-    w.write_bits(0, 2); // coding_method = 0 (4-bit Rice parameter)
-    w.write_bits(porder as u64, 4);
-
-    let mut idx = order;
-    for (p, &k) in params.iter().enumerate().take(parts) {
-        let part_end = (p + 1) * psize;
-        w.write_bits(k as u64, 4);
-        for &r in &residuals[idx..part_end] {
-            w.write_rice_signed(r as i64, k);
-        }
-        idx = part_end;
-    }
-}
-
-/// Encodes a single FLAC subframe (choosing Constant, Fixed 0..=4, FIR LPC-8, or Verbatim) into `w`
-/// in a single bitstream pass without temporary `BitWriter` allocations.
-fn encode_subframe(w: &mut BitWriter, raw_samples: &[i32], subframe_bps: u8) {
-    let n = raw_samples.len();
-    assert!(n > 0);
-
-    // 1. Constant check + wasted_bits detection in a single pass
-    let first = raw_samples[0];
-    let mut is_constant = true;
-    let mut or_mask = 0u32;
-    for &s in raw_samples {
-        if s != first {
-            is_constant = false;
-        }
-        or_mask |= s as u32;
-    }
-    if is_constant {
-        w.write_bit(false); // zero pad
-        w.write_bits(0, 6); // Constant (000000)
-        w.write_bit(false); // no wasted bits
-        w.write_signed_bits(first as i64, subframe_bps as u32);
-        return;
-    }
-
-    let wasted_bits = if or_mask == 0 {
-        0
-    } else {
-        (or_mask.trailing_zeros() as u8).min(subframe_bps.saturating_sub(2))
-    };
-    let effective_bps = subframe_bps - wasted_bits;
-    let shifted_buf: Vec<i32>;
-    let samples: &[i32] = if wasted_bits > 0 {
-        shifted_buf = raw_samples.iter().map(|&s| s >> wasted_bits).collect();
-        &shifted_buf
-    } else {
-        raw_samples
-    };
-
-    // 2. Evaluate all 5 Fixed predictor orders (0..=4) in a SINGLE fused NEON pass (`libFLAC/fixed.c`)
-    let max_fixed_order = 4.min(n.saturating_sub(1));
-    let l1_orders = flac_eval_fixed_orders_l1(samples);
-    let mut best_fixed_order = 0usize;
-    let mut best_l1 = l1_orders[0];
-    for (order, &l1) in l1_orders
-        .iter()
-        .enumerate()
-        .take(max_fixed_order + 1)
-        .skip(1)
-    {
-        if l1 < best_l1 {
-            best_l1 = l1;
-            best_fixed_order = order;
-        }
-    }
-
-    // 3. Evaluate FIR LPC (order 8) on blocks >= 64 samples when Fixed order >= 2 is chosen
-    let mut best_lpc: Option<(Vec<i32>, i32, Vec<i32>)> = None;
-    if n >= 64
-        && best_fixed_order >= 2
-        && let Some((coeffs, shift, lpc_res, lpc_l1)) = try_compute_lpc8_subframe(samples, best_l1)
-        && lpc_l1 + (lpc_l1 / 20) < best_l1
-    {
-        best_lpc = Some((coeffs, shift, lpc_res));
-    }
-
-    // 4. Compute multi-partition Rice parameters for the winning predictor vs Verbatim and emit once into `w`
-    let wasted_flag_bits = if wasted_bits > 0 {
-        1 + (wasted_bits as usize)
-    } else {
-        1
-    };
-    let verbatim_bits = 7 + wasted_flag_bits + n * (effective_bps as usize);
-
-    if let Some((coeffs, shift, lpc_res)) = best_lpc {
-        let order = coeffs.len();
-        let (porder, params, r_bits) = find_best_rice_partitions(order, &lpc_res);
-        let lpc_bits =
-            7 + wasted_flag_bits + order * (effective_bps as usize) + 4 + 5 + order * 12 + r_bits;
-        if lpc_bits <= verbatim_bits {
-            w.write_bit(false);
-            w.write_bits((32 + order - 1) as u64, 6);
-            write_wasted_bits_flag(w, wasted_bits);
-            for &s in &samples[..order] {
-                w.write_signed_bits(s as i64, effective_bps as u32);
+/// Writes the partitioned Rice coding of `res[order..]` described by `plan`.
+#[inline(always)]
+fn write_residual(w: &mut BitWriter, res: &[i32], order: usize, plan: &RicePlan) {
+    let (param_bits, escape) = if plan.wide { (5, 31) } else { (4, 15) };
+    w.write_bits(u64::from(plan.wide), 2);
+    w.write_bits(plan.porder as u64, 4);
+    let psize = res.len() >> plan.porder;
+    for p in 0..1usize << plan.porder {
+        let part = &res[(p * psize).max(order)..(p + 1) * psize];
+        let k = plan.params[p];
+        if k == FLAC_RICE_ESCAPED {
+            let raw = plan.raw_bits[p] as u32;
+            w.write_bits(escape, param_bits);
+            w.write_bits(raw as u64, 5);
+            if raw > 0 {
+                for &r in part {
+                    w.write_signed_bits(r as i64, raw);
+                }
             }
-            w.write_bits(12 - 1, 4);
+        } else {
+            w.write_bits(k as u64, param_bits);
+            w.write_rice_signed_i32(part, k as u32);
+        }
+    }
+}
+
+/// Per-thread buffers of the subframe search, reused from frame to frame.
+#[derive(Default)]
+struct EncoderWorkspace {
+    /// Apodization window for blocks of `window.len()` samples.
+    window: Vec<f64>,
+    /// Mean of the squared window, the share of the energy it keeps.
+    window_power: f64,
+    windowed: Vec<f64>,
+    shifted: Vec<i32>,
+    candidate: Vec<i32>,
+    tree: Box<RiceTree>,
+    side: Vec<i32>,
+    mid: Vec<i32>,
+    /// Winning residual (warm-up samples first) of each analysed channel.
+    residuals: [Vec<i32>; 4],
+    /// The block's channels, deinterleaved from 16-bit input.
+    input: Vec<Vec<i32>>,
+}
+
+impl EncoderWorkspace {
+    fn prepare(&mut self, n: usize) {
+        if self.window.len() != n {
+            self.window = apodization_window(n);
+            self.window_power = self.window.iter().map(|w| w * w).sum::<f64>() / n.max(1) as f64;
+        }
+        for v in [
+            &mut self.shifted,
+            &mut self.candidate,
+            &mut self.side,
+            &mut self.mid,
+        ] {
+            v.resize(n, 0);
+        }
+        for v in &mut self.residuals {
+            v.resize(n, 0);
+        }
+        self.windowed.resize(n, 0.0);
+    }
+}
+
+/// Tukey window of `n` samples: flat, with raised-cosine tapers over [`TUKEY_TAPER`] of the block.
+/// (It beat `libavcodec`'s Welch window on music, speech and tones alike.)
+fn apodization_window(n: usize) -> Vec<f64> {
+    let mut w = vec![1.0f64; n];
+    let taper = (TUKEY_TAPER / 2.0 * n as f64) as usize;
+    for i in 0..taper {
+        let v = 0.5 - 0.5 * (std::f64::consts::PI * i as f64 / taper as f64).cos();
+        w[i] = v;
+        w[n - 1 - i] = v;
+    }
+    w
+}
+
+/// Levinson-Durbin recursion on autocorrelation `r`: `lpc[m - 1][..m]` predicts
+/// `x[i] ≈ Σ lpc[m - 1][j] · x[i - 1 - j]` with error energy `err[m]`. Returns the highest order solved.
+fn levinson_durbin(
+    r: &[f64],
+    max_order: usize,
+    lpc: &mut [[f64; MAX_LPC_ORDER]; MAX_LPC_ORDER],
+    err: &mut [f64; MAX_LPC_ORDER + 1],
+) -> usize {
+    let mut a = [0.0f64; MAX_LPC_ORDER];
+    let mut e = r[0];
+    err[0] = e;
+    for m in 0..max_order {
+        let mut acc = r[m + 1];
+        for j in 0..m {
+            acc -= a[j] * r[m - j];
+        }
+        let k = acc / e;
+        if !k.is_finite() || k.abs() >= 1.0 {
+            return m;
+        }
+        let prev = a;
+        a[m] = k;
+        for j in 0..m {
+            a[j] = prev[j] - k * prev[m - 1 - j];
+        }
+        e *= 1.0 - k * k;
+        lpc[m] = a;
+        err[m + 1] = e;
+        if e <= 0.0 {
+            return m + 1;
+        }
+    }
+    max_order
+}
+
+/// Quantizes `a` to `precision`-bit coefficients with the largest shift (`<= 15`) that fits,
+/// carrying each rounding error into the next tap (`libavcodec/lpc.c:quantize_lpc_coefs`).
+fn quantize_lpc(a: &[f64], precision: u32, out: &mut [i32]) -> Option<u32> {
+    let qmax = (1i32 << (precision - 1)) - 1;
+    let cmax = a.iter().fold(0.0f64, |m, &c| m.max(c.abs()));
+    if cmax <= 0.0 || !cmax.is_finite() {
+        return None;
+    }
+    let mut shift = 15i32;
+    while shift > 0 && cmax * f64::from(1u32 << shift) > qmax as f64 {
+        shift -= 1;
+    }
+    let scale = if cmax * f64::from(1u32 << shift) > qmax as f64 {
+        qmax as f64 / cmax
+    } else {
+        f64::from(1u32 << shift)
+    };
+    let mut error = 0.0f64;
+    let mut any = false;
+    for (o, &c) in out.iter_mut().zip(a) {
+        error += c * scale;
+        let q = (error.round() as i32).clamp(-qmax, qmax);
+        error -= q as f64;
+        *o = q;
+        any |= q != 0;
+    }
+    any.then_some(shift as u32)
+}
+
+/// Expected Rice bits per residual whose folded values average `mean`, at the best parameter.
+fn rice_bits_per_sample(mean: f64) -> f64 {
+    let t = mean * std::f64::consts::LN_2;
+    let k = if t < 1.0 { 0.0 } else { t.log2().floor() };
+    let cost = |k: f64| k + 1.0 + mean / k.exp2();
+    cost(k).min(cost(k + 1.0))
+}
+
+/// Picks the cheapest coding of one subframe of `bps`-bit samples `raw`, leaving its residual
+/// (warm-up samples first, or the samples themselves for Verbatim) in `out`.
+#[inline(always)]
+fn plan_subframe(
+    raw: &[i32],
+    bps: u32,
+    ws: &mut EncoderWorkspace,
+    out: &mut Vec<i32>,
+    l1_hint: Option<&[u64; 5]>,
+) -> SubframePlan {
+    let n = raw.len();
+    let first = raw[0];
+    // `mag` ORs `|s|` rounded down to odd, so `bitlen(mag)` bounds every magnitude.
+    let (mut or, mut diff, mut mag) = (0u32, 0u32, 0u32);
+    for &s in raw {
+        or |= s as u32;
+        diff |= (s ^ first) as u32;
+        mag |= (s ^ (s >> 31)) as u32;
+    }
+    let mut plan = SubframePlan {
+        predictor: Predictor::Constant(first),
+        wasted: 0,
+        bits: 8 + bps as usize,
+        rice: RicePlan::default(),
+    };
+    if diff == 0 {
+        return plan;
+    }
+
+    let wasted = or.trailing_zeros().min(bps - 1);
+    let x: &[i32] = if wasted > 0 {
+        for (d, &s) in ws.shifted.iter_mut().zip(raw) {
+            *d = s >> wasted;
+        }
+        &ws.shifted
+    } else {
+        raw
+    };
+    let ebps = bps - wasted;
+    // `s ^ (s >> 31)` is `|s|` or `|s| - 1`, so every `|x|` is at most `2^bitlen(mag >> wasted)`.
+    let max_abs = 1u64 << (32 - (mag >> wasted).leading_zeros());
+    let head = 8 + wasted as usize;
+    plan.wasted = wasted;
+    plan.predictor = Predictor::Verbatim;
+    plan.bits = head + n * ebps as usize;
+
+    // Fixed predictor with the smallest L1 residual, and its single-partition cost estimate.
+    let fixed = (ebps <= 26 && n > 4).then(|| {
+        let l1 = match l1_hint {
+            Some(l1) if wasted == 0 => *l1,
+            _ => flac_eval_fixed_orders_l1(x),
+        };
+        let order = (0..5).min_by_key(|&o| l1[o]).unwrap_or(0);
+        // Folded residuals sum to about `2 · L1 - cnt / 2` (half of them negative).
+        let cnt = n - order;
+        let folded = (2 * l1[order]).saturating_sub(cnt as u64 / 2);
+        let est = head + order * ebps as usize + 2 + 4 + 4 + rice_bits_estimate(folded, cnt);
+        (order, est, l1[order])
+    });
+    // Size of the best predicted coding with its residual in a single partition, to compare
+    // with the fixed predictor's estimate.
+    let mut single_partition = usize::MAX;
+
+    // LPC from the windowed autocorrelation, unless a fixed predictor leaves almost nothing.
+    let max_order = MAX_LPC_ORDER.min(n / 4);
+    if max_order > 0 && fixed.is_none_or(|f| f.2 > n as u64) {
+        for ((d, &s), &w) in ws.windowed.iter_mut().zip(x).zip(&ws.window) {
+            *d = s as f64 * w;
+        }
+        let mut r = [0.0f64; MAX_LPC_ORDER + 1];
+        flac_autocorr_f64(&ws.windowed, &mut r[..=max_order]);
+        if r[0] > 0.0 {
+            let mut lpc = [[0.0f64; MAX_LPC_ORDER]; MAX_LPC_ORDER];
+            let mut err = [0.0f64; MAX_LPC_ORDER + 1];
+            let solved = levinson_durbin(&r, max_order, &mut lpc, &mut err);
+            let precision = LPC_PRECISION;
+            // Only the order of smallest expected size is coded: its header, and Rice codes for
+            // residuals of the energy the recursion predicts (the window keeps `window_power` of
+            // the energy, and folded Laplacian residuals average `sqrt(2 · variance)`). The
+            // estimate ranks orders well: also coding the runner-up bought 0.1 % for 15 % more time.
+            let scale = 2.0 / (n as f64 * ws.window_power);
+            let expected = |m: usize| {
+                let bits = rice_bits_per_sample((err[m].max(0.0) * scale).sqrt());
+                bits * (n - m) as f64 + (m * (precision + ebps) as usize) as f64
+            };
+            let order = (1..=solved).min_by(|&a, &b| expected(a).total_cmp(&expected(b)));
+            let mut coeffs = [0i32; MAX_LPC_ORDER];
+            if let Some(order) = order
+                && let Some(shift) =
+                    quantize_lpc(&lpc[order - 1][..order], precision, &mut coeffs[..order])
+                && {
+                    let c = &coeffs[..order];
+                    let abs_sum: u64 = c.iter().map(|&v| v.unsigned_abs() as u64).sum();
+                    if (abs_sum + 1) * max_abs < 1 << 31 {
+                        flac_lpc_residual_i32(x, c, shift, &mut ws.candidate);
+                        true
+                    } else {
+                        lpc_residual_i64(x, c, shift, &mut ws.candidate)
+                    }
+                }
+            {
+                let (rbits, rbits0, rice) = plan_rice(&ws.candidate, order, &mut ws.tree);
+                let lpc_head = head + order * (ebps + precision) as usize + 4 + 5;
+                single_partition = lpc_head + rbits0;
+                if lpc_head + rbits < plan.bits {
+                    plan.predictor = Predictor::Lpc {
+                        order,
+                        precision,
+                        shift,
+                        coeffs,
+                    };
+                    plan.bits = lpc_head + rbits;
+                    plan.rice = rice;
+                    std::mem::swap(out, &mut ws.candidate);
+                }
+            }
+        }
+    }
+
+    // The fixed predictor, when its estimate (which ignores partitioning) comes near the best.
+    if let Some((order, est, _)) = fixed
+        && (est as f64) < single_partition.min(plan.bits) as f64 * FIXED_TRY_MARGIN
+    {
+        flac_lpc_residual_i32(x, FIXED_TAPS[order], 0, &mut ws.candidate);
+        let (rbits, _, rice) = plan_rice(&ws.candidate, order, &mut ws.tree);
+        let bits = head + order * ebps as usize + rbits;
+        if bits < plan.bits {
+            plan.predictor = Predictor::Fixed(order);
+            plan.bits = bits;
+            plan.rice = rice;
+            std::mem::swap(out, &mut ws.candidate);
+        }
+    }
+
+    if matches!(plan.predictor, Predictor::Verbatim) {
+        out[..n].copy_from_slice(x);
+    }
+    plan
+}
+
+/// 64-bit LPC residual for coefficient sets whose sums may overflow 32 bits; `false` when a
+/// residual does not fit in `i32`.
+fn lpc_residual_i64(x: &[i32], coeffs: &[i32], shift: u32, res: &mut [i32]) -> bool {
+    let order = coeffs.len();
+    res[..order].copy_from_slice(&x[..order]);
+    for i in order..x.len() {
+        let mut sum = 0i64;
+        for (j, &c) in coeffs.iter().enumerate() {
+            sum += c as i64 * x[i - 1 - j] as i64;
+        }
+        let r = x[i] as i64 - (sum >> shift);
+        if r != r as i32 as i64 {
+            return false;
+        }
+        res[i] = r as i32;
+    }
+    true
+}
+
+/// Writes one subframe of `bps`-bit samples planned by [`plan_subframe`] with residual `res`.
+#[inline(always)]
+fn write_subframe(w: &mut BitWriter, plan: &SubframePlan, res: &[i32], bps: u32) {
+    let ebps = bps - plan.wasted;
+    let type_code = match plan.predictor {
+        Predictor::Constant(_) => 0,
+        Predictor::Verbatim => 1,
+        Predictor::Fixed(order) => 8 + order as u64,
+        Predictor::Lpc { order, .. } => 32 + order as u64 - 1,
+    };
+    w.write_bits(type_code, 7); // zero pad bit + 6-bit type
+    write_wasted_bits_flag(w, plan.wasted as u8);
+    match plan.predictor {
+        Predictor::Constant(v) => w.write_signed_bits(v as i64, bps),
+        Predictor::Verbatim => {
+            for &s in res {
+                w.write_signed_bits(s as i64, ebps);
+            }
+        }
+        Predictor::Fixed(order) => {
+            for &s in &res[..order] {
+                w.write_signed_bits(s as i64, ebps);
+            }
+            write_residual(w, res, order, &plan.rice);
+        }
+        Predictor::Lpc {
+            order,
+            precision,
+            shift,
+            coeffs,
+        } => {
+            for &s in &res[..order] {
+                w.write_signed_bits(s as i64, ebps);
+            }
+            w.write_bits(precision as u64 - 1, 4);
             w.write_signed_bits(shift as i64, 5);
-            for &c in &coeffs {
-                w.write_signed_bits(c as i64, 12);
+            for &c in &coeffs[..order] {
+                w.write_signed_bits(c as i64, precision);
             }
-            write_residual_partitions(w, order, porder, &params, &lpc_res);
-            return;
+            write_residual(w, res, order, &plan.rice);
         }
-    } else {
-        let mut best_residuals = vec![0i32; n];
-        compute_fixed_residuals(best_fixed_order, samples, &mut best_residuals);
-        let (porder, params, r_bits) = find_best_rice_partitions(best_fixed_order, &best_residuals);
-        let fixed_bits =
-            7 + wasted_flag_bits + best_fixed_order * (effective_bps as usize) + r_bits;
-        if fixed_bits <= verbatim_bits {
-            w.write_bit(false);
-            w.write_bits((8 + best_fixed_order) as u64, 6);
-            write_wasted_bits_flag(w, wasted_bits);
-            for &s in &samples[..best_fixed_order] {
-                w.write_signed_bits(s as i64, effective_bps as u32);
-            }
-            write_residual_partitions(w, best_fixed_order, porder, &params, &best_residuals);
-            return;
-        }
-    }
-
-    // Verbatim fallback when incompressible noise exceeds raw PCM size
-    w.write_bit(false);
-    w.write_bits(1, 6);
-    write_wasted_bits_flag(w, wasted_bits);
-    for &s in samples {
-        w.write_signed_bits(s as i64, effective_bps as u32);
     }
 }
 
@@ -2149,52 +2307,6 @@ fn write_wasted_bits_flag(w: &mut BitWriter, wasted_bits: u8) {
     }
 }
 
-/// Estimates the optimal stereo decorrelation mode (`Independent`, `LeftSide`, `RightSide`, `MidSide`)
-/// using 2nd-order residual Rice bit-cost (`libavcodec/flacenc.c:estimate_stereo_mode`).
-#[inline]
-fn estimate_stereo_mode(left: &[i32], right: &[i32]) -> FlacChannelMode {
-    let n = left.len();
-    if n < 3 {
-        return FlacChannelMode::Independent(2);
-    }
-    let mut sum = [0u64; 4]; // [left, right, mid, side]
-    for i in 2..n {
-        let lt = (left[i] as i64) - 2 * (left[i - 1] as i64) + (left[i - 2] as i64);
-        let rt = (right[i] as i64) - 2 * (right[i - 1] as i64) + (right[i - 2] as i64);
-        sum[0] += lt.unsigned_abs();
-        sum[1] += rt.unsigned_abs();
-        sum[2] += ((lt + rt) >> 1).unsigned_abs();
-        sum[3] += (lt - rt).unsigned_abs();
-    }
-
-    let mut bits = [0usize; 4];
-    for i in 0..4 {
-        let s2 = sum[i].saturating_mul(2);
-        let k = find_optimal_rice_param(s2, n);
-        bits[i] = rice_encode_count(s2, n, k);
-    }
-
-    let scores = [
-        bits[0] + bits[1], // Independent (Left + Right)
-        bits[0] + bits[3], // LeftSide    (Left + Side)
-        bits[3] + bits[1], // RightSide   (Side + Right)
-        bits[2] + bits[3], // MidSide     (Mid + Side)
-    ];
-
-    let mut best = 0usize;
-    for i in 1..4 {
-        if scores[i] < scores[best] {
-            best = i;
-        }
-    }
-    match best {
-        1 => FlacChannelMode::LeftSide,
-        2 => FlacChannelMode::RightSide,
-        3 => FlacChannelMode::MidSide,
-        _ => FlacChannelMode::Independent(2),
-    }
-}
-
 /// Pure-Rust lossless FLAC encoder.
 #[derive(Clone, Debug)]
 pub struct FlacEncoder {
@@ -2208,7 +2320,7 @@ pub struct FlacEncoder {
 impl FlacEncoder {
     pub fn new(sample_rate: u32, channels: u8, bits_per_sample: u8) -> Self {
         Self {
-            block_size: 4096,
+            block_size: DEFAULT_BLOCK_SIZE,
             sample_rate,
             channels,
             bits_per_sample,
@@ -2229,20 +2341,110 @@ impl FlacEncoder {
 
     /// Encodes a single FLAC frame from channel slices `&[&[i32]]` without cloning independent channel vectors.
     pub fn encode_frame_slices(&self, planar: &[&[i32]], frame_number: u64) -> Result<Vec<u8>> {
+        self.encode_frame_with(planar, frame_number, &mut EncoderWorkspace::default())
+    }
+
+    /// Encodes one frame. On x86_64 the AVX2 dispatch level runs the same code compiled for
+    /// AVX2, BMI2 and LZCNT (which every AVX2 CPU has): the plain loops of the search vectorize
+    /// 8 lanes wide and the bit twiddling gets flag-free shifts and `lzcnt`. Integer results and
+    /// unfused float operations are identical either way, so both write the same stream.
+    fn encode_frame_with(
+        &self,
+        planar: &[&[i32]],
+        frame_number: u64,
+        ws: &mut EncoderWorkspace,
+    ) -> Result<Vec<u8>> {
+        #[cfg(target_arch = "x86_64")]
+        if ragdoll_core::dispatch::avx2()
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            // Safety: the CPU supports AVX2, BMI2 and LZCNT (checked just above).
+            return unsafe { self.encode_frame_avx2(planar, frame_number, ws) };
+        }
+        self.encode_frame_impl(planar, frame_number, ws)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    unsafe fn encode_frame_avx2(
+        &self,
+        planar: &[&[i32]],
+        frame_number: u64,
+        ws: &mut EncoderWorkspace,
+    ) -> Result<Vec<u8>> {
+        self.encode_frame_impl(planar, frame_number, ws)
+    }
+
+    #[inline(always)]
+    fn encode_frame_impl(
+        &self,
+        planar: &[&[i32]],
+        frame_number: u64,
+        ws: &mut EncoderWorkspace,
+    ) -> Result<Vec<u8>> {
         if planar.is_empty() || planar.len() != self.channels as usize {
             return Err(RagdollError::InvalidData(
                 "FLAC encode_frame_slices channel count mismatch".into(),
             ));
         }
         let block_size = planar[0].len();
-        if block_size == 0 {
+        if block_size == 0 || planar.iter().any(|c| c.len() != block_size) {
             return Err(RagdollError::InvalidData(
-                "FLAC encode_frame_slices empty block".into(),
+                "FLAC encode_frame_slices empty or ragged block".into(),
             ));
         }
+        ws.prepare(block_size);
+        let bps = self.bits_per_sample as u32;
 
-        let channel_mode = if self.channels == 2 {
-            estimate_stereo_mode(planar[0], planar[1])
+        // Stereo: of left (0), right (1), side (2, `bps + 1` bits) and mid (3), rank the four
+        // channel pairs by each channel's best fixed predictor (as `libavcodec` does), plan the
+        // channels of the pairs within `STEREO_TRY_MARGIN` of the best exactly, and keep the
+        // cheapest of those pairs.
+        const PAIRS: [([usize; 2], FlacChannelMode); 4] = [
+            ([0, 1], FlacChannelMode::Independent(2)),
+            ([0, 2], FlacChannelMode::LeftSide),
+            ([2, 1], FlacChannelMode::RightSide),
+            ([3, 2], FlacChannelMode::MidSide),
+        ];
+        let mut plans = [None; 4];
+        let mut stereo_pair = None;
+        let channel_mode = if self.channels == 2 && bps < 32 {
+            let (l, r) = (planar[0], planar[1]);
+            let (mut side, mut mid) = (std::mem::take(&mut ws.side), std::mem::take(&mut ws.mid));
+            decorrelate_mid_side_i32(l, r, &mut mid, &mut side);
+            let chans = [l, r, &side[..], &mid[..]];
+            let l1s = chans.map(flac_eval_fixed_orders_l1);
+            // Each channel costs at most its Verbatim size (which makes side dearer on noise).
+            let est: [usize; 4] = std::array::from_fn(|c| {
+                let c_bps = bps as usize + usize::from(c == 2);
+                (0..5)
+                    .map(|o| rice_bits_estimate(2 * l1s[c][o], block_size - o) + o * c_bps)
+                    .fold(block_size * c_bps, usize::min)
+            });
+            let pair_est = |p: [usize; 2]| est[p[0]].saturating_add(est[p[1]]);
+            let best = PAIRS.iter().map(|&(p, _)| pair_est(p)).min().unwrap_or(0);
+            let mut wanted = [false; 4];
+            for (p, _) in PAIRS {
+                if pair_est(p) as f64 <= best as f64 * STEREO_TRY_MARGIN {
+                    (wanted[p[0]], wanted[p[1]]) = (true, true);
+                }
+            }
+            let mut res = std::mem::take(&mut ws.residuals);
+            for (c, x) in chans.into_iter().enumerate() {
+                if wanted[c] {
+                    let sub_bps = bps + u32::from(c == 2);
+                    plans[c] = Some(plan_subframe(x, sub_bps, ws, &mut res[c], Some(&l1s[c])));
+                }
+            }
+            (ws.residuals, ws.side, ws.mid) = (res, side, mid);
+            let bits = |c: usize| plans[c].map_or(usize::MAX, |p: SubframePlan| p.bits);
+            let (pair, mode) = *PAIRS
+                .iter()
+                .min_by_key(|(p, _)| bits(p[0]).saturating_add(bits(p[1])))
+                .unwrap();
+            stereo_pair = Some(pair);
+            mode
         } else {
             FlacChannelMode::Independent(self.channels)
         };
@@ -2257,63 +2459,20 @@ impl FlacEncoder {
             header_crc8: 0,
             header_len_bytes: 0,
         };
-
         let mut w = BitWriter::with_capacity(block_size * (self.channels as usize) * 2 + 32);
         header.write(&mut w);
 
-        match channel_mode {
-            FlacChannelMode::Independent(_) => {
-                for (c, &sf) in planar.iter().enumerate() {
-                    let sf_bps = channel_mode.subframe_bps(self.bits_per_sample, c);
-                    encode_subframe(&mut w, sf, sf_bps);
-                }
+        if let Some(pair) = stereo_pair {
+            for c in pair {
+                let plan = plans[c].as_ref().unwrap();
+                write_subframe(&mut w, plan, &ws.residuals[c], bps + u32::from(c == 2));
             }
-            FlacChannelMode::LeftSide => {
-                let mut side = vec![0i32; block_size];
-                for i in 0..block_size {
-                    side[i] = planar[0][i] - planar[1][i];
-                }
-                encode_subframe(
-                    &mut w,
-                    planar[0],
-                    channel_mode.subframe_bps(self.bits_per_sample, 0),
-                );
-                encode_subframe(
-                    &mut w,
-                    &side,
-                    channel_mode.subframe_bps(self.bits_per_sample, 1),
-                );
-            }
-            FlacChannelMode::RightSide => {
-                let mut side = vec![0i32; block_size];
-                for i in 0..block_size {
-                    side[i] = planar[0][i] - planar[1][i];
-                }
-                encode_subframe(
-                    &mut w,
-                    &side,
-                    channel_mode.subframe_bps(self.bits_per_sample, 0),
-                );
-                encode_subframe(
-                    &mut w,
-                    planar[1],
-                    channel_mode.subframe_bps(self.bits_per_sample, 1),
-                );
-            }
-            FlacChannelMode::MidSide => {
-                let mut mid = vec![0i32; block_size];
-                let mut side = vec![0i32; block_size];
-                decorrelate_mid_side_i32(planar[0], planar[1], &mut mid, &mut side);
-                encode_subframe(
-                    &mut w,
-                    &mid,
-                    channel_mode.subframe_bps(self.bits_per_sample, 0),
-                );
-                encode_subframe(
-                    &mut w,
-                    &side,
-                    channel_mode.subframe_bps(self.bits_per_sample, 1),
-                );
+        } else {
+            for &x in planar {
+                let mut res = std::mem::take(&mut ws.residuals[0]);
+                let plan = plan_subframe(x, bps, ws, &mut res, None);
+                write_subframe(&mut w, &plan, &res, bps);
+                ws.residuals[0] = res;
             }
         }
 
@@ -2336,11 +2495,43 @@ impl FlacEncoder {
         &self,
         audio: &AudioFrame,
     ) -> Result<(FlacStreamInfo, Vec<(Vec<u8>, usize)>)> {
-        let (planar, detected_bps) = audio_frame_to_planar_i32(audio)?;
-        let bps = if self.bits_per_sample != 0 {
-            self.bits_per_sample
-        } else {
-            detected_bps
+        let (stream_info, packets) = self.encode_packets(audio)?;
+        let bs = self.block_size;
+        let total = stream_info.total_samples as usize;
+        let framed = packets
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, (total - i * bs).min(bs)))
+            .collect();
+        Ok((stream_info, framed))
+    }
+
+    /// Encodes every block of `audio`, on all cores when there are enough blocks, and computes
+    /// `STREAMINFO` (the MD5 alongside the frames).
+    fn encode_packets(&self, audio: &AudioFrame) -> Result<(FlacStreamInfo, Vec<Vec<u8>>)> {
+        let ch = audio.channels as usize;
+        if ch == 0 || ch > 8 {
+            return Err(RagdollError::InvalidData(
+                "FLAC encodes 1 to 8 channels".into(),
+            ));
+        }
+        // 16-bit input stored as 16-bit samples is deinterleaved block by block inside the
+        // workers and hashed as it is; other formats are converted up front.
+        let s16 = (audio.format == SampleFormat::S16le
+            && matches!(self.bits_per_sample, 0 | 9..=16))
+        .then(|| &audio.as_i16_slice()[..audio.num_samples * ch]);
+        let (planar, bps) = match s16 {
+            Some(_) if self.bits_per_sample == 0 => (Vec::new(), 16),
+            Some(_) => (Vec::new(), self.bits_per_sample),
+            None => {
+                let (planar, detected) = audio_frame_to_planar_i32(audio)?;
+                let bps = if self.bits_per_sample != 0 {
+                    self.bits_per_sample
+                } else {
+                    detected
+                };
+                (planar, bps)
+            }
         };
         let enc = Self {
             block_size: self.block_size,
@@ -2349,99 +2540,109 @@ impl FlacEncoder {
             bits_per_sample: bps,
             compute_md5: self.compute_md5,
         };
-
         let total_samples = audio.num_samples;
-        let num_frames = if total_samples == 0 {
-            0
-        } else {
-            total_samples.div_ceil(enc.block_size)
+        let bs = enc.block_size;
+        let num_frames = total_samples.div_ceil(bs);
+        let encode_one = |f_idx: usize, ws: &mut EncoderWorkspace| {
+            let offset = f_idx * bs;
+            let count = (total_samples - offset).min(bs);
+            let mut input = std::mem::take(&mut ws.input);
+            let mut refs: [&[i32]; 8] = [&[]; 8];
+            if let Some(pcm) = s16 {
+                input.resize_with(ch, Vec::new);
+                let src = &pcm[offset * ch..(offset + count) * ch];
+                if let [l, r] = &mut input[..] {
+                    l.resize(count, 0);
+                    r.resize(count, 0);
+                    for ((l, r), s) in l.iter_mut().zip(r.iter_mut()).zip(src.as_chunks::<2>().0) {
+                        (*l, *r) = (s[0] as i32, s[1] as i32);
+                    }
+                } else {
+                    for (c, dst) in input.iter_mut().enumerate() {
+                        dst.clear();
+                        dst.extend(src[c..].iter().step_by(ch).map(|&s| s as i32));
+                    }
+                }
+                for (r, c) in refs.iter_mut().zip(&input) {
+                    *r = c;
+                }
+            } else {
+                for (r, c) in refs.iter_mut().zip(&planar) {
+                    *r = &c[offset..offset + count];
+                }
+            }
+            let packet = enc.encode_frame_with(&refs[..ch], f_idx as u64, ws);
+            ws.input = input;
+            packet
         };
-        let mut packets = Vec::with_capacity(num_frames);
-        let mut min_frame_size = u32::MAX;
-        let mut max_frame_size = 0u32;
+        let md5 = || {
+            if !enc.compute_md5 {
+                [0u8; 16]
+            } else if s16.is_some() {
+                // FLAC hashes 9- to 16-bit samples as 16-bit little-endian words: the input bytes.
+                md5_digest(&audio.data.as_slice()[..total_samples * ch * 2])
+            } else {
+                compute_flac_pcm_md5_planar(&planar, bps)
+            }
+        };
 
+        let mut packets = Vec::with_capacity(num_frames);
+        let md5_signature;
         if num_frames >= 8 {
             let workers = ragdoll_core::CpuTopology::detect()
                 .optimal_threads(ragdoll_core::global_power_mode(), 0)
                 .min(num_frames);
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, usize)>>>> = (0..num_frames)
+            let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..num_frames)
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
-
-            std::thread::scope(|s| {
-                for _ in 0..workers {
-                    s.spawn(|| {
-                        ragdoll_core::apply_current_power_mode_to_thread();
-                        let mut slice_refs = Vec::with_capacity(planar.len());
-                        loop {
-                            let f_idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if f_idx >= num_frames {
-                                break;
-                            }
-                            let offset = f_idx * enc.block_size;
-                            let count = (total_samples - offset).min(enc.block_size);
-                            slice_refs.clear();
-                            for ch in &planar {
-                                slice_refs.push(&ch[offset..offset + count]);
-                            }
-                            let res = enc
-                                .encode_frame_slices(&slice_refs, f_idx as u64)
-                                .map(|b| (b, count));
-                            if let Ok(mut g) = slots[f_idx].lock() {
-                                *g = Some(res);
-                            }
-                        }
-                    });
+            let work = || {
+                ragdoll_core::apply_current_power_mode_to_thread();
+                let mut ws = EncoderWorkspace::default();
+                loop {
+                    let f_idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if f_idx >= num_frames {
+                        break;
+                    }
+                    let res = encode_one(f_idx, &mut ws);
+                    if let Ok(mut g) = slots[f_idx].lock() {
+                        *g = Some(res);
+                    }
                 }
+            };
+            md5_signature = std::thread::scope(|s| {
+                for _ in 1..workers {
+                    s.spawn(work);
+                }
+                // The calling thread hashes the PCM first, then joins the frame workers.
+                let digest = md5();
+                work();
+                digest
             });
-
             for slot in slots {
-                let (packet, count) = slot.into_inner().unwrap().unwrap()?;
-                let pkt_len = packet.len() as u32;
-                min_frame_size = min_frame_size.min(pkt_len);
-                max_frame_size = max_frame_size.max(pkt_len);
-                packets.push((packet, count));
+                packets.push(slot.into_inner().unwrap().unwrap()?);
             }
         } else {
-            let mut offset = 0usize;
-            let mut frame_num = 0u64;
-            let mut slice_refs = Vec::with_capacity(planar.len());
-            while offset < total_samples {
-                let count = (total_samples - offset).min(enc.block_size);
-                slice_refs.clear();
-                for ch in &planar {
-                    slice_refs.push(&ch[offset..offset + count]);
-                }
-                let packet = enc.encode_frame_slices(&slice_refs, frame_num)?;
-                let pkt_len = packet.len() as u32;
-                min_frame_size = min_frame_size.min(pkt_len);
-                max_frame_size = max_frame_size.max(pkt_len);
-                packets.push((packet, count));
-                offset += count;
-                frame_num += 1;
+            let mut ws = EncoderWorkspace::default();
+            for f_idx in 0..num_frames {
+                packets.push(encode_one(f_idx, &mut ws)?);
             }
+            md5_signature = md5();
         }
 
-        if total_samples == 0 {
-            min_frame_size = 0;
-        }
-        let nominal_bs = (enc.block_size as u16).max(16);
-        let md5_signature = if enc.compute_md5 {
-            if audio.format == ragdoll_core::SampleFormat::S16le && bps == 16 {
-                let byte_len = total_samples * (audio.channels as usize) * 2;
-                md5_digest(&audio.data.as_slice()[..byte_len])
-            } else {
-                compute_flac_pcm_md5_planar(&planar, bps)
-            }
-        } else {
-            [0u8; 16]
-        };
-
+        let (min_frame_size, max_frame_size) =
+            packets.iter().fold((u32::MAX, 0u32), |(lo, hi), p| {
+                (lo.min(p.len() as u32), hi.max(p.len() as u32))
+            });
+        let nominal_bs = (bs as u16).max(16);
         let stream_info = FlacStreamInfo {
             min_block_size: nominal_bs,
             max_block_size: nominal_bs,
-            min_frame_size,
+            min_frame_size: if packets.is_empty() {
+                0
+            } else {
+                min_frame_size
+            },
             max_frame_size,
             sample_rate: enc.sample_rate,
             channels: enc.channels,
@@ -2454,125 +2655,15 @@ impl FlacEncoder {
 
     /// Encodes a complete `.flac` file (`fLaC` magic + `STREAMINFO` + framed audio packets) from an [`AudioFrame`].
     pub fn encode_stream(&self, audio: &AudioFrame) -> Result<Vec<u8>> {
-        let (planar, detected_bps) = audio_frame_to_planar_i32(audio)?;
-        let bps = if self.bits_per_sample != 0 {
-            self.bits_per_sample
-        } else {
-            detected_bps
-        };
-        let enc = Self {
-            block_size: self.block_size,
-            sample_rate: audio.sample_rate,
-            channels: audio.channels,
-            bits_per_sample: bps,
-            compute_md5: self.compute_md5,
-        };
-
-        let total_samples = audio.num_samples;
-        let num_frames = if total_samples == 0 {
-            0
-        } else {
-            total_samples.div_ceil(enc.block_size)
-        };
-        let mut frames_encoded = Vec::new();
-        let mut min_frame_size = u32::MAX;
-        let mut max_frame_size = 0u32;
-
-        if num_frames >= 8 {
-            let workers = ragdoll_core::CpuTopology::detect()
-                .optimal_threads(ragdoll_core::global_power_mode(), 0)
-                .min(num_frames);
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..num_frames)
-                .map(|_| std::sync::Mutex::new(None))
-                .collect();
-
-            std::thread::scope(|s| {
-                for _ in 0..workers {
-                    s.spawn(|| {
-                        ragdoll_core::apply_current_power_mode_to_thread();
-                        let mut slice_refs = Vec::with_capacity(planar.len());
-                        loop {
-                            let f_idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if f_idx >= num_frames {
-                                break;
-                            }
-                            let offset = f_idx * enc.block_size;
-                            let count = (total_samples - offset).min(enc.block_size);
-                            slice_refs.clear();
-                            for ch in &planar {
-                                slice_refs.push(&ch[offset..offset + count]);
-                            }
-                            let res = enc.encode_frame_slices(&slice_refs, f_idx as u64);
-                            if let Ok(mut g) = slots[f_idx].lock() {
-                                *g = Some(res);
-                            }
-                        }
-                    });
-                }
-            });
-
-            for slot in slots {
-                let packet = slot.into_inner().unwrap().unwrap()?;
-                let pkt_len = packet.len() as u32;
-                min_frame_size = min_frame_size.min(pkt_len);
-                max_frame_size = max_frame_size.max(pkt_len);
-                frames_encoded.extend_from_slice(&packet);
-            }
-        } else {
-            let mut offset = 0usize;
-            let mut frame_num = 0u64;
-            let mut slice_refs = Vec::with_capacity(planar.len());
-            while offset < total_samples {
-                let count = (total_samples - offset).min(enc.block_size);
-                slice_refs.clear();
-                for ch in &planar {
-                    slice_refs.push(&ch[offset..offset + count]);
-                }
-                let packet = enc.encode_frame_slices(&slice_refs, frame_num)?;
-                let pkt_len = packet.len() as u32;
-                min_frame_size = min_frame_size.min(pkt_len);
-                max_frame_size = max_frame_size.max(pkt_len);
-                frames_encoded.extend_from_slice(&packet);
-                offset += count;
-                frame_num += 1;
-            }
-        }
-
-        if total_samples == 0 {
-            min_frame_size = 0;
-        }
-        let nominal_bs = (enc.block_size as u16).max(16);
-
-        let md5_signature = if enc.compute_md5 {
-            if audio.format == ragdoll_core::SampleFormat::S16le && bps == 16 {
-                let byte_len = total_samples * (audio.channels as usize) * 2;
-                md5_digest(&audio.data.as_slice()[..byte_len])
-            } else {
-                compute_flac_pcm_md5_planar(&planar, bps)
-            }
-        } else {
-            [0u8; 16]
-        };
-
-        let stream_info = FlacStreamInfo {
-            min_block_size: nominal_bs,
-            max_block_size: nominal_bs,
-            min_frame_size,
-            max_frame_size,
-            sample_rate: enc.sample_rate,
-            channels: enc.channels,
-            bits_per_sample: enc.bits_per_sample,
-            total_samples: total_samples as u64,
-            md5_signature,
-        };
-
-        let mut out = Vec::with_capacity(42 + frames_encoded.len());
+        let (stream_info, packets) = self.encode_packets(audio)?;
+        let mut out = Vec::with_capacity(42 + packets.iter().map(Vec::len).sum::<usize>());
         out.extend_from_slice(FLAC_STREAM_MARKER);
         // Metadata block header: is_last=1 (0x80) | type=0 (STREAMINFO), length = 34
         out.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
         out.extend_from_slice(&stream_info.to_bytes());
-        out.extend_from_slice(&frames_encoded);
+        for p in &packets {
+            out.extend_from_slice(p);
+        }
         Ok(out)
     }
 }
@@ -3267,5 +3358,148 @@ mod tests {
             .flat_map(|i| [into[0][i] as i16, into[1][i] as i16])
             .collect();
         assert_eq!(pcm, audio.as_i16_slice());
+    }
+
+    /// 44.1 kHz 16-bit stereo test signals: `(name, interleaved samples)`.
+    fn encoder_test_signals(n: usize) -> Vec<(&'static str, Vec<i16>)> {
+        use std::f64::consts::TAU;
+        let mut rng = Rng(0x0F1A_C5EE_D000_0091);
+        let sr = 44_100.0;
+        let mut out = Vec::new();
+
+        // Music: notes of a few harmonics each with plucked envelopes, mixed differently per
+        // channel, over a little noise.
+        let notes = [220.0, 277.18, 329.63, 440.0, 554.37, 164.81];
+        let mut music = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let t = i as f64 / sr;
+            let (mut l, mut r) = (0.0, 0.0);
+            for (j, &f) in notes.iter().enumerate() {
+                let start = j as f64 * 0.31;
+                let age = (t - start).rem_euclid(1.7);
+                let env = (-3.0 * age).exp();
+                let v: f64 = (1..5)
+                    .map(|h| (TAU * f * h as f64 * t).sin() / (h * h) as f64)
+                    .sum::<f64>()
+                    * env;
+                l += v * (0.3 + 0.1 * j as f64);
+                r += v * (0.8 - 0.1 * j as f64);
+            }
+            let noise = rng.signed(3) as f64;
+            music.push((l * 5000.0 + noise) as i16);
+            music.push((r * 5000.0 + noise * 0.5) as i16);
+        }
+        out.push(("music", music));
+
+        // Speech: a glottal pulse train of drifting pitch through three formant resonators,
+        // in syllables separated by digital silence; the right channel is delayed and quieter.
+        let mut speech_mono = vec![0.0f64; n];
+        let formants = [(700.0, 0.97), (1200.0, 0.96), (2600.0, 0.94)];
+        let mut state = [[0.0f64; 2]; 3];
+        let mut phase = 0.0f64;
+        for (i, s) in speech_mono.iter_mut().enumerate() {
+            let t = i as f64 / sr;
+            let f0 = 110.0 + 25.0 * (TAU * 0.9 * t).sin();
+            phase = (phase + f0 / sr).fract();
+            let voiced = (TAU * 3.7 * t).sin() * 0.5 + 0.5;
+            let gate = (TAU * 0.4 * t).sin() > -0.6;
+            let excitation = (2.0 * phase - 1.0).powi(3) * voiced + rng.signed(4) as f64 * 0.01;
+            let mut y = 0.0;
+            for ((f, rad), st) in formants.iter().zip(state.iter_mut()) {
+                let c = 2.0 * rad * (TAU * f / sr).cos();
+                let v = excitation + c * st[0] - rad * rad * st[1];
+                (st[1], st[0]) = (st[0], v);
+                y += v;
+            }
+            *s = if gate { y * 400.0 } else { 0.0 };
+        }
+        let speech = (0..n)
+            .flat_map(|i| {
+                let l = speech_mono[i].clamp(-32768.0, 32767.0) as i16;
+                let r = (speech_mono[i.saturating_sub(3)] * 0.8).clamp(-32768.0, 32767.0) as i16;
+                [l, r]
+            })
+            .collect();
+        out.push(("speech", speech));
+
+        // Tones: steady and decaying sinusoids at a low level.
+        let tonal = (0..n)
+            .flat_map(|i| {
+                let t = i as f64 / sr;
+                let l = 0.15 * (TAU * 220.0 * t).sin() * (-(t % 2.0)).exp()
+                    + 0.1 * (TAU * 329.63 * t).sin() * (-((t + 1.0) % 2.0)).exp()
+                    + 0.05 * (TAU * 440.0 * t + 2.0 * (TAU * 5.0 * t).sin()).sin();
+                let r = 0.15 * (TAU * 220.0 * t + 0.3).sin() * (-(t % 2.0)).exp()
+                    + 0.04 * (TAU * 880.0 * t).sin();
+                [(l * 32767.0) as i16, (r * 32767.0) as i16]
+            })
+            .collect();
+        out.push(("tonal", tonal));
+
+        // Full-scale white noise: nothing to predict, Verbatim or escaped partitions.
+        out.push(("noise", (0..2 * n).map(|_| rng.signed(16) as i16).collect()));
+        out
+    }
+
+    /// The encoder's streams decode bit-exactly (MD5 checked) in Ragdoll's decoder and FFmpeg's,
+    /// and come out smaller than FFmpeg's `-compression_level 5` on music, speech and tones.
+    #[test]
+    fn encoder_round_trips_and_beats_ffmpeg_level_5() {
+        use std::process::Command;
+        let n = 2 * 44_100;
+        let dir = std::env::temp_dir();
+        for (name, pcm) in encoder_test_signals(n) {
+            let mut audio = AudioFrame::new(44_100, 2, SampleFormat::S16le, n);
+            audio.as_i16_mut_slice().copy_from_slice(&pcm);
+            let ours = FlacEncoder::new(44_100, 2, 16)
+                .with_md5(true)
+                .encode_stream(&audio)
+                .unwrap();
+            let (_, decoded) = FlacDecoder::decode_stream(&ours).unwrap();
+            assert_eq!(decoded.as_i16_slice(), &pcm[..], "{name}: Ragdoll decode");
+
+            let tag = format!("ragdoll_flacenc_{}_{name}", std::process::id());
+            let (raw, ours_path, ff_path, dec_path) = (
+                dir.join(format!("{tag}.raw")),
+                dir.join(format!("{tag}_ours.flac")),
+                dir.join(format!("{tag}_ff.flac")),
+                dir.join(format!("{tag}_dec.raw")),
+            );
+            std::fs::write(&raw, audio.data.as_slice()).unwrap();
+            std::fs::write(&ours_path, &ours).unwrap();
+            let raw_in = ["-f", "s16le", "-ar", "44100", "-ac", "2", "-i"];
+            let encoded = Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .args(raw_in)
+                .arg(&raw)
+                .args(["-c:a", "flac", "-compression_level", "5"])
+                .arg(&ff_path)
+                .status();
+            if ragdoll_core::testing::tool_succeeded(encoded, "ffmpeg FLAC encode") {
+                let status = Command::new("ffmpeg")
+                    .args(["-y", "-v", "error", "-i"])
+                    .arg(&ours_path)
+                    .args(["-f", "s16le"])
+                    .arg(&dec_path)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{name}: FFmpeg decode");
+                assert_eq!(
+                    std::fs::read(&dec_path).unwrap(),
+                    audio.data.as_slice(),
+                    "{name}: FFmpeg decode"
+                );
+                // Compare the audio frames, without FFmpeg's extra metadata blocks.
+                let ff = std::fs::read(&ff_path).unwrap();
+                let ff_frames = ff.len() - parse_flac_stream_header(&ff).unwrap().1;
+                let our_frames = ours.len() - parse_flac_stream_header(&ours).unwrap().1;
+                let ratio = our_frames as f64 / ff_frames as f64;
+                eprintln!("{name}: {our_frames} bytes vs FFmpeg level 5 {ff_frames} ({ratio:.4})");
+                assert!(ratio < 1.0, "{name}: {our_frames} vs {ff_frames} bytes");
+            }
+            for p in [raw, ours_path, ff_path, dec_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
     }
 }
