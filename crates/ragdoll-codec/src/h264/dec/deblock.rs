@@ -2,6 +2,21 @@
 
 use super::picture::{BlockInfo, MbType, NO_PIC, PicState, RefIds, Structure};
 use super::tables::{ALPHA, BETA, TC0};
+
+/// [`TC0`] by indexA and bS `0..=3`, `-1` for bS 0 (no filtering of the segment).
+static TC0_BS: [[i8; 4]; 52] = {
+    let mut t = [[-1i8; 4]; 52];
+    let mut i = 0;
+    while i < 52 {
+        let mut b = 1;
+        while b < 4 {
+            t[i][b] = TC0[i][b - 1] as i8;
+            b += 1;
+        }
+        i += 1;
+    }
+    t
+};
 use ragdoll_simd::{h264_chroma_deblock_edge, h264_luma_deblock_edge};
 
 /// Per-slice deblocking controls.
@@ -70,7 +85,7 @@ fn filter_mb_dir<const DIR: usize>(
             continue;
         }
         let bs = local.strengths(st, DIR, edge);
-        if bs == [0; 4] {
+        if u32::from_ne_bytes(bs) == 0 {
             continue;
         }
         let p_addr = match (edge, DIR) {
@@ -350,7 +365,8 @@ fn filter_luma_edge<const DIR: usize>(
         ((mb_y * 16 + edge * 4) * w + mb_x * 16, w, 1)
     };
     // bS 4 belongs to whole macroblock edges, so an edge is either all bS 4 or all below.
-    if bs == [4; 4] {
+    let v = u32::from_ne_bytes(bs);
+    if v == 0x0404_0404 {
         let plane = &mut st.planes[0];
         if DIR == 0 {
             h264_luma_deblock_edge::<false, true>(plane, q0, w, alpha, beta, [0; 4]);
@@ -359,11 +375,9 @@ fn filter_luma_edge<const DIR: usize>(
         }
         return;
     }
-    if !bs.contains(&4) {
-        let tc0 = bs.map(|b| match b {
-            0 => -1,
-            _ => TC0[ia][b as usize - 1] as i8,
-        });
+    // Bit 2 is set in bS 4 only.
+    if v & 0x0404_0404 == 0 {
+        let tc0 = bs.map(|b| TC0_BS[ia][b as usize & 3]);
         let plane = &mut st.planes[0];
         if DIR == 0 {
             h264_luma_deblock_edge::<false, false>(plane, q0, w, alpha, beta, tc0);
@@ -410,7 +424,8 @@ fn filter_chroma_edge<const DIR: usize>(
         ((mb_y * 8 + cedge * 4) * w + mb_x * 8, w, 1)
     };
     let plane = &mut st.planes[1 + c];
-    if bs == [4; 4] {
+    let v = u32::from_ne_bytes(bs);
+    if v == 0x0404_0404 {
         if DIR == 0 {
             h264_chroma_deblock_edge::<false, true>(plane, q0, w, alpha, beta, [0; 4]);
         } else {
@@ -418,11 +433,8 @@ fn filter_chroma_edge<const DIR: usize>(
         }
         return;
     }
-    if !bs.contains(&4) {
-        let tc0 = bs.map(|b| match b {
-            0 => -1,
-            _ => TC0[ia][b as usize - 1] as i8,
-        });
+    if v & 0x0404_0404 == 0 {
+        let tc0 = bs.map(|b| TC0_BS[ia][b as usize & 3]);
         if DIR == 0 {
             h264_chroma_deblock_edge::<false, false>(plane, q0, w, alpha, beta, tc0);
         } else {
