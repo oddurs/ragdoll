@@ -1804,6 +1804,7 @@ fn idct4_butterfly_epi16_avx2(
 /// result is row `k` of the 8x8 region in the low lane and row `k + 4` in the high lane.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
     use std::arch::x86_64::*;
     unsafe {
@@ -1854,9 +1855,12 @@ unsafe fn idct_add_8x8_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
     }
 }
 
-/// [`add_idct4x4_8x8`] in 32-bit arithmetic, for any coefficients.
+/// [`add_idct4x4_8x8`] in 32-bit arithmetic, for any coefficients (kept out of line: it is the
+/// rare path, and the 16-bit kernel stays small enough to inline).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cold]
+#[inline(never)]
 unsafe fn idct_add_8x8_wide_avx2(dst: *mut u8, ds: usize, blocks: &[[i16; 16]; 4]) {
     use std::arch::x86_64::*;
     unsafe {
