@@ -458,7 +458,14 @@ impl PicState {
     /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
     /// row `y`, to that of a new picture.
     pub fn clear_mb(&mut self, addr: usize, x: usize, y: usize) {
-        self.clear_mb_state(addr, x, y);
+        self.cbp[addr] = 0;
+        self.qp[addr] = 0;
+        self.qpc[addr] = [0; 2];
+        self.t8x8[addr] = false;
+        self.chroma_pred_mode[addr] = 0;
+        self.cbf_dc[addr] = 0;
+        self.motion_edges[addr] = ANY_INNER_EDGE;
+        self.clear_mb_state(x, y);
         self.reset_mb_blocks(x, y);
     }
 
@@ -471,19 +478,15 @@ impl PicState {
         }
     }
 
-    /// [`Self::clear_mb`] but for the blocks' [`BlockInfo`], which macroblock decoding writes in
-    /// full.
-    pub fn clear_mb_state(&mut self, addr: usize, x: usize, y: usize) {
-        self.cbp[addr] = 0;
-        self.qp[addr] = 0;
-        self.qpc[addr] = [0; 2];
-        self.t8x8[addr] = false;
-        self.chroma_pred_mode[addr] = 0;
-        self.cbf_dc[addr] = 0;
-        self.motion_edges[addr] = ANY_INNER_EDGE;
+    /// The part of [`Self::clear_mb`] a macroblock being decoded needs: its coefficient counts,
+    /// which only coded blocks write. Every macroblock writes its QP, CBP, transform size and
+    /// motion (see `reset_blocks` in `mb`); the chroma prediction mode, DC flags and motion edges
+    /// are read only from macroblocks whose decoding wrote them.
+    pub fn clear_mb_state(&mut self, x: usize, y: usize) {
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
-        fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
+        // `intra_mode` needs no reset: it is read only for Intra_4x4 and Intra_8x8 macroblocks,
+        // which write all of it before reading their own.
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);

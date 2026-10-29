@@ -525,7 +525,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let a = self.mb.addr;
         // Every macroblock type writes all of its blocks' motion (see `reset_blocks`).
         if self.st.recycled {
-            self.st.clear_mb_state(a, self.mb.x, self.mb.y);
+            self.st.clear_mb_state(self.mb.x, self.mb.y);
         }
         self.partial_motion = false;
         // The reference lists `refs` reads, as a table of `st.ref_tables`.
@@ -803,6 +803,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
         self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.cbp[a] = 0;
+        self.st.t8x8[a] = false;
         self.last_dqp_nz = false;
         if self.cx.sh.slice_type.is_b() {
             self.st.mb_type[a] = MbType::BSkip;
@@ -1090,6 +1092,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     fn decode_intra_mb(&mut self, t: u32) -> Result<()> {
         let a = self.mb.addr;
+        self.st.t8x8[a] = false;
         if t == 25 {
             return self.decode_pcm();
         }
@@ -1401,15 +1404,43 @@ impl<'a, 'c> Dec<'a, 'c> {
         })
     }
 
+    /// Without MBAFF: the left and top neighbours of the 4x4 block at MB-relative `(bx, by)` in
+    /// a per-block array with `1 << sh` blocks per macroblock side, as `(index, in another
+    /// macroblock, macroblock)` when available.
+    #[inline(always)]
+    fn nb_flat(&self, sh: usize, bx: usize, by: usize) -> [Option<(usize, bool, usize)>; 2] {
+        let w = self.st.mb_w << sh;
+        let i = ((self.mb.y << sh) + by) * w + (self.mb.x << sh) + bx;
+        let a = self.mb.addr;
+        [
+            (bx > 0 || self.nb & NB_L != 0).then(|| (i - 1, bx == 0, a.wrapping_sub(1))),
+            (by > 0 || self.nb & NB_T != 0).then(|| (i - w, by == 0, a.wrapping_sub(self.st.mb_w))),
+        ]
+    }
+
     /// CAVLC `nC` for the luma 4x4 block at MB-relative 4x4 `(bx, by)` (9.2.1).
+    #[inline]
     fn nc_luma(&self, bx: usize, by: usize) -> u8 {
+        if !self.st.mbaff {
+            let [a, b] = self
+                .nb_flat(2, bx, by)
+                .map(|n| n.map(|(i, _, _)| self.st.nnz[i]));
+            return combine_nc(a, b);
+        }
         let [a, b] = self
             .nb_blocks(0, bx, by)
             .map(|n| n.map(|(_, i)| self.st.nnz[i]));
         combine_nc(a, b)
     }
 
+    #[inline]
     fn nc_chroma(&self, p: usize, bx: usize, by: usize) -> u8 {
+        if !self.st.mbaff {
+            let [a, b] = self
+                .nb_flat(1, bx, by)
+                .map(|n| n.map(|(i, _, _)| self.st.nnz_c[p][i]));
+            return combine_nc(a, b);
+        }
         let [a, b] = self
             .nb_blocks(1, bx, by)
             .map(|n| n.map(|(_, i)| self.st.nnz_c[p][i]));
@@ -1417,7 +1448,16 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// CABAC coded_block_flag ctxIdxInc for a luma 4x4 block (9.3.3.1.1.9).
+    #[inline]
     fn cbf_luma_inc(&self, bx: usize, by: usize, intra: bool) -> u8 {
+        if !self.st.mbaff {
+            let [a, b] = self.nb_flat(2, bx, by).map(|n| match n {
+                Some((_, true, m)) if self.st.mb_type[m] == MbType::IPcm => 1,
+                Some((i, _, _)) => self.st.blocks[i].nz as u8,
+                None => intra as u8,
+            });
+            return a + 2 * b;
+        }
         let [a, b] = self.nb_blocks(0, bx, by).map(|n| match n {
             Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
             Some((_, i)) => self.st.blocks[i].nz as u8,
@@ -1426,7 +1466,16 @@ impl<'a, 'c> Dec<'a, 'c> {
         a + 2 * b
     }
 
+    #[inline]
     fn cbf_chroma_ac_inc(&self, p: usize, bx: usize, by: usize, intra: bool) -> u8 {
+        if !self.st.mbaff {
+            let [a, b] = self.nb_flat(1, bx, by).map(|n| match n {
+                Some((_, true, m)) if self.st.mb_type[m] == MbType::IPcm => 1,
+                Some((i, _, _)) => (self.st.nnz_c[p][i] > 0) as u8,
+                None => intra as u8,
+            });
+            return a + 2 * b;
+        }
         let [a, b] = self.nb_blocks(1, bx, by).map(|n| match n {
             Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
             Some((_, i)) => (self.st.nnz_c[p][i] > 0) as u8,
@@ -1510,6 +1559,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let lst = if intra { 0 } else { 3 };
         let cabac = CABAC;
+        // DC coded_block_flags are set below as DC blocks are read.
+        self.st.cbf_dc[a] = 0;
         let dq = self.cx.dq;
         let mut coeffs = ResidualCoeffs::new();
 
