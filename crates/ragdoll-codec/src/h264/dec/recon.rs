@@ -3,8 +3,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_idct4_add, h264_luma_mc,
-    h264_luma_mc_avg, h264_weight_bi, h264_weight_uni, luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_idct4_add, h264_idct8_add,
+    h264_luma_mc, h264_luma_mc_avg, h264_weight_bi, h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -175,11 +175,6 @@ pub fn chroma_dc(dq: &Dequant, list: usize, qpc: i32, c: &[i32; 4]) -> [i32; 4] 
     f.map(|v| ((v * ls) << (qpc / 6)) >> 5)
 }
 
-#[inline]
-fn clip(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
-}
-
 /// Inverse 4x4 transform of raster coefficients `d` and addition to `dst` (8.5.12.2); `d` is
 /// zeroed for the next block.
 #[inline]
@@ -188,51 +183,11 @@ pub fn idct4_add(dst: &mut [u8], stride: usize, d: &mut [i32; 16]) {
     *d = [0; 16];
 }
 
-fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
-    let a0 = d[0] + d[4];
-    let a1 = -d[3] + d[5] - d[7] - (d[7] >> 1);
-    let a2 = d[0] - d[4];
-    let a3 = d[1] + d[7] - d[3] - (d[3] >> 1);
-    let a4 = (d[2] >> 1) - d[6];
-    let a5 = -d[1] + d[7] + d[5] + (d[5] >> 1);
-    let a6 = d[2] + (d[6] >> 1);
-    let a7 = d[3] + d[5] + d[1] + (d[1] >> 1);
-    let b0 = a0 + a6;
-    let b1 = a1 + (a7 >> 2);
-    let b2 = a2 + a4;
-    let b3 = a3 + (a5 >> 2);
-    let b4 = a2 - a4;
-    let b5 = (a3 >> 2) - a5;
-    let b6 = a0 - a6;
-    let b7 = a7 - (a1 >> 2);
-    [
-        b0 + b7,
-        b2 + b5,
-        b4 + b3,
-        b6 + b1,
-        b6 - b1,
-        b4 - b3,
-        b2 - b5,
-        b0 - b7,
-    ]
-}
-
 /// Inverse 8x8 transform of raster coefficients `d` and addition to `dst` (8.5.13.2); `d` is
 /// zeroed for the next block.
+#[inline]
 pub fn idct8_add(dst: &mut [u8], stride: usize, d: &mut [i32; 64]) {
-    let mut g = [0i32; 64];
-    for i in 0..8 {
-        let mut row = [0i32; 8];
-        row.copy_from_slice(&d[i * 8..i * 8 + 8]);
-        g[i * 8..i * 8 + 8].copy_from_slice(&idct8_1d(row));
-    }
-    for j in 0..8 {
-        let col = idct8_1d(std::array::from_fn(|i| g[i * 8 + j]));
-        for (i, v) in col.iter().enumerate() {
-            let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + ((v + 32) >> 6));
-        }
-    }
+    h264_idct8_add(dst, stride, d);
     *d = [0; 64];
 }
 

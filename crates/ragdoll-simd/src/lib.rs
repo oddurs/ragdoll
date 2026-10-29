@@ -71,7 +71,7 @@ pub use h264_enc::{
     quant_4x4_x4, quant_4x4_x4_scalar, sub_dct4x4_8x8, sub_dct4x4_8x8_scalar, sub_dct4x4_16x4,
     sub_dct4x4_16x4_scalar, zigzag_4x4_x4, zigzag_4x4_x4_scalar,
 };
-pub use h264_idct::{h264_idct4_add, h264_idct4_add_scalar};
+pub use h264_idct::{h264_idct4_add, h264_idct4_add_scalar, h264_idct8_add, h264_idct8_add_scalar};
 pub use h264_mc::{
     chroma_mc_cols, h264_avg, h264_avg_scalar, h264_chroma_mc, h264_chroma_mc_avg,
     h264_chroma_mc_avg_scalar, h264_chroma_mc_scalar, h264_luma_mc, h264_luma_mc_avg,
