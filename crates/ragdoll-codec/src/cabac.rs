@@ -1516,22 +1516,28 @@ impl<'a> CabacDecoder<'a> {
             n += 1;
         }
 
-        let mut num_eq1 = 0usize;
-        let mut num_gt1 = 0usize;
-        let gt_max = if cat == 3 { 3 } else { 4 };
-
+        // Level contexts by "node" (FFmpeg's node_ctx): the count of levels equal to 1 so far
+        // (0..=3) while none exceeded 1, else 4 + the count of levels above 1 (9.3.3.1.3).
+        const LEVEL1_CTX: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+        const LEVEL_GT1_CTX: [[u8; 8]; 2] = [[5, 5, 5, 5, 6, 7, 8, 9], [5, 5, 5, 5, 6, 7, 8, 8]];
+        const NEXT_NODE: [[u8; 8]; 2] = [[1, 2, 3, 3, 4, 5, 6, 7], [4, 4, 4, 4, 5, 6, 7, 7]];
+        // The 10 level contexts (16 taken so that a masked index needs no bounds check).
+        let lvl: &mut [CabacContext; 16] = (&mut ctxs[lvl_base..lvl_base + 16])
+            .try_into()
+            .expect("16 contexts");
+        let gt1_ctx = &LEVEL_GT1_CTX[(cat == 3) as usize];
+        let mut node = 0usize;
         for k in (0..n).rev() {
-            let c0 = if num_gt1 > 0 { 0 } else { (1 + num_eq1).min(4) };
-            let abs_m1 = if self.decode_decision(&mut ctxs[lvl_base + c0]) == 0 {
-                num_eq1 += 1;
-                0u32
+            let val = if self.decode_decision(&mut lvl[LEVEL1_CTX[node] as usize & 15]) == 0 {
+                node = NEXT_NODE[0][node] as usize & 7;
+                1
             } else {
-                let c1 = 5 + num_gt1.min(gt_max);
-                let mut v = 1u32;
-                while v < 14 && self.decode_decision(&mut ctxs[lvl_base + c1]) != 0 {
+                let c1 = &mut lvl[gt1_ctx[node] as usize & 15];
+                let mut v = 2u32;
+                while v < 15 && self.decode_decision(c1) != 0 {
                     v += 1;
                 }
-                if v == 14 {
+                if v == 15 {
                     let mut k = 0u32;
                     while k < 24 && self.decode_bypass() != 0 {
                         v += 1 << k;
@@ -1543,12 +1549,10 @@ impl<'a> CabacDecoder<'a> {
                     }
                     v += rem;
                 }
-                num_gt1 += 1;
-                v
+                node = NEXT_NODE[1][node] as usize & 7;
+                v.min(32767) as i16
             };
-            let sign = self.decode_bypass() != 0;
-            let val = (abs_m1 + 1).min(32767) as i16;
-            out.level[k] = if sign { -val } else { val };
+            out.level[k & 63] = if self.decode_bypass() != 0 { -val } else { val };
         }
         n
     }
