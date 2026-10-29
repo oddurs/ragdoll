@@ -166,7 +166,7 @@ Seal Ragdoll `v1.0` as a production replacement for FFmpeg: expose an ergonomic,
 
 ## m11-validation — Phase 11 — Validation & QA Engine: Oracle-Backed Conformance, Interop, Fuzzing & Generated Support Matrix
 
-`######····` 59% · 19 of 32 done
+`#######···` 61% · 20 of 33 done
 
 Make every published claim about Ragdoll traceable to an independent oracle. Scalar references gate SIMD; spec conformance streams gate parsers and decoders; reference implementations (FFmpeg, JM, libFLAC, libopus, dav1d, mkvalidator, MP4Box, tsduck) gate interop in both directions; coverage-guided fuzzing gates robustness; rate-distortion, instruction-count and memory gates catch regressions; and the documentation support matrix is generated from QA results instead of written by hand, so the docs cannot overclaim.
 
@@ -213,6 +213,7 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [x] `SIMD-0091` FLAC encoder: match FFmpeg level 5 compression while staying faster <sup>kernel · p1 · codec-audio</sup>
 - [x] `BUG-0097` H.264 decoder panics on out-of-range slice deblocking offsets <sup>bug · p1 · codec-video</sup>
 - [x] `BUG-0098` CLI text snapshots fail when a masked timing changes width (probe latency of 1000 us or more) <sup>bug · p1</sup>
+- [x] `0099` Site and README: refresh codec benchmark numbers and limitations after the speed rounds <sup>docs · p2 · arch</sup>
 
 ## Unscheduled
 

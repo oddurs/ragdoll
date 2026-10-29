@@ -16,12 +16,12 @@ Video and audio codecs, written from the specifications (the Opus codec is a por
 
 **Entropy coding.** CAVLC (`encode_cavlc_block`, `decode_cavlc_block`) and CABAC (`CabacEncoder`, `CabacDecoder`, `CabacContext`, `init_cabac_contexts`).
 
-**Decoder.** `H264Decoder::new()` takes parameter sets with `set_extradata` and access units with `decode_annex_b_packet`, which returns frames as they leave the decoded picture buffer; `decode_stream_pts_ordered` decodes a whole Annex-B stream into presentation order. It handles Baseline, Main and High: CAVLC and CABAC, P and B slices, the 8×8 transform, weighted prediction, multiple slices, long-term references and MMCO, field pictures (PAFF), MBAFF and 4:0:0. Output is bit-exact with the JM reference decoder and FFmpeg; `tests/h264_reference.rs` checks it against hashes from both. It does not support 4:2:2, 4:4:4, bit depths above 8, lossless, SP/SI slices or slice groups, and it decodes on one thread.
+**Decoder.** `H264Decoder::new()` takes parameter sets with `set_extradata` and access units with `decode_annex_b_packet`, which returns frames as they leave the decoded picture buffer; `decode_stream_pts_ordered` decodes a whole Annex-B stream into presentation order. It handles Baseline, Main and High: CAVLC and CABAC, P and B slices, the 8×8 transform, weighted prediction, multiple slices, long-term references and MMCO, field pictures (PAFF), MBAFF and 4:0:0. Output is bit-exact with the JM reference decoder and FFmpeg; `tests/h264_reference.rs` checks it against hashes from both. It does not support 4:2:2, 4:4:4, bit depths above 8, lossless, SP/SI slices or slice groups. `with_threads(n)` decodes frame pictures on `n` worker threads, each waiting only for the reference rows its motion vectors reach; the output is identical to one thread's, and `flush` returns the pictures still in flight at the end of a stream.
 
 **Encoder.** `H264Encoder::new(width, height, fps, qp)` produces Constrained Baseline (CAVLC) access units from 8-bit 4:2:0 frames. `with_profile(H264Profile::Main)` or `High` switches to CABAC, and High adds the adaptive 8×8 transform. `with_rate_control` takes a `RateControlMode`: `FixedQp`, `Crf` (with variance-adaptive quantization) or `Abr`, the last two with optional VBV `maxrate` and `bufsize`. Macroblocks are `I_4x4`, `I_16x16`, `P_L0_16x16` with quarter-pel refinement, and `P_Skip`, with the in-loop deblocking filter on. Slices are I and P only; there are no B-frames. `encode_frame` returns one Annex-B access unit per frame, with an IDR every `keyint` frames (30 by default; the CLI uses 15).
 
 <Callout kind="status" title="Performance">
-Single-threaded, the decoder runs 1080p High-profile CABAC at about 29 fps where libavcodec manages about 181, and the encoder's compression is close to x264's `ultrafast` preset, well behind `veryfast`. See [Benchmarks](/docs/benchmarks/).
+The decoder runs 1080p High-profile CABAC at about 162 fps on one thread, level with libavcodec, and at about 545 fps with four threads, ahead of libavcodec's frame threading (461 fps). The encoder makes smaller files than x264's `ultrafast` preset at equal quality and is slightly faster; `veryfast` still compresses about a quarter better. See [Benchmarks](/docs/benchmarks/).
 </Callout>
 
 ## AAC-LC (`aac`)
@@ -30,8 +30,8 @@ Single-threaded, the decoder runs 1080p High-profile CABAC at about 29 fps where
 - `AacEncoder::new(sample_rate, channels, bitrate_bps)` encodes mono or stereo with long blocks only (KBD window, 2048-point MDCT). `extra_data()` returns the two-byte `AudioSpecificConfig`; `encode_raw_frame`, `encode_adts_frame` and `encode_stream_frames` produce access units.
 - `AudioSpecificConfig` and `AdtsHeader` parse and write the MP4/Matroska and ADTS headers.
 
-<Callout kind="status" title="No AAC rate control">
-The encoder has no rate control. `bitrate_bps` only selects one of three quantizer offsets, so the output bitrate follows the signal rather than the target: a 128 kbit/s request can come out far below or far above 128 kbit/s.
+<Callout kind="status" title="AAC rate control">
+The encoder holds `bitrate_bps` with a bit reservoir: each frame's quantizer offset is bisected on exact bit counts, and the average bitrate lands within 5% of the target from 32 to 320 kbit/s on speech, music and synthetic signals. It uses long blocks only, and its quality has been compared by SNR, not with a psychoacoustic model.
 </Callout>
 
 ## Opus (`opus`)

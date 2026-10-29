@@ -30,7 +30,7 @@ Ragdoll is a media framework and command-line tool written entirely in Rust. It 
 
 - **No C libraries and no third-party crates.** `Cargo.lock` lists seven packages, all of them in this repository.
 - **Explicit SIMD, verified.** Hot loops are hand-written NEON intrinsics on `aarch64`, with AVX2 versions of the hottest on `x86_64`. Each kernel has a scalar reference, and the tests require the two to match bit for bit.
-- **Correct before fast.** The H.264 decoder is bit-exact with the JM reference and FFmpeg, and the Opus decoder sample-exact with libopus. Most codecs are still slower than FFmpeg's; the [benchmarks](https://oddurs.github.io/ragdoll/docs/benchmarks/) say by how much.
+- **Correct before fast.** The H.264 decoder is bit-exact with the JM reference and FFmpeg, and the Opus decoder sample-exact with libopus. Every codec measured is now at least level with its reference implementation, and most are faster; the [benchmarks](https://oddurs.github.io/ragdoll/docs/benchmarks/) say by how much.
 - **Zero-copy by default.** Demuxers return packets that borrow from a memory-mapped file; muxers write with vectored I/O; frames come from aligned, pooled buffers; errors come back as `Result<_, RagdollError>`.
 - **A CLI with verbs and a Rust library.** `probe`, `remux`, `transcode`, `cut`, `concat`, `package`, `extract`, `metrics`, plus `ProbeBuilder`, `TranscodeBuilder`, `CutBuilder` and `PackageBuilder`. Named options, JSON output, Unix pipes, and TOML recipes.
 
@@ -89,7 +89,7 @@ The [CLI reference](https://oddurs.github.io/ragdoll/docs/cli/) covers every sub
 | :-- | :-- | :-- |
 | **Containers** | MP4 / MOV, Matroska, WebM, MPEG-TS (188/192/204), Ogg, Y4M, WAV / RF64, FLAC, PNG, JPEG, Netpbm, WebVTT, SRT | MP4 (fast-start, fragmented, and CMAF `fMP4`), HLS (`master.m3u8`), DASH (`manifest.mpd`), Matroska, MPEG-TS, Ogg, Y4M, WAV, FLAC, PNG, JPEG, Netpbm, WebVTT, SRT |
 | **Video** | H.264 High / Main / Baseline, bit-exact with the reference decoders (CABAC & CAVLC, I/P/B, $8\times8$ transform, weighted prediction, interlaced PAFF / MBAFF, 8-bit 4:2:0 and 4:0:0), RGDI | H.264 High / Main / Constrained Baseline (CABAC & CAVLC, I/P frames, fixed QP / CRF / ABR / VBV), RGDI |
-| **Audio** | AAC-LC (mono to 5.1), Opus (CELT, SILK and hybrid; sample-exact with libopus), FLAC, PCM (u8 / s16 / s24 / s32 / f32) | AAC-LC (no rate control yet), Opus (CELT-only), FLAC, PCM; with polyphase resampling, channel remixing and EBU R128 loudness normalization |
+| **Audio** | AAC-LC (mono to 5.1), Opus (CELT, SILK and hybrid; sample-exact with libopus), FLAC, PCM (u8 / s16 / s24 / s32 / f32) | AAC-LC (with rate control), Opus (CELT-only), FLAC, PCM; with polyphase resampling, channel remixing and EBU R128 loudness normalization |
 | **Pass-through** | HEVC, VP9, AV1 are carried through containers without decoding; AV1 OBU / IVF streams can be inspected | |
 | **Pixels & Filters** | YUV 4:2:0 / 4:2:2 / 4:4:4, NV12, 10-bit (`Yuv420p10le`), RGB24, RGBA, BGRA, Oklab; BT.601 / 709 / 2020; Lanczos-3, Spline36, Mitchell, bilinear scaling; crop / auto-crop, pad, rotate/flip, RGBA overlay, perceptual Oklab HDR10/HLG $\to$ SDR tonemap | |
 | **Metrics** | PSNR, SSIM, MS-SSIM, VMAF-Lite | |
@@ -136,24 +136,27 @@ Read the [architecture overview](https://oddurs.github.io/ragdoll/docs/architect
 
 ## Performance
 
-Ragdoll is correct first and not yet fast everywhere. Single-threaded, in-process, codec calls only, against libavcodec 6.1.1, x264 and libopus on one x86_64 AVX2 machine (about ±15% noise):
+In-process, codec calls only, the same number of threads on both sides, against libavcodec 6.1.1, x264 and libopus on one x86_64 AVX2 machine (about ±5–10% noise; a ratio above 1× means Ragdoll is faster):
 
 | Workload | Ragdoll | Reference | Ratio |
 | :-- | --: | --: | --: |
-| H.264 decode, 1080p High / CABAC | 29 fps | FFmpeg 181 fps | 0.16× |
-| H.264 decode, 720p Baseline | 77 fps | FFmpeg 834 fps | 0.09× |
-| H.264 encode, 720p QP 26 (similar size and PSNR to `ultrafast`) | 59 fps | x264 `ultrafast` 489 fps | 0.12× |
-| AAC-LC decode | 176× real time | FFmpeg 2367× | 0.07× |
-| Opus decode / encode | — | libopus | about 0.8× / 1× |
-| FLAC encode (files ~11% larger) / decode | — | FFmpeg | 1.5× / 0.4× |
+| H.264 decode, 1080p High / CABAC, 4 threads | 545 fps | FFmpeg 461 fps | 1.18× |
+| H.264 decode, 1080p High / CABAC, 1 thread | 162 fps | FFmpeg 169 fps | 0.96× |
+| H.264 decode, 720p Baseline, 4 threads / 1 thread | 1306 / 666 fps | FFmpeg 1349 / 711 fps | 0.97× / 0.94× |
+| H.264 encode, 720p QP 26 (smaller files, higher PSNR than `ultrafast`) | 366 fps | x264 `ultrafast` 342 fps | 1.07× |
+| AAC-LC decode / encode | 2510× / 174× real time | FFmpeg 1802× / 51× | 1.39× / 3.4× |
+| Opus decode (SILK) / encode (CELT low delay) | 1546× / 192× real time | FFmpeg 1085× / libopus 121× | 1.42× / 1.58× |
+| FLAC decode / encode (files ~21% smaller than level 5) | 1193× / 2778× real time | FFmpeg 920× / 475× | 1.29× / 5.9× |
+
+Single-thread H.264 decoding moved between 0.94× and 1.07× across measuring sessions: treat it as a tie.
 
 `ragdoll self-test` checks every SIMD kernel against its scalar reference and shows the gain on your machine. `ragdoll bench` times twelve end-to-end workloads in-process; its `--compare-ffmpeg` column runs FFmpeg as a separate process, so its speedups mostly measure FFmpeg's start-up and are not a codec comparison, and its energy table is an estimate, not a measurement. Read the [methodology and caveats](https://oddurs.github.io/ragdoll/docs/benchmarks/) before quoting any of these.
 
 ## Roadmap
 
 - **Available today:** the containers, codecs, filters and metrics above; frame-accurate cut and concat; HLS and DASH packaging; a GOP-parallel pipeline with pipes, multi-track A/V sync and bounded-memory video; TOML recipes; the Rust builders.
-- **In development:** decoder speed, starting with SIMD macroblock reconstruction for H.264, then AAC-LC, FLAC and Opus.
-- **Planned:** conformance and interop test runners, coverage-guided fuzzing, performance and memory regression gates, AAC rate control, bounded-memory audio, multithreaded H.264 decoding, and Python bindings.
+- **In development:** a clear single-thread lead for the H.264 decoder; H.264 encoder compression closer to x264 `veryfast`.
+- **Planned:** conformance and interop test runners, coverage-guided fuzzing, performance and memory regression gates, bounded-memory audio, and Python bindings.
 
 The [roadmap page](https://oddurs.github.io/ragdoll/docs/roadmap/) has details and known limitations.
 

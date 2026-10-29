@@ -5,7 +5,7 @@ export const metadata = { title: "Introduction" };
 Ragdoll is a media framework and command-line tool written entirely in Rust. It reads and writes containers, decodes and encodes video and audio, converts color and scales images, and measures quality. Every component is built from the bitstream up, with hand-written SIMD in the hot loops and no C libraries.
 
 <Callout kind="status" title="Pre-release software">
-Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, H.264 decoding and encoding, AAC-LC, Opus and FLAC work today. Interfaces will change before 1.0. The H.264 decoder is bit-exact but single-threaded and several times slower than FFmpeg, and the H.264 encoder compresses about as well as x264's `ultrafast` preset. See [Roadmap](/docs/roadmap/) for what is available and what is next.
+Ragdoll is at `v0.1.0`. Containers, pixel processing, quality metrics, H.264 decoding and encoding, AAC-LC, Opus and FLAC work today. Interfaces will change before 1.0. The H.264 decoder is bit-exact and about as fast as FFmpeg's, and the H.264 encoder compresses better than x264's `ultrafast` preset but well behind `veryfast`. See [Roadmap](/docs/roadmap/) for what is available and what is next.
 </Callout>
 
 ## What it is
