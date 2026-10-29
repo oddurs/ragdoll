@@ -2377,11 +2377,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         if spatial && inference && mask == 0xF {
             let col = if need_col {
                 let c = col_mb.get_or_insert_with(|| self.colocated_mb());
-                c.uniform().then(|| c.block(0, 0))
+                c.uniform().then(|| c.ref_mv(0, 0))
             } else {
-                Some((-1, [0, 0], NO_PIC, 0))
+                Some((-1, [0, 0]))
             };
-            if let Some((col_ref, col_mv, _, _)) = col {
+            if let Some((col_ref, col_mv)) = col {
                 return self.store_direct(0, 0, 4, sp_ref, spatial_mvs(col_ref, col_mv));
             }
         }
@@ -2404,12 +2404,17 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     (bx, by)
                 };
-                let (col_ref, col_mv, col_pic, vscale) = if need_col {
+                let (col_ref, col_mv, col_pic, vscale) = if !need_col {
+                    (-1, [0, 0], NO_PIC, 0)
+                } else if spatial {
+                    let (r, mv) = col_mb
+                        .get_or_insert_with(|| self.colocated_mb())
+                        .ref_mv(cbx, cby);
+                    (r, mv, NO_PIC, 0)
+                } else {
                     col_mb
                         .get_or_insert_with(|| self.colocated_mb())
                         .block(cbx, cby)
-                } else {
-                    (-1, [0, 0], NO_PIC, 0)
                 };
                 let (refs, mvs) = if spatial {
                     (sp_ref, spatial_mvs(col_ref, col_mv))
@@ -3052,6 +3057,27 @@ impl ColMb<'_> {
         let mb = row * self.mb_w + self.mbx;
         m.mb_intra.get(mb).copied().unwrap_or(true)
             || m.mb_uniform.get(mb).copied().unwrap_or(false)
+    }
+
+    /// `(refIdxCol, mvCol)` of MB-relative 4x4 block `(cbx, cby)`: [`Self::block`] without the
+    /// picture and scale, which spatial direct prediction does not use.
+    #[inline]
+    fn ref_mv(&self, cbx: usize, cby: usize) -> (i8, [i16; 2]) {
+        let Some(m) = self.m else {
+            return (-1, [0, 0]);
+        };
+        let (row, by) = match self.layout {
+            ColLayout::Same(row) => (row, cby),
+            ColLayout::FrameFromField(row, half) => (row, half + cby / 2),
+            ColLayout::FieldFromFrame(r2) => (r2 + cby / 2, 2 * (cby % 2)),
+        };
+        let mb = row * self.mb_w + self.mbx;
+        if mb >= m.mb_intra.len() || m.mb_intra[mb] {
+            return (-1, [0, 0]);
+        }
+        let b = &m.blocks[(row * 4 + by) * self.mb_w * 4 + self.mbx * 4 + cbx];
+        let l = if b.ref_idx[0] >= 0 { 0 } else { 1 };
+        (b.ref_idx[l], b.mv[l])
     }
 
     /// `(refIdxCol, mvCol, referenced picture id, vertical scale)` of MB-relative 4x4 block
