@@ -1030,8 +1030,27 @@ impl<'a, 'c> Dec<'a, 'c> {
                 _ => (self.st.cbp[a] >> ((yw / 8) * 2 + xw / 8)) & 1,
             }
         };
-        let la = [nb_bit(-1, 0), nb_bit(-1, 8)];
-        let tb = [nb_bit(0, -1), nb_bit(8, -1)];
+        let (la, tb) = if self.st.mbaff {
+            (
+                [nb_bit(-1, 0), nb_bit(-1, 8)],
+                [nb_bit(0, -1), nb_bit(8, -1)],
+            )
+        } else {
+            // The left macroblock's right 8x8s (bits 1, 3) and the top one's bottom 8x8s
+            // (bits 2, 3); all set when unavailable or I_PCM, clear when skipped.
+            let bits = |m: Option<usize>| -> u8 {
+                match m {
+                    None => 0xF,
+                    Some(a) => match self.st.mb_type[a] {
+                        MbType::IPcm => 0xF,
+                        t if t.is_skip() => 0,
+                        _ => self.st.cbp[a] & 0xF,
+                    },
+                }
+            };
+            let (l, t) = (bits(self.mb_left()), bits(self.mb_top()));
+            ([(l >> 1) & 1, (l >> 3) & 1], [(t >> 2) & 1, (t >> 3) & 1])
+        };
         let chroma_of = |m: Option<usize>| -> u8 {
             match m {
                 None => 0,
@@ -1889,6 +1908,53 @@ impl<'a, 'c> Dec<'a, 'c> {
         part: Option<(Part, usize)>,
         done: u16,
     ) -> [i16; 2] {
+        if !self.st.mbaff {
+            // Neighbours by block coordinates: inside the macroblock when decoded (`done`),
+            // else in the left, top, top-right or top-left macroblock when available.
+            let st = &*self.st;
+            let s = st.mb_w * 4;
+            let i = st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+            let at = |j: usize| (st.blocks[j].ref_idx[list], st.blocks[j].mv[list]);
+            let inside = |x: usize, y: usize| done & (1 << BLK4_AT[y][x]) != 0;
+            let nb = self.nb;
+            let get = |ok: bool, j: usize| if ok { at(j) } else { NO_MV };
+            let a = get(
+                if bx > 0 {
+                    inside(bx - 1, by)
+                } else {
+                    nb & NB_L != 0
+                },
+                i.wrapping_sub(1),
+            );
+            let b = get(
+                if by > 0 {
+                    inside(bx, by - 1)
+                } else {
+                    nb & NB_T != 0
+                },
+                i.wrapping_sub(s),
+            );
+            let cx = bx + w;
+            let c_ok = match (by > 0, cx < 4) {
+                (true, true) => inside(cx, by - 1),
+                // The macroblock to the right follows in decoding order.
+                (true, false) => false,
+                (false, true) => nb & NB_T != 0,
+                (false, false) => nb & NB_TR != 0,
+            };
+            let c = if c_ok {
+                at((i + w).wrapping_sub(s))
+            } else {
+                let d_ok = match (bx > 0, by > 0) {
+                    (true, true) => inside(bx - 1, by - 1),
+                    (false, true) => nb & NB_L != 0,
+                    (true, false) => nb & NB_T != 0,
+                    (false, false) => nb & NB_TL != 0,
+                };
+                get(d_ok, i.wrapping_sub(s + 1))
+            };
+            return mvp_from(a, b, c, refidx, part);
+        }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let a = self.neighbour(list, x - 1, y, done);
         let b = self.neighbour(list, x, y - 1, done);
