@@ -3576,7 +3576,8 @@ fn extract_mb_planes(
 ///
 /// [`H264Decoder::decode_annex_b_packet`] returns pictures in decode order, each stamped with a PTS
 /// that orders it within its IDR period; [`H264Decoder::decode_stream_pts_ordered`] returns a whole
-/// stream in presentation order.
+/// stream in presentation order. [`H264Decoder::with_threads`] decodes several frames at once
+/// (frame threading), with the same output.
 #[derive(Clone, Debug, Default)]
 pub struct H264Decoder {
     /// Most recent SPS seen, for callers that inspect stream headers.
@@ -3590,6 +3591,17 @@ pub struct H264Decoder {
 impl H264Decoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Decodes progressive frame pictures on `threads` worker threads, several at a time, as
+    /// FFmpeg's frame threading does (1 decodes on the calling thread). The output is the same
+    /// for any thread count. With more than one, [`Self::decode_annex_b_packet`] returns each
+    /// picture a few access units after the one that completes it (`None` until then), and
+    /// [`Self::flush`] returns the remaining ones at the end of the stream; a decoding error is
+    /// reported in place of its picture.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.core.set_threads(threads);
+        self
     }
 
     /// Feeds Annex-B SPS/PPS headers (for example converted `avcC` extradata) into the decoder.
@@ -3618,7 +3630,13 @@ impl H264Decoder {
             self.feed_nal(nal)?;
         }
         self.core.finish_picture();
-        Ok(self.core.pop_decoded())
+        self.core.pop_decoded(false)
+    }
+
+    /// Ends the stream: returns the pictures not yet returned by
+    /// [`Self::decode_annex_b_packet`], in decode order.
+    pub fn flush(&mut self) -> Result<Vec<VideoFrame>> {
+        self.core.flush()
     }
 
     /// Decodes an entire Annex-B stream and returns its pictures in presentation order, with PTS
@@ -3628,7 +3646,7 @@ impl H264Decoder {
             self.feed_nal(nal)?;
         }
         self.core.finish_picture();
-        let mut frames = self.core.drain_output_order();
+        let mut frames = self.core.drain_output_order()?;
         let tb = self.core.fps().unwrap_or(Rational64::FPS_30).recip();
         for (idx, f) in frames.iter_mut().enumerate() {
             f.pts = Timestamp::new(idx as i64, tb);

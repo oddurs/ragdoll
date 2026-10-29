@@ -151,7 +151,8 @@ impl Dpb {
 
     /// Keeps a store no longer needed for reuse by [`Dpb::new_store`].
     pub fn release(&mut self, store: FrameStore) {
-        if self.free.len() < FREE_STORES {
+        // A store decoded on a worker shares its samples with the decoder's plane pool instead.
+        if store.sync.is_none() && self.free.len() < FREE_STORES {
             self.free.push(store);
         }
     }

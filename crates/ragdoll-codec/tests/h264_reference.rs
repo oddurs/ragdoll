@@ -60,6 +60,46 @@ fn fnv1a(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
+/// The hash of `frames` (in output order) cropped to `w`x`h`.
+fn hash_frames(name: &str, frames: &[ragdoll_core::VideoFrame], w: usize, h: usize) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for f in frames {
+        assert_eq!((f.width, f.height), (w, h), "{name}: dimensions");
+        for p in 0..3 {
+            let (pw, ph) = if p == 0 {
+                (w, h)
+            } else {
+                (w.div_ceil(2), h.div_ceil(2))
+            };
+            for y in 0..ph {
+                fnv1a(&mut hash, &f.plane(p).row(y)[..pw]);
+            }
+        }
+    }
+    hash
+}
+
+/// Splits an Annex-B stream into access units: a new one starts at an AUD, SEI, SPS or PPS,
+/// or at a slice whose `first_mb_in_slice` is 0, after a slice.
+fn access_units(data: &[u8]) -> Vec<&[u8]> {
+    let starts: Vec<usize> = (0..data.len().saturating_sub(3))
+        .filter(|&i| data[i..i + 3] == [0, 0, 1])
+        .collect();
+    let (mut aus, mut begin, mut has_slice) = (Vec::new(), 0, false);
+    for &s in &starts {
+        let ty = data.get(s + 3).map_or(0, |b| b & 31);
+        let first_mb_zero = data.get(s + 4).is_some_and(|b| b & 0x80 != 0);
+        if has_slice && (matches!(ty, 6..=9) || (matches!(ty, 1 | 5) && first_mb_zero)) {
+            aus.push(&data[begin..s]);
+            begin = s;
+            has_slice = false;
+        }
+        has_slice |= matches!(ty, 1 | 5);
+    }
+    aus.push(&data[begin..]);
+    aus
+}
+
 #[test]
 fn decodes_bit_exact_with_reference_decoders() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/h264");
@@ -67,23 +107,51 @@ fn decodes_bit_exact_with_reference_decoders() {
         let data = std::fs::read(dir.join(name)).unwrap();
         let out = H264Decoder::new().decode_stream_pts_ordered(&data).unwrap();
         assert_eq!(out.len(), frames, "{name}: frame count");
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for f in &out {
-            assert_eq!((f.width, f.height), (w, h), "{name}: dimensions");
-            for p in 0..3 {
-                let (pw, ph) = if p == 0 {
-                    (w, h)
-                } else {
-                    (w.div_ceil(2), h.div_ceil(2))
-                };
-                for y in 0..ph {
-                    fnv1a(&mut hash, &f.plane(p).row(y)[..pw]);
-                }
-            }
-        }
         assert_eq!(
-            hash, expected,
+            hash_frames(name, &out, w, h),
+            expected,
             "{name}: decoded output differs from the reference decoders"
         );
+    }
+}
+
+/// Frame threading gives the same output, through both decoding calls, with fewer workers than
+/// pictures in flight and with more.
+#[test]
+fn frame_threads_decode_bit_exact() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/h264");
+    for (name, w, h, frames, expected) in CASES {
+        let data = std::fs::read(dir.join(name)).unwrap();
+        for threads in [2, 4] {
+            let out = H264Decoder::new()
+                .with_threads(threads)
+                .decode_stream_pts_ordered(&data)
+                .unwrap();
+            assert_eq!(out.len(), frames, "{name}, {threads} threads: frame count");
+            assert_eq!(
+                hash_frames(name, &out, w, h),
+                expected,
+                "{name}, {threads} threads: whole-stream output differs"
+            );
+
+            // Access unit by access unit: pictures come out in decode order, a few later.
+            let mut dec = H264Decoder::new().with_threads(threads);
+            let mut out = Vec::new();
+            for au in access_units(&data) {
+                out.extend(dec.decode_annex_b_packet(au).unwrap());
+            }
+            out.extend(dec.flush().unwrap());
+            assert_eq!(
+                out.len(),
+                frames,
+                "{name}, {threads} threads: packet frame count"
+            );
+            out.sort_by_key(|f| f.pts.ticks);
+            assert_eq!(
+                hash_frames(name, &out, w, h),
+                expected,
+                "{name}, {threads} threads: packet output differs"
+            );
+        }
     }
 }

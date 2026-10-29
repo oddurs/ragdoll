@@ -32,8 +32,21 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
     if st.mbaff {
         return deblock_mbaff(st, slices, has_chroma);
     }
-    let (mb_w, mb_h) = (st.mb_w, st.mb_h);
-    for mb_y in 0..mb_h {
+    deblock_rows(st, slices, has_chroma, 0..st.mb_h);
+}
+
+/// Filters the decoded macroblocks of rows `rows` of a picture without MBAFF, in raster order.
+/// Filtering row `y` reads and writes rows `y - 1` (its top edge) and `y` only, so the rows
+/// of a picture may be filtered in order as decoding completes them, each once the row below
+/// it is decoded (whose intra prediction reads unfiltered samples).
+pub fn deblock_rows(
+    st: &mut PicState,
+    slices: &[SliceDeblock],
+    has_chroma: bool,
+    rows: std::ops::Range<usize>,
+) {
+    let mb_w = st.mb_w;
+    for mb_y in rows {
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
             if st.mb_type[addr] == MbType::None {
