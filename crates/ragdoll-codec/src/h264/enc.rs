@@ -1378,6 +1378,12 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16
         if nz == 0 {
             continue;
         }
+        // A level above 1 scores 9 for its block, which keeps the quadrant and the macroblock.
+        if nz >> 4 != 0 {
+            cbp |= 1 << i8x8;
+            total += 9;
+            continue;
+        }
         let zz = zigzag_4x4_x4(group);
         let masks = nonzero_mask_4x4_x4(&zz);
         let score: u32 = (0..4).map(|b| decimate_masked(&zz[b], masks[b])).sum();
@@ -1615,6 +1621,9 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
         let nz = quant_4x4_x4(group, q);
         if nz == 0 {
             continue;
+        }
+        if nz >> 4 != 0 {
+            return false;
         }
         let zz = zigzag_4x4_x4(group);
         for (z, &mask) in zz.iter().zip(&nonzero_mask_4x4_x4(&zz)) {

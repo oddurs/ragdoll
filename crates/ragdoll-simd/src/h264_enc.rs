@@ -381,14 +381,15 @@ pub struct Quant4x4 {
 }
 
 /// Quantizes the four $4\times4$ blocks of `blocks` in place; bit `b` of the result is set when
-/// block `b` has a non-zero level.
+/// block `b` has a non-zero level, and bit `4 + b` when it has a level of magnitude above 1.
 ///
 /// # Panics
 /// If `q.shift` is not in `1..=31` or `q.bias` is not below `1 << q.shift`.
-#[inline]
+#[inline(always)]
 pub fn quant_4x4_x4(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
     assert!((1..32).contains(&q.shift) && q.bias < 1 << q.shift);
-    assert!(q.mf.iter().all(|&m| m <= i16::MAX as u16));
+    // Every multiplier fits in 15 bits.
+    assert!(q.mf.iter().fold(0, |a, &m| a | m) <= i16::MAX as u16);
     #[cfg(target_arch = "aarch64")]
     if ragdoll_core::dispatch::neon() {
         // Safety: NEON is baseline on aarch64.
@@ -403,6 +404,7 @@ pub fn quant_4x4_x4(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
 }
 
 /// Scalar reference for [`quant_4x4_x4`].
+#[inline(never)]
 pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
     let mut nz = 0;
     for (b, blk) in blocks.iter_mut().enumerate() {
@@ -414,6 +416,9 @@ pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         if blk.iter().any(|&c| c != 0) {
             nz |= 1 << b;
         }
+        if blk.iter().any(|&c| c.unsigned_abs() > 1) {
+            nz |= 0x10 << b;
+        }
     }
     nz
 }
@@ -423,7 +428,7 @@ pub fn quant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
 ///
 /// # Panics
 /// If a scale exceeds 65535 in magnitude.
-#[inline]
+#[inline(always)]
 pub fn dequant_4x4_x4(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
     check_scale(scale);
     #[cfg(target_arch = "aarch64")]
@@ -448,6 +453,7 @@ fn check_scale(scale: &[i32; 16]) {
 }
 
 /// Scalar reference for [`dequant_4x4_x4`].
+#[inline(never)]
 pub fn dequant_4x4_x4_scalar(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
     check_scale(scale);
     for blk in blocks.iter_mut() {
@@ -511,7 +517,7 @@ fn hadamard_edge(x: &[u8]) -> [i16; 4] {
 /// `dc`, in that order (`x264_intra_satd_x3_16x16`). One Hadamard transform of the source serves
 /// all three: a prediction with equal rows (columns) transforms to a single non-zero row
 /// (column), and the DC prediction to a single coefficient.
-#[inline]
+#[inline(always)]
 pub fn intra_satd_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
     let tv: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&top[b * 4..]));
     let th: [[i16; 4]; 4] = std::array::from_fn(|b| hadamard_edge(&left[b * 4..]));
@@ -520,11 +526,22 @@ pub fn intra_satd_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc:
         // Safety: avx2() is true only when the CPU supports AVX2.
         return unsafe { intra_satd_x3_avx2(src, &tv, &th, 16 * dc as i16) };
     }
+    intra_satd_x3_strips(src, &tv, &th, 16 * dc as i16)
+}
+
+/// [`intra_satd_x3_16x16`] through the dispatched $4\times4$ Hadamard of each strip.
+#[inline(never)]
+fn intra_satd_x3_strips(
+    src: &[u8; 256],
+    tv: &[[i16; 4]; 4],
+    th: &[[i16; 4]; 4],
+    dc16: i16,
+) -> [u32; 3] {
     let mut out = [[[0i16; 16]; 4]; 4];
     for (strip, o) in out.iter_mut().enumerate() {
         hadamard4x4_16x4(&src[strip * 64..], 16, o);
     }
-    intra_satd_x3_from(&out, &tv, &th, 16 * dc as i16)
+    intra_satd_x3_from(&out, tv, th, dc16)
 }
 
 /// Scalar reference for [`intra_satd_x3_16x16`].
@@ -1431,6 +1448,7 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         let mf = _mm256_loadu_si256(q.mf.as_ptr() as *const __m256i);
         let bias = _mm256_set1_epi32(q.bias as i32);
         let shift = _mm_cvtsi32_si128(q.shift as i32);
+        let one = _mm256_set1_epi16(1);
         let mut nz = 0;
         for (b, blk) in blocks.iter_mut().enumerate() {
             let p = blk.as_mut_ptr() as *mut __m256i;
@@ -1440,10 +1458,15 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
             let (lo, hi) = (_mm256_mullo_epi16(a, mf), _mm256_mulhi_epu16(a, mf));
             let p0 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_unpacklo_epi16(lo, hi), bias), shift);
             let p1 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_unpackhi_epi16(lo, hi), bias), shift);
-            let level = _mm256_sign_epi16(_mm256_packs_epi32(p0, p1), c);
+            let mag = _mm256_packs_epi32(p0, p1);
+            let level = _mm256_sign_epi16(mag, c);
             _mm256_storeu_si256(p, level);
             if _mm256_testz_si256(level, level) == 0 {
                 nz |= 1 << b;
+                let big = _mm256_cmpgt_epi16(mag, one);
+                if _mm256_testz_si256(big, big) == 0 {
+                    nz |= 0x10 << b;
+                }
             }
         }
         nz
@@ -2182,7 +2205,7 @@ unsafe fn quant_neon(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
         let cap = vdupq_n_u32(i16::MAX as u32);
         let mut nz = 0;
         for (b, blk) in blocks.iter_mut().enumerate() {
-            let mut any = vdupq_n_u16(0);
+            let mut max = vdupq_n_u16(0);
             for h in 0..2 {
                 let c = vld1q_s16(blk.as_ptr().add(h * 8));
                 let mf = vld1q_u16(q.mf.as_ptr().add(h * 8));
@@ -2198,10 +2221,12 @@ unsafe fn quant_neon(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
                 ));
                 let level = vbslq_s16(vcltzq_s16(c), vnegq_s16(l), l);
                 vst1q_s16(blk.as_mut_ptr().add(h * 8), level);
-                any = vorrq_u16(any, vreinterpretq_u16_s16(level));
+                max = vmaxq_u16(max, vreinterpretq_u16_s16(l));
             }
-            if vmaxvq_u16(any) != 0 {
-                nz |= 1 << b;
+            match vmaxvq_u16(max) {
+                0 => {}
+                1 => nz |= 1 << b,
+                _ => nz |= 0x11 << b,
             }
         }
         nz
@@ -2504,6 +2529,37 @@ mod tests {
                 let mut b = a;
                 assert_eq!(quant_4x4_x4(&mut a, &q), quant_4x4_x4_scalar(&mut b, &q));
                 assert_eq!(a, b, "shift {shift}");
+            }
+        }
+        // Blocks whose levels are all within +-1, or hold one larger level, set only the
+        // non-zero bits, or both bits, of their block.
+        let q = Quant4x4 {
+            mf: [13107; 16],
+            bias: (1 << 15) / 6,
+            shift: 15,
+        };
+        for round in 0..200u32 {
+            let mut a = [[0i16; 16]; 4];
+            for (i, c) in a.iter_mut().flatten().enumerate() {
+                let r = next();
+                *c = match (r >> 20) % 16 {
+                    0..=5 => 0,
+                    6..=9 => 2,
+                    10..=14 => -3,
+                    _ => (r >> 24) as i16 - 128,
+                };
+                if i == 16 * (round as usize % 4) + (r as usize % 16) && round % 3 == 0 {
+                    *c = -60;
+                }
+            }
+            a[(round as usize + 1) % 4] = [0; 16];
+            let mut b = a;
+            let nz = quant_4x4_x4(&mut a, &q);
+            assert_eq!(nz, quant_4x4_x4_scalar(&mut b, &q), "round {round}");
+            assert_eq!(a, b);
+            for (k, blk) in a.iter().enumerate() {
+                assert_eq!(nz >> k & 1 != 0, blk.iter().any(|&c| c != 0));
+                assert_eq!(nz >> (4 + k) & 1 != 0, blk.iter().any(|&c| c.abs() > 1));
             }
         }
     }
