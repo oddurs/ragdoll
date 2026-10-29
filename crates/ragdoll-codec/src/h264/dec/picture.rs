@@ -91,13 +91,25 @@ pub const NO_BLOCK: BlockInfo = BlockInfo {
     direct: false,
 };
 
+/// A macroblock row of [`NO_BLOCK`], copied from memory rather than rebuilt for every row.
+static NO_BLOCK_ROW: [BlockInfo; 4] = [NO_BLOCK; 4];
+
 /// Sets the `W`x`h` rectangle of `v` whose rows start at `i`, `i + stride`, ... to `val`, with
 /// one bounds check (`h >= 1`).
 #[inline(always)]
 pub fn fill_rect<T: Copy, const W: usize>(v: &mut [T], i: usize, stride: usize, h: usize, val: T) {
     let s = &mut v[i..i + (h - 1) * stride + W];
-    for r in 0..h {
-        s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+    if size_of::<T>() <= 8 {
+        for r in 0..h {
+            s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+        }
+        return;
+    }
+    // Later rows copy the first: a multi-field `T` is then built once, not once per row.
+    let (first, rest) = s.split_at_mut(W);
+    first.copy_from_slice(&[val; W]);
+    for r in 1..h {
+        rest[r * stride - W..r * stride].copy_from_slice(first);
     }
 }
 
@@ -346,7 +358,10 @@ impl PicState {
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
         fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
-        fill_rect::<_, 4>(&mut self.blocks, i, w, 4, NO_BLOCK);
+        let rows = &mut self.blocks[i..i + 3 * w + 4];
+        for r in 0..4 {
+            rows[r * w..r * w + 4].copy_from_slice(&NO_BLOCK_ROW);
+        }
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);

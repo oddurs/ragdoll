@@ -936,19 +936,20 @@ pub struct CabacDecoder<'a> {
     /// Next byte of `data` not yet in `value`.
     pos: usize,
     /// `codIOffset` in the top 10 bits (9 plus headroom for a bypass shift), followed by the
-    /// stream's next `bits` bits.
+    /// stream's next bits and then a single set marker bit with zeros below it (FFmpeg's
+    /// `CABAC_MASK` scheme): the marker's position counts the valid bits, and while it stays in
+    /// the low 32 bits at least [`Self::MIN_BITS`] of them remain, so a decision checks for a
+    /// refill with one test.
     value: u64,
-    /// Valid stream bits below the offset; at least [`Self::MIN_BITS`] between decisions.
-    bits: u32,
     range: u32,
 }
 
 impl<'a> CabacDecoder<'a> {
     /// Bit position of the offset's least significant bit in `value`.
     const SHIFT: u32 = 54;
-    /// Lookahead kept between bins: a decision consumes at most 7 bits (range is at least 6
-    /// after an LPS) and a bypass bin 1.
-    const MIN_BITS: u32 = 8;
+    /// Valid bits left when the marker is at bit 31, its highest position between bins: more
+    /// than a decision (at most 7, range being at least 6 after an LPS) or a bypass bin consume.
+    const MIN_BITS: u32 = Self::SHIFT - 1 - 31;
 
     /// Initializes a CABAC arithmetic decoder from byte-aligned slice payload `data` (ITU-T H.264 9.3.1.2).
     pub fn new(data: &'a [u8]) -> Result<Self> {
@@ -959,7 +960,6 @@ impl<'a> CabacDecoder<'a> {
             data,
             pos: 0,
             value: 0,
-            bits: 0,
             range: 510,
         };
         d.start();
@@ -968,55 +968,55 @@ impl<'a> CabacDecoder<'a> {
 
     /// Loads the 9-bit initial offset from `pos` (9.3.1.2).
     fn start(&mut self) {
-        self.value = 0;
-        self.bits = 0;
+        // No valid bits: the marker sits just below the offset.
+        self.value = 1 << (Self::SHIFT - 1);
         self.refill();
         self.consume(9);
         self.range = 510;
     }
 
-    /// Tops the lookahead up to at least 47 bits; past the end of `data` the stream reads as zeros.
+    /// Fills the bits below the valid ones with whole bytes, leaving the marker in the low byte;
+    /// past the end of `data` the stream reads as zeros.
     #[inline(always)]
     fn refill(&mut self) {
-        (self.pos, self.value, self.bits) =
-            Self::refilled(self.data, self.pos, self.value, self.bits);
+        (self.pos, self.value) = Self::refilled(self.data, self.pos, self.value);
     }
 
     /// [`Self::refill`] on values, so that the decoder state of a caller can stay in registers.
     #[cold]
     #[inline(never)]
-    fn refilled(data: &[u8], mut pos: usize, mut value: u64, mut bits: u32) -> (usize, u64, u32) {
+    fn refilled(data: &[u8], mut pos: usize, value: u64) -> (usize, u64) {
+        let m = value.trailing_zeros();
+        // Whole bytes fit above bit 0: the new marker lands at m - 8 * k, in 0..8.
+        let k = m / 8;
+        debug_assert!(k >= 1 && Self::SHIFT - 1 - (m - 8 * k) >= Self::MIN_BITS);
+        let mut value = value ^ (1 << m);
         if let Some(b) = data.get(pos..pos + 8) {
-            // Bits below the valid ones are the stream's own, so OR-ing them again later is harmless.
             let v = u64::from_be_bytes(b.try_into().expect("8 bytes"));
-            value |= (v >> (64 - Self::SHIFT)) >> bits;
-            let n = (Self::SHIFT - bits) >> 3;
-            pos += n as usize;
-            bits += n * 8;
+            value |= (v >> (64 - 8 * k)) << (m + 1 - 8 * k);
         } else {
-            while bits + 8 <= Self::SHIFT {
-                let b = data.get(pos).copied().unwrap_or(0) as u64;
-                value |= b << (Self::SHIFT - 8 - bits);
-                bits += 8;
-                pos += 1;
+            for j in 0..k {
+                let b = data.get(pos + j as usize).copied().unwrap_or(0) as u64;
+                value |= b << (m + 1 - 8 * (j + 1));
             }
         }
-        (pos, value, bits)
+        pos += k as usize;
+        (pos, value | 1 << (m - 8 * k))
     }
 
     /// Shifts `n` stream bits into the offset.
     #[inline(always)]
     fn consume(&mut self, n: u32) {
         self.value <<= n;
-        self.bits -= n;
-        if self.bits < Self::MIN_BITS {
+        if self.value as u32 == 0 {
             self.refill();
         }
     }
 
     /// Bit position in `data` of the next unread bit.
     fn bit_pos(&self) -> usize {
-        self.pos * 8 - self.bits as usize
+        let bits = Self::SHIFT - 1 - self.value.trailing_zeros();
+        self.pos * 8 - bits as usize
     }
 
     /// Decodes a single binary decision (`0` or `1`) using `ctx` (ITU-T H.264 9.3.3.2.1).
