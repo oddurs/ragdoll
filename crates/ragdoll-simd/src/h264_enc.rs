@@ -1538,13 +1538,10 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
             let mag = _mm256_packs_epi32(p0, p1);
             let level = _mm256_sign_epi16(mag, c);
             _mm256_storeu_si256(p, level);
-            if _mm256_testz_si256(level, level) == 0 {
-                nz |= 1 << b;
-                let big = _mm256_cmpgt_epi16(mag, one);
-                if _mm256_testz_si256(big, big) == 0 {
-                    nz |= 0x10 << b;
-                }
-            }
+            // Without branches: which blocks are coded depends on the content.
+            let big = _mm256_cmpgt_epi16(mag, one);
+            nz |= ((_mm256_testz_si256(level, level) ^ 1) as u32) << b;
+            nz |= ((_mm256_testz_si256(big, big) ^ 1) as u32) << (4 + b);
         }
         nz
     }

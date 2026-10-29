@@ -498,6 +498,10 @@ static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
     t
 };
 
+/// `coeff_token` table of each `nC` (0..=16; larger ones share the last), as
+/// `nc_to_table_idx`, without the branches.
+const NC_CLASS: [u8; 17] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+
 /// CAVLC `residual_block` of a zig-zag scanned block of `N` = 16 or 15 coefficients (`nc` selects
 /// the `coeff_token` table), or of the 4 chroma DC coefficients (`N` = 4); the bits equal
 /// [`encode_cavlc_block`]'s.
@@ -518,7 +522,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     let (token_len, token_bits): (&[u8], &[u8]) = if N == 4 {
         (&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS)
     } else {
-        let t = nc_to_table_idx(nc);
+        let t = NC_CLASS[nc.min(16) as usize] as usize;
         (&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
     };
     if mask == 0 {
