@@ -1418,6 +1418,21 @@ impl<'a, 'c> Dec<'a, 'c> {
         ]
     }
 
+    /// Neighbours A and B of the luma 4x4 block at MB-relative `(bx, by)`, each `(macroblock,
+    /// block index)` when available (as [`Self::blk`], every block of the current macroblock
+    /// counting as decoded).
+    #[inline]
+    fn nb_ab(&self, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
+        if !self.st.mbaff {
+            let a = self.mb.addr;
+            return self
+                .nb_flat(2, bx, by)
+                .map(|n| n.map(|(i, other, m)| (if other { m } else { a }, i)));
+        }
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        [self.blk(x - 1, y, 0xFFFF), self.blk(x, y - 1, 0xFFFF)]
+    }
+
     /// CAVLC `nC` for the luma 4x4 block at MB-relative 4x4 `(bx, by)` (9.2.1).
     #[inline]
     fn nc_luma(&self, bx: usize, by: usize) -> u8 {
@@ -1936,10 +1951,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         if !self.is_cabac() {
             return self.read_te(n - 1);
         }
-        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let is_b = self.cx.sh.slice_type.is_b();
-        let cond = |xn: isize, yn: isize| -> u8 {
-            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
+        let cond = |n: Option<(usize, usize)>| -> u8 {
+            let Some((addr, i)) = n else {
                 return 0;
             };
             let t = self.st.mb_type[addr];
@@ -1957,7 +1971,8 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             (self.st.blocks[i].ref_idx[list] > thresh) as u8
         };
-        let (ca, cb) = (cond(x - 1, y), cond(x, y - 1));
+        let [na, nb] = self.nb_ab(bx, by);
+        let (ca, cb) = (cond(na), cond(nb));
         let (cd, ctxs) = self.cabac();
         let v = cd.decode_ref_idx(&mut ctxs[..], ca, cb);
         if v as u32 >= n {
@@ -1976,9 +1991,9 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             return Ok(([x as i16, y as i16], [0, 0]));
         }
-        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
-        let absn = |xn: isize, yn: isize, comp: usize| -> u32 {
-            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
+        let [na, nb] = self.nb_ab(bx, by);
+        let absn = |n: Option<(usize, usize)>, comp: usize| -> u32 {
+            let Some((addr, i)) = n else {
                 return 0;
             };
             let v = self.st.blocks[i].mvd[list][comp] as u32;
@@ -1989,7 +2004,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 _ => v,
             }
         };
-        let sums = [0, 1].map(|comp| absn(x - 1, y, comp) + absn(x, y - 1, comp));
+        let sums = [0, 1].map(|comp| absn(na, comp) + absn(nb, comp));
         let mut mvd = [0i16; 2];
         let mut amvd = [0u8; 2];
         for comp in 0..2 {
