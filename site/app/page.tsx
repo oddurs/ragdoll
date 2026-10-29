@@ -56,10 +56,12 @@ const commands = [
 ];
 
 const bench = [
-  { name: "H.264 decode, 1080p High (CABAC)", ours: "29 fps", theirs: "FFmpeg 181 fps", x: 0.16 },
-  { name: "H.264 decode, 720p Baseline", ours: "77 fps", theirs: "FFmpeg 834 fps", x: 0.09 },
-  { name: "H.264 encode, 720p QP 26", ours: "59 fps", theirs: "x264 ultrafast 489 fps", x: 0.12 },
-  { name: "AAC-LC decode", ours: "176× real time", theirs: "FFmpeg 2367×", x: 0.07 },
+  { name: "H.264 decode, 1080p High (CABAC), 4 threads", ours: "545 fps", theirs: "FFmpeg 461 fps", x: 1.18 },
+  { name: "H.264 decode, 1080p High (CABAC), 1 thread", ours: "162 fps", theirs: "FFmpeg 169 fps", x: 0.96 },
+  { name: "H.264 encode, 720p QP 26", ours: "366 fps", theirs: "x264 ultrafast 342 fps", x: 1.07 },
+  { name: "AAC-LC decode", ours: "2510× real time", theirs: "FFmpeg 1802×", x: 1.39 },
+  { name: "Opus decode (SILK)", ours: "1546× real time", theirs: "FFmpeg 1085×", x: 1.42 },
+  { name: "FLAC decode", ours: "1193× real time", theirs: "FFmpeg 920×", x: 1.29 },
 ];
 
 const status = [
@@ -69,6 +71,7 @@ const status = [
     items: [
       "MP4, Matroska / WebM, MPEG-TS, Ogg, WAV, PNG, JPEG",
       "H.264 Baseline / Main / High decode and encode",
+      "Frame-threaded H.264 decoding",
       "AAC-LC, Opus, FLAC, PCM; EBU R128 loudness",
       "Cut, concat, HLS and DASH packaging",
       "Filters, HDR tone mapping, quality metrics",
@@ -78,10 +81,8 @@ const status = [
     s: "doing",
     title: "In development",
     items: [
-      "H.264 decoder speed: SIMD reconstruction",
-      "Partition-sized motion compensation",
-      "AAC-LC decoder speed",
-      "FLAC and Opus decoder speed",
+      "H.264 decoder speed: a clear lead on one thread",
+      "H.264 encoder compression, towards x264 veryfast",
     ],
   },
   {
@@ -91,8 +92,7 @@ const status = [
       "Conformance and interop runners",
       "Coverage-guided fuzzing",
       "Performance and memory regression gates",
-      "AAC rate control, bounded-memory audio",
-      "Multithreaded H.264 decoding",
+      "Bounded-memory audio",
     ],
   },
 ];
@@ -250,9 +250,10 @@ export default function Home() {
             <p className="eyebrow">Performance</p>
             <h2>Measured, not promised.</h2>
             <p>
-              Single-threaded codec throughput against libavcodec 6.1.1 and x264, both called
-              in-process on the same inputs, on an x86_64 AVX2 Xeon at 2.1 GHz. The H.264 decoder
-              matches the reference bit for bit; it does not yet match FFmpeg&apos;s speed.
+              Codec throughput against libavcodec 6.1.1, libopus and x264, all called in-process on
+              the same inputs with the same number of threads, on an x86_64 AVX2 Xeon at 2.1 GHz.
+              The H.264 decoder matches the reference bit for bit, and is level with FFmpeg on one
+              thread and ahead with four.
             </p>
           </div>
           <div className="table-wrap" style={{ border: 0 }}>
@@ -275,7 +276,7 @@ export default function Home() {
                     </td>
                     <td>
                       <div className="bench-bar">
-                        <i style={{ width: `${b.x * 120}px` }} />
+                        <i style={{ width: `${b.x * 80}px` }} />
                         <b>{b.x.toFixed(2)}×</b>
                       </div>
                     </td>
@@ -285,9 +286,9 @@ export default function Home() {
             </table>
           </div>
           <p className="footnote">
-            One machine, ±15% run to run; a ratio of 1.00× is parity. Opus decodes at about 0.8× and
-            encodes at about 1× libopus; FLAC encodes 1.5× faster than FFmpeg (level 5) with ~11%
-            larger files and decodes 2.5× slower. Read the{" "}
+            One machine, ±5–10% from session to session; a ratio of 1.00× is parity. Opus also
+            encodes 1.6× faster than libopus, AAC-LC encodes 3.4× faster than FFmpeg, and FLAC
+            encodes 5.9× faster than FFmpeg&apos;s level 5 with smaller files. Read the{" "}
             <Link href="/docs/benchmarks/">methodology and caveats</Link> before quoting them.
           </p>
         </section>

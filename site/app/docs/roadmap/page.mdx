@@ -9,7 +9,7 @@ Ragdoll is pre-1.0. This page describes what works today, what is being built no
 - **Foundation.** 128-bit timebases and rescaling, CICP and Oklab colorimetry, 64-byte-aligned frame pools, bit I/O with Exp-Golomb and Rice coding, CRC-8/16/32.
 - **Pixels and filters.** YUV, NV12, RGB and Oklab conversion; 10-bit to 8-bit dithering; Lanczos-3, Spline36, Mitchell and bilinear scaling; crop and auto-crop, pad, rotate and flip, frame-rate conversion, RGBA overlay, and HDR10 / HLG to SDR tone mapping; PSNR, SSIM, MS-SSIM and VMAF-Lite.
 - **Containers.** Zero-copy MP4 / MOV (fast-start, fragmented and CMAF), Matroska / WebM, MPEG-TS and Ogg; Y4M, WAV / RF64, FLAC, PNG, JPEG, Netpbm, WebVTT and SubRip. HEVC, VP9 and AV1 tracks are carried through containers without decoding.
-- **Video codecs.** An H.264 decoder that is bit-exact with the JM reference and FFmpeg on Baseline, Main and High streams (CAVLC and CABAC, B-frames, the 8×8 transform, weighted prediction, multiple slices, long-term references), interlaced streams (PAFF and MBAFF) and monochrome 4:0:0. An H.264 encoder for Constrained Baseline, Main and High (CABAC, 8×8 transform) with fixed QP, CRF and ABR / VBV rate control, whose output FFmpeg decodes byte-identically. The RGDI intermediate codec; AV1 OBU / IVF bitstream inspection.
+- **Video codecs.** An H.264 decoder that is bit-exact with the JM reference and FFmpeg on Baseline, Main and High streams (CAVLC and CABAC, B-frames, the 8×8 transform, weighted prediction, multiple slices, long-term references), interlaced streams (PAFF and MBAFF) and monochrome 4:0:0, with frame threads whose output is identical to one thread's. An H.264 encoder for Constrained Baseline, Main and High (CABAC, 8×8 transform) with fixed QP, CRF and ABR / VBV rate control, whose output FFmpeg decodes byte-identically. The RGDI intermediate codec; AV1 OBU / IVF bitstream inspection.
 - **Audio codecs.** An AAC-LC decoder within the ISO/IEC 14496-26 conformance tolerance (mono to 5.1, 8–96 kHz) and an AAC-LC encoder; an Opus decoder that is sample-exact with libopus 1.3.1 on the RFC 8251 test vectors, and a CELT-only Opus encoder that is byte-identical with libopus in restricted-low-delay mode; lossless FLAC (16 and 24-bit); PCM. Polyphase resampling, channel remixing between mono, stereo, 5.1 and 7.1, and EBU R128 loudness and true-peak normalization.
 - **Editing and packaging.** Frame-accurate `cut` that re-encodes only the GOPs at each boundary, `concat`, and `package`: one command from a source file to a CMAF HLS and DASH bitrate ladder.
 - **Pipeline, CLI and library.** GOP-parallel encoding; video decoded, filtered and encoded in batches bounded by a memory budget (256 MiB, or 64 MiB in efficiency mode); stdin / stdout pipes; multi-track audio, video and subtitles re-timed with 128-bit arithmetic; TOML recipes; output that is byte-identical regardless of thread count and power mode. The `probe`, `remux`, `transcode`, `cut`, `concat`, `package`, `extract`, `metrics`, `synth`, `bench` and `self-test` commands, and the `ProbeBuilder`, `TranscodeBuilder`, `CutBuilder` and `PackageBuilder` Rust API.
@@ -28,19 +28,16 @@ Ragdoll is pre-1.0. This page describes what works today, what is being built no
 | **Hardening** | Coverage-guided and differential fuzzing with bounded allocation and time; property and output-determinism tests; Miri, model checking and mutation testing for `unsafe` code. |
 | **Quality and performance gates** | Rate-distortion regression tracking (BD-rate, with VMAF-Lite calibrated against libvmaf); instruction-count, allocation and soak-test budgets in CI; a generated support matrix and public scorecard. |
 | **Benchmarks** | Making `ragdoll bench --compare-ffmpeg` compare like with like, and report only hardware data it actually measured. |
-| **Audio** | Rate control for the AAC encoder; audio decoded and processed in bounded batches like video. |
-| **Speed** | Multithreaded H.264 decoding; a faster H.264 encoder at equal compression; Opus encoding faster than libopus; FLAC compression on par with FFmpeg's. |
+| **Audio** | Audio decoded and processed in bounded batches like video; short blocks and a psychoacoustic model for the AAC encoder. |
+| **Speed** | A clear single-thread lead for the H.264 decoder; H.264 compression closer to x264 `veryfast`. |
 | **Integrations** | Python bindings with zero-copy frame export (DLPack) for machine-learning pipelines. A decision on hardware acceleration, within the rule of no C. |
 
 ## Known limitations
 
-- **H.264 decoding is slow and single-threaded.** On one core it runs about 6× slower than FFmpeg (1080p High: 29 fps against 181 fps), so 1080p30 decodes just under real time. FFmpeg's frame threading widens the gap further.
 - **H.264 decoding covers 8-bit 4:2:0 and 4:0:0.** 4:2:2, 4:4:4 and high-bit-depth streams are rejected.
-- **The H.264 encoder** writes I and P frames only (no B-frames) in fixed 15-frame GOPs. Compression is close to x264's `ultrafast` preset and well behind `veryfast`, at about an eighth of `ultrafast`'s speed (720p: 59 fps against 489 fps).
-- **The AAC-LC decoder is slow.** It runs at about 176× real time, 13× slower than FFmpeg. Coupling channel elements (CCE) are rejected.
-- **The AAC-LC encoder has no rate control.** The target bitrate is ignored: a 128 kbit/s request can produce anything from about 35 to 290 kbit/s depending on the signal. It uses long blocks only.
+- **The H.264 encoder** writes I and P frames only (no B-frames) in fixed 15-frame GOPs. It makes smaller files than x264's `ultrafast` preset at equal quality, slightly faster, but `veryfast` compresses about a quarter better (at a fifth of the speed).
+- **AAC-LC** coupling channel elements (CCE) are rejected by the decoder. The encoder uses long blocks only.
 - **The Opus encoder is CELT-only.** It does not produce SILK or hybrid packets.
-- **FLAC** decodes about 2.5× slower than FFmpeg (partly because Ragdoll verifies the MD5 signature), and encodes files about 11% larger than FFmpeg's level 5.
 - **Audio is decoded whole into memory** when it is re-encoded or processed (resampling, channel changes, loudness, audio-only transcodes): about 1.4 GB per hour of 48 kHz stereo. Video is bounded by the memory budget; audio is not yet.
 - **AV1 is inspection only.** Ragdoll parses AV1 OBU and IVF bitstreams but does not decode them. HEVC and VP9 are pass-through only.
 - **`metrics` needs inputs of the same resolution.** Comparing files of different sizes currently aborts instead of returning an error.
