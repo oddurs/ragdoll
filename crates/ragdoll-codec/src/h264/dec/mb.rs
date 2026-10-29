@@ -447,8 +447,9 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn begin_mb(&mut self, addr: usize) {
         self.mb = self.pos(addr);
         let a = self.mb.addr;
+        // Every macroblock type writes all of its blocks' motion (see `reset_blocks`).
         if self.st.recycled {
-            self.st.clear_mb(a, self.mb.x, self.mb.y);
+            self.st.clear_mb_state(a, self.mb.x, self.mb.y);
         }
         self.partial_motion = false;
         self.st.slice_num[a] = self.cx.slice_num;
@@ -703,7 +704,14 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     // ----- macroblock decoding --------------------------------------------------------------
 
+    /// Decodes a skipped macroblock; on an error its blocks are reset rather than left
+    /// half-written.
     fn decode_skip(&mut self, addr: usize) -> Result<()> {
+        self.decode_skip_mb(addr)
+            .inspect_err(|_| self.reset_blocks())
+    }
+
+    fn decode_skip_mb(&mut self, addr: usize) -> Result<()> {
         self.begin_mb(addr);
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
@@ -716,7 +724,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             self.st.mb_type[a] = MbType::PSkip;
             let mv = self.p_skip_mv();
             let id = self.ref_id(0, 0)?;
-            self.fill_motion(0, 0, 4, 4, 0, (0, mv), id, [0, 0]);
+            self.fill_blocks(0, 0, 4, 4, 0, (0, mv), id, [0, 0]);
         }
         self.inter_predict_mb()?;
         Ok(())
@@ -727,7 +735,14 @@ impl<'a, 'c> Dec<'a, 'c> {
         [chroma_qp(qp, o[0]), chroma_qp(qp, o[1])]
     }
 
+    /// Decodes a coded macroblock; on an error its blocks are reset rather than left
+    /// half-written.
     fn decode_mb(&mut self, addr: usize) -> Result<()> {
+        self.decode_coded_mb(addr)
+            .inspect_err(|_| self.reset_blocks())
+    }
+
+    fn decode_coded_mb(&mut self, addr: usize) -> Result<()> {
         self.begin_mb(addr);
         let slice_type = self.cx.sh.slice_type;
         let raw = self.read_mb_type()?;
@@ -746,6 +761,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             if t > 25 {
                 return Err(bad("H.264 mb_type out of range"));
             }
+            self.reset_blocks();
             return self.decode_intra_mb(t);
         }
         if slice_type.is_b() {
@@ -1534,6 +1550,41 @@ impl<'a, 'c> Dec<'a, 'c> {
             .ok_or_else(|| bad("H.264 ref_idx beyond the reference list"))
     }
 
+    /// Resets the current macroblock's blocks to no motion, no coefficients.
+    fn reset_blocks(&mut self) {
+        self.st.reset_mb_blocks(self.mb.x, self.mb.y);
+    }
+
+    /// Writes the whole [`BlockInfo`] of the MB-relative 4x4 rectangle `(bx, by, w, h)`: motion
+    /// `m` for `list`, none for the other, no coefficients.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_blocks(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w: usize,
+        h: usize,
+        list: usize,
+        m: Mv,
+        pic: u32,
+        mvd: [u8; 2],
+    ) {
+        let mut b = NO_BLOCK;
+        b.ref_idx[list] = m.0;
+        b.mv[list] = m.1;
+        b.ref_pic[list] = pic;
+        b.mvd[list] = mvd;
+        self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
+        let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+        let s = self.st.mb_w * 4;
+        match w {
+            1 => fill_rect::<_, 1>(&mut self.st.blocks, i, s, h, b),
+            2 => fill_rect::<_, 2>(&mut self.st.blocks, i, s, h, b),
+            3 => fill_rect::<_, 3>(&mut self.st.blocks, i, s, h, b),
+            _ => fill_rect::<_, 4>(&mut self.st.blocks, i, s, h, b),
+        }
+    }
+
     /// Writes motion for the MB-relative 4x4 rectangle `(bx, by, w, h)` of one list.
     #[allow(clippy::too_many_arguments)]
     fn fill_motion(
@@ -1788,6 +1839,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
         let info: [(u8, u8, u8, u8); 4] = subs.map(|s| P_SUB_TYPES[s]);
+        self.reset_blocks();
         self.decode_sub_mbs(&info, raw == 4)?;
         let no_small = subs.iter().all(|&s| s == 0);
         self.finish_inter(no_small)
@@ -1828,6 +1880,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 direct_mask |= 1 << i;
             }
         }
+        self.reset_blocks();
         if direct_mask != 0 {
             self.direct_motion(direct_mask)?;
         }
@@ -1851,6 +1904,13 @@ impl<'a, 'c> Dec<'a, 'c> {
             Part::P8x16 => &[(0, 0, 2, 4), (2, 0, 2, 4)],
             Part::P8x8 => unreachable!(),
         };
+        // In P slices each partition's blocks are written in full when its vector is known;
+        // otherwise the lists are written separately over reset blocks, whose list 1 and direct
+        // flags the CABAC contexts of later partitions also read.
+        let l0_only = !self.cx.sh.slice_type.is_b();
+        if !l0_only {
+            self.reset_blocks();
+        }
         let mut refs = [[-1i8; 2]; 2];
         for list in 0..2 {
             for (p, &(bx, by, w, h)) in rects.iter().enumerate() {
@@ -1886,7 +1946,11 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let mvp = self.mvp(list, bx, by, w, r, shape, done);
                     let mv = [mvp[0].wrapping_add(mvd[0]), mvp[1].wrapping_add(mvd[1])];
                     let id = self.ref_id(list, r)?;
-                    self.fill_motion(bx, by, w, h, list, (r, mv), id, amvd);
+                    if l0_only {
+                        self.fill_blocks(bx, by, w, h, list, (r, mv), id, amvd);
+                    } else {
+                        self.fill_motion(bx, by, w, h, list, (r, mv), id, amvd);
+                    }
                 }
                 // An unused list keeps the macroblock's reset motion (no reference).
                 done |= rect_mask(bx, by, w, h);
@@ -1896,6 +1960,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// P_8x8 / B_8x8 sub-macroblocks. `info[i] = (count, w, h, pred)`; `count == 0` is B_Direct_8x8.
+    /// The blocks must have been reset (B_Direct_8x8 sub-macroblocks are derived first).
     fn decode_sub_mbs(&mut self, info: &[(u8, u8, u8, u8); 4], ref0: bool) -> Result<()> {
         let mut refs = [[-1i8; 2]; 4];
         for list in 0..2 {
