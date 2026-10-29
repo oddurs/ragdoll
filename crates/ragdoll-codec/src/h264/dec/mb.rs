@@ -1863,9 +1863,8 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let mv = [mvp[0].wrapping_add(mvd[0]), mvp[1].wrapping_add(mvd[1])];
                     let id = self.ref_id(list, r)?;
                     self.fill_motion(bx, by, w, h, list, (r, mv), id, amvd);
-                } else {
-                    self.fill_motion(bx, by, w, h, list, (-1, [0, 0]), NO_PIC, [0, 0]);
                 }
+                // An unused list keeps the macroblock's reset motion (no reference).
                 done |= rect_mask(bx, by, w, h);
             }
         }
@@ -1919,8 +1918,6 @@ impl<'a, 'c> Dec<'a, 'c> {
                         let mv = [mvp[0].wrapping_add(mvd[0]), mvp[1].wrapping_add(mvd[1])];
                         let id = self.ref_id(list, r)?;
                         self.fill_motion(x, y, w, h, list, (r, mv), id, amvd);
-                    } else {
-                        self.fill_motion(x, y, w, h, list, (-1, [0, 0]), NO_PIC, [0, 0]);
                     }
                     done |= rect_mask(x, y, w, h);
                 }
