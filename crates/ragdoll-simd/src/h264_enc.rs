@@ -771,6 +771,54 @@ pub fn pixel_avg_16x16_scalar(dst: &mut [u8; 256], a: &[u8], sa: usize, b: &[u8]
     }
 }
 
+/// SAD of the contiguous $16\times16$ block `src` against `(a + b + 1) >> 1` of the strided
+/// blocks `a` and `b`, without storing the average (`x264` `pixel_avg` then `sad`).
+///
+/// # Panics
+/// If a source is shorter than 16 rows of 16 samples at its stride.
+#[inline]
+pub fn pixel_sad_avg_16x16(src: &[u8; 256], a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+    check_block(a, sa, 16, 16);
+    check_block(b, sb, 16, 16);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut acc = vdupq_n_u16(0);
+            for r in 0..16 {
+                let v = vrhaddq_u8(
+                    vld1q_u8(a.as_ptr().add(r * sa)),
+                    vld1q_u8(b.as_ptr().add(r * sb)),
+                );
+                let s = vld1q_u8(src.as_ptr().add(r * 16));
+                acc = vabal_u8(acc, vget_low_u8(s), vget_low_u8(v));
+                acc = vabal_high_u8(acc, s, v);
+            }
+            return vaddlvq_u16(acc);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        return unsafe { sad_avg16_avx2(src, a.as_ptr(), sa, b.as_ptr(), sb) };
+    }
+    pixel_sad_avg_16x16_scalar(src, a, sa, b, sb)
+}
+
+/// Scalar reference for [`pixel_sad_avg_16x16`].
+pub fn pixel_sad_avg_16x16_scalar(
+    src: &[u8; 256],
+    a: &[u8],
+    sa: usize,
+    b: &[u8],
+    sb: usize,
+) -> u32 {
+    let mut avg = [0u8; 256];
+    pixel_avg_16x16_scalar(&mut avg, a, sa, b, sb);
+    pixel_sad_16x16_scalar(src, 16, &avg, 16)
+}
+
 /// H.264 frame zig-zag scan of a $4\times4$ block (Table 8-13), as raster positions.
 const ZIGZAG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
@@ -1452,6 +1500,24 @@ unsafe fn avg16_avx2(dst: &mut [u8; 256], a: *const u8, sa: usize, b: *const u8,
             );
             _mm256_storeu_si256(dst.as_mut_ptr().add(r * 16) as *mut __m256i, v);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_avg16_avx2(src: &[u8; 256], a: *const u8, sa: usize, b: *const u8, sb: usize) -> u32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+        for r in (0..16).step_by(2) {
+            let v = _mm256_avg_epu8(
+                x86::load_2x16(a.add(r * sa), sa),
+                x86::load_2x16(b.add(r * sb), sb),
+            );
+            let s = _mm256_loadu_si256(src.as_ptr().add(r * 16) as *const __m256i);
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(s, v));
+        }
+        x86::hsum_epi64(acc)
     }
 }
 
@@ -2224,6 +2290,15 @@ mod tests {
             pixel_avg_16x16(&mut a, &src[1..], pw, &src[pw..], pw);
             pixel_avg_16x16_scalar(&mut b, &src[1..], pw, &src[pw..], pw);
             assert_eq!(a, b);
+            let blk: [u8; 256] = std::array::from_fn(|i| src[(i / 16) * pw + i % 16 + 3]);
+            assert_eq!(
+                pixel_sad_avg_16x16(&blk, &src[1..], pw, &src[pw..], pw),
+                pixel_sad_avg_16x16_scalar(&blk, &src[1..], pw, &src[pw..], pw)
+            );
+            assert_eq!(
+                pixel_sad_avg_16x16(&[255; 256], &src[2..], pw, &src[pw + 1..], pw),
+                pixel_sad_avg_16x16_scalar(&[255; 256], &src[2..], pw, &src[pw + 1..], pw)
+            );
         }
     }
 

@@ -13,9 +13,9 @@ use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
     h264_luma_mc, hpel_window, hpel_window_centre, intra_pred_plane, intra_satd_x3_16x16,
-    nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_x4_16x16,
-    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4,
-    zigzag_4x4_x4,
+    nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16,
+    pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8,
+    sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -845,8 +845,6 @@ impl MotionSearch<'_> {
         hpel_window(&self.r.buf, self.r.at(bx - 1, by - 1), self.r.stride, win);
         let mut best = center;
         let mut best_cost = full_cost;
-        let mut cand = [0u8; 256];
-        let mut have_pred = false;
         let mut have_centre = false;
         for (step, iters) in [(2i32, 1), (1, 2)] {
             for _ in 0..iters {
@@ -868,13 +866,13 @@ impl MotionSearch<'_> {
                         hpel_window_centre(win);
                         have_centre = true;
                     }
-                    self.window_pred(win, bx, by, mv, &mut cand);
-                    let cost = pixel_sad_16x16(self.src, 16, &cand, 16) + self.mv_cost(mv);
+                    let cost = match self.window_src(win, bx, by, mv) {
+                        WinSrc::One(a, sa) => pixel_sad_16x16(self.src, 16, a, sa),
+                        WinSrc::Avg(a, sa, b, sb) => pixel_sad_avg_16x16(self.src, a, sa, b, sb),
+                    } + self.mv_cost(mv);
                     if cost < best_cost {
                         best_cost = cost;
                         best = mv;
-                        pred.copy_from_slice(&cand);
-                        have_pred = true;
                     }
                 }
                 if best == from {
@@ -882,10 +880,49 @@ impl MotionSearch<'_> {
                 }
             }
         }
-        if !have_pred {
-            self.window_pred(win, bx, by, best, pred);
-        }
+        self.window_pred(win, bx, by, best, pred);
         ([best[0] as i16, best[1] as i16], best_cost)
+    }
+
+    /// The block or pair of blocks whose (rounded) average is the prediction at quarter-pel
+    /// `mv` from the window interpolated around full-pel `(bx, by)`; `mv` lies within three
+    /// quarter samples of that position.
+    fn window_src<'a>(
+        &'a self,
+        win: &'a HpelWindow,
+        bx: isize,
+        by: isize,
+        mv: [i32; 2],
+    ) -> WinSrc<'a> {
+        let (ix, iy) = (
+            self.x0 as isize + (mv[0] >> 2) as isize,
+            self.y0 as isize + (mv[1] >> 2) as isize,
+        );
+        let (wx, wy) = ((ix - bx + 1) as usize, (iy - by + 1) as usize);
+        let r = self.r;
+        // Integer samples displaced by (dx, dy), and the window planes displaced likewise.
+        let g = |dx: isize, dy: isize| &r.buf[r.at(ix + dx, iy + dy)..];
+        let w = |p: &'a [u8], dx: usize, dy: usize| &p[(wy + dy) * HPEL_WIN_W + wx + dx..];
+        let (sg, sw) = (r.stride, HPEL_WIN_W);
+        let (h, v, c) = (&win.h[..], &win.v[..], &win.c[..]);
+        match (mv[0] & 3, mv[1] & 3) {
+            (0, 0) => WinSrc::One(g(0, 0), sg),
+            (2, 0) => WinSrc::One(w(h, 0, 0), sw),
+            (0, 2) => WinSrc::One(w(v, 0, 0), sw),
+            (2, 2) => WinSrc::One(w(c, 0, 0), sw),
+            (1, 0) => WinSrc::Avg(g(0, 0), sg, w(h, 0, 0), sw),
+            (3, 0) => WinSrc::Avg(w(h, 0, 0), sw, g(1, 0), sg),
+            (0, 1) => WinSrc::Avg(g(0, 0), sg, w(v, 0, 0), sw),
+            (0, 3) => WinSrc::Avg(w(v, 0, 0), sw, g(0, 1), sg),
+            (1, 1) => WinSrc::Avg(w(h, 0, 0), sw, w(v, 0, 0), sw),
+            (3, 1) => WinSrc::Avg(w(h, 0, 0), sw, w(v, 1, 0), sw),
+            (1, 3) => WinSrc::Avg(w(v, 0, 0), sw, w(h, 0, 1), sw),
+            (3, 3) => WinSrc::Avg(w(v, 1, 0), sw, w(h, 0, 1), sw),
+            (2, 1) => WinSrc::Avg(w(h, 0, 0), sw, w(c, 0, 0), sw),
+            (2, 3) => WinSrc::Avg(w(c, 0, 0), sw, w(h, 0, 1), sw),
+            (1, 2) => WinSrc::Avg(w(v, 0, 0), sw, w(c, 0, 0), sw),
+            _ => WinSrc::Avg(w(c, 0, 0), sw, w(v, 1, 0), sw),
+        }
     }
 
     /// The prediction at quarter-pel `mv` from the window interpolated around full-pel
@@ -898,35 +935,17 @@ impl MotionSearch<'_> {
         mv: [i32; 2],
         dst: &mut [u8; 256],
     ) {
-        let (ix, iy) = (
-            self.x0 as isize + (mv[0] >> 2) as isize,
-            self.y0 as isize + (mv[1] >> 2) as isize,
-        );
-        let (wx, wy) = ((ix - bx + 1) as usize, (iy - by + 1) as usize);
-        let r = self.r;
-        // Integer samples displaced by (dx, dy), and the window offset displaced likewise.
-        let g = |dx: isize, dy: isize| &r.buf[r.at(ix + dx, iy + dy)..];
-        let w = |dx: usize, dy: usize| (wy + dy) * HPEL_WIN_W + wx + dx;
-        let (sg, sw) = (r.stride, HPEL_WIN_W);
-        match (mv[0] & 3, mv[1] & 3) {
-            (0, 0) => copy_rows::<16>(g(0, 0), 0, sg, dst, 0, 16, 16),
-            (2, 0) => copy_rows::<16>(&win.h[w(0, 0)..], 0, sw, dst, 0, 16, 16),
-            (0, 2) => copy_rows::<16>(&win.v[w(0, 0)..], 0, sw, dst, 0, 16, 16),
-            (2, 2) => copy_rows::<16>(&win.c[w(0, 0)..], 0, sw, dst, 0, 16, 16),
-            (1, 0) => pixel_avg_16x16(dst, g(0, 0), sg, &win.h[w(0, 0)..], sw),
-            (3, 0) => pixel_avg_16x16(dst, &win.h[w(0, 0)..], sw, g(1, 0), sg),
-            (0, 1) => pixel_avg_16x16(dst, g(0, 0), sg, &win.v[w(0, 0)..], sw),
-            (0, 3) => pixel_avg_16x16(dst, &win.v[w(0, 0)..], sw, g(0, 1), sg),
-            (1, 1) => pixel_avg_16x16(dst, &win.h[w(0, 0)..], sw, &win.v[w(0, 0)..], sw),
-            (3, 1) => pixel_avg_16x16(dst, &win.h[w(0, 0)..], sw, &win.v[w(1, 0)..], sw),
-            (1, 3) => pixel_avg_16x16(dst, &win.v[w(0, 0)..], sw, &win.h[w(0, 1)..], sw),
-            (3, 3) => pixel_avg_16x16(dst, &win.v[w(1, 0)..], sw, &win.h[w(0, 1)..], sw),
-            (2, 1) => pixel_avg_16x16(dst, &win.h[w(0, 0)..], sw, &win.c[w(0, 0)..], sw),
-            (2, 3) => pixel_avg_16x16(dst, &win.c[w(0, 0)..], sw, &win.h[w(0, 1)..], sw),
-            (1, 2) => pixel_avg_16x16(dst, &win.v[w(0, 0)..], sw, &win.c[w(0, 0)..], sw),
-            _ => pixel_avg_16x16(dst, &win.c[w(0, 0)..], sw, &win.v[w(1, 0)..], sw),
+        match self.window_src(win, bx, by, mv) {
+            WinSrc::One(a, sa) => copy_rows::<16>(a, 0, sa, dst, 0, 16, 16),
+            WinSrc::Avg(a, sa, b, sb) => pixel_avg_16x16(dst, a, sa, b, sb),
         }
     }
+}
+
+/// Source of a sub-pel prediction: one strided block, or two whose rounded average it is.
+enum WinSrc<'a> {
+    One(&'a [u8], usize),
+    Avg(&'a [u8], usize, &'a [u8], usize),
 }
 
 /// Edge samples for intra $16\times16$ prediction: top row, left column and top-left corner.
