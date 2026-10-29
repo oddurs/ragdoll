@@ -544,6 +544,40 @@ fn intra_satd_x3_strips(
     intra_satd_x3_from(&out, tv, th, dc16)
 }
 
+/// SADs of the contiguous $16\times16$ block `src` against its vertical, horizontal and DC
+/// intra predictions from the `top` and `left` edge samples and the DC value `dc`
+/// (`x264_intra_sad_x3_16x16`).
+#[inline]
+pub fn intra_sad_x3_16x16(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { intra_sad_x3_neon(src, top, left, dc) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { intra_sad_x3_avx2(src, top, left, dc) };
+    }
+    intra_sad_x3_16x16_scalar(src, top, left, dc)
+}
+
+/// Scalar reference for [`intra_sad_x3_16x16`].
+pub fn intra_sad_x3_16x16_scalar(
+    src: &[u8; 256],
+    top: &[u8; 16],
+    left: &[u8; 16],
+    dc: u8,
+) -> [u32; 3] {
+    let mut sum = [0u32; 3];
+    for (i, &s) in src.iter().enumerate() {
+        sum[0] += s.abs_diff(top[i % 16]) as u32;
+        sum[1] += s.abs_diff(left[i / 16]) as u32;
+        sum[2] += s.abs_diff(dc) as u32;
+    }
+    sum
+}
+
 /// Scalar reference for [`intra_satd_x3_16x16`].
 pub fn intra_satd_x3_16x16_scalar(
     src: &[u8; 256],
@@ -1436,6 +1470,34 @@ fn dct4_butterfly_avx2(d: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x86_64
 /// [`intra_satd_x3_16x16`]: the transform of each strip stays in registers holding one column
 /// of coefficients per block (`o[h]` lane `4 b + v`), so each prediction only replaces a few
 /// lanes.
+/// [`intra_sad_x3_16x16`]: two rows per register; the horizontal prediction of each row is its
+/// left sample broadcast by a byte shuffle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn intra_sad_x3_avx2(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let t = _mm256_broadcastsi128_si256(_mm_loadu_si128(top.as_ptr() as *const __m128i));
+        let l = _mm256_broadcastsi128_si256(_mm_loadu_si128(left.as_ptr() as *const __m128i));
+        let d = _mm256_set1_epi8(dc as i8);
+        let two = _mm256_set1_epi8(2);
+        // Row y in the low lane, y + 1 in the high lane.
+        let mut idx = _mm256_set_m128i(_mm_set1_epi8(1), _mm_setzero_si128());
+        let mut acc = [_mm256_setzero_si256(); 3];
+        for y in (0..16).step_by(2) {
+            let s = _mm256_loadu_si256(src.as_ptr().add(y * 16) as *const __m256i);
+            acc[0] = _mm256_add_epi64(acc[0], _mm256_sad_epu8(s, t));
+            acc[1] = _mm256_add_epi64(acc[1], _mm256_sad_epu8(s, _mm256_shuffle_epi8(l, idx)));
+            acc[2] = _mm256_add_epi64(acc[2], _mm256_sad_epu8(s, d));
+            idx = _mm256_add_epi8(idx, two);
+        }
+        acc.map(|a| {
+            let x = _mm_add_epi64(_mm256_castsi256_si128(a), _mm256_extracti128_si256::<1>(a));
+            (_mm_cvtsi128_si64(x) + _mm_extract_epi64::<1>(x)) as u32
+        })
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn intra_satd_x3_avx2(
@@ -2294,6 +2356,25 @@ unsafe fn chroma_mc_neon(src: *const u8, ss: usize, fx: u8, fy: u8, out: &mut [u
     }
 }
 
+/// [`intra_sad_x3_16x16`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn intra_sad_x3_neon(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let t = vld1q_u8(top.as_ptr());
+        let d = vdupq_n_u8(dc);
+        let mut acc = [vdupq_n_u16(0); 3];
+        for (y, &l) in left.iter().enumerate() {
+            let s = vld1q_u8(src.as_ptr().add(y * 16));
+            acc[0] = vpadalq_u8(acc[0], vabdq_u8(s, t));
+            acc[1] = vpadalq_u8(acc[1], vabdq_u8(s, vdupq_n_u8(l)));
+            acc[2] = vpadalq_u8(acc[2], vabdq_u8(s, d));
+        }
+        acc.map(|a| vaddlvq_u16(a))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn hv_neon(
@@ -2740,6 +2821,16 @@ mod tests {
             let want = preds.map(|p| pixel_satd_16x16_scalar(&src, 16, &p, 16));
             assert_eq!(intra_satd_x3_16x16_scalar(&src, &top, &left, dc), want);
             assert_eq!(intra_satd_x3_16x16(&src, &top, &left, dc), want);
+            let want = preds.map(|p| pixel_sad_16x16_scalar(&src, 16, &p, 16));
+            assert_eq!(intra_sad_x3_16x16_scalar(&src, &top, &left, dc), want);
+            assert_eq!(intra_sad_x3_16x16(&src, &top, &left, dc), want);
+            for (flat, other) in [([255u8; 256], 0u8), ([0; 256], 255)] {
+                let want = [255 * 256; 3];
+                assert_eq!(
+                    intra_sad_x3_16x16(&flat, &[other; 16], &[other; 16], other),
+                    want
+                );
+            }
             for (flat, other) in [([255u8; 256], 0u8), ([0; 256], 255)] {
                 let want = [
                     pixel_satd_16x16_scalar(&flat, 16, &[other; 256], 16),

@@ -13,9 +13,9 @@ use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, chroma_mc_8x8_x2, dequant_4x4_x4, h264_chroma_deblock, h264_luma_deblock,
     h264_luma_mc, hadamard4x4_16x4, hpel_16x16, hpel_window, hpel_window_centre, intra_pred_plane,
-    intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8,
-    pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
-    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
+    intra_sad_x3_16x16, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4,
+    pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16,
+    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -1230,13 +1230,28 @@ fn pred_chroma(
 /// is only tried when `plane` is set.
 #[inline(always)]
 fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc, plane: bool) -> (u32, u8) {
-    let (top, left, tl) = i16_edges(&pic.y, mb_x, mb_y);
+    analyse_i16_edges(i16_edges(&pic.y, mb_x, mb_y), src, plane)
+}
+
+/// The intra $16\times16$ DC prediction from the available edges.
+#[inline(always)]
+fn i16_dc(top: Option<&[u8; 16]>, left: Option<&[u8; 16]>) -> u8 {
     let sum = |e: &[u8; 16]| e.iter().map(|&v| v as u32).sum::<u32>();
-    let dc = match (&top, &left) {
+    match (top, left) {
         (Some(t), Some(l)) => ((sum(t) + sum(l) + 16) >> 5) as u8,
         (Some(e), None) | (None, Some(e)) => ((sum(e) + 8) >> 4) as u8,
         (None, None) => 128,
-    };
+    }
+}
+
+/// [`analyse_i16`] from the edges of [`i16_edges`].
+#[inline(always)]
+fn analyse_i16_edges(
+    (top, left, tl): (Option<[u8; 16]>, Option<[u8; 16]>, u8),
+    src: &MbSrc,
+    plane: bool,
+) -> (u32, u8) {
+    let dc = i16_dc(top.as_ref(), left.as_ref());
     let [v, h, d] = intra_satd_x3_16x16(
         &src.y,
         top.as_ref().unwrap_or(&[0; 16]),
@@ -2352,20 +2367,44 @@ impl EncState {
         let (full, full_cost, nb) = ms.full_pel(&cands[..n]);
         // A full-pel match whose luma residual already quantizes to nothing needs no refinement.
         let full_mv = [full[0] * 4, full[1] * 4];
-        let mv = if full_cost - ms.mv_cost(full_mv) <= sl.skip_bounds.luma {
+        let (mv, me_cost) = if full_cost - ms.mv_cost(full_mv) <= sl.skip_bounds.luma {
             let r = &self.refp.y;
             r.load::<16>(ms.full_off(full[0], full[1]), &mut py);
-            [full_mv[0] as i16, full_mv[1] as i16]
+            ([full_mv[0] as i16, full_mv[1] as i16], full_cost)
         } else {
-            ms.sub_pel(full, full_cost, nb, &mut self.win, &mut py).0
+            ms.sub_pel(full, full_cost, nb, &mut self.win, &mut py)
         };
-        let inter_satd = pixel_satd_16x16(&src.y, 16, &py, 16);
+
+        // 3. Intra 16x16 when inter prediction is poor. The Fast preset first compares SADs and
+        // analyses intra only when its best SAD is within 1.75 times the inter one.
+        let edges = i16_edges(&self.cur.y, mb_x, mb_y);
+        let try_intra = !sl.fast || {
+            let inter_sad = me_cost - ms.mv_cost([mv[0] as i32, mv[1] as i32]);
+            let (top, left) = (edges.0.as_ref(), edges.1.as_ref());
+            let [v, h, d] = intra_sad_x3_16x16(
+                &src.y,
+                top.unwrap_or(&[0; 16]),
+                left.unwrap_or(&[0; 16]),
+                i16_dc(top, left),
+            );
+            let mut best = d;
+            if top.is_some() {
+                best = best.min(v);
+            }
+            if left.is_some() {
+                best = best.min(h);
+            }
+            4 * best < 7 * inter_sad
+        };
+        let inter_satd = if try_intra {
+            pixel_satd_16x16(&src.y, 16, &py, 16)
+        } else {
+            0
+        };
         let inter_cost = inter_satd
             + lambda * (se_bits((mv[0] - mvp[0]) as i32) + se_bits((mv[1] - mvp[1]) as i32) + 1);
-
-        // 3. Intra 16x16 when inter prediction is poor.
         if inter_satd > 24 * lambda {
-            let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src, !sl.fast);
+            let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, !sl.fast);
             if i16_satd + lambda * 8 < inter_cost {
                 self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
                 self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
