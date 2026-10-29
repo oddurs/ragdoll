@@ -46,7 +46,8 @@ impl Dequant {
     }
 
     /// Scales the `n` nonzero 4x4 coefficients of `c` into `out` (8.5.12.1): level `k` goes to
-    /// raster position `scan[c.pos[k] + off]`; other positions of `out` are left as they are.
+    /// raster position `map[c.pos[k]]` (a row of [`super::tables::SCAN_MAP4`]); other positions
+    /// of `out` are left as they are.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn scale4_coeffs(
@@ -55,8 +56,7 @@ impl Dequant {
         qp: i32,
         c: &ResidualCoeffs,
         n: usize,
-        off: usize,
-        scan: &[usize; 16],
+        map: &[u8; 16],
         out: &mut [i32; 16],
     ) {
         let ls = &self.ls4[list][(qp % 6) as usize];
@@ -64,13 +64,13 @@ impl Dequant {
         if qp >= 24 {
             let sh = qp / 6 - 4;
             for (&k, &v) in pos.iter().zip(level) {
-                let p = scan[(k as usize + off) & 15] & 15;
+                let p = map[k as usize & 15] as usize & 15;
                 out[p] = (v as i32 * ls[p]) << sh;
             }
         } else {
             let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
             for (&k, &v) in pos.iter().zip(level) {
-                let p = scan[(k as usize + off) & 15] & 15;
+                let p = map[k as usize & 15] as usize & 15;
                 out[p] = (v as i32 * ls[p] + rnd) >> sh;
             }
         }

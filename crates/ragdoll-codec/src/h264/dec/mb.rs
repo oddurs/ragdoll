@@ -19,7 +19,7 @@ use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
 use super::tables::{
     B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, FIELD_SCAN4X4,
-    FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN4X4, SCAN8X8, chroma_qp,
+    FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN_MAP4, SCAN4X4, SCAN8X8, chroma_qp,
 };
 
 /// A reference picture as seen by one slice.
@@ -1603,6 +1603,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             (&SCAN4X4, &SCAN8X8)
         };
+        let map4 = [&SCAN_MAP4[field as usize][0], &SCAN_MAP4[field as usize][1]];
         let a = self.mb.addr;
         let qp = self.qp;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
@@ -1708,13 +1709,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let (cd, ctxs) = self.cabac();
                     let n =
                         cd.decode_residual_coeffs(&mut ctxs[..], cat, inc, max, field, &mut coeffs);
-                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, map4[16 - max], out);
                     n
                 } else {
                     let nc = self.nc_luma(bx, by);
                     let r = self.reader();
                     let n = decode_cavlc_coeffs(r, max, nc, &mut coeffs)?;
-                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, map4[16 - max], out);
                     n
                 };
                 let j = self.st.b4(x4, y4);
@@ -1769,13 +1770,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let (cd, ctxs) = self.cabac();
                     let n =
                         cd.decode_residual_coeffs(&mut ctxs[..], 4, inc, 15, field, &mut coeffs);
-                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, map4[1], out);
                     n
                 } else {
                     let nc = self.nc_chroma(p, bx, by);
                     let r = self.reader();
                     let n = decode_cavlc_coeffs(r, 15, nc, &mut coeffs)?;
-                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, map4[1], out);
                     n
                 };
                 let j = self.st.c4(x4, y4);
