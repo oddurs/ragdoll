@@ -771,6 +771,65 @@ pub fn pixel_avg_16x16_scalar(dst: &mut [u8; 256], a: &[u8], sa: usize, b: &[u8]
     }
 }
 
+/// Positions in `[avg2 | avg3]` of the edge `[L, L, K, J, I, M, A, B, C, D, E, F, G, H, H, H]`
+/// (`avg2[i]` of samples `i, i + 1`, `avg3[i]` centred on `i + 1`) of every sample of the six
+/// directional intra $4\times4$ predictions, modes 3 to 8, raster order.
+const PRED4_DIR: [[u8; 16]; 6] = [
+    [
+        22, 23, 24, 25, 23, 24, 25, 26, 24, 25, 26, 27, 25, 26, 27, 28,
+    ],
+    [
+        20, 21, 22, 23, 19, 20, 21, 22, 18, 19, 20, 21, 17, 18, 19, 20,
+    ],
+    [5, 6, 7, 8, 20, 21, 22, 23, 19, 5, 6, 7, 18, 20, 21, 22],
+    [4, 20, 21, 22, 3, 19, 4, 20, 2, 18, 3, 19, 1, 17, 2, 18],
+    [6, 7, 8, 9, 22, 23, 24, 25, 7, 8, 9, 10, 23, 24, 25, 26],
+    [3, 18, 2, 17, 2, 17, 1, 16, 1, 16, 0, 0, 0, 0, 0, 0],
+];
+
+/// The six directional intra $4\times4$ predictions (ITU-T H.264 8.3.1.2.4-9, modes 3 to 8,
+/// 16 raster samples each) from the top and top-right samples `top`, the left column `left`
+/// and the corner `tl`: every sample is a 2- or 3-tap average of neighbouring edge samples,
+/// so all six are byte shuffles of the edge's two filtered versions (`x264` `predict_4x4`).
+#[inline]
+pub fn intra4x4_pred_dir(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 16]; 6] {
+    let [a, b, c, d, e, f, g, h] = *top;
+    let [i, j, k, l] = *left;
+    let edge = [l, l, k, j, i, tl, a, b, c, d, e, f, g, h, h, h];
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { pred4_dir_neon(&edge) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2 (and so SSSE3).
+        return unsafe { pred4_dir_avx2(&edge) };
+    }
+    pred4_dir_from_edge(&edge)
+}
+
+/// [`intra4x4_pred_dir`] through the shuffle table, without SIMD.
+fn pred4_dir_from_edge(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    let mut t = [0u8; 32];
+    for n in 0..15 {
+        t[n] = ((edge[n] as u16 + edge[n + 1] as u16 + 1) >> 1) as u8;
+    }
+    for n in 0..14 {
+        t[16 + n] = ((edge[n] as u16 + 2 * edge[n + 1] as u16 + edge[n + 2] as u16 + 2) >> 2) as u8;
+    }
+    PRED4_DIR.map(|idx| idx.map(|x| t[x as usize]))
+}
+
+/// Scalar reference for [`intra4x4_pred_dir`]: the generic 4x4 predictor, mode by mode.
+pub fn intra4x4_pred_dir_scalar(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 16]; 6] {
+    std::array::from_fn(|n| {
+        let mut out = [0u8; 16];
+        crate::predict_intra_4x4_u8_scalar(n as u8 + 3, Some(top), Some(left), tl, &mut out, 4);
+        out
+    })
+}
+
 /// SAD of the contiguous $16\times16$ block `src` against `(a + b + 1) >> 1` of the strided
 /// blocks `a` and `b`, without storing the average (`x264` `pixel_avg` then `sad`).
 ///
@@ -1583,6 +1642,61 @@ unsafe fn plane_neon<const N: usize>(a: i32, b: i32, c: i32, dst: &mut [u8]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pred4_dir_avx2(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let e = _mm_loadu_si128(edge.as_ptr() as *const __m128i);
+        let (e1, e2) = (_mm_srli_si128::<1>(e), _mm_srli_si128::<2>(e));
+        let avg2 = _mm_avg_epu8(e, e1);
+        // (x + 2 y + z + 2) >> 2 = avg(avg(x, z) - ((x ^ z) & 1), y), exactly.
+        let xz = _mm_sub_epi8(
+            _mm_avg_epu8(e, e2),
+            _mm_and_si128(_mm_xor_si128(e, e2), _mm_set1_epi8(1)),
+        );
+        let avg3 = _mm_avg_epu8(xz, e1);
+        let mut out = [[0u8; 16]; 6];
+        for (o, idx) in out.iter_mut().zip(&PRED4_DIR) {
+            let idx = _mm_loadu_si128(idx.as_ptr() as *const __m128i);
+            // Indices 16.. select avg3: pshufb zeroes a lane whose index has the top bit set.
+            let lo = _mm_shuffle_epi8(
+                avg2,
+                _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15))),
+            );
+            let hi = _mm_shuffle_epi8(
+                avg3,
+                _mm_or_si128(
+                    _mm_sub_epi8(idx, _mm_set1_epi8(16)),
+                    _mm_cmplt_epi8(idx, _mm_set1_epi8(16)),
+                ),
+            );
+            _mm_storeu_si128(o.as_mut_ptr() as *mut __m128i, _mm_or_si128(lo, hi));
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pred4_dir_neon(edge: &[u8; 16]) -> [[u8; 16]; 6] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let e = vld1q_u8(edge.as_ptr());
+        let z = vdupq_n_u8(0);
+        let (e1, e2) = (vextq_u8::<1>(e, z), vextq_u8::<2>(e, z));
+        let avg2 = vrhaddq_u8(e, e1);
+        let xz = vsubq_u8(vrhaddq_u8(e, e2), vandq_u8(veorq_u8(e, e2), vdupq_n_u8(1)));
+        let avg3 = vrhaddq_u8(xz, e1);
+        let t = uint8x16x2_t(avg2, avg3);
+        let mut out = [[0u8; 16]; 6];
+        for (o, idx) in out.iter_mut().zip(&PRED4_DIR) {
+            vst1q_u8(o.as_mut_ptr(), vqtbl2q_u8(t, vld1q_u8(idx.as_ptr())));
+        }
+        out
+    }
+}
+
 /// Rows of the second (packed) half of an AVX2 window pass.
 #[cfg(target_arch = "x86_64")]
 const HPEL_HALF: usize = HPEL_WIN_H / 2;
@@ -2103,6 +2217,29 @@ mod tests {
             intra_pred_plane::<8>(a, b, c, &mut s8);
             intra_pred_plane_scalar::<8>(a, b, c, &mut r8);
             assert_eq!(s8, r8, "8x8 {a} {b} {c}");
+        }
+    }
+
+    #[test]
+    fn directional_4x4_predictions_match_the_generic_predictor() {
+        let e = plane(13, 40, 51);
+        for n in 0..40 {
+            let r = &e[n * 13..n * 13 + 13];
+            let top: [u8; 8] = r[..8].try_into().unwrap();
+            let left: [u8; 4] = r[8..12].try_into().unwrap();
+            let want = intra4x4_pred_dir_scalar(&top, &left, r[12]);
+            assert_eq!(intra4x4_pred_dir(&top, &left, r[12]), want, "edge {r:?}");
+            let edge = [
+                left[3], left[3], left[2], left[1], left[0], r[12], top[0], top[1], top[2], top[3],
+                top[4], top[5], top[6], top[7], top[7], top[7],
+            ];
+            assert_eq!(pred4_dir_from_edge(&edge), want);
+        }
+        for v in [0u8, 255] {
+            assert_eq!(
+                intra4x4_pred_dir(&[v; 8], &[255 - v; 4], v),
+                intra4x4_pred_dir_scalar(&[v; 8], &[255 - v; 4], v)
+            );
         }
     }
 

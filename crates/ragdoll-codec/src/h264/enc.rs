@@ -13,9 +13,9 @@ use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
     h264_luma_mc, hadamard4x4_16x4, hpel_window, hpel_window_centre, intra_pred_plane,
-    intra_satd_x3_16x16, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16,
-    pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd,
-    quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8,
+    pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
+    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -2383,18 +2383,29 @@ impl EncState {
                     best = (satd + mode_bits(m), m);
                 }
             }
-            let mut pred = [0u8; 16];
+            // The six directional modes at once; unavailable edges only feed modes skipped here.
+            let dirs = intra4x4_pred_dir(
+                top.as_ref().unwrap_or(&[128; 8]),
+                left.as_ref().unwrap_or(&[128; 4]),
+                tl,
+            );
             for m in 3..=8u8 {
                 if !intra4x4_mode_available(m, top.is_some(), left.is_some()) {
                     continue;
                 }
-                predict_intra_4x4_u8(m, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
-                let cost = pixel_satd_4x4(&src.y[so..], 16, &pred, 4) + mode_bits(m);
+                let cost =
+                    pixel_satd_4x4(&src.y[so..], 16, &dirs[m as usize - 3], 4) + mode_bits(m);
                 if cost < best.0 {
                     best = (cost, m);
                 }
             }
-            predict_intra_4x4_u8(best.1, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
+            let pred = if best.1 >= 3 {
+                dirs[best.1 as usize - 3]
+            } else {
+                let mut pred = [0u8; 16];
+                predict_intra_4x4_u8(best.1, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
+                pred
+            };
             total += best.0;
             if total >= budget {
                 for (b, &m) in saved.iter().enumerate() {
