@@ -1294,10 +1294,10 @@ fn quant_one(c: &[i16; 16], q: &Quant4x4) -> ([i16; 16], bool) {
 }
 
 /// Residual of an inter-predicted macroblock after quantization and decimation.
-struct InterResidual {
+struct InterResidual<'a> {
     luma_q4: [[i16; 16]; 16],
-    luma_q8: [[i16; 64]; 4],
-    use_8x8: bool,
+    /// The $8\times8$ levels when the macroblock uses the $8\times8$ transform.
+    luma_q8: Option<&'a [[i16; 64]; 4]>,
     cbp_luma: u8,
     chroma: ChromaLevels,
     cbp_chroma: u8,
@@ -1389,14 +1389,13 @@ fn group4(blocks: &mut [[i16; 16]; 16], i8x8: usize) -> &mut [[i16; 16]; 4] {
 /// Quantizes the luma residual with $4\times4$ transforms and decimates nearly empty $8\times8$
 /// blocks; returns the levels and the coded block pattern.
 #[inline(always)]
-fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16]; 16], u8) {
-    let mut q4 = [[0i16; 16]; 16];
-    dct_luma(src, pred, &mut q4);
+fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8, q4: &mut [[i16; 16]; 16]) -> u8 {
+    dct_luma(src, pred, q4);
     let q = quant4(qp, false);
     let mut cbp = 0u8;
     let mut total = 0u32;
     for i8x8 in 0..4 {
-        let group = group4(&mut q4, i8x8);
+        let group = group4(q4, i8x8);
         let nz = quant_4x4_x4(group, q);
         if nz == 0 {
             continue;
@@ -1418,10 +1417,10 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 16
         total += score;
     }
     if total < 6 && cbp != 0 {
-        q4 = [[0; 16]; 16];
+        *q4 = [[0; 16]; 16];
         cbp = 0;
     }
-    (q4, cbp)
+    cbp
 }
 
 /// Transformed and quantized chroma residual of a macroblock.
@@ -1467,9 +1466,15 @@ impl ChromaLevels {
 
 /// Transforms and quantizes the chroma residual of both planes.
 #[inline(always)]
-fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool) -> ChromaLevels {
+fn quant_chroma(
+    src: &MbSrc,
+    pu: &[u8; 64],
+    pv: &[u8; 64],
+    qpc: u8,
+    intra: bool,
+    out: &mut ChromaLevels,
+) {
     let q = quant4(qpc, intra);
-    let mut out = ChromaLevels::ZERO;
     for (p, (s, pred)) in [(&src.u, pu), (&src.v, pv)].into_iter().enumerate() {
         let mut c = [[0i16; 16]; 4];
         sub_dct4x4_8x8(s, 8, pred, 8, &mut c);
@@ -1482,10 +1487,13 @@ fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool)
                 a.copy_from_slice(&z[1..]);
             }
             out.raster[p] = c;
+        } else {
+            out.ac_masks[p] = [0; 4];
+            out.ac[p] = [[0; 15]; 4];
+            out.raster[p] = [[0; 16]; 4];
         }
         out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
     }
-    out
 }
 
 /// [`quantize_luma_dc4x4`] in 32-bit arithmetic: the DC of a residual block is at most
@@ -1577,8 +1585,8 @@ fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64
 /// Quantizes the chroma residual of an inter macroblock, dropping a plane's AC levels when they
 /// are nearly empty.
 #[inline(always)]
-fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> ChromaLevels {
-    let mut c = quant_chroma(src, pu, pv, qpc, false);
+fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, c: &mut ChromaLevels) {
+    quant_chroma(src, pu, pv, qpc, false, c);
     for p in 0..2 {
         if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
             c.ac[p] = [[0; 15]; 4];
@@ -1586,7 +1594,6 @@ fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> Chr
             c.raster[p] = [[0; 16]; 4];
         }
     }
-    c
 }
 
 /// SAD thresholds of the skip decision at one QP.
@@ -1677,7 +1684,8 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
 /// `x264_macroblock_probe_pskip`, chroma part: no DC level, and AC levels decimated per plane.
 #[inline(always)]
 fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool {
-    let c = quant_chroma(src, pu, pv, qpc, false);
+    let mut c = ChromaLevels::ZERO;
+    quant_chroma(src, pu, pv, qpc, false, &mut c);
     if c.dc.iter().flatten().any(|&l| l != 0) {
         return false;
     }
@@ -2336,26 +2344,27 @@ impl EncState {
 
         // 4. P_L0_16x16 (or P_Skip when its residual vanishes at the skip vector).
         mc_chroma(&self.refp, mb_x * 8, mb_y * 8, mv, &mut pu, &mut pv);
-        let (luma_q4, cbp4) = quant_luma_4x4_inter(&src.y, &py, qp);
         let mut res = InterResidual {
-            luma_q4,
-            luma_q8: [[0; 64]; 4],
-            use_8x8: false,
-            cbp_luma: cbp4,
+            luma_q4: [[0; 16]; 16],
+            luma_q8: None,
+            cbp_luma: 0,
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        res.cbp_luma = cbp4;
+        let q8_store;
         if sl.t8x8 && sl.use_cabac && cbp4 != 0 {
             let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
             let nnz4: usize = res.luma_q4.iter().flatten().filter(|&&c| c != 0).count();
             let nnz8: usize = q8.iter().flatten().filter(|&&c| c != 0).count();
             if nnz8 <= nnz4 {
-                res.luma_q8 = q8;
-                res.use_8x8 = true;
+                q8_store = q8;
+                res.luma_q8 = Some(&q8_store);
                 res.cbp_luma = cbp8;
             }
         }
-        res.chroma = quant_chroma_inter(src, &pu, &pv, qpc);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);
@@ -2397,7 +2406,7 @@ impl EncState {
         let qp_delta = if cbp != 0 { qp as i32 - sl.cur_qp } else { 0 };
         let eff_qp = (sl.cur_qp + qp_delta).clamp(0, 51) as u8;
         let eff_qpc = chroma_qp(eff_qp as i32, sl.chroma_qp_offset);
-        if res.use_8x8 && cbp_luma != 0 {
+        if res.luma_q8.is_some() && cbp_luma != 0 {
             self.mb_8x8_flag[mb_idx] = true;
         }
         match cabac {
@@ -2421,11 +2430,7 @@ impl EncState {
                     qp_delta,
                     &mut sl.prev_qp_delta_nz,
                     &res.luma_q4,
-                    if res.use_8x8 {
-                        Some(&res.luma_q8)
-                    } else {
-                        None
-                    },
+                    res.luma_q8,
                     &res.chroma.dc,
                     &res.chroma.ac,
                     &mut self.luma_nnz,
@@ -2468,8 +2473,8 @@ impl EncState {
         }
         sl.cur_qp = eff_qp as i32;
         self.mb_qps[mb_idx] = eff_qp;
-        if res.use_8x8 {
-            for (i8x8, q8) in res.luma_q8.iter().enumerate() {
+        if let Some(luma_q8) = res.luma_q8 {
+            for (i8x8, q8) in luma_q8.iter().enumerate() {
                 if cbp_luma & (1 << i8x8) != 0 {
                     let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
                     add8x8_idct_u8(&mut py[o..], 16, &dequantize_block8x8(q8, eff_qp));
@@ -2638,7 +2643,8 @@ impl EncState {
         let (chroma_mode, mut pu, mut pv) =
             analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
-        let c = quant_chroma(src, &pu, &pv, qpc, true);
+        let mut c = ChromaLevels::ZERO;
+        quant_chroma(src, &pu, &pv, qpc, true, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
@@ -2817,7 +2823,8 @@ impl EncState {
         let dc_q = quant_luma_dc(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
-        let c = quant_chroma(src, &pu, &pv, eff_qpc, true);
+        let mut c = ChromaLevels::ZERO;
+        quant_chroma(src, &pu, &pv, eff_qpc, true, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let mb_type = 1 + mode as u32 + 4 * cbp_chroma as u32 + if cbp_luma != 0 { 12 } else { 0 };
