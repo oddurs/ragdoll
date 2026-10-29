@@ -59,11 +59,6 @@ pub struct SliceCtx<'a> {
     pub dq: &'a Dequant,
 }
 
-enum Entropy<'a> {
-    Cavlc(BitReader<'a>),
-    Cabac(CabacDecoder<'a>, Box<[CabacContext; NUM_CABAC_CONTEXTS]>),
-}
-
 /// [`Dec::nb`] bits.
 const NB_L: u8 = 1;
 const NB_T: u8 = 2;
@@ -76,22 +71,37 @@ fn bad(msg: &'static str) -> RagdollError {
 
 /// Decodes the slice data of one slice into `st`.
 pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result<()> {
+    // One decoder instance per entropy coder and MBAFF keeps each one's hot code small.
+    match (cx.pps.cabac, st.mbaff) {
+        (true, false) => decode_slice_as::<true, false>(cx, st, rbsp),
+        (false, false) => decode_slice_as::<false, false>(cx, st, rbsp),
+        (true, true) => decode_slice_as::<true, true>(cx, st, rbsp),
+        (false, true) => decode_slice_as::<false, true>(cx, st, rbsp),
+    }
+}
+
+/// [`decode_slice`] for CABAC (`CABAC`) or CAVLC slices, of an MBAFF frame (`MBAFF`) or not.
+fn decode_slice_as<const CABAC: bool, const MBAFF: bool>(
+    cx: &SliceCtx<'_>,
+    st: &mut PicState,
+    rbsp: &[u8],
+) -> Result<()> {
     let sh = cx.sh;
-    let mut r = BitReader::new(rbsp);
-    r.skip_bits(sh.data_bit_offset)?;
-    let ent = if cx.pps.cabac {
-        r.align_to_byte();
-        let pos = r.bits_read() / 8;
-        let data = rbsp.get(pos..).ok_or(RagdollError::BitstreamEndOfData)?;
-        let ctxs = Box::new(init_cabac_contexts(
-            sh.qp as u8,
-            sh.slice_type.is_intra(),
-            sh.cabac_init_idc as u8,
-        ));
-        Entropy::Cabac(CabacDecoder::new(data)?, ctxs)
+    let mut rd = BitReader::new(rbsp);
+    rd.skip_bits(sh.data_bit_offset)?;
+    // A CAVLC slice's CABAC decoder is never used: it reads two zero bytes.
+    let cd = if CABAC {
+        rd.align_to_byte();
+        let pos = rd.bits_read() / 8;
+        CabacDecoder::new(rbsp.get(pos..).ok_or(RagdollError::BitstreamEndOfData)?)?
     } else {
-        Entropy::Cavlc(r)
+        CabacDecoder::new(&[0, 0])?
     };
+    let ctxs = Box::new(init_cabac_contexts(
+        sh.qp as u8,
+        sh.slice_type.is_intra(),
+        sh.cabac_init_idc as u8,
+    ));
     let total = st.mb_w * st.mb_h;
     let first = sh.first_mb as usize * if st.mbaff { 2 } else { 1 };
     if first >= total {
@@ -109,10 +119,12 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         st.push_ref_table(ref_ids(&f[0]));
         st.push_ref_table(ref_ids(&f[1]));
     }
-    let mut d = Dec {
+    let mut d = Dec::<CABAC, MBAFF> {
         cx,
         st,
-        ent,
+        rd,
+        cd,
+        ctxs,
         qp: sh.qp,
         qpc: {
             let o = cx.pps.chroma_qp_index_offset;
@@ -255,10 +267,16 @@ impl Residual {
     }
 }
 
-struct Dec<'a, 'c> {
+/// A slice's decoder, for a CABAC (`CABAC`) or CAVLC slice, of an MBAFF frame (`MBAFF`, as
+/// `st.mbaff`) or not.
+struct Dec<'a, 'c, const CABAC: bool, const MBAFF: bool> {
     cx: &'c SliceCtx<'a>,
     st: &'c mut PicState,
-    ent: Entropy<'a>,
+    /// CAVLC: the slice data.
+    rd: BitReader<'a>,
+    /// CABAC: the arithmetic decoder and its context variables.
+    cd: CabacDecoder<'a>,
+    ctxs: Box<[CabacContext; NUM_CABAC_CONTEXTS]>,
     qp: i32,
     /// Chroma QPs (Cb, Cr) of [`Self::qp`].
     qpc: [u8; 2],
@@ -309,10 +327,10 @@ struct Dec<'a, 'c> {
     weighted: bool,
 }
 
-impl<'a, 'c> Dec<'a, 'c> {
+impl<'a, 'c, const CABAC: bool, const MBAFF: bool> Dec<'a, 'c, CABAC, MBAFF> {
     fn run(&mut self, first: usize, total: usize) -> Result<()> {
         let slice_type = self.cx.sh.slice_type;
-        let mbaff = self.st.mbaff;
+        let mbaff = MBAFF;
         let mut addr = first;
         if !self.is_cabac() {
             loop {
@@ -407,7 +425,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Position of the macroblock at decoding address `addr`.
     fn pos(&self, addr: usize) -> MbPos {
         let w = self.st.mb_w;
-        let (x, y) = if self.st.mbaff {
+        let (x, y) = if MBAFF {
             let pair = addr / 2;
             (pair % w, 2 * (pair / w) + addr % 2)
         } else if addr == self.mb.addr + 1 {
@@ -469,7 +487,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             .mb_top()
             .filter(|&m| !self.st.mbs[m].mb_type.is_skip())
             .is_some() as u8;
-        if self.st.mbaff {
+        if MBAFF {
             (self.mb, self.nb) = saved;
         }
         let is_b = self.cx.sh.slice_type.is_b();
@@ -482,10 +500,8 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn reader(&mut self) -> &mut BitReader<'a> {
-        match &mut self.ent {
-            Entropy::Cavlc(r) => r,
-            Entropy::Cabac(..) => unreachable!("CAVLC syntax read in a CABAC slice"),
-        }
+        debug_assert!(!CABAC, "CAVLC syntax read in a CABAC slice");
+        &mut self.rd
     }
 
     fn cabac(
@@ -494,10 +510,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         &mut CabacDecoder<'a>,
         &mut [CabacContext; NUM_CABAC_CONTEXTS],
     ) {
-        match &mut self.ent {
-            Entropy::Cabac(cd, ctxs) => (cd, ctxs),
-            Entropy::Cavlc(_) => unreachable!("CABAC syntax read in a CAVLC slice"),
-        }
+        debug_assert!(CABAC, "CABAC syntax read in a CAVLC slice");
+        (&mut self.cd, &mut self.ctxs)
     }
 
     /// Whether the current macroblock is a field macroblock.
@@ -507,7 +521,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// MBAFF field macroblock: uses the field reference lists of its parity.
     fn mbaff_field(&self) -> bool {
-        self.st.mbaff && self.field
+        MBAFF && self.field
     }
 
     /// Reference list `list` as seen by the current macroblock.
@@ -543,7 +557,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn is_cabac(&self) -> bool {
-        matches!(self.ent, Entropy::Cabac(..))
+        CABAC
     }
 
     // ----- neighbourhood -------------------------------------------------------------------
@@ -551,7 +565,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Makes `addr` the current macroblock, finding its neighbours' availability.
     fn set_mb(&mut self, addr: usize) {
         self.mb = self.pos(addr);
-        if self.st.mbaff {
+        if MBAFF {
             return;
         }
         let (x, y, w, a) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
@@ -595,7 +609,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn begin_mb(&mut self, addr: usize) {
-        if self.st.mbaff || self.nb_addr != addr {
+        if MBAFF || self.nb_addr != addr {
             self.set_mb(addr);
         }
         let a = self.mb.addr;
@@ -636,7 +650,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         let nx = (px >> sh) as usize;
         let xw = (px & (s - 1)) as usize;
-        if !self.st.mbaff {
+        if !MBAFF {
             let py = self.mb.y as isize * s + yn;
             if py < 0 || py >= h * s {
                 return None;
@@ -729,7 +743,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The available macroblock left of the current one.
     #[inline]
     fn mb_left(&self) -> Option<usize> {
-        if self.st.mbaff {
+        if MBAFF {
             return self.mb_nb(-1, 0);
         }
         (self.nb & NB_L != 0).then(|| self.mb.addr - 1)
@@ -738,7 +752,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The available macroblock above the current one.
     #[inline]
     fn mb_top(&self) -> Option<usize> {
-        if self.st.mbaff {
+        if MBAFF {
             return self.mb_nb(0, -1);
         }
         (self.nb & NB_T != 0).then(|| self.mb.addr - self.st.mb_w)
@@ -747,7 +761,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
     /// current MB are available when their bit is set in `done` (by `luma4x4BlkIdx`).
     fn blk(&self, xn: isize, yn: isize, done: u16) -> Option<(usize, usize)> {
-        if !self.st.mbaff {
+        if !MBAFF {
             // Without MBAFF the 4x4 block follows from absolute luma coordinates directly.
             let px = (self.mb.x * 16) as isize + xn;
             let py = (self.mb.y * 16) as isize + yn;
@@ -802,7 +816,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// Intra availability of the samples left of luma rows `y0..y0 + n` of the current MB. In MBAFF
     /// frames these rows can come from both macroblocks of the left pair.
     fn left_ok(&self, y0: usize, n: usize) -> bool {
-        let rows = if self.st.mbaff { n } else { 1 };
+        let rows = if MBAFF { n } else { 1 };
         (y0..y0 + rows).all(|y| self.intra_ok(self.locate(-1, y as isize, false).map(|l| l.0)))
     }
 
@@ -1056,7 +1070,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// of it; [`intra::NO_MODE`] where a neighbour is unavailable and 2 where it is not coded in
     /// Intra_4x4 or Intra_8x8 (8.3.1.1).
     fn intra_mode_grid(&self) -> Option<intra::ModeGrid> {
-        if self.st.mbaff {
+        if MBAFF {
             return None;
         }
         let w4 = self.st.mb_w * 4;
@@ -1110,7 +1124,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 _ => (self.st.mbs[a].cbp >> ((yw / 8) * 2 + xw / 8)) & 1,
             }
         };
-        let (la, tb) = if self.st.mbaff {
+        let (la, tb) = if MBAFF {
             (
                 [nb_bit(-1, 0), nb_bit(-1, 8)],
                 [nb_bit(0, -1), nb_bit(8, -1)],
@@ -1190,6 +1204,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     // ----- intra macroblocks ----------------------------------------------------------------
 
+    #[inline(never)]
     fn decode_intra_mb(&mut self, t: u32) -> Result<()> {
         let a = self.mb.addr;
         self.st.mbs[a].t8x8 = false;
@@ -1292,14 +1307,14 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             384
         };
-        match &mut self.ent {
-            Entropy::Cavlc(r) => {
-                r.align_to_byte();
-                for s in samples.iter_mut().take(n) {
-                    *s = r.read_bits(8)? as u8;
-                }
+        if CABAC {
+            self.cd.align_for_pcm(&mut samples[..n])?;
+        } else {
+            let r = &mut self.rd;
+            r.align_to_byte();
+            for s in samples.iter_mut().take(n) {
+                *s = r.read_bits(8)? as u8;
             }
-            Entropy::Cabac(cd, _) => cd.align_for_pcm(&mut samples[..n])?,
         }
         self.st.mbs[a].mb_type = MbType::IPcm;
         self.st.mbs[a].cbp = 0x2F;
@@ -1350,7 +1365,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (off, ls, px, py) = self.view(0);
         // Intra availability of the neighbouring macroblocks as intra::INTRA_* flags; without
         // MBAFF it is the same for all their rows.
-        let nb = (!self.st.mbaff).then(|| {
+        let nb = (!MBAFF).then(|| {
             intra::flags((
                 self.intra_ok(self.mb_left()),
                 self.intra_ok(self.mb_top()),
@@ -1469,7 +1484,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     #[allow(clippy::type_complexity)]
     fn nb_blocks(&self, c: usize, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
         let chroma = c > 0;
-        if !self.st.mbaff {
+        if !MBAFF {
             // Without MBAFF the left and top blocks follow from block coordinates directly.
             // Blocks per MB side: 1 << sh.
             let sh = if chroma { 1 } else { 2 };
@@ -1523,7 +1538,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// counting as decoded).
     #[inline]
     fn nb_ab(&self, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
-        if !self.st.mbaff {
+        if !MBAFF {
             let a = self.mb.addr;
             return self
                 .nb_flat(2, bx, by)
@@ -1536,7 +1551,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// CAVLC `nC` for the luma 4x4 block at MB-relative 4x4 `(bx, by)` (9.2.1).
     #[inline]
     fn nc_luma(&self, bx: usize, by: usize) -> u8 {
-        if !self.st.mbaff {
+        if !MBAFF {
             let [a, b] = self
                 .nb_flat(2, bx, by)
                 .map(|n| n.map(|(i, _, _)| self.st.nnz[i]));
@@ -1550,7 +1565,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     #[inline]
     fn nc_chroma(&self, p: usize, bx: usize, by: usize) -> u8 {
-        if !self.st.mbaff {
+        if !MBAFF {
             let [a, b] = self
                 .nb_flat(1, bx, by)
                 .map(|n| n.map(|(i, _, _)| self.st.nnz_c[p][i]));
@@ -1565,7 +1580,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// CABAC coded_block_flag ctxIdxInc for a luma 4x4 block (9.3.3.1.1.9).
     #[inline]
     fn cbf_luma_inc(&self, bx: usize, by: usize, intra: bool) -> u8 {
-        if !self.st.mbaff {
+        if !MBAFF {
             let [a, b] = self.nb_flat(2, bx, by).map(|n| match n {
                 Some((_, true, m)) if self.st.mbs[m].mb_type == MbType::IPcm => 1,
                 Some((i, _, _)) => self.st.blocks[i].nz as u8,
@@ -1583,7 +1598,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     #[inline]
     fn cbf_chroma_ac_inc(&self, p: usize, bx: usize, by: usize, intra: bool) -> u8 {
-        if !self.st.mbaff {
+        if !MBAFF {
             let [a, b] = self.nb_flat(1, bx, by).map(|n| match n {
                 Some((_, true, m)) if self.st.mbs[m].mb_type == MbType::IPcm => 1,
                 Some((i, _, _)) => (self.st.nnz_c[p][i] > 0) as u8,
@@ -1631,11 +1646,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         inc: u8,
     ) -> Result<usize> {
         let field = self.field_mb();
-        match &mut self.ent {
-            Entropy::Cavlc(r) => decode_cavlc_block(r, out, nc, chroma_dc),
-            Entropy::Cabac(cd, ctxs) => Ok(cd
-                .decode_residual_block(&mut ctxs[..], cat, inc, out, field)
-                .1),
+        if CABAC {
+            Ok(self
+                .cd
+                .decode_residual_block(&mut self.ctxs[..], cat, inc, out, field)
+                .1)
+        } else {
+            decode_cavlc_block(&mut self.rd, out, nc, chroma_dc)
         }
     }
 
@@ -1647,16 +1664,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         intra: bool,
         res: &mut Residual,
     ) -> Result<()> {
-        // One instance per entropy coder keeps each one's hot code small.
-        if self.is_cabac() {
-            self.read_residual_with::<true>(cbp, is_i16, t8, intra, res)
-        } else {
-            self.read_residual_with::<false>(cbp, is_i16, t8, intra, res)
-        }
+        self.read_residual_with(cbp, is_i16, t8, intra, res)
     }
 
     #[inline(never)]
-    fn read_residual_with<const CABAC: bool>(
+    fn read_residual_with(
         &mut self,
         cbp: u8,
         is_i16: bool,
@@ -1964,7 +1976,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         [0, 1].map(|list| {
             let (r, mv) = (self.st.blocks[i].ref_idx[list], self.st.blocks[i].mv[list]);
-            if r < 0 || !self.st.mbaff {
+            if r < 0 || !MBAFF {
                 return Some((r, mv));
             }
             Some(match (self.field, self.st.mbs[a].mb_field) {
@@ -1981,7 +1993,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             return NO_MV;
         };
         let (r, mv) = (self.st.blocks[i].ref_idx[list], self.st.blocks[i].mv[list]);
-        if r < 0 || !self.st.mbaff {
+        if r < 0 || !MBAFF {
             return (r, mv);
         }
         match (self.field, self.st.mbs[a].mb_field) {
@@ -2003,7 +2015,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         part: Option<(Part, usize)>,
         done: u16,
     ) -> [i16; 2] {
-        if !self.st.mbaff {
+        if !MBAFF {
             // Neighbours by block coordinates: inside the macroblock when decoded (`done`),
             // else in the left, top, top-right or top-left macroblock when available.
             let st = &*self.st;
@@ -2061,7 +2073,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
-        let [a, b, c] = if self.st.mbaff {
+        let [a, b, c] = if MBAFF {
             self.mb_neighbours()[0]
         } else {
             self.mb_neighbours_flat(0)
@@ -2097,7 +2109,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// as for a 16x16 partition's predictor (8.4.1.3.2).
     #[inline(always)]
     fn mb_neighbours(&self) -> [[Mv; 3]; 2] {
-        if self.st.mbaff {
+        if MBAFF {
             let a = self.neighbour_pair(-1, 0, 0);
             let b = self.neighbour_pair(0, -1, 0);
             let c = self.neighbour_pair(16, -1, 0);
@@ -2151,7 +2163,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 return 0;
             }
             // A field neighbour of a frame MB counts reference indices in fields (9.3.3.1.1.6).
-            let thresh = if self.st.mbaff && !self.field && self.st.mbs[addr].mb_field {
+            let thresh = if MBAFF && !self.field && self.st.mbs[addr].mb_field {
                 1
             } else {
                 0
@@ -2185,7 +2197,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             let v = self.st.blocks[i].mvd[list][comp] as u32;
             // Vertical components between frame and field MBs are rescaled (9.3.3.1.1.7).
-            match (comp, self.st.mbaff, self.field, self.st.mbs[addr].mb_field) {
+            match (comp, MBAFF, self.field, self.st.mbs[addr].mb_field) {
                 (1, true, false, true) => v * 2,
                 (1, true, true, false) => v / 2,
                 _ => v,
@@ -2234,6 +2246,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.finish_inter(no_small)
     }
 
+    #[inline(never)]
     fn decode_b_mb(&mut self, raw: u32) -> Result<()> {
         let a = self.mb.addr;
         if raw == 0 {
@@ -2287,11 +2300,23 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// 16x16, 16x8 and 8x16 partitions: ref_idx and mvd syntax, motion derivation.
     fn decode_partitions(&mut self, part: Part, pred: [u8; 2]) -> Result<()> {
-        let rects: &[(usize, usize, usize, usize)] = match part {
-            Part::P16x16 => &[(0, 0, 4, 4)],
-            Part::P16x8 => &[(0, 0, 4, 2), (0, 2, 4, 2)],
-            Part::P8x16 => &[(0, 0, 2, 4), (2, 0, 2, 4)],
+        // One instance per shape: its partitions and their sizes become constants, and the
+        // loops over them branch no more.
+        match part {
+            Part::P16x16 => self.decode_partitions_as::<0>(pred),
+            Part::P16x8 => self.decode_partitions_as::<1>(pred),
+            Part::P8x16 => self.decode_partitions_as::<2>(pred),
             Part::P8x8 => unreachable!(),
+        }
+    }
+
+    /// [`Self::decode_partitions`] for shape `SHAPE`: 16x16, 16x8 or 8x16.
+    #[inline(always)]
+    fn decode_partitions_as<const SHAPE: u8>(&mut self, pred: [u8; 2]) -> Result<()> {
+        let (part, rects): (Part, &[(usize, usize, usize, usize)]) = match SHAPE {
+            0 => (Part::P16x16, &[(0, 0, 4, 4)]),
+            1 => (Part::P16x8, &[(0, 0, 4, 2), (0, 2, 4, 2)]),
+            _ => (Part::P8x16, &[(0, 0, 2, 4), (2, 0, 2, 4)]),
         };
         // In P slices each partition's blocks are written in full when its vector is known;
         // otherwise the lists are written separately over reset blocks, whose list 1 and direct
