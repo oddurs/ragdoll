@@ -2,8 +2,8 @@
 //! for packet-loss concealment, and the pitch pre/post-filter.
 
 use super::math::{
-    ilog2, mac16, maxabs16, maxabs32, mul16, mul16_32_q15, mul16_p15, mul16_q15, mul32_q31, pshr32,
-    round16, saturate, shl32, sround16, vshr32,
+    ilog2, inner_prod, mac16, maxabs16, maxabs32, mul16, mul16_32_q15, mul16_p15, mul16_q15,
+    mul32_q31, pshr32, round16, saturate, shl32, sround16, vshr32,
 };
 use super::range::ilog;
 
@@ -14,7 +14,28 @@ pub const COMBFILTER_MINPERIOD: i32 = 15;
 
 /// Plain correlation `xcorr[i] = sum_j x[j] * y[i + j]` (`celt_pitch_xcorr`); returns the
 /// maximum, at least 1. Integer sums are exact, so libopus's unrolling does not matter.
-fn pitch_xcorr(x: &[i16], y: &[i16], xcorr: &mut [i32], len: usize, max_pitch: usize) -> i32 {
+pub fn pitch_xcorr(x: &[i16], y: &[i16], xcorr: &mut [i32], len: usize, max_pitch: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd_enc::pitch_xcorr_avx2(x, y, xcorr, len, max_pitch) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd_enc::pitch_xcorr_neon(x, y, xcorr, len, max_pitch) };
+    }
+    pitch_xcorr_scalar(x, y, xcorr, len, max_pitch)
+}
+
+/// Scalar reference of [`pitch_xcorr`].
+pub fn pitch_xcorr_scalar(
+    x: &[i16],
+    y: &[i16],
+    xcorr: &mut [i32],
+    len: usize,
+    max_pitch: usize,
+) -> i32 {
     let mut maxcorr = 1i32;
     for i in 0..max_pitch {
         let mut sum = 0i32;
@@ -192,10 +213,7 @@ pub fn pitch_search(x_lp: &[i16], y: &[i16], len: usize, max_pitch: usize) -> us
         if (i as i32 - 2 * best[0] as i32).abs() > 2 && (i as i32 - 2 * best[1] as i32).abs() > 2 {
             continue;
         }
-        let mut sum = 0i32;
-        for j in 0..len >> 1 {
-            sum = sum.wrapping_add(mul16(x_lp[j] as i32, y[i + j] as i32) >> shift);
-        }
+        let sum = dot_shr(&x_lp[..len >> 1], &y[i..i + (len >> 1)], shift);
         xcorr[i] = (-1).max(sum);
         maxcorr = maxcorr.max(sum);
     }
@@ -223,6 +241,41 @@ pub fn pitch_search(x_lp: &[i16], y: &[i16], len: usize, max_pitch: usize) -> us
         0
     };
     (2 * best[0] as i32 - offset) as usize
+}
+
+/// `sum_j MULT16_16(a[j], b[j])` (wrapping) of equal-length slices: [`inner_prod`] for long
+/// vectors.
+pub fn dot16(a: &[i16], b: &[i16]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd_enc::dot16_avx2(a, b) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd_enc::dot16_neon(a, b) };
+    }
+    assert!(b.len() == a.len());
+    inner_prod(a, b)
+}
+
+/// `sum_j MULT16_16(a[j], b[j]) >> shift` (wrapping) of equal-length slices, `shift < 32`.
+pub fn dot_shr(a: &[i16], b: &[i16], shift: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        return unsafe { super::simd_enc::dot16_shr_avx2(a, b, shift) };
+    }
+    dot_shr_scalar(a, b, shift)
+}
+
+/// Scalar reference of [`dot_shr`].
+pub fn dot_shr_scalar(a: &[i16], b: &[i16], shift: i32) -> i32 {
+    assert!(b.len() == a.len());
+    a.iter().zip(b).fold(0i32, |s, (&u, &v)| {
+        s.wrapping_add(mul16(u as i32, v as i32) >> shift)
+    })
 }
 
 /// `_celt_lpc`: LPC coefficients (Q12) from autocorrelation.

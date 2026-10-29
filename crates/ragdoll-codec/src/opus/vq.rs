@@ -1,8 +1,6 @@
 //! Pyramid vector quantisation: codeword enumeration (`cwrs.c`) and the PVQ search, spreading
 //! rotation and renormalisation (`vq.c`).
 
-use std::sync::OnceLock;
-
 use super::bands::MAX_BAND;
 use super::math::{
     add16, atan2p, cos_norm, div, ilog2, inner_prod, mac16, mul16, mul16_32_q16, mul16_p15,
@@ -24,30 +22,40 @@ const U_PAD: usize = 8;
 const U_STRIDE: usize = U_PAD + U_COLS;
 
 /// `CELT_PVQ_U_ROW`: U(n, k), the number of n-dimensional codewords with k pulses and a positive
-/// first element, at `[U_PAD + min(n, k)][U_PAD + max(n, k)]`. Built from the recurrence
-/// U(n, k) = U(n-1, k) + U(n, k-1) + U(n-1, k-1); entries libopus uses fit 32 bits.
+/// first element, at `[U_PAD + min(n, k)][U_PAD + max(n, k)]`. Built at compile time from the
+/// recurrence U(n, k) = U(n-1, k) + U(n, k-1) + U(n-1, k-1); entries libopus uses fit 32 bits.
+static U_TABLE: [[u32; U_STRIDE]; U_PAD + 15] = {
+    // Full symmetric table u[n][k] for n < 15, k < U_COLS, in 64 bits (overflowing entries are
+    // never read by valid codebooks).
+    let mut u = [[0u64; U_COLS]; 15];
+    u[0][0] = 1;
+    let mut n = 1;
+    while n < 15 {
+        let mut k = 1;
+        while k < U_COLS {
+            u[n][k] = u[n - 1][k]
+                .wrapping_add(u[n][k - 1])
+                .wrapping_add(u[n - 1][k - 1]);
+            k += 1;
+        }
+        n += 1;
+    }
+    let mut t = [[0u32; U_STRIDE]; U_PAD + 15];
+    let mut n = 0;
+    while n < 15 {
+        let mut k = 0;
+        while k < U_COLS {
+            t[U_PAD + n][U_PAD + k] = u[n][k] as u32;
+            k += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+#[inline(always)]
 fn u_table() -> &'static [[u32; U_STRIDE]; U_PAD + 15] {
-    static T: OnceLock<Box<[[u32; U_STRIDE]; U_PAD + 15]>> = OnceLock::new();
-    T.get_or_init(|| {
-        // Full symmetric table u[n][k] for n < 15, k < U_COLS, in 64 bits (overflowing entries
-        // are never read by valid codebooks).
-        let mut u = vec![[0u64; U_COLS]; 15];
-        u[0][0] = 1;
-        for n in 1..15 {
-            for k in 1..U_COLS {
-                u[n][k] = u[n - 1][k]
-                    .wrapping_add(u[n][k - 1])
-                    .wrapping_add(u[n - 1][k - 1]);
-            }
-        }
-        let mut t = Box::new([[0u32; U_STRIDE]; U_PAD + 15]);
-        for (row, src) in t[U_PAD..].iter_mut().zip(&u) {
-            for (d, s) in row[U_PAD..].iter_mut().zip(src) {
-                *d = *s as u32;
-            }
-        }
-        t
-    })
+    &U_TABLE
 }
 
 #[inline]
@@ -485,7 +493,17 @@ fn extract_collapse_mask<T: Copy + Into<i32>>(iy: &[T], n: usize, b: usize) -> u
 }
 
 /// `op_pvq_search`: best `k`-pulse codeword for `x`; `x` is made non-negative in place.
-fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
+pub fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && x.len() == n && (1..=MAX_BAND).contains(&n) {
+        // Safety: avx2() is true only when the CPU supports AVX2; the sizes are checked.
+        return unsafe { super::simd_enc::pvq_search_avx2(x, iy, k, n) };
+    }
+    pvq_search_scalar(x, iy, k, n)
+}
+
+/// Scalar reference of [`pvq_search`].
+pub fn pvq_search_scalar(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
     let mut y = [0i16; MAX_BAND];
     let mut signx = [0i32; MAX_BAND];
     for j in 0..n {
@@ -526,17 +544,41 @@ fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
         iy[0] += pulses_left;
         pulses_left = 0;
     }
-    for i in 0..pulses_left {
-        let rshift = 1 + ilog2(k - pulses_left + i + 1);
+    let yy = pvq_pulses(x, &mut y, iy, n, k, pulses_left, 0, xy, yy);
+    for j in 0..n {
+        iy[j] = (iy[j] ^ -signx[j]) + signx[j];
+    }
+    yy as i32
+}
+
+/// The pulse-at-a-time search of `op_pvq_search`, from pulse `i0` of the `pulses_left` still to
+/// place: each goes where it maximises the correlation over the energy. `x` is the magnitude of
+/// the target, `y` twice the pulses so far and `iy` the pulses; returns the final energy `yy`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pvq_pulses(
+    x: &[i16],
+    y: &mut [i16],
+    iy: &mut [i32],
+    n: usize,
+    k: i32,
+    pulses_left: i32,
+    i0: i32,
+    mut xy: i32,
+    mut yy: i16,
+) -> i16 {
+    for i in i0..pulses_left {
+        // `k - pulses_left + i + 1` is positive but for a degenerate projection; then the
+        // shift wraps as a release build's `>>` does.
+        let rshift = (1 + ilog2(k - pulses_left + i + 1)) as u32;
         let mut best_id = 0usize;
         yy = add16(yy as i32, 1) as i16;
-        let mut rxy = ((xy.wrapping_add(x[0] as i32)) >> rshift) as i16 as i32;
+        let mut rxy = xy.wrapping_add(x[0] as i32).wrapping_shr(rshift) as i16 as i32;
         let mut ryy = add16(yy as i32, y[0] as i32);
         rxy = mul16_q15(rxy, rxy) as i16 as i32;
         let mut best_den = ryy;
         let mut best_num = rxy;
         for j in 1..n {
-            rxy = ((xy.wrapping_add(x[j] as i32)) >> rshift) as i16 as i32;
+            rxy = xy.wrapping_add(x[j] as i32).wrapping_shr(rshift) as i16 as i32;
             ryy = add16(yy as i32, y[j] as i32);
             rxy = mul16_q15(rxy, rxy) as i16 as i32;
             if mul16(best_den, rxy) > mul16(ryy, best_num) {
@@ -550,10 +592,7 @@ fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
         y[best_id] = y[best_id].wrapping_add(2);
         iy[best_id] += 1;
     }
-    for j in 0..n {
-        iy[j] = (iy[j] ^ -signx[j]) + signx[j];
-    }
-    yy as i32
+    yy
 }
 
 /// `alg_quant`: quantises `x` with `k` pulses; returns the collapse mask.

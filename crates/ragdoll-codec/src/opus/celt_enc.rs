@@ -8,13 +8,12 @@ use super::celt::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF};
 use super::celt_tables::{E_MEANS, EBANDS, LOG_N, WINDOW};
 use super::energy::{DB_SHIFT, amp2log2, quant_coarse, quant_finalise, quant_fine};
 use super::math::{
-    add16, celt_udiv, exp2, frac_div32, ilog2, inner_prod, log2, mac16, maxabs16, mul16,
-    mul16_32_q15, mul16_q14, mul16_q15, pshr32, rcp, rsqrt_norm, shl16, shl32, sqrt, sround16,
-    sub16, vshr32,
+    add16, celt_udiv, exp2, frac_div32, ilog2, inner_prod, log2, maxabs16, mul16, mul16_32_q15,
+    mul16_q14, mul16_q15, pshr32, rcp, rsqrt_norm, shl16, shl32, sqrt, sround16, sub16, vshr32,
 };
 use super::mdct::mdct_forward;
 use super::plc::{
-    COMBFILTER_MINPERIOD, Comb, SIG_SHIFT, comb_filter_to, pitch_downsample, pitch_search,
+    COMBFILTER_MINPERIOD, Comb, SIG_SHIFT, comb_filter_to, dot16, pitch_downsample, pitch_search,
 };
 use super::range::{BITRES, Ec, ilog};
 use super::rate::{NB_EBANDS, compute_allocation, init_caps};
@@ -1636,13 +1635,10 @@ fn remove_doubling(
     let prev_period = prev_period / 2;
     let n = n / 2;
     let xo = maxperiod as usize;
-    let at = |k: i32| x[(xo as i32 + k) as usize] as i32;
+    // Correlation of the `n` values from `xo + a` with those from `xo + b`.
     let dot = |a: i32, b: i32| -> i32 {
-        let mut s = 0i32;
-        for i in 0..n as i32 {
-            s = mac16(s, at(a + i), at(b + i));
-        }
-        s
+        let (a, b) = ((xo as i32 + a) as usize, (xo as i32 + b) as usize);
+        dot16(&x[a..a + n], &x[b..b + n])
     };
     if *t0_ >= maxperiod {
         *t0_ = maxperiod - 1;
@@ -1651,14 +1647,16 @@ fn remove_doubling(
     let mut t = t0;
     let xx = dot(0, 0);
     let mut xy = dot(0, -t0);
-    let mut yy_lookup = vec![0i32; maxperiod as usize + 1];
+    let mut yy_lookup = [0i32; MAXPERIOD / 2 + 1];
+    let yy_lookup = &mut yy_lookup[..maxperiod as usize + 1];
     yy_lookup[0] = xx;
     let mut yy = xx;
-    for i in 1..=maxperiod {
-        yy = yy
-            .wrapping_add(mul16(at(-i), at(-i)))
-            .wrapping_sub(mul16(at(n as i32 - i), at(n as i32 - i)));
-        yy_lookup[i as usize] = 0.max(yy);
+    // yy_lookup[i] = sum of x[xo - i + j]^2 for j < n: one value in, one out per step.
+    let (head, tail) = (&x[..xo], &x[..xo + n]);
+    for (i, (&a, &b)) in head.iter().rev().zip(tail.iter().rev()).enumerate() {
+        let (a, b) = (a as i32, b as i32);
+        yy = yy.wrapping_add(a * a).wrapping_sub(b * b);
+        yy_lookup[i + 1] = 0.max(yy);
     }
     yy = yy_lookup[t0 as usize];
     let mut best_xy = xy;
