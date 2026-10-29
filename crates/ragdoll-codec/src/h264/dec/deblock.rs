@@ -1,6 +1,6 @@
 //! Deblocking filter (ITU-T H.264 8.7).
 
-use super::picture::{MbType, NO_PIC, PicState, Structure};
+use super::picture::{BlockInfo, MbType, NO_PIC, PicState, RefIds, Structure};
 use super::tables::{ALPHA, BETA, TC0};
 use ragdoll_simd::{h264_chroma_deblock_edge, h264_luma_deblock_edge};
 
@@ -95,6 +95,8 @@ struct EdgeCtx {
     /// 4x4 index of the MB's top-left block, and the 4x4 stride.
     b0: usize,
     s: usize,
+    /// This MB, and the left and top MBs (the p side of edges 0).
+    mb: [usize; 3],
     /// Intra: this MB, the left MB, the top MB.
     intra: [bool; 3],
     field: bool,
@@ -109,6 +111,7 @@ impl EdgeCtx {
         Self {
             b0: mb_y * 4 * s + mb_x * 4,
             s,
+            mb: [addr, addr.wrapping_sub(1), addr.wrapping_sub(st.mb_w)],
             intra: [
                 st.mb_type[addr].is_intra(),
                 mb_x > 0 && st.mb_type[addr - 1].is_intra(),
@@ -121,7 +124,7 @@ impl EdgeCtx {
 
     /// Boundary strengths of the four 4-sample segments of `edge` (0..4) in direction `dir`
     /// (0 vertical, 1 horizontal).
-    #[inline]
+    #[inline(always)]
     fn strengths(&self, st: &PicState, dir: usize, edge: usize) -> [u8; 4] {
         // Field macroblocks: intra MB edges between vertically adjacent MBs get bS 3, and
         // vertical vectors are compared in field units (4 quarter frame samples = 2 quarter
@@ -140,19 +143,50 @@ impl EdgeCtx {
         let q0 = self.b0 + edge * step;
         // Inside a partition of one motion only coefficients count.
         let check_motion = (edge == 0) | (self.motion_edges & (1 << (4 * dir + edge)) != 0);
+        let (qm, pm) = (
+            self.mb[0],
+            if edge == 0 {
+                self.mb[1 + dir]
+            } else {
+                self.mb[0]
+            },
+        );
+        // Blocks under one reference table with equal indices refer to the same pictures.
+        let tq = st.mb_table[qm] as usize;
+        let one_table = pm == qm || st.mb_table[pm] as usize == tq;
+        // Within a table without repeated pictures, (list, index) pairs stand in for pictures.
+        let by_index = one_table && st.ref_unique.get(tq).copied().unwrap_or(false);
+        let index_ids = |b: &BlockInfo| -> [u32; 2] {
+            [0, 1].map(|l| match b.ref_idx[l] {
+                r if r >= 0 => (l as u32) << 8 | r as u32,
+                _ => NO_PIC,
+            })
+        };
+        let table = |m: usize| st.ref_tables.get(st.mb_table[m] as usize);
+        let pics = |t: Option<&RefIds>, b: &BlockInfo| -> [u32; 2] {
+            [0, 1].map(|l| match (t, b.ref_idx[l]) {
+                (Some(t), r) if r >= 0 => t[l][r as usize & 31],
+                _ => NO_PIC,
+            })
+        };
         let mut bs = [0u8; 4];
         for (k, slot) in bs.iter_mut().enumerate() {
             let qi = q0 + k * along;
             let pi = qi - step;
-            let nz = st.blocks[pi].nz | st.blocks[qi].nz;
+            let (bp, bq) = (&st.blocks[pi], &st.blocks[qi]);
+            let nz = bp.nz | bq.nz;
             *slot = 2 * nz as u8;
             if check_motion && !nz {
                 // Evaluated without short-circuits: one branch on the outcome.
-                let (rp, rq) = (st.blocks[pi].ref_pic, st.blocks[qi].ref_pic);
-                let (mp, mq) = (st.blocks[pi].mv, st.blocks[qi].mv);
+                let (mp, mq) = (bp.mv, bq.mv);
                 let same =
-                    (rp[0] == rq[0]) & (rp[1] == rq[1]) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
+                    one_table & (bp.ref_idx == bq.ref_idx) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
                 if !same {
+                    let (rp, rq) = if by_index {
+                        (index_ids(bp), index_ids(bq))
+                    } else {
+                        (pics(table(pm), bp), pics(table(qm), bq))
+                    };
                     *slot = motion_differs(rp, mp, rq, mq, ylim) as u8;
                 }
             }
@@ -206,12 +240,12 @@ fn motion_differs(
     }
 }
 
-/// [`motion_differs`] between 4x4 blocks `p` and `q` of `st`.
-fn blocks_differ(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
+/// [`motion_differs`] between 4x4 blocks `p` (of macroblock `pm`) and `q` (of `qm`) of `st`.
+fn blocks_differ(st: &PicState, pm: usize, p: usize, qm: usize, q: usize, ylim: i32) -> bool {
     motion_differs(
-        st.blocks[p].ref_pic,
+        st.ref_pics(pm, p),
         st.blocks[p].mv,
-        st.blocks[q].ref_pic,
+        st.ref_pics(qm, q),
         st.blocks[q].mv,
         ylim,
     )
@@ -475,7 +509,7 @@ fn mbaff_bs(
     if pf != qf {
         return 1;
     }
-    blocks_differ(st, pi, qi, if qf { 2 } else { 4 }) as u8
+    blocks_differ(st, pm, pi, qm, qi, if qf { 2 } else { 4 }) as u8
 }
 
 /// Deblocking of an MBAFF frame: macroblocks in decoding order (pairs, top MB first), with sample
