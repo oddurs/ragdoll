@@ -2357,8 +2357,8 @@ impl EncState {
         // Hadamard transforms of the source blocks (raster order) give the vertical, horizontal
         // and DC SATDs without building those predictions (`x264_intra_satd_x3_4x4`).
         let mut had = [[0i16; 16]; 16];
-        for (strip, h) in had.chunks_exact_mut(4).enumerate() {
-            hadamard4x4_16x4(&src.y[strip * 64..], 16, h.try_into().unwrap());
+        for (strip, h) in had.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            hadamard4x4_16x4(&src.y[strip * 64..], 16, h);
         }
         let quant = quant4(qp, true);
         let scale = dequant4(qp);
