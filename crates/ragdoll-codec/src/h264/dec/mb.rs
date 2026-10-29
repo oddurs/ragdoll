@@ -1285,7 +1285,17 @@ impl<'a, 'c, const CABAC: bool, const MBAFF: bool> Dec<'a, 'c, CABAC, MBAFF> {
             self.last_dqp_nz = false;
             self.set_qp();
         }
-        self.reconstruct_intra(kind, &modes, &mut res)?;
+        // The row above may already be filtered: prediction reads its unfiltered samples.
+        let (x, y) = (self.mb.x, self.mb.y);
+        let swap = self.st.border_swapped(y);
+        if swap {
+            self.st.swap_border(x, y);
+        }
+        let r = self.reconstruct_intra(kind, &modes, &mut res);
+        if swap {
+            self.st.swap_border(x, y);
+        }
+        r?;
         self.res = Some(res);
         Ok(())
     }

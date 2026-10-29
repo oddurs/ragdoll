@@ -814,6 +814,13 @@ pub struct RowFilter {
     pub has_chroma: bool,
     /// Where final rows are published, for a picture others predict from while it is decoded.
     pub sync: Option<Arc<PicSync>>,
+    /// Frame without MBAFF decoded on a worker thread: each row is filtered as soon as it is
+    /// decoded, rather than once the row below it is, so that later pictures may predict from
+    /// it a row sooner; the unfiltered bottom line of the last row filtered is kept in
+    /// [`Self::border`] for the intra prediction of the row below (as FFmpeg does).
+    pub immediate: bool,
+    /// The unfiltered bottom luma line of the last row filtered, then its Cb and Cr lines.
+    pub border: Vec<u8>,
 }
 
 impl PicState {
@@ -821,6 +828,9 @@ impl PicState {
     pub fn start_rows(&mut self, has_chroma: bool, sync: Option<Arc<PicSync>>) {
         let mut slices = std::mem::take(&mut self.rows.slices);
         slices.clear();
+        let immediate = sync.is_some() && !self.mbaff && self.structure == Structure::Frame;
+        let mut border = std::mem::take(&mut self.rows.border);
+        border.resize(2 * self.width, 0);
         self.rows = RowFilter {
             on: !self.mbaff,
             next: 0,
@@ -829,6 +839,8 @@ impl PicState {
             slices,
             has_chroma,
             sync,
+            immediate,
+            border,
         };
     }
 
@@ -850,7 +862,52 @@ impl PicState {
     #[cold]
     fn rows_done(&mut self, rows: usize) {
         self.publish_motion(rows);
-        self.filter_rows(rows - 1);
+        if self.rows.immediate {
+            self.save_border(rows - 1);
+            self.filter_rows(rows);
+        } else {
+            self.filter_rows(rows - 1);
+        }
+    }
+
+    /// Keeps the unfiltered bottom lines of macroblock row `row` in [`RowFilter::border`].
+    fn save_border(&mut self, row: usize) {
+        let (w, cw) = (self.width, self.width / 2);
+        let b = &mut self.rows.border;
+        b[..w].copy_from_slice(&self.planes[0][(16 * row + 15) * w..][..w]);
+        if self.rows.has_chroma {
+            for c in 0..2 {
+                let line = &self.planes[1 + c][(8 * row + 7) * cw..][..cw];
+                b[w + c * cw..w + (c + 1) * cw].copy_from_slice(line);
+            }
+        }
+    }
+
+    /// With [`RowFilter::immediate`], once the row above macroblock `(x, y)` is filtered:
+    /// swaps the samples above the macroblock that its intra prediction reads (top-left, top
+    /// and top-right) with their unfiltered values kept in [`RowFilter::border`]. A second
+    /// call swaps them back.
+    pub fn swap_border(&mut self, x: usize, y: usize) {
+        let (w, cw) = (self.width, self.width / 2);
+        let (lo, hi) = ((16 * x).saturating_sub(1), (16 * x + 24).min(w));
+        let line = &mut self.planes[0][(16 * y - 1) * w..][..w];
+        line[lo..hi].swap_with_slice(&mut self.rows.border[lo..hi]);
+        if self.rows.has_chroma {
+            let (lo, hi) = ((8 * x).saturating_sub(1), (8 * x + 8).min(cw));
+            let [cb, cr] = self.planes.chroma_mut();
+            for (c, p) in [cb, cr].into_iter().enumerate() {
+                let line = &mut p[(8 * y - 1) * cw..][..cw];
+                let saved = &mut self.rows.border[w + c * cw..w + (c + 1) * cw];
+                line[lo..hi].swap_with_slice(&mut saved[lo..hi]);
+            }
+        }
+    }
+
+    /// Whether intra prediction of macroblock row `y` reads the unfiltered row above from
+    /// [`RowFilter::border`] (see [`Self::swap_border`]).
+    #[inline]
+    pub fn border_swapped(&self, y: usize) -> bool {
+        self.rows.immediate && y > 0 && self.rows.done >= y
     }
 
     /// Copies the motion of decoded rows `..end` to the picture's [`LiveMotion`] and publishes it.
