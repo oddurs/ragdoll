@@ -1713,17 +1713,20 @@ impl<'a, 'c> Dec<'a, 'c> {
         })
     }
 
-    fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Option<Mv> {
-        let (a, i) = self.blk(xn, yn, done)?;
+    /// Motion of the available block covering luma `(xn, yn)`, [`NO_MV`] if there is none.
+    fn neighbour(&self, list: usize, xn: isize, yn: isize, done: u16) -> Mv {
+        let Some((a, i)) = self.blk(xn, yn, done) else {
+            return NO_MV;
+        };
         let (r, mv) = (self.st.blocks[i].ref_idx[list], self.st.blocks[i].mv[list]);
         if r < 0 || !self.st.mbaff {
-            return Some((r, mv));
+            return (r, mv);
         }
-        Some(match (self.field, self.st.mb_field[a]) {
+        match (self.field, self.st.mb_field[a]) {
             (true, false) => (r * 2, [mv[0], mv[1] / 2]),
             (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
             _ => (r, mv),
-        })
+        }
     }
 
     /// Motion vector predictor (8.4.1.3) for the MB-relative 4x4 rectangle `(bx, by, w, h)`.
@@ -1741,24 +1744,24 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let a = self.neighbour(list, x - 1, y, done);
         let b = self.neighbour(list, x, y - 1, done);
-        let c = self
-            .neighbour(list, x + (w * 4) as isize, y - 1, done)
-            .or_else(|| self.neighbour(list, x - 1, y - 1, done));
+        let mut c = self.neighbour(list, x + (w * 4) as isize, y - 1, done);
+        if c.0 == UNAV {
+            c = self.neighbour(list, x - 1, y - 1, done);
+        }
         mvp_from(a, b, c, refidx, part)
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
         let [a, b, c] = self.mb_neighbours()[0];
-        match (a, b) {
-            (None, _) | (_, None) => [0, 0],
-            (Some((0, [0, 0])), _) | (_, Some((0, [0, 0]))) => [0, 0],
-            _ => mvp_from(a, b, c, 0, None),
+        if a.0 == UNAV || b.0 == UNAV || a == (0, [0, 0]) || b == (0, [0, 0]) {
+            return [0, 0];
         }
+        mvp_raw(a, b, c, 0)
     }
 
     /// Neighbours A, B and C (D where C is unavailable) of the whole macroblock in both lists,
     /// as for a 16x16 partition's predictor (8.4.1.3.2).
-    fn mb_neighbours(&self) -> [[Option<Mv>; 3]; 2] {
+    fn mb_neighbours(&self) -> [[Mv; 3]; 2] {
         if self.st.mbaff {
             let a = self.neighbour_pair(-1, 0, 0);
             let b = self.neighbour_pair(0, -1, 0);
@@ -1769,7 +1772,8 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 c
             };
-            return [[a[0], b[0], c[0]], [a[1], b[1], c[1]]];
+            let r = |n: Option<Mv>| n.unwrap_or(NO_MV);
+            return [[r(a[0]), r(b[0]), r(c[0])], [r(a[1]), r(b[1]), r(c[1])]];
         }
         // Without MBAFF the neighbours are the adjacent macroblocks' corner blocks.
         let (x, y, w) = (self.mb.x, self.mb.y, self.st.mb_w);
@@ -1778,9 +1782,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         let st = &*self.st;
         let at = |i: usize| {
             let b = st.blocks[i];
-            [0, 1].map(|l| Some((b.ref_idx[l], b.mv[l])))
+            [0, 1].map(|l| (b.ref_idx[l], b.mv[l]))
         };
-        let none = [None, None];
+        let none = [NO_MV, NO_MV];
         let nb = self.nb;
         let a = if nb & NB_L != 0 { at(i - 1) } else { none };
         let b = if nb & NB_T != 0 { at(i - s) } else { none };
@@ -2082,8 +2086,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             // Neighbours A, B and C (or D) of the whole MB, as for a 16x16 partition's predictor.
             let nb = self.mb_neighbours();
             for (list, &[a, b, c]) in nb.iter().enumerate() {
-                let rr = |n: Option<Mv>| n.map_or(-1, |n| n.0);
-                sp_ref[list] = min_positive(rr(a), min_positive(rr(b), rr(c)));
+                sp_ref[list] = min_positive(a.0.max(-1), min_positive(b.0.max(-1), c.0.max(-1)));
             }
             if sp_ref[0] < 0 && sp_ref[1] < 0 {
                 sp_ref = [0, 0];
@@ -2092,7 +2095,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 for list in 0..2 {
                     if sp_ref[list] >= 0 {
                         let [a, b, c] = nb[list];
-                        sp_mv[list] = mvp_from(a, b, c, sp_ref[list], None);
+                        sp_mv[list] = mvp_raw(a, b, c, sp_ref[list]);
                     }
                 }
             }
@@ -2778,42 +2781,41 @@ impl ColMb<'_> {
     }
 }
 
-/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition.
-fn mvp_from(
-    a: Option<Mv>,
-    b: Option<Mv>,
-    c: Option<Mv>,
-    refidx: i8,
-    part: Option<(Part, usize)>,
-) -> [i16; 2] {
-    match part {
-        Some((Part::P16x8, 0)) if b.is_some_and(|n| n.0 == refidx) => return b.unwrap().1,
-        Some((Part::P16x8, 1)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-        Some((Part::P8x16, 0)) if a.is_some_and(|n| n.0 == refidx) => return a.unwrap().1,
-        Some((Part::P8x16, 1)) if c.is_some_and(|n| n.0 == refidx) => return c.unwrap().1,
-        _ => {}
-    }
-    let (a, b, c) = if b.is_none() && c.is_none() && a.is_some() {
+/// Reference index of an unavailable neighbour in [`mvp_raw`] form; its vector is zero.
+const UNAV: i8 = i8::MIN;
+const NO_MV: Mv = (UNAV, [0, 0]);
+
+/// [`mvp_from`] without a partition shape, for neighbours given with [`UNAV`] for unavailable
+/// (`refidx` is at least 0).
+fn mvp_raw(a: Mv, b: Mv, c: Mv, refidx: i8) -> [i16; 2] {
+    let (a, b, c) = if b.0 == UNAV && c.0 == UNAV && a.0 != UNAV {
         (a, a, a)
     } else {
         (a, b, c)
     };
-    let un = (-1i8, [0i16; 2]);
-    let (a, b, c) = (a.unwrap_or(un), b.unwrap_or(un), c.unwrap_or(un));
-    let matches = [a.0 == refidx, b.0 == refidx, c.0 == refidx];
-    if matches.iter().filter(|&&m| m).count() == 1 {
-        return if matches[0] {
-            a.1
-        } else if matches[1] {
-            b.1
-        } else {
-            c.1
-        };
+    let m = (a.0 == refidx) as u8 | ((b.0 == refidx) as u8) << 1 | ((c.0 == refidx) as u8) << 2;
+    match m {
+        1 => a.1,
+        2 => b.1,
+        4 => c.1,
+        _ => [
+            median(a.1[0], b.1[0], c.1[0]),
+            median(a.1[1], b.1[1], c.1[1]),
+        ],
     }
-    [
-        median(a.1[0], b.1[0], c.1[0]),
-        median(a.1[1], b.1[1], c.1[1]),
-    ]
+}
+
+/// Motion vector predictor (8.4.1.3) from the neighbours A, B and C (or D) of a partition,
+/// [`NO_MV`] where unavailable.
+fn mvp_from(a: Mv, b: Mv, c: Mv, refidx: i8, part: Option<(Part, usize)>) -> [i16; 2] {
+    match part {
+        Some((Part::P16x8, 0)) if b.0 == refidx => return b.1,
+        Some((Part::P16x8, 1)) if a.0 == refidx => return a.1,
+        Some((Part::P8x16, 0)) if a.0 == refidx => return a.1,
+        Some((Part::P8x16, 1)) if c.0 == refidx => return c.1,
+        _ => {}
+    }
+    mvp_raw(a, b, c, refidx)
 }
 
 /// Reference indices and vectors of both lists for one direct-mode block.
