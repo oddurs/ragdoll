@@ -259,6 +259,295 @@ pub unsafe fn pvq_search_avx2(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -
     }
 }
 
+/// AVX2 [`super::mdct::fold_copy_scalar`] from step `i0`, four steps at a time; returns the
+/// first step it left (at most `i1`).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn fold_copy_avx2(
+    input: &[i32],
+    f: &mut [i32],
+    h: usize,
+    i0: usize,
+    i1: usize,
+) -> usize {
+    use std::arch::x86_64::*;
+    let n2 = f.len();
+    assert!(2 * i1 <= n2 && n2 + h <= input.len());
+    let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    let (ip, fp) = (input.as_ptr(), f.as_mut_ptr());
+    let mut i = i0;
+    while i + 4 <= i1 {
+        // Safety: f[2i..2i + 8] is in `f` as i + 4 <= i1 <= n2 / 2; the reads
+        // input[h + 2i..h + 2i + 8] end at most at h + 2 i1 <= n2 + h, and
+        // input[n2 + h - 2i - 8..n2 + h - 2i] start at least at n2 + h - 2 i1 >= 0.
+        unsafe {
+            // f[2i + 2k] = input[n2 - 1 + h - 2i - 2k], f[2i + 2k + 1] = input[h + 2i + 2k].
+            let a = _mm256_loadu_si256(ip.add(h + 2 * i) as *const __m256i);
+            let b = _mm256_loadu_si256(ip.add(n2 + h - 2 * i - 8) as *const __m256i);
+            let r = _mm256_permutevar8x32_epi32(b, rev);
+            let v = _mm256_blend_epi32::<0xAA>(r, _mm256_slli_epi64::<32>(a));
+            _mm256_storeu_si256(fp.add(2 * i) as *mut __m256i, v);
+        }
+        i += 4;
+    }
+    i
+}
+
+/// `(a * t) >> 15` of the 32-bit values in the even lanes of `a` and the 16-bit `t`, in the
+/// low halves of the 64-bit lanes (`MULT16_32_Q15`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn q15_64(
+    a: std::arch::x86_64::__m256i,
+    t: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    _mm256_srli_epi64::<15>(_mm256_mul_epi32(a, t))
+}
+
+/// AVX2 [`super::mdct::pre_rotate_forward_scalar`], four steps at a time; returns the first
+/// step it left.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, and the entries of `st.bitrev` must be below `f.len() / 2`
+/// (they are a permutation in every [`super::mdct::FftState`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn pre_rotate_forward_avx2(
+    f: &[i32],
+    f2: &mut [i32],
+    t: &[i16],
+    st: &super::mdct::FftState,
+) -> usize {
+    use std::arch::x86_64::*;
+    let n2 = f.len();
+    let n4 = n2 >> 1;
+    assert!(f2.len() == n2 && t.len() >= n2 && st.bitrev.len() == n4);
+    debug_assert!(st.bitrev.iter().all(|&r| (r as usize) < n4));
+    let sh = st.scale_shift - 1;
+    let scale = _mm256_set1_epi32(st.scale as i16 as i32);
+    let round = _mm256_set1_epi32((1 << sh) >> 1);
+    let cnt = _mm_cvtsi32_si128(sh);
+    let (fp, tp, yp) = (f.as_ptr(), t.as_ptr(), f2.as_mut_ptr());
+    let mut i = 0;
+    while i + 4 <= n4 {
+        // Safety: the reads are of f[2i..2i + 8] and t[i..i + 4], t[n4 + i..n4 + i + 4]; the
+        // stores of pairs at 2 bitrev[i + k] < n2.
+        unsafe {
+            let v = _mm256_loadu_si256(fp.add(2 * i) as *const __m256i);
+            let (re, im) = (v, _mm256_srli_epi64::<32>(v));
+            let t0 = _mm256_cvtepi16_epi64(_mm_loadl_epi64(tp.add(i) as *const __m128i));
+            let t1 = _mm256_cvtepi16_epi64(_mm_loadl_epi64(tp.add(n4 + i) as *const __m128i));
+            let yr = _mm256_sub_epi64(q15_64(re, t0), q15_64(im, t1));
+            let yi = _mm256_add_epi64(q15_64(im, t0), q15_64(re, t1));
+            // MULT16_32_Q16(scale, y), then PSHR32.
+            let yr = _mm256_srli_epi64::<16>(_mm256_mul_epi32(yr, scale));
+            let yi = _mm256_srli_epi64::<16>(_mm256_mul_epi32(yi, scale));
+            let y = _mm256_blend_epi32::<0xAA>(yr, _mm256_slli_epi64::<32>(yi));
+            let y = _mm256_sra_epi32(_mm256_add_epi32(y, round), cnt);
+            let r = |k: usize| 2 * *st.bitrev.get_unchecked(i + k) as usize;
+            let lo = _mm256_castsi256_si128(y);
+            let hi = _mm256_extracti128_si256::<1>(y);
+            _mm_storel_epi64(yp.add(r(0)) as *mut __m128i, lo);
+            _mm_storeh_pd(yp.add(r(1)) as *mut f64, _mm_castsi128_pd(lo));
+            _mm_storel_epi64(yp.add(r(2)) as *mut __m128i, hi);
+            _mm_storeh_pd(yp.add(r(3)) as *mut f64, _mm_castsi128_pd(hi));
+        }
+        i += 4;
+    }
+    i
+}
+
+/// AVX2 [`super::mdct::post_rotate_forward_scalar`] with stride 1: steps `i` from the front and
+/// `n4 - 1 - i` from the back, four of each at a time; returns how many front steps it did
+/// (the scalar loop does the steps between).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn post_rotate_forward_avx2(f2: &[i32], out: &mut [i32], t: &[i16]) -> usize {
+    use std::arch::x86_64::*;
+    let n2 = f2.len();
+    let n4 = n2 >> 1;
+    assert!(out.len() >= n2 && t.len() >= n2);
+    let swap = _mm256_setr_epi32(6, 7, 4, 5, 2, 3, 0, 1);
+    let (fp, tp, op) = (f2.as_ptr(), t.as_ptr(), out.as_mut_ptr());
+    // (yr, yi) of the four steps from `i`, interleaved.
+    let rot = |i: usize| {
+        // Safety: the callers' steps are below n4.
+        unsafe {
+            let v = _mm256_loadu_si256(fp.add(2 * i) as *const __m256i);
+            let (re, im) = (v, _mm256_srli_epi64::<32>(v));
+            let t0 = _mm256_cvtepi16_epi64(_mm_loadl_epi64(tp.add(i) as *const __m128i));
+            let t1 = _mm256_cvtepi16_epi64(_mm_loadl_epi64(tp.add(n4 + i) as *const __m128i));
+            let yr = _mm256_sub_epi64(q15_64(im, t1), q15_64(re, t0));
+            let yi = _mm256_add_epi64(q15_64(re, t1), q15_64(im, t0));
+            _mm256_blend_epi32::<0xAA>(yr, _mm256_slli_epi64::<32>(yi))
+        }
+    };
+    let mut i = 0;
+    while i + 4 <= n4 / 2 {
+        let (a, b) = (rot(i), rot(n4 - 4 - i));
+        // out[2i + 2k] = yr(i + k) and out[2i + 2k + 1] = yi(n4 - 1 - i - k); at the back,
+        // out[n2 - 2i - 8 + 2k] = yr(n4 - 4 - i + k) and the odd values yi(i + 3 - k).
+        let front = _mm256_blend_epi32::<0xAA>(a, _mm256_permutevar8x32_epi32(b, swap));
+        let back = _mm256_blend_epi32::<0xAA>(b, _mm256_permutevar8x32_epi32(a, swap));
+        // Safety: the front values 2i..2i + 8 and the back ones n2 - 2i - 8..n2 - 2i are in
+        // `out` and apart, as i + 4 <= n4 / 2.
+        unsafe {
+            _mm256_storeu_si256(op.add(2 * i) as *mut __m256i, front);
+            _mm256_storeu_si256(op.add(n2 - 2 * i - 8) as *mut __m256i, back);
+        }
+        i += 4;
+    }
+    i
+}
+
+/// AVX2 `celt_maxabs32`.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn maxabs32_avx2(x: &[i32]) -> i32 {
+    use std::arch::x86_64::*;
+    let n8 = x.len() & !7;
+    let (mut hi, mut lo) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+    for c in x[..n8].chunks_exact(8) {
+        // Safety: `c` holds 8 values.
+        let v = unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) };
+        hi = _mm256_max_epi32(hi, v);
+        lo = _mm256_min_epi32(lo, v);
+    }
+    let (mut a, mut b) = ([0i32; 8], [0i32; 8]);
+    // Safety: `a` and `b` hold 8 values.
+    unsafe {
+        _mm256_storeu_si256(a.as_mut_ptr() as *mut __m256i, hi);
+        _mm256_storeu_si256(b.as_mut_ptr() as *mut __m256i, lo);
+    }
+    let mut maxval = a.iter().fold(0, |m, &v| v.max(m));
+    let mut minval = b.iter().fold(0, |m, &v| v.min(m));
+    for &v in &x[n8..] {
+        maxval = maxval.max(v);
+        minval = minval.min(v);
+    }
+    maxval.max(minval.wrapping_neg())
+}
+
+/// AVX2 [`super::plc::decimate_scalar`] from output 1, eight outputs at a time; returns the
+/// first output it left.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn decimate_avx2(xs: &[i32], x_lp: &mut [i16], shift: i32, add: bool) -> usize {
+    use std::arch::x86_64::*;
+    let half = x_lp.len();
+    assert!(xs.len() >= 2 * half);
+    let cnt = _mm_cvtsi32_si128(shift);
+    let (xp, op) = (xs.as_ptr(), x_lp.as_mut_ptr());
+    // The even and the odd lanes of a and b, in order.
+    let even = |a: __m256i, b: __m256i| {
+        let v = _mm256_shuffle_ps::<0x88>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b));
+        _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(v))
+    };
+    let odd = |a: __m256i, b: __m256i| {
+        let v = _mm256_shuffle_ps::<0xDD>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b));
+        _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(v))
+    };
+    let mut i = 1;
+    while i + 8 <= half {
+        // Safety: the reads xs[2i - 1..2i + 16] stay below 2 half, the 8 outputs below half.
+        unsafe {
+            let ld = |p: *const i32| _mm256_loadu_si256(p as *const __m256i);
+            let (a0, a1) = (ld(xp.add(2 * i)), ld(xp.add(2 * i + 8)));
+            let (b0, b1) = (ld(xp.add(2 * i - 1)), ld(xp.add(2 * i + 7)));
+            let (e, o, op1) = (even(a0, a1), odd(a0, a1), even(b0, b1));
+            let s = _mm256_srai_epi32::<1>(_mm256_add_epi32(op1, o));
+            let v = _mm256_sra_epi32(_mm256_srai_epi32::<1>(_mm256_add_epi32(s, e)), cnt);
+            // The low 16 bits of each lane, in order.
+            let v = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(v));
+            let v = _mm256_permute4x64_epi64::<0x08>(_mm256_packs_epi32(v, v));
+            let mut v = _mm256_castsi256_si128(v);
+            let o = op.add(i) as *mut __m128i;
+            if add {
+                v = _mm_add_epi16(v, _mm_loadu_si128(o));
+            }
+            _mm_storeu_si128(o, v);
+        }
+        i += 8;
+    }
+    i
+}
+
+/// AVX2 [`super::plc::fir5_scalar`] on all but a prefix of `x`, sixteen outputs at a time from
+/// the end down (so each block still reads its inputs); returns the length of the prefix left.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn fir5_avx2(x: &mut [i16], num: &[i32; 5]) -> usize {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    if n < 21 {
+        return n;
+    }
+    let blocks = (n - 5) / 16;
+    let start = n - 16 * blocks;
+    // Coefficient pairs for pmaddwd against (x[i - 1], x[i - 2]), (x[i - 3], x[i - 4]) and
+    // (x[i - 5], 0).
+    let pair = |a: i32, b: i32| _mm256_set1_epi32((b << 16) | (a & 0xffff));
+    let (c01, c23, c4) = (pair(num[0], num[1]), pair(num[2], num[3]), pair(num[4], 0));
+    let round = _mm256_set1_epi32(1 << 11);
+    let z = _mm256_setzero_si256();
+    let xp = x.as_mut_ptr();
+    for b in (0..blocks).rev() {
+        let i = start + 16 * b;
+        // Safety: the reads x[i - 5..i + 16] and the store x[i..i + 16] are in `x` (i >= 5).
+        unsafe {
+            let ld = |k: usize| _mm256_loadu_si256(xp.add(i - k) as *const __m256i);
+            let (u0, u1, u2, u3, u4, u5) = (ld(0), ld(1), ld(2), ld(3), ld(4), ld(5));
+            // SHL32(x[i], 12) + the taps, in unpacklo / unpackhi order.
+            let half = |x0: __m256i, p1: __m256i, p2: __m256i, p3: __m256i| {
+                let s = _mm256_srai_epi32::<4>(x0);
+                let s = _mm256_add_epi32(s, _mm256_madd_epi16(p1, c01));
+                let s = _mm256_add_epi32(s, _mm256_madd_epi16(p2, c23));
+                let s = _mm256_add_epi32(s, _mm256_madd_epi16(p3, c4));
+                // ROUND16(s, 12), truncated.
+                let s = _mm256_srai_epi32::<12>(_mm256_add_epi32(s, round));
+                _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(s))
+            };
+            let lo = half(
+                _mm256_unpacklo_epi16(z, u0),
+                _mm256_unpacklo_epi16(u1, u2),
+                _mm256_unpacklo_epi16(u3, u4),
+                _mm256_unpacklo_epi16(u5, z),
+            );
+            let hi = half(
+                _mm256_unpackhi_epi16(z, u0),
+                _mm256_unpackhi_epi16(u1, u2),
+                _mm256_unpackhi_epi16(u3, u4),
+                _mm256_unpackhi_epi16(u5, z),
+            );
+            _mm256_storeu_si256(xp.add(i) as *mut __m256i, _mm256_packs_epi32(lo, hi));
+        }
+    }
+    start
+}
+
 /// AVX2 [`super::plc::pitch_xcorr_scalar`]: `xcorr[i] = sum_j x[j] * y[i + j]` for
 /// `i < max_pitch` and `j < len`; returns the largest, at least 1. `pmaddwd` forms the
 /// products in pairs; integer sums wrap the same in any order, so four lags at a time share
@@ -280,8 +569,6 @@ pub unsafe fn pitch_xcorr_avx2(
     assert!(x.len() >= len && y.len() + 1 >= len + max_pitch && xcorr.len() >= max_pitch);
     let n16 = len & !15;
     let (xp, yp) = (x.as_ptr(), y.as_ptr());
-    // Safety (of each call): `p` is valid for 16 values.
-    let ld = |p: *const i16| unsafe { _mm256_loadu_si256(p as *const __m256i) };
     let tail = |i: usize, mut s: i32| {
         for j in n16..len {
             s = s.wrapping_add(x[j] as i32 * y[i + j] as i32);
@@ -293,6 +580,7 @@ pub unsafe fn pitch_xcorr_avx2(
     // Safety: every load is of 16 values of `x` below `len`, or of `y` below `i + 3 + len`
     // with `i + 3 < max_pitch`.
     unsafe {
+        let ld = |p: *const i16| _mm256_loadu_si256(p as *const __m256i);
         while i + 4 <= max_pitch {
             let z = _mm256_setzero_si256();
             let (mut s0, mut s1, mut s2, mut s3) = (z, z, z, z);
@@ -483,6 +771,82 @@ mod tests {
                     let yb = pvq_search_scalar(&mut xb, &mut ib, k as i32, n);
                     assert_eq!((ya, &ia, &xa), (yb, &ib, &xb), "n {n} k {k} amp {amp}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn mdct_forward_matches_scalar() {
+        use super::super::celt_tables::WINDOW;
+        use super::super::mdct::{mdct_forward, mdct_forward_scalar};
+        let mut seed = 3u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as i32
+        };
+        for shift in 0..4 {
+            let n2 = 960 >> shift;
+            for stride in [1usize, 2, 4, 8] {
+                // Pre-emphasised signal levels, full scale and beyond, and extremes.
+                for amp in [1 << 12, 1 << 20, 1 << 27, i32::MAX] {
+                    let input: Vec<i32> = (0..n2 + 120)
+                        .map(|k| match k % 53 {
+                            0 => i32::MIN,
+                            1 => i32::MAX,
+                            _ => rnd() % amp,
+                        })
+                        .collect();
+                    let (mut a, mut b) = (vec![0i32; n2 * stride], vec![0i32; n2 * stride]);
+                    let (mut f, mut f2) = (vec![0i32; 960], vec![0i32; 960]);
+                    mdct_forward(&input, &mut a, &WINDOW, 120, shift, stride, &mut f, &mut f2);
+                    mdct_forward_scalar(&input, &mut b, &WINDOW, 120, shift, stride);
+                    assert_eq!(a, b, "shift {shift} stride {stride} amp {amp}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pitch_downsample_kernels_match_scalar() {
+        use super::super::math::maxabs32;
+        use super::super::plc::{decimate_scalar, fir5, fir5_scalar};
+        let mut seed = 5u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as i32
+        };
+        for n in (1..60).chain([255, 256, 257, 992, 1000]) {
+            for amp in [1 << 10, 1 << 24, i32::MAX] {
+                let xs: Vec<i32> = (0..2 * n + 1)
+                    .map(|k| match k % 31 {
+                        0 => i32::MIN,
+                        1 => i32::MAX,
+                        _ => rnd() % amp,
+                    })
+                    .collect();
+                assert_eq!(
+                    super::super::plc::maxabs32_long(&xs),
+                    maxabs32(&xs),
+                    "maxabs n {n}"
+                );
+                for (shift, add) in [(0, false), (1, true), (11, false), (22, true)] {
+                    let init: Vec<i16> = (0..n).map(|_| rnd() as i16).collect();
+                    let (mut a, mut b) = (init.clone(), init.clone());
+                    super::super::plc::decimate(&xs, &mut a, shift, add);
+                    decimate_scalar(&xs, &mut b, shift, add, 1);
+                    assert_eq!(a, b, "decimate n {n} shift {shift}");
+                }
+            }
+            let x = signal16(n, n as u32 + 77, 32768);
+            for num in [
+                [3277, -8000, 12000, -16384, 300],
+                [-32768, 32767, -32768, 32767, -32768],
+                [26214, 0, 0, 0, 0],
+            ] {
+                let (mut a, mut b) = (x.clone(), x.clone());
+                fir5(&mut a, &num, n);
+                fir5_scalar(&mut b, &num, n);
+                assert_eq!(a, b, "fir5 n {n}");
             }
         }
     }

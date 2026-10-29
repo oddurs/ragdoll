@@ -95,6 +95,8 @@ struct Scratch {
     pitch_buf: Vec<i16>,
     /// Transient analysis signal.
     tmp: Vec<i16>,
+    /// MDCT working space (`2 * 960`).
+    mdct: Vec<i32>,
 }
 
 /// `v` resized to `len` values; existing values are kept, not cleared.
@@ -369,14 +371,14 @@ impl CeltEncoder {
         let mut band_log_e2 = [0i16; 2 * NB_EBANDS];
         let second_mdct = short_blocks != 0 && self.complexity >= 8;
         if second_mdct {
-            compute_mdcts(0, inb, freq, c, cc, lm);
+            compute_mdcts(0, inb, freq, c, cc, lm, &mut scratch.mdct);
             compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e2, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
                 *v = add16(*v as i32, shl16(lm, DB_SHIFT) >> 1) as i16;
             }
         }
-        compute_mdcts(short_blocks, inb, freq, c, cc, lm);
+        compute_mdcts(short_blocks, inb, freq, c, cc, lm, &mut scratch.mdct);
         if cc == 2 && c == 1 {
             tf_chan = 0;
         }
@@ -415,7 +417,7 @@ impl CeltEncoder {
         {
             is_transient = true;
             short_blocks = m;
-            compute_mdcts(short_blocks, inb, freq, c, cc, lm);
+            compute_mdcts(short_blocks, inb, freq, c, cc, lm, &mut scratch.mdct);
             compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
@@ -922,7 +924,16 @@ impl CeltEncoder {
     }
 }
 
-fn compute_mdcts(short_blocks: usize, inb: &[i32], out: &mut [i32], c: usize, cc: usize, lm: i32) {
+fn compute_mdcts(
+    short_blocks: usize,
+    inb: &[i32],
+    out: &mut [i32],
+    c: usize,
+    cc: usize,
+    lm: i32,
+    work: &mut Vec<i32>,
+) {
+    let (f, f2) = sized(work, 2 * 960).split_at_mut(960);
     let (b, n, shift) = if short_blocks != 0 {
         (short_blocks, 120usize, 3usize)
     } else {
@@ -932,7 +943,16 @@ fn compute_mdcts(short_blocks: usize, inb: &[i32], out: &mut [i32], c: usize, cc
         for blk in 0..b {
             let ib = ch * (b * n + OVERLAP) + blk * n;
             let ob = blk + ch * n * b;
-            mdct_forward(&inb[ib..], &mut out[ob..], &WINDOW, OVERLAP, shift, b);
+            mdct_forward(
+                &inb[ib..],
+                &mut out[ob..],
+                &WINDOW,
+                OVERLAP,
+                shift,
+                b,
+                f,
+                f2,
+            );
         }
     }
     if cc == 2 && c == 1 {
