@@ -2372,19 +2372,30 @@ fn cavlc_block(
     r.skip_peeked(trailing_ones as u32);
 
     let mut lt = t::first_level_table(total_coeff, trailing_ones);
-    for lv in &mut level[trailing_ones..total_coeff] {
+    let mut k = trailing_ones;
+    while k < total_coeff {
         let v = r.peek32_min(8);
-        let e = t::LEVEL[(lt << 8 | (v >> 24) as usize) & 0xfff];
-        if e != 0 {
-            r.skip_peeked((e & 15) as u32);
-            *lv = (e as i16) >> 8;
-            lt = ((e >> 4) & 15) as usize;
-        } else {
+        let e = t::LEVEL_PAIR[(lt << 8 | (v >> 24) as usize) & 0xfff];
+        if e == 0 {
             r.check_skipped()?;
             // On a copy, so that `r` itself never leaves registers.
             let mut esc = r.clone();
-            (*lv, lt) = cavlc_level_escape(&mut esc, lt)?;
+            (level[k & 15], lt) = cavlc_level_escape(&mut esc, lt)?;
             *r = esc;
+            k += 1;
+            continue;
+        }
+        // One or two levels; the second only when a coefficient is left for it.
+        level[k & 15] = e as i8 as i16;
+        if (e >> 20) & 15 != 0 && k + 1 < total_coeff {
+            level[(k + 1) & 15] = (e >> 8) as i8 as i16;
+            r.skip_peeked((e >> 20) & 15);
+            lt = (e >> 28) as usize;
+            k += 2;
+        } else {
+            r.skip_peeked((e >> 16) & 15);
+            lt = ((e >> 24) & 15) as usize;
+            k += 1;
         }
     }
 
@@ -2412,24 +2423,37 @@ fn cavlc_block(
     let mut i = 1;
     while i < total_coeff && zl > 0 {
         let v = r.peek32_min(11);
-        let e = t::RUN_BEFORE[zl & 15][(v >> 29) as usize];
-        let run = if e != 0 {
-            // At most zeros_left by construction.
-            r.skip_peeked((e & 15) as u32);
-            (e >> 4) as usize
-        } else {
+        let e = t::RUN_PAIR[zl & 15][(v >> 26) as usize] as usize;
+        if e == 0 {
             // zeros_left > 6: `0001` is 7, ..., `00000000001` is 14.
             let lz = v.leading_zeros();
             if lz > 10 || lz as usize + 4 > zl {
                 return Err(fail(r, "CAVLC invalid run_before"));
             }
             r.skip_peeked(lz + 1);
-            lz as usize + 4
-        };
-        zl -= run;
-        p -= 1 + run;
-        pos[i & 15] = p as u8;
-        i += 1;
+            zl -= lz as usize + 4;
+            p -= lz as usize + 5;
+            pos[i & 31] = p as u8;
+            i += 1;
+            continue;
+        }
+        // One or two runs, both at most zeros_left by construction; the second only when a
+        // coefficient is left for it.
+        let run1 = e & 15;
+        p -= 1 + run1;
+        pos[i & 31] = p as u8;
+        if e >> 16 != 0 && i + 1 < total_coeff {
+            let run2 = (e >> 4) & 15;
+            r.skip_peeked(((e >> 12) & 15) as u32);
+            p -= 1 + run2;
+            pos[(i + 1) & 31] = p as u8;
+            zl -= run1 + run2;
+            i += 2;
+        } else {
+            r.skip_peeked(((e >> 8) & 15) as u32);
+            zl -= run1;
+            i += 1;
+        }
     }
     if i < total_coeff {
         // No zeros left: the rest are consecutive, written 16 at a time past the count.
@@ -2441,7 +2465,7 @@ fn cavlc_block(
     Ok(total_coeff)
 }
 
-/// A level the [`cavlc_tables::LEVEL`] lookup does not cover (a long prefix or suffix), read with
+/// A level the [`cavlc_tables::LEVEL_PAIR`] lookup does not cover (a long prefix or suffix), read with
 /// level table `lt`'s suffixLength; returns the level and the next level table.
 #[cold]
 #[inline(never)]
@@ -2702,7 +2726,7 @@ mod cavlc_tables {
 
     /// `run_before` per zeros_left (`1..=15`) and the next 3 bits: `run << 4 | len`, or 0 for
     /// the codes longer than 3 bits (`000` with zeros_left > 6).
-    pub(super) static RUN_BEFORE: [[u8; 8]; 16] = {
+    pub(super) const RUN_BEFORE: [[u8; 8]; 16] = {
         let mut t = [[0u8; 8]; 16];
         let mut zl = 1;
         while zl < 16 {
@@ -2725,6 +2749,39 @@ mod cavlc_tables {
                 // Complete codes for zeros_left <= 6, with no run beyond zeros_left.
                 assert!(k == 6 || (t[zl][j] != 0 && (t[zl][j] >> 4) as usize <= zl));
                 j += 1;
+            }
+            zl += 1;
+        }
+        t
+    };
+
+    /// Up to two `run_before` codes per zeros_left (`1..=15`) and the next 6 bits: `run1 |
+    /// run2 << 4 | len1 << 8 | (len1 + len2) << 12 | 1 << 16`, without the last part when the
+    /// second code is longer than 3 bits, or 0 when the first one is. A second run with no
+    /// zeros left is an empty code for 0.
+    pub(super) static RUN_PAIR: [[u32; 64]; 16] = {
+        let mut t = [[0u32; 64]; 16];
+        let mut zl = 1;
+        while zl < 16 {
+            let mut b = 0;
+            while b < 64 {
+                let e1 = RUN_BEFORE[zl][b >> 3] as u32;
+                if e1 != 0 {
+                    let (run1, len1) = (e1 >> 4, e1 & 15);
+                    let zl2 = zl - run1 as usize;
+                    let e2 = if zl2 == 0 {
+                        0
+                    } else {
+                        RUN_BEFORE[zl2][((b << len1) >> 3) & 7] as u32
+                    };
+                    t[zl][b] = run1 | len1 << 8;
+                    if zl2 == 0 {
+                        t[zl][b] |= len1 << 12 | 1 << 16;
+                    } else if e2 != 0 {
+                        t[zl][b] |= (e2 >> 4) << 4 | (len1 + (e2 & 15)) << 12 | 1 << 16;
+                    }
+                }
+                b += 1;
             }
             zl += 1;
         }
@@ -2776,7 +2833,7 @@ mod cavlc_tables {
     /// Levels whose level_prefix, stop bit and suffix fit in 8 bits, per level table
     /// ([`LEVEL_MODE`]) and the next 8 bits (`table << 8 | bits`): `level << 8 | next_table << 4
     /// | len` (`level` as an `i8`), or 0 where the level is longer.
-    pub(super) static LEVEL: [u16; 16 * 256] = {
+    const LEVEL: [u16; 16 * 256] = {
         let mut t = [0u16; 16 * 256];
         let mut k = 0;
         while k < 9 {
@@ -2801,6 +2858,32 @@ mod cavlc_tables {
                     };
                     t[k << 8 | i] =
                         ((lv as i8 as u8 as u16) << 8) | ((next as u16) << 4) | len as u16;
+                }
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
+
+    /// Up to two [`LEVEL`] codes in the next 8 bits, per level table: `level1 | level2 << 8 |
+    /// len1 << 16 | (len1 + len2) << 20 | next1 << 24 | next2 << 28` (levels as `i8`; `len1 +
+    /// len2` is 0 without a second code), or 0 where the first level is longer.
+    pub(super) static LEVEL_PAIR: [u32; 16 * 256] = {
+        let mut t = [0u32; 16 * 256];
+        let mut k = 0;
+        while k < 9 {
+            let mut i = 0;
+            while i < 256 {
+                let e1 = LEVEL[k << 8 | i] as u32;
+                if e1 != 0 {
+                    let (len1, next1) = (e1 & 15, (e1 >> 4) & 15);
+                    let mut e = (e1 >> 8) | len1 << 16 | next1 << 24;
+                    let e2 = LEVEL[(next1 as usize) << 8 | ((i << len1) & 0xff)] as u32;
+                    if e2 != 0 && (e2 & 15) <= 8 - len1 {
+                        e |= (e2 >> 8) << 8 | (len1 + (e2 & 15)) << 20 | ((e2 >> 4) & 15) << 28;
+                    }
+                    t[k << 8 | i] = e;
                 }
                 i += 1;
             }
