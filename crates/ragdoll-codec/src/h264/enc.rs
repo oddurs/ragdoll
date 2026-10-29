@@ -184,9 +184,27 @@ pub(super) struct EncState {
     mb_vars: Vec<f32>,
     bits_buf: Vec<u8>,
     win: Box<HpelWindow>,
+    /// Motion vector costs by QP (see [`EncState::mv_costs`]), built on first use.
+    mv_cost_tabs: Vec<Vec<u16>>,
 }
 
 impl EncState {
+    /// `LAMBDA[qp]` times the bits of a motion vector difference component `d`, at index
+    /// `d + MV_COST_RANGE`, for `|d| <= MV_COST_RANGE` (`x264` `p_cost_mv`).
+    fn mv_costs(&mut self, qp: u8) -> &[u16] {
+        if self.mv_cost_tabs.len() <= qp as usize {
+            self.mv_cost_tabs.resize(qp as usize + 1, Vec::new());
+        }
+        let t = &mut self.mv_cost_tabs[qp as usize];
+        if t.is_empty() {
+            let lambda = LAMBDA[qp as usize] as u32;
+            *t = (-MV_COST_RANGE..=MV_COST_RANGE)
+                .map(|d| (lambda * se_bits(d)) as u16)
+                .collect();
+        }
+        t
+    }
+
     /// Sizes the pictures and grids and clears the per-frame state. `ref_grid` and `mv_grid` are
     /// left alone: every macroblock writes its own entries before a later one reads them.
     fn prepare(&mut self, mb_w: usize, mb_h: usize, slice_qp: u8, cabac: bool) {
@@ -330,9 +348,23 @@ struct SliceState {
     skip_bounds: SkipBounds,
 }
 
+/// Column and row of $4\times4$ block `b` (decoding order) in its macroblock.
 #[inline(always)]
 fn blk_xy(b: usize) -> (usize, usize) {
-    ((b & 1) + ((b >> 1) & 2), ((b >> 1) & 1) + ((b >> 2) & 2))
+    const XY: [(u8, u8); 16] = {
+        let mut t = [(0u8, 0u8); 16];
+        let mut b = 0;
+        while b < 16 {
+            t[b] = (
+                ((b & 1) + ((b >> 1) & 2)) as u8,
+                (((b >> 1) & 1) + ((b >> 2) & 2)) as u8,
+            );
+            b += 1;
+        }
+        t
+    };
+    let (x, y) = XY[b & 15];
+    (x as usize, y as usize)
 }
 
 #[inline(always)]
@@ -347,21 +379,10 @@ fn se_bits(d: i32) -> u32 {
     2 * (32 - (v + 1).leading_zeros()) - 1
 }
 
-/// Set bits of a mask of at most 16 bits. The crate targets baseline x86-64, which has no
-/// `popcnt`: two table lookups beat the bit-twiddling fallback of `count_ones`.
+/// Set bits of a mask of at most 16 bits (`popcnt` in the x86-64-v3 frame coder).
 #[inline(always)]
 fn pop16(mask: u32) -> u8 {
-    static POP8: [u8; 256] = {
-        let mut t = [0u8; 256];
-        let mut i = 0;
-        while i < 256 {
-            t[i] = (i as u32).count_ones() as u8;
-            i += 1;
-        }
-        t
-    };
-    debug_assert!(mask < 1 << 16);
-    POP8[(mask & 0xFF) as usize] + POP8[(mask >> 8 & 0xFF) as usize]
+    mask.count_ones() as u8
 }
 
 /// `x264_decimate_score`: 9 when a level exceeds 1, else a weight that falls with the zero runs.
@@ -780,6 +801,10 @@ impl MvBounds {
     }
 }
 
+/// Largest motion vector difference component [`EncState::mv_costs`] covers; larger ones are
+/// costed directly.
+const MV_COST_RANGE: i32 = 4096;
+
 /// Motion search of one $16\times16$ partition against the reference luma plane.
 struct MotionSearch<'a> {
     r: &'a Plane,
@@ -788,6 +813,8 @@ struct MotionSearch<'a> {
     y0: usize,
     mvp: [i16; 2],
     lambda: u32,
+    /// The [`EncState::mv_costs`] of `lambda`.
+    mv_costs: &'a [u16],
     bounds: MvBounds,
     /// Quarter-pel refinement iterations after the half-pel step.
     qpel_iters: u32,
@@ -796,7 +823,11 @@ struct MotionSearch<'a> {
 impl MotionSearch<'_> {
     #[inline(always)]
     fn mv_cost(&self, mv: [i32; 2]) -> u32 {
-        self.lambda * (se_bits(mv[0] - self.mvp[0] as i32) + se_bits(mv[1] - self.mvp[1] as i32))
+        let c = |d: i32| match self.mv_costs.get((d + MV_COST_RANGE) as usize) {
+            Some(&c) => c as u32,
+            None => self.lambda * se_bits(d),
+        };
+        c(mv[0] - self.mvp[0] as i32) + c(mv[1] - self.mvp[1] as i32)
     }
 
     #[inline(always)]
@@ -2354,6 +2385,7 @@ impl EncState {
         }
         cands[n] = self.prev_mb_mv[mb_idx];
         n += 1;
+        self.mv_costs(qp);
         let ms = MotionSearch {
             r: &self.refp.y,
             src: &src.y,
@@ -2361,6 +2393,7 @@ impl EncState {
             y0,
             mvp,
             lambda,
+            mv_costs: &self.mv_cost_tabs[qp as usize],
             bounds,
             qpel_iters: if sl.fast { 0 } else { 2 },
         };
