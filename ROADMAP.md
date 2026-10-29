@@ -180,7 +180,6 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `BENCH-0068` Performance and memory gates: instruction-count budgets, allocation counting and soak tests <sup>benchmark · p2 · bench</sup>
 - [ ] `0069` QA report, generated support matrix and public scorecard, with tiered CI <sup>feature · p1 · arch</sup>
 - [ ] `0070` Formal checks on unsafe code: Miri, Kani proofs and mutation testing <sup>chore · p3 · arch</sup>
-- [ ] `BUG-0082` AAC encoder ignores its target bitrate (no rate control; 35 kbit/s at 128k) <sup>bug · p2 · codec-audio</sup>
 - [ ] `BUG-0085` ragdoll bench --compare-ffmpeg prints made-up hardware telemetry and compares in-process calls with whole FFmpeg processes <sup>bug · p1 · bench</sup>
 - [ ] `BUG-0086` Audio transcode decodes the whole track into one AudioFrame, so peak RSS grows with duration <sup>bug · p2 · pipeline</sup>
 - [ ] `0088` H.264 decoder: multithreaded decoding to beat FFmpeg's frame-threaded throughput <sup>feature · p1</sup>
@@ -194,6 +193,7 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 ### in progress
 
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
+- [ ] `BUG-0082` AAC encoder ignores its target bitrate (no rate control; 35 kbit/s at 128k) <sup>bug · p2 · codec-audio</sup>
 - [ ] `SIMD-0087` Opus decoder slower than FFmpeg's native decoder (0.58x CELT, 0.69x SILK) <sup>kernel · p1</sup>
 - [ ] `SIMD-0091` FLAC encoder: match FFmpeg level 5 compression while staying faster <sup>kernel · p1 · codec-audio</sup>
 
