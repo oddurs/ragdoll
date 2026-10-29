@@ -47,6 +47,10 @@ pub struct OpusPacketEncoder {
     hybrid_stereo_width_q14: i32,
     stereo_width_q14: i32,
     range_final: u32,
+    /// The DC-rejected input of a frame, kept to reuse its allocation.
+    pcm_buf: Vec<i16>,
+    /// The range coder's buffer, kept to reuse its allocation.
+    ec_buf: Vec<u8>,
 }
 
 impl OpusPacketEncoder {
@@ -82,6 +86,8 @@ impl OpusPacketEncoder {
             hybrid_stereo_width_q14: 1 << 14,
             stereo_width_q14: 0,
             range_final: 0,
+            pcm_buf: Vec::new(),
+            ec_buf: Vec::new(),
         })
     }
 
@@ -330,7 +336,8 @@ impl OpusPacketEncoder {
             let nb_frames = frame_size / enc_frame_size;
             return self.encode_multiframe(pcm, nb_frames, enc_frame_size, data);
         }
-        let mut pcm_buf = vec![0i16; frame_size * self.channels];
+        let mut pcm_buf = std::mem::take(&mut self.pcm_buf);
+        pcm_buf.resize(frame_size * self.channels, 0);
         dc_reject(
             &pcm[..frame_size * self.channels],
             &mut pcm_buf,
@@ -379,15 +386,18 @@ impl OpusPacketEncoder {
             self.hybrid_stereo_width_q14 = self.stereo_width_q14;
         }
         let nb_compr_bytes = (max_data_bytes - 1) as usize;
-        let mut enc = Ec::encoder(nb_compr_bytes);
+        let mut enc = Ec::encoder_with(std::mem::take(&mut self.ec_buf), nb_compr_bytes);
         self.celt.start = 0;
         let mut ret = 0usize;
         if enc.tell() <= 8 * nb_compr_bytes as i32 {
             self.celt.vbr = self.use_vbr;
-            ret = self
+            let r = self
                 .celt
-                .encode_with_ec(&pcm_buf, frame_size, nb_compr_bytes, &mut enc)
-                .map_err(|_| OpusError::InternalError)?;
+                .encode_with_ec(&pcm_buf, frame_size, nb_compr_bytes, &mut enc);
+            self.pcm_buf = pcm_buf;
+            ret = r.map_err(|_| OpusError::InternalError)?;
+        } else {
+            self.pcm_buf = pcm_buf;
         }
         data[0] = gen_toc(self.mode, FS / fsz, curr_bandwidth, self.stream_channels);
         self.range_final = enc.rng;
@@ -403,6 +413,7 @@ impl OpusPacketEncoder {
             ret = 1;
             self.range_final = 0;
         }
+        self.ec_buf = enc.buf;
         ret += 1;
         if !self.use_vbr {
             packet_pad(data, ret, max_data_bytes as usize)?;
@@ -533,14 +544,33 @@ fn gen_toc(mode: i32, mut framerate: i32, bandwidth: i32, channels: usize) -> u8
 /// `dc_reject` (fixed point): a one-pole 3 Hz high-pass.
 fn dc_reject(input: &[i16], out: &mut [i16], hp_mem: &mut [i32; 4], len: usize, channels: usize) {
     let shift = ilog2(FS / (3 * 4));
-    for c in 0..channels {
-        for i in 0..len {
-            let x = (input[channels * i + c] as i32) << 14;
-            let y = x.wrapping_sub(hp_mem[2 * c]);
-            hp_mem[2 * c] =
-                hp_mem[2 * c].wrapping_add(pshr32(x.wrapping_sub(hp_mem[2 * c]), shift));
-            out[channels * i + c] = saturate(pshr32(y, 14), 32767) as i16;
+    // One sample through a channel's filter, whose state is `m`. The state is a serial
+    // recursion, so the channels of a frame advance side by side.
+    let step = |v: i16, m: &mut i32| {
+        let x = (v as i32) << 14;
+        let y = x.wrapping_sub(*m);
+        *m = m.wrapping_add(pshr32(x.wrapping_sub(*m), shift));
+        saturate(pshr32(y, 14), 32767) as i16
+    };
+    let (input, out) = (&input[..channels * len], &mut out[..channels * len]);
+    if channels == 2 {
+        let (mut m0, mut m1) = (hp_mem[0], hp_mem[2]);
+        for (o, x) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<2>().0)
+        {
+            o[0] = step(x[0], &mut m0);
+            o[1] = step(x[1], &mut m1);
         }
+        (hp_mem[0], hp_mem[2]) = (m0, m1);
+    } else {
+        let mut m = hp_mem[0];
+        for (o, &x) in out.iter_mut().zip(input) {
+            *o = step(x, &mut m);
+        }
+        hp_mem[0] = m;
     }
 }
 

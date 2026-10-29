@@ -3,7 +3,7 @@
 
 use super::celt_tables::{E_MEANS, E_PROB_MODEL};
 use super::math::{log2, mac16, mul16, mul16_32_q15, mul16_q15, pshr32, shl16, shl32};
-use super::range::Ec;
+use super::range::{Ec, EcSave};
 use super::rate::{MAX_FINE_BITS, NB_EBANDS};
 
 pub const DB_SHIFT: i32 = 10;
@@ -256,18 +256,22 @@ pub fn quant_coarse(
     if end - start > 10 {
         max_decay = max_decay.min(shl32(nb_available_bytes, DB_SHIFT - 3));
     }
-    let start_state = enc.clone();
-    let mut old_intra = old.to_vec();
-    let mut error_intra = error.to_vec();
+    let mut start_state = EcSave::default();
+    enc.save(&mut start_state);
+    let (mut old_buf, mut error_buf) = ([0i16; 2 * NB_EBANDS], [0i16; 2 * NB_EBANDS]);
+    let old_intra = &mut old_buf[..old.len()];
+    old_intra.copy_from_slice(old);
+    let error_intra = &mut error_buf[..error.len()];
+    error_intra.copy_from_slice(error);
     let mut badness1 = 0;
     if two_pass || intra {
         badness1 = quant_coarse_impl(
             start,
             end,
             e,
-            &mut old_intra,
+            old_intra,
             budget,
-            &mut error_intra,
+            error_intra,
             enc,
             c,
             lm,
@@ -277,8 +281,9 @@ pub fn quant_coarse(
     }
     if !intra {
         let tell_intra = enc.tell_frac() as i32;
-        let intra_state = enc.clone();
-        *enc = start_state;
+        let mut intra_state = EcSave::default();
+        enc.save(&mut intra_state);
+        enc.restore(&start_state);
         let badness2 = quant_coarse_impl(
             start, end, e, old, budget, error, enc, c, lm, false, max_decay,
         );
@@ -286,14 +291,14 @@ pub fn quant_coarse(
             && (badness1 < badness2
                 || (badness1 == badness2 && enc.tell_frac() as i32 + intra_bias > tell_intra))
         {
-            *enc = intra_state;
-            old.copy_from_slice(&old_intra);
-            error.copy_from_slice(&error_intra);
+            enc.restore(&intra_state);
+            old.copy_from_slice(old_intra);
+            error.copy_from_slice(error_intra);
             intra = true;
         }
     } else {
-        old.copy_from_slice(&old_intra);
-        error.copy_from_slice(&error_intra);
+        old.copy_from_slice(old_intra);
+        error.copy_from_slice(error_intra);
     }
     if intra {
         *delayed_intra = new_distortion;

@@ -183,7 +183,6 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 - [ ] `BUG-0085` ragdoll bench --compare-ffmpeg prints made-up hardware telemetry and compares in-process calls with whole FFmpeg processes <sup>bug · p1 · bench</sup>
 - [ ] `BUG-0086` Audio transcode decodes the whole track into one AudioFrame, so peak RSS grows with duration <sup>bug · p2 · pipeline</sup>
 - [ ] `0088` H.264 decoder: multithreaded decoding to beat FFmpeg's frame-threaded throughput <sup>feature · p1</sup>
-- [ ] `SIMD-0090` Opus encoder: beat libopus float speed (0.93x) <sup>kernel · p1</sup>
 
 ### up next
 
@@ -193,6 +192,7 @@ Make every published claim about Ragdoll traceable to an independent oracle. Sca
 
 - [ ] `SIMD-0076` H.264 decoder performance: SIMD macroblock reconstruction and partition-sized motion compensation <sup>kernel · p1 · codec-video</sup>
 - [ ] `SIMD-0089` H.264 encoder slower than x264 at equal compression (0.12x ultrafast) <sup>kernel · p1</sup>
+- [ ] `SIMD-0090` Opus encoder: beat libopus float speed (0.93x) <sup>kernel · p1</sup>
 
 ### shipped
 

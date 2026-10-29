@@ -21,6 +21,25 @@ pub const fn ilog(v: u32) -> i32 {
     (32 - v.leading_zeros()) as i32
 }
 
+/// The largest coder buffer an [`EcSave`] holds: a CELT frame's 1275 bytes.
+const SAVE_BYTES: usize = 1275;
+
+/// An encoder state saved by [`Ec::save`]: the coder (`ec_save = *ec`) with its buffer's
+/// bytes, so that the encoder can try a choice and go back on it without allocating.
+pub struct EcSave {
+    ec: Ec,
+    bytes: [u8; SAVE_BYTES],
+}
+
+impl Default for EcSave {
+    fn default() -> Self {
+        Self {
+            ec: Ec::encoder_with(Vec::new(), 0),
+            bytes: [0; SAVE_BYTES],
+        }
+    }
+}
+
 /// Range coder state (`ec_ctx`).
 #[derive(Clone, Debug)]
 pub struct Ec {
@@ -68,10 +87,13 @@ impl Ec {
         d
     }
 
-    /// Starts encoding into a buffer of `size` bytes (`ec_enc_init`).
-    pub fn encoder(size: usize) -> Self {
+    /// Starts encoding into a buffer of `size` bytes (`ec_enc_init`), held in `buf` (cleared to
+    /// `size` zero bytes) so that a caller can reuse one allocation.
+    pub fn encoder_with(mut buf: Vec<u8>, size: usize) -> Self {
+        buf.clear();
+        buf.resize(size, 0);
         Self {
-            buf: vec![0; size],
+            buf,
             storage: size as u32,
             end_offs: 0,
             end_window: 0,
@@ -84,6 +106,25 @@ impl Ec {
             rem: -1,
             error: 0,
         }
+    }
+
+    /// Saves this encoder's state, buffer included, into `s` (the buffer's `storage` bytes,
+    /// at most [`SAVE_BYTES`]).
+    pub fn save(&self, s: &mut EcSave) {
+        let len = self.storage as usize;
+        s.bytes[..len].copy_from_slice(&self.buf[..len]);
+        s.ec = Ec {
+            buf: Vec::new(),
+            ..*self
+        };
+    }
+
+    /// Returns this encoder to the state [`Self::save`] put in `s`.
+    pub fn restore(&mut self, s: &EcSave) {
+        let mut buf = std::mem::take(&mut self.buf);
+        let len = s.ec.storage as usize;
+        buf[..len].copy_from_slice(&s.bytes[..len]);
+        *self = Ec { buf, ..s.ec };
     }
 
     /// Bits used so far, rounded up (`ec_tell`).

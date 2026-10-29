@@ -31,6 +31,7 @@ mod silk;
 mod silk_dsp;
 mod silk_tables;
 mod simd;
+mod simd_enc;
 mod vq;
 
 use ragdoll_core::{

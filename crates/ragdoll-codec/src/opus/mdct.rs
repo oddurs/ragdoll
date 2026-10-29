@@ -526,8 +526,31 @@ pub(super) fn post_rotate_one(y: &mut [i32], t: &[i16], i: usize) {
 }
 
 /// `clt_mdct_forward`: forward MDCT of `input` (`N/2 + overlap` samples) into `stride`-interleaved
-/// coefficients.
+/// coefficients. `f` and `f2` are working space of at least `N/2` values.
+#[allow(clippy::too_many_arguments)]
 pub fn mdct_forward(
+    input: &[i32],
+    out: &mut [i32],
+    window: &[i16],
+    overlap: usize,
+    shift: usize,
+    stride: usize,
+    f: &mut [i32],
+    f2: &mut [i32],
+) {
+    let (t, n) = trig(shift);
+    let st = &FFT_STATES[shift];
+    let n2 = n >> 1;
+    let (f, f2) = (&mut f[..n2], &mut f2[..n2]);
+    fold_forward(input, f, window, overlap);
+    pre_rotate_forward(f, f2, &t[..n2], st);
+    fft_impl(st, f2);
+    post_rotate_forward(f2, out, &t[..n2], stride);
+}
+
+/// [`mdct_forward`] as libopus writes it, the reference of the stages' SIMD versions.
+#[cfg(test)]
+pub fn mdct_forward_scalar(
     input: &[i32],
     out: &mut [i32],
     window: &[i16],
@@ -537,58 +560,79 @@ pub fn mdct_forward(
 ) {
     let (t, n) = trig(shift);
     let st = &FFT_STATES[shift];
-    let scale = st.scale;
-    let scale_shift = st.scale_shift - 1;
     let n2 = n >> 1;
-    let n4 = n >> 2;
-    let mut fbuf = [0i32; 960];
-    let f = &mut fbuf[..n2];
-    {
-        // Window, shuffle and fold.
-        let mut xp1 = overlap >> 1;
-        let mut xp2 = n2 - 1 + (overlap >> 1);
-        let mut wp1 = overlap >> 1;
-        let mut wp2 = (overlap >> 1).wrapping_sub(1);
-        let mut yp = 0usize;
-        let mut i = 0usize;
-        while i < (overlap + 3) >> 2 {
-            f[yp] = mul16_32_q15(window[wp2] as i32, input[xp1 + n2])
-                .wrapping_add(mul16_32_q15(window[wp1] as i32, input[xp2]));
-            f[yp + 1] = mul16_32_q15(window[wp1] as i32, input[xp1])
-                .wrapping_sub(mul16_32_q15(window[wp2] as i32, input[xp2 - n2]));
-            yp += 2;
-            xp1 += 2;
-            xp2 = xp2.wrapping_sub(2);
-            wp1 += 2;
-            wp2 = wp2.wrapping_sub(2);
-            i += 1;
-        }
-        wp1 = 0;
-        wp2 = overlap - 1;
-        while i < n4 - ((overlap + 3) >> 2) {
-            f[yp] = input[xp2];
-            f[yp + 1] = input[xp1];
-            yp += 2;
-            xp1 += 2;
-            xp2 = xp2.wrapping_sub(2);
-            i += 1;
-        }
-        while i < n4 {
-            f[yp] = mul16_32_q15(window[wp2] as i32, input[xp2])
-                .wrapping_sub(mul16_32_q15(window[wp1] as i32, input[xp1 - n2]));
-            f[yp + 1] = mul16_32_q15(window[wp2] as i32, input[xp1])
-                .wrapping_add(mul16_32_q15(window[wp1] as i32, input[xp2 + n2]));
-            yp += 2;
-            xp1 += 2;
-            xp2 = xp2.wrapping_sub(2);
-            wp1 += 2;
-            wp2 = wp2.wrapping_sub(2);
-            i += 1;
-        }
+    let (mut f, mut f2) = (vec![0i32; n2], vec![0i32; n2]);
+    let q = (overlap + 3) >> 2;
+    fold_window_scalar(input, &mut f, window, overlap);
+    fold_copy_scalar(input, &mut f, overlap >> 1, q, (n >> 2) - q);
+    pre_rotate_forward_scalar(&f, &mut f2, &t[..n2], st, 0);
+    fft_impl_scalar(st, &mut f2);
+    post_rotate_forward_scalar(&f2, out, &t[..n2], stride, 0, n >> 2);
+}
+
+/// Window, shuffle and fold of the forward MDCT: `f` (`N/2` values) from `input`.
+fn fold_forward(input: &[i32], f: &mut [i32], window: &[i16], overlap: usize) {
+    let n4 = f.len() >> 1;
+    let q = (overlap + 3) >> 2;
+    fold_window_scalar(input, f, window, overlap);
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd_enc::fold_copy_avx2(input, f, overlap >> 1, q, n4 - q) };
+        fold_copy_scalar(input, f, overlap >> 1, done, n4 - q);
+        return;
     }
-    let mut f2buf = [0i32; 960];
-    let f2 = &mut f2buf[..n2];
-    for i in 0..n4 {
+    fold_copy_scalar(input, f, overlap >> 1, q, n4 - q);
+}
+
+/// The windowed steps of the forward MDCT's folding: the first and last `(overlap + 3) / 4`.
+pub fn fold_window_scalar(input: &[i32], f: &mut [i32], window: &[i16], overlap: usize) {
+    let n2 = f.len();
+    let n4 = n2 >> 1;
+    let q = (overlap + 3) >> 2;
+    let h = overlap >> 1;
+    for i in 0..q {
+        let (xp1, xp2) = (h + 2 * i, n2 - 1 + h - 2 * i);
+        let (w1, w2) = (window[h + 2 * i] as i32, window[h - 1 - 2 * i] as i32);
+        f[2 * i] = mul16_32_q15(w2, input[xp1 + n2]).wrapping_add(mul16_32_q15(w1, input[xp2]));
+        f[2 * i + 1] = mul16_32_q15(w1, input[xp1]).wrapping_sub(mul16_32_q15(w2, input[xp2 - n2]));
+    }
+    for i in n4 - q..n4 {
+        let k = i - (n4 - q);
+        let (xp1, xp2) = (h + 2 * i, n2 - 1 + h - 2 * i);
+        let (w1, w2) = (window[2 * k] as i32, window[overlap - 1 - 2 * k] as i32);
+        f[2 * i] = mul16_32_q15(w2, input[xp2]).wrapping_sub(mul16_32_q15(w1, input[xp1 - n2]));
+        f[2 * i + 1] = mul16_32_q15(w2, input[xp1]).wrapping_add(mul16_32_q15(w1, input[xp2 + n2]));
+    }
+}
+
+/// The unwindowed steps `i0..i1` of the forward MDCT's folding (`h` is half the overlap).
+pub fn fold_copy_scalar(input: &[i32], f: &mut [i32], h: usize, i0: usize, i1: usize) {
+    let n2 = f.len();
+    for i in i0..i1 {
+        f[2 * i] = input[n2 - 1 + h - 2 * i];
+        f[2 * i + 1] = input[h + 2 * i];
+    }
+}
+
+/// Pre-rotation of the forward MDCT: the folded `f` rotated, scaled and bit-reversed into
+/// `f2`, the FFT input.
+fn pre_rotate_forward(f: &[i32], f2: &mut [i32], t: &[i16], st: &FftState) {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2; `bitrev` is a permutation.
+        let done = unsafe { super::simd_enc::pre_rotate_forward_avx2(f, f2, t, st) };
+        pre_rotate_forward_scalar(f, f2, t, st, done);
+        return;
+    }
+    pre_rotate_forward_scalar(f, f2, t, st, 0);
+}
+
+/// Scalar reference of [`pre_rotate_forward`], from step `i0` on.
+pub fn pre_rotate_forward_scalar(f: &[i32], f2: &mut [i32], t: &[i16], st: &FftState, i0: usize) {
+    let n4 = f.len() >> 1;
+    let (scale, scale_shift) = (st.scale, st.scale_shift - 1);
+    for i in i0..n4 {
         let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
         let (re, im) = (f[2 * i], f[2 * i + 1]);
         let yr = smul(re, t0).wrapping_sub(smul(im, t1));
@@ -597,16 +641,37 @@ pub fn mdct_forward(
         f2[2 * rev] = pshr32(mul16_32_q16(scale, yr), scale_shift);
         f2[2 * rev + 1] = pshr32(mul16_32_q16(scale, yi), scale_shift);
     }
-    fft_impl(st, f2);
-    let mut yp1 = 0usize;
-    let mut yp2 = stride * (n2 - 1);
-    for (i, fp) in f2.as_chunks::<2>().0.iter().enumerate() {
+}
+
+/// Post-rotation of the forward MDCT: the FFT output `f2` rotated into `stride`-interleaved
+/// coefficients, from both ends of `out`.
+fn post_rotate_forward(f2: &[i32], out: &mut [i32], t: &[i16], stride: usize) {
+    let n4 = f2.len() >> 1;
+    #[cfg(target_arch = "x86_64")]
+    if stride == 1 && ragdoll_core::dispatch::avx2() {
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd_enc::post_rotate_forward_avx2(f2, out, t) };
+        post_rotate_forward_scalar(f2, out, t, stride, done, n4 - done);
+        return;
+    }
+    post_rotate_forward_scalar(f2, out, t, stride, 0, n4);
+}
+
+/// Scalar reference of [`post_rotate_forward`], steps `i0..i1`.
+pub fn post_rotate_forward_scalar(
+    f2: &[i32],
+    out: &mut [i32],
+    t: &[i16],
+    stride: usize,
+    i0: usize,
+    i1: usize,
+) {
+    let n2 = f2.len();
+    let n4 = n2 >> 1;
+    for i in i0..i1 {
         let (t0, t1) = (t[i] as i32, t[n4 + i] as i32);
-        let yr = smul(fp[1], t1).wrapping_sub(smul(fp[0], t0));
-        let yi = smul(fp[0], t1).wrapping_add(smul(fp[1], t0));
-        out[yp1] = yr;
-        out[yp2] = yi;
-        yp1 += 2 * stride;
-        yp2 = yp2.wrapping_sub(2 * stride);
+        let (re, im) = (f2[2 * i], f2[2 * i + 1]);
+        out[2 * stride * i] = smul(im, t1).wrapping_sub(smul(re, t0));
+        out[stride * (n2 - 1 - 2 * i)] = smul(re, t1).wrapping_add(smul(im, t0));
     }
 }

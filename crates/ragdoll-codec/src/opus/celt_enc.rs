@@ -3,18 +3,19 @@
 //! input. The analysis-driven paths of libopus (tonality analysis, surround masking, LFE, hybrid
 //! mode) are not used by the Opus layer here and are left out.
 
-use super::bands::{AllBands, compute_band_energies, haar1, normalise_bands, quant_all_bands};
+use super::bands::{
+    AllBands, MAX_BAND, compute_band_energies, haar1, normalise_bands, quant_all_bands,
+};
 use super::celt::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF};
 use super::celt_tables::{E_MEANS, EBANDS, LOG_N, WINDOW};
 use super::energy::{DB_SHIFT, amp2log2, quant_coarse, quant_finalise, quant_fine};
 use super::math::{
-    add16, celt_udiv, exp2, frac_div32, ilog2, inner_prod, log2, mac16, maxabs16, mul16,
-    mul16_32_q15, mul16_q14, mul16_q15, pshr32, rcp, rsqrt_norm, shl16, shl32, sqrt, sround16,
-    sub16, vshr32,
+    add16, celt_udiv, exp2, frac_div32, ilog2, inner_prod, log2, maxabs16, mul16, mul16_32_q15,
+    mul16_q14, mul16_q15, pshr32, rcp, rsqrt_norm, shl16, shl32, sqrt, sround16, sub16, vshr32,
 };
 use super::mdct::mdct_forward;
 use super::plc::{
-    COMBFILTER_MINPERIOD, Comb, SIG_SHIFT, comb_filter_to, pitch_downsample, pitch_search,
+    COMBFILTER_MINPERIOD, Comb, SIG_SHIFT, comb_filter_to, dot16, pitch_downsample, pitch_search,
 };
 use super::range::{BITRES, Ec, ilog};
 use super::rate::{NB_EBANDS, compute_allocation, init_caps};
@@ -75,6 +76,33 @@ pub struct CeltEncoder {
     old_log_e: [i16; 2 * NB_EBANDS],
     old_log_e2: [i16; 2 * NB_EBANDS],
     energy_error: [i16; 2 * NB_EBANDS],
+    scratch: Scratch,
+}
+
+/// Per-frame working buffers, kept between frames to reuse their allocations. Every value a
+/// frame reads is written by that frame first (but for `x`, cleared each frame).
+#[derive(Clone, Default)]
+struct Scratch {
+    /// Pre-emphasised, pre-filtered input with the overlap history (`cc * (n + OVERLAP)`).
+    inb: Vec<i32>,
+    /// MDCT coefficients (`cc * n`).
+    freq: Vec<i32>,
+    /// Normalised bands (`c * n`).
+    x: Vec<i16>,
+    /// Pre-filter input with the pitch history (`cc * (n + MAXPERIOD)`).
+    pre: Vec<i32>,
+    /// The 2x-decimated pitch analysis signal.
+    pitch_buf: Vec<i16>,
+    /// Transient analysis signal.
+    tmp: Vec<i16>,
+    /// MDCT working space (`2 * 960`).
+    mdct: Vec<i32>,
+}
+
+/// `v` resized to `len` values; existing values are kept, not cleared.
+fn sized<T: Copy + Default>(v: &mut Vec<T>, len: usize) -> &mut [T] {
+    v.resize(len, T::default());
+    &mut v[..len]
 }
 
 impl CeltEncoder {
@@ -120,6 +148,7 @@ impl CeltEncoder {
             old_log_e: [0; 2 * NB_EBANDS],
             old_log_e2: [0; 2 * NB_EBANDS],
             energy_error: [0; 2 * NB_EBANDS],
+            scratch: Scratch::default(),
         };
         s.reset();
         s
@@ -178,6 +207,20 @@ impl CeltEncoder {
         nb_compressed_bytes: usize,
         enc: &mut Ec,
     ) -> Result<usize, ()> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let r = self.encode_frame(pcm, frame_size, nb_compressed_bytes, enc, &mut scratch);
+        self.scratch = scratch;
+        r
+    }
+
+    fn encode_frame(
+        &mut self,
+        pcm: &[i16],
+        frame_size: usize,
+        nb_compressed_bytes: usize,
+        enc: &mut Ec,
+        scratch: &mut Scratch,
+    ) -> Result<usize, ()> {
         let cc = self.channels;
         let c = self.stream_channels;
         let start = self.start;
@@ -230,7 +273,7 @@ impl CeltEncoder {
         }
         let mut total_bits = nb_compressed_bytes * 8;
         let eff_end = end.min(NB_EBANDS);
-        let mut inb = vec![0i32; cc * (n + OVERLAP)];
+        let inb = sized(&mut scratch.inb, cc * (n + OVERLAP));
         let mut sample_max = self.overlap_max.max(maxabs16(&pcm[..c * (n - OVERLAP)]));
         self.overlap_max = maxabs16(&pcm[c * (n - OVERLAP)..c * n]);
         sample_max = sample_max.max(self.overlap_max);
@@ -252,15 +295,14 @@ impl CeltEncoder {
             enc.nbits_total += tell - enc.tell();
         }
         for ch in 0..cc {
-            // celt_preemphasis, fast path (no clipping, no upsampling).
-            let mut mm = self.preemph_mem_e[ch];
             let base = ch * (n + OVERLAP) + OVERLAP;
-            for i in 0..n {
-                let x = pcm[cc * i + ch] as i32;
-                inb[base + i] = shl32(x, SIG_SHIFT).wrapping_sub(mm);
-                mm = mul16(PREEMPH, x) >> (15 - SIG_SHIFT);
-            }
-            self.preemph_mem_e[ch] = mm;
+            self.preemph_mem_e[ch] = preemphasis(
+                &pcm[..cc * n],
+                cc,
+                ch,
+                &mut inb[base..base + n],
+                self.preemph_mem_e[ch],
+            );
         }
         let mut pitch_index = MINPERIOD as i32;
         let mut gain1 = 0i32;
@@ -274,7 +316,9 @@ impl CeltEncoder {
             prefilter_tapset = self.tapset_decision;
             let mut qg = 0;
             pf_on = self.run_prefilter(
-                &mut inb,
+                inb,
+                &mut scratch.pre,
+                &mut scratch.pitch_buf,
                 n,
                 prefilter_tapset,
                 &mut pitch_index,
@@ -302,8 +346,14 @@ impl CeltEncoder {
         let mut short_blocks = 0usize;
         let mut tf_chan = 0usize;
         if self.complexity >= 1 {
-            is_transient =
-                transient_analysis(&inb, n + OVERLAP, cc, &mut tf_estimate, &mut tf_chan);
+            is_transient = transient_analysis(
+                inb,
+                n + OVERLAP,
+                cc,
+                &mut tf_estimate,
+                &mut tf_chan,
+                &mut scratch.tmp,
+            );
         }
         let mut transient_got_disabled = false;
         if lm > 0 && enc.tell() + 3 <= total_bits {
@@ -314,24 +364,24 @@ impl CeltEncoder {
             is_transient = false;
             transient_got_disabled = true;
         }
-        let mut freq = vec![0i32; cc * n];
+        let freq = sized(&mut scratch.freq, cc * n);
         let mut band_e = [0i32; 2 * NB_EBANDS];
         let mut band_log_e = [0i16; 2 * NB_EBANDS];
         let mut band_log_e2 = [0i16; 2 * NB_EBANDS];
         let second_mdct = short_blocks != 0 && self.complexity >= 8;
         if second_mdct {
-            compute_mdcts(0, &inb, &mut freq, c, cc, lm);
-            compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+            compute_mdcts(0, inb, freq, c, cc, lm, &mut scratch.mdct);
+            compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e2, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
                 *v = add16(*v as i32, shl16(lm, DB_SHIFT) >> 1) as i16;
             }
         }
-        compute_mdcts(short_blocks, &inb, &mut freq, c, cc, lm);
+        compute_mdcts(short_blocks, inb, freq, c, cc, lm, &mut scratch.mdct);
         if cc == 2 && c == 1 {
             tf_chan = 0;
         }
-        compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+        compute_band_energies(freq, &mut band_e, eff_end, c, lm);
         amp2log2(eff_end, end, &band_e, &mut band_log_e, c);
         let temporal_vbr;
         {
@@ -366,8 +416,8 @@ impl CeltEncoder {
         {
             is_transient = true;
             short_blocks = m;
-            compute_mdcts(short_blocks, &inb, &mut freq, c, cc, lm);
-            compute_band_energies(&freq, &mut band_e, eff_end, c, lm);
+            compute_mdcts(short_blocks, inb, freq, c, cc, lm, &mut scratch.mdct);
+            compute_band_energies(freq, &mut band_e, eff_end, c, lm);
             amp2log2(eff_end, end, &band_e, &mut band_log_e, c);
             for v in band_log_e2[..c * NB_EBANDS].iter_mut() {
                 *v = add16(*v as i32, shl16(lm, DB_SHIFT) >> 1) as i16;
@@ -377,8 +427,9 @@ impl CeltEncoder {
         if lm > 0 && enc.tell() + 3 <= total_bits {
             enc.enc_bit_logp(is_transient, 3);
         }
-        let mut x = vec![0i16; c * n];
-        normalise_bands(&freq, &mut x, &band_e, eff_end, c, m);
+        let x = sized(&mut scratch.x, c * n);
+        x.fill(0);
+        normalise_bands(freq, x, &band_e, eff_end, c, m);
         let enable_tf_analysis = effective_bytes >= 15 * ci && self.complexity >= 2;
         let mut offsets = [0i32; NB_EBANDS];
         let mut importance = [0i32; NB_EBANDS];
@@ -410,7 +461,7 @@ impl CeltEncoder {
                 is_transient,
                 &mut tf_res,
                 lambda,
-                &x,
+                x,
                 n,
                 lm,
                 tf_estimate,
@@ -464,7 +515,7 @@ impl CeltEncoder {
                 };
             } else {
                 self.spread_decision = spreading_decision(
-                    &x,
+                    x,
                     &mut self.tonal_average,
                     self.spread_decision,
                     &mut self.hf_average,
@@ -516,7 +567,7 @@ impl CeltEncoder {
                 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4, 5, 6, 8, 8,
             ];
             if lm != 0 {
-                dual_stereo = stereo_analysis(&x, lm, n);
+                dual_stereo = stereo_analysis(x, lm, n);
             }
             self.intensity = hysteresis_decision(
                 (equiv_rate / 1000) as i16 as i32,
@@ -529,7 +580,7 @@ impl CeltEncoder {
         let mut alloc_trim = 5;
         if tellf + (6 << BITRES) <= total_bits - total_boost {
             alloc_trim = alloc_trim_analysis(
-                &x,
+                x,
                 &band_log_e,
                 end,
                 lm,
@@ -671,7 +722,7 @@ impl CeltEncoder {
                 complexity: self.complexity,
                 norm: &mut [0; 2 * 8 * 78],
             },
-            &mut x,
+            x,
             c,
             enc,
             &mut seed,
@@ -745,6 +796,8 @@ impl CeltEncoder {
     fn run_prefilter(
         &mut self,
         inb: &mut [i32],
+        pre_buf: &mut Vec<i32>,
+        pitch_buf: &mut Vec<i16>,
         n: usize,
         prefilter_tapset: i32,
         pitch: &mut i32,
@@ -754,8 +807,8 @@ impl CeltEncoder {
         nb_available_bytes: i32,
     ) -> bool {
         let cc = self.channels;
-        let mut pre = vec![vec![0i32; n + MAXPERIOD]; cc];
-        for (ch, p) in pre.iter_mut().enumerate() {
+        let pre = sized(pre_buf, cc * (n + MAXPERIOD));
+        for (ch, p) in pre.chunks_exact_mut(n + MAXPERIOD).enumerate() {
             p[..MAXPERIOD]
                 .copy_from_slice(&self.prefilter_mem[ch * MAXPERIOD..(ch + 1) * MAXPERIOD]);
             let base = ch * (n + OVERLAP) + OVERLAP;
@@ -764,18 +817,19 @@ impl CeltEncoder {
         let mut pitch_index;
         let mut gain1;
         if enabled {
-            let mut pitch_buf = vec![0i16; (MAXPERIOD + n) >> 1];
-            let refs: Vec<&[i32]> = pre.iter().map(|p| p.as_slice()).collect();
-            pitch_downsample(&refs, &mut pitch_buf, MAXPERIOD + n);
+            let pitch_buf = sized(pitch_buf, (MAXPERIOD + n) >> 1);
+            let (p0, p1) = pre.split_at(n + MAXPERIOD);
+            let refs: [&[i32]; 2] = [p0, p1];
+            pitch_downsample(&refs[..cc], pitch_buf, MAXPERIOD + n);
             pitch_index = pitch_search(
                 &pitch_buf[MAXPERIOD >> 1..],
-                &pitch_buf,
+                pitch_buf,
                 n,
                 MAXPERIOD - 3 * MINPERIOD,
             ) as i32;
             pitch_index = MAXPERIOD as i32 - pitch_index;
             gain1 = remove_doubling(
-                &pitch_buf,
+                pitch_buf,
                 MAXPERIOD,
                 MINPERIOD,
                 n,
@@ -831,7 +885,7 @@ impl CeltEncoder {
             gain1 = 3072 * (qg + 1);
             pf_on = true;
         }
-        for (ch, p) in pre.iter().enumerate() {
+        for (ch, p) in pre.chunks_exact(n + MAXPERIOD).enumerate() {
             self.prefilter_period = self.prefilter_period.max(COMBFILTER_MINPERIOD);
             let base = ch * (n + OVERLAP);
             inb[base..base + OVERLAP]
@@ -869,7 +923,53 @@ impl CeltEncoder {
     }
 }
 
-fn compute_mdcts(short_blocks: usize, inb: &[i32], out: &mut [i32], c: usize, cc: usize, lm: i32) {
+/// `celt_preemphasis`, fast path (no clipping, no upsampling): channel `ch` of the `cc`
+/// interleaved channels of `pcm` into `out`, from and returning the filter memory.
+pub fn preemphasis(pcm: &[i16], cc: usize, ch: usize, out: &mut [i32], mem: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && !out.is_empty() {
+        out[0] = shl32(pcm[ch] as i32, SIG_SHIFT).wrapping_sub(mem);
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd_enc::preemphasis_avx2(pcm, cc, ch, out) };
+        return preemphasis_scalar(pcm, cc, ch, out, mem, done);
+    }
+    preemphasis_scalar(pcm, cc, ch, out, mem, 0)
+}
+
+/// Scalar reference of [`preemphasis`], from sample `i0` on (whose memory is that of
+/// sample `i0 - 1`, or `mem` for the first).
+pub fn preemphasis_scalar(
+    pcm: &[i16],
+    cc: usize,
+    ch: usize,
+    out: &mut [i32],
+    mem: i32,
+    i0: usize,
+) -> i32 {
+    let mem_of = |x: i32| mul16(PREEMPH, x) >> (15 - SIG_SHIFT);
+    let mut mm = if i0 == 0 {
+        mem
+    } else {
+        mem_of(pcm[cc * (i0 - 1) + ch] as i32)
+    };
+    for (i, o) in out.iter_mut().enumerate().skip(i0) {
+        let x = pcm[cc * i + ch] as i32;
+        *o = shl32(x, SIG_SHIFT).wrapping_sub(mm);
+        mm = mem_of(x);
+    }
+    mm
+}
+
+fn compute_mdcts(
+    short_blocks: usize,
+    inb: &[i32],
+    out: &mut [i32],
+    c: usize,
+    cc: usize,
+    lm: i32,
+    work: &mut Vec<i32>,
+) {
+    let (f, f2) = sized(work, 2 * 960).split_at_mut(960);
     let (b, n, shift) = if short_blocks != 0 {
         (short_blocks, 120usize, 3usize)
     } else {
@@ -879,7 +979,16 @@ fn compute_mdcts(short_blocks: usize, inb: &[i32], out: &mut [i32], c: usize, cc
         for blk in 0..b {
             let ib = ch * (b * n + OVERLAP) + blk * n;
             let ob = blk + ch * n * b;
-            mdct_forward(&inb[ib..], &mut out[ob..], &WINDOW, OVERLAP, shift, b);
+            mdct_forward(
+                &inb[ib..],
+                &mut out[ob..],
+                &WINDOW,
+                OVERLAP,
+                shift,
+                b,
+                f,
+                f2,
+            );
         }
     }
     if cc == 2 && c == 1 {
@@ -895,6 +1004,7 @@ fn transient_analysis(
     c: usize,
     tf_estimate: &mut i32,
     tf_chan: &mut usize,
+    tmp: &mut Vec<i16>,
 ) -> bool {
     const INV_TABLE: [u8; 128] = [
         255, 255, 156, 110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25, 23, 22, 21, 20, 19, 18,
@@ -903,38 +1013,55 @@ fn transient_analysis(
         5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
         4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
     ];
-    let mut tmp = vec![0i16; len];
+    let tmps = sized(tmp, c * len);
     let forward_shift = 4;
     let len2 = len / 2;
     let mut mask_metric = 0i32;
-    for ch in 0..c {
-        let mut mem0 = 0i32;
-        let mut mem1 = 0i32;
-        for i in 0..len {
-            let x = inb[i + ch * len] >> SIG_SHIFT;
-            let y = mem0.wrapping_add(x);
-            mem0 = mem1.wrapping_add(y).wrapping_sub(shl32(x, 1));
-            mem1 = x.wrapping_sub(y >> 1);
-            tmp[i] = sround16(y, 2);
+    // The high-pass filter: a serial recursion per channel, so two channels run side by side.
+    #[inline(always)]
+    fn hp(v: i32, mem: &mut (i32, i32)) -> i16 {
+        let x = v >> SIG_SHIFT;
+        let y = mem.0.wrapping_add(x);
+        mem.0 = mem.1.wrapping_add(y).wrapping_sub(shl32(x, 1));
+        mem.1 = x.wrapping_sub(y >> 1);
+        sround16(y, 2)
+    }
+    if c == 2 {
+        let (t0, t1) = tmps.split_at_mut(len);
+        let (mut m0, mut m1) = ((0, 0), (0, 0));
+        for (((a, b), &u), &v) in t0.iter_mut().zip(t1).zip(&inb[..len]).zip(&inb[len..]) {
+            *a = hp(u, &mut m0);
+            *b = hp(v, &mut m1);
         }
+    } else {
+        let mut m = (0, 0);
+        for (a, &u) in tmps.iter_mut().zip(&inb[..len]) {
+            *a = hp(u, &mut m);
+        }
+    }
+    for (ch, tmp) in tmps.chunks_exact_mut(len).enumerate() {
         tmp[..12].fill(0);
-        let shift = 14 - ilog2(1.max(maxabs16(&tmp)));
+        let shift = 14 - ilog2(1.max(maxabs16(tmp)));
         if shift != 0 {
             for v in tmp.iter_mut() {
                 *v = shl16(*v as i32, shift) as i16;
             }
         }
+        // Energies of sample pairs, then their forward smoothing (in place: the pair of
+        // output i is at 2i >= i).
+        let mut x2 = [0i16; (960 + OVERLAP) / 2];
+        let x2 = &mut x2[..len2];
+        for (e, p) in x2.iter_mut().zip(tmp.as_chunks::<2>().0) {
+            let (a, b) = (p[0] as i32, p[1] as i32);
+            *e = pshr32(mul16(a, a) + mul16(b, b), 16) as i16;
+        }
         let mut mean = 0i32;
-        mem0 = 0;
-        for i in 0..len2 {
-            let x2 = pshr32(
-                mul16(tmp[2 * i] as i32, tmp[2 * i] as i32)
-                    + mul16(tmp[2 * i + 1] as i32, tmp[2 * i + 1] as i32),
-                16,
-            ) as i16 as i32;
+        let mut mem0 = 0i32;
+        for (t, &e) in tmp.iter_mut().zip(x2.iter()) {
+            let x2 = e as i32;
             mean += x2;
-            tmp[i] = (mem0 + pshr32(x2 - mem0, forward_shift)) as i16;
-            mem0 = tmp[i] as i32;
+            *t = (mem0 + pshr32(x2 - mem0, forward_shift)) as i16;
+            mem0 = *t as i32;
         }
         mem0 = 0;
         let mut max_e = 0i32;
@@ -1027,14 +1154,18 @@ fn tf_analysis(
         let n = ((eb(i + 1) - eb(i)) << lm) as usize;
         let narrow = eb(i + 1) - eb(i) == 1;
         let off = tf_chan * n0 + ((eb(i) << lm) as usize);
-        let mut tmp = x[off..off + n].to_vec();
-        let mut l1 = l1_metric(&tmp, if is_transient { lm } else { 0 }, bias);
+        let mut buf = [0i16; MAX_BAND];
+        let tmp = &mut buf[..n];
+        tmp.copy_from_slice(&x[off..off + n]);
+        let mut l1 = l1_metric(tmp, if is_transient { lm } else { 0 }, bias);
         let mut best_l1 = l1;
         let mut best_level = 0;
         if is_transient && !narrow {
-            let mut tmp1 = tmp.clone();
-            haar1(&mut tmp1, n >> lm, 1 << lm);
-            l1 = l1_metric(&tmp1, lm + 1, bias);
+            let mut buf1 = [0i16; MAX_BAND];
+            let tmp1 = &mut buf1[..n];
+            tmp1.copy_from_slice(tmp);
+            haar1(tmp1, n >> lm, 1 << lm);
+            l1 = l1_metric(tmp1, lm + 1, bias);
             if l1 < best_l1 {
                 best_l1 = l1;
                 best_level = -1;
@@ -1043,8 +1174,8 @@ fn tf_analysis(
         let kmax = lm + !(is_transient || narrow) as i32;
         for k in 0..kmax {
             let b = if is_transient { lm - k - 1 } else { k + 1 };
-            haar1(&mut tmp, n >> k, 1 << k);
-            l1 = l1_metric(&tmp, b, bias);
+            haar1(tmp, n >> k, 1 << k);
+            l1 = l1_metric(tmp, b, bias);
             if l1 < best_l1 {
                 best_l1 = l1;
                 best_level = k + 1;
@@ -1636,13 +1767,10 @@ fn remove_doubling(
     let prev_period = prev_period / 2;
     let n = n / 2;
     let xo = maxperiod as usize;
-    let at = |k: i32| x[(xo as i32 + k) as usize] as i32;
+    // Correlation of the `n` values from `xo + a` with those from `xo + b`.
     let dot = |a: i32, b: i32| -> i32 {
-        let mut s = 0i32;
-        for i in 0..n as i32 {
-            s = mac16(s, at(a + i), at(b + i));
-        }
-        s
+        let (a, b) = ((xo as i32 + a) as usize, (xo as i32 + b) as usize);
+        dot16(&x[a..a + n], &x[b..b + n])
     };
     if *t0_ >= maxperiod {
         *t0_ = maxperiod - 1;
@@ -1651,14 +1779,16 @@ fn remove_doubling(
     let mut t = t0;
     let xx = dot(0, 0);
     let mut xy = dot(0, -t0);
-    let mut yy_lookup = vec![0i32; maxperiod as usize + 1];
+    let mut yy_lookup = [0i32; MAXPERIOD / 2 + 1];
+    let yy_lookup = &mut yy_lookup[..maxperiod as usize + 1];
     yy_lookup[0] = xx;
     let mut yy = xx;
-    for i in 1..=maxperiod {
-        yy = yy
-            .wrapping_add(mul16(at(-i), at(-i)))
-            .wrapping_sub(mul16(at(n as i32 - i), at(n as i32 - i)));
-        yy_lookup[i as usize] = 0.max(yy);
+    // yy_lookup[i] = sum of x[xo - i + j]^2 for j < n: one value in, one out per step.
+    let (head, tail) = (&x[..xo], &x[..xo + n]);
+    for (i, (&a, &b)) in head.iter().rev().zip(tail.iter().rev()).enumerate() {
+        let (a, b) = (a as i32, b as i32);
+        yy = yy.wrapping_add(a * a).wrapping_sub(b * b);
+        yy_lookup[i + 1] = 0.max(yy);
     }
     yy = yy_lookup[t0 as usize];
     let mut best_xy = xy;
