@@ -113,7 +113,7 @@ fn filter_edge<const DIR: usize>(
     };
     let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
     filter_luma_edge::<DIR>(st, mb_x, mb_y, edge, bs, qp, sl);
-    if has_chroma && edge % 2 == 0 {
+    if has_chroma && edge.is_multiple_of(2) {
         for c in 0..2 {
             let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
             filter_chroma_edge::<DIR>(st, c, mb_x, mb_y, edge / 2, bs, qp, sl);
