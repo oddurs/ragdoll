@@ -824,13 +824,18 @@ struct MotionSearch<'a> {
 }
 
 impl MotionSearch<'_> {
+    /// Cost of one component `d` of a motion vector difference.
     #[inline(always)]
-    fn mv_cost(&self, mv: [i32; 2]) -> u32 {
-        let c = |d: i32| match self.mv_costs.get((d + MV_COST_RANGE) as usize) {
+    fn mvd_cost(&self, d: i32) -> u32 {
+        match self.mv_costs.get((d + MV_COST_RANGE) as usize) {
             Some(&c) => c as u32,
             None => self.lambda * se_bits(d),
-        };
-        c(mv[0] - self.mvp[0] as i32) + c(mv[1] - self.mvp[1] as i32)
+        }
+    }
+
+    #[inline(always)]
+    fn mv_cost(&self, mv: [i32; 2]) -> u32 {
+        self.mvd_cost(mv[0] - self.mvp[0] as i32) + self.mvd_cost(mv[1] - self.mvp[1] as i32)
     }
 
     #[inline(always)]
@@ -887,19 +892,38 @@ impl MotionSearch<'_> {
             });
             let mut moved = None;
             if inside {
-                let sads = pixel_sad_x4_16x16(
-                    self.src,
-                    &self.r.buf,
-                    pts.map(|p| self.full_off(p[0], p[1])),
-                    self.r.stride,
+                let (o, st) = (self.full_off(best[0], best[1]), self.r.stride);
+                let sads =
+                    pixel_sad_x4_16x16(self.src, &self.r.buf, [o - st, o - 1, o + 1, o + st], st);
+                // Each vector component takes one of three values around the centre.
+                let (dx, dy) = (
+                    best[0] * 4 - self.mvp[0] as i32,
+                    best[1] * 4 - self.mvp[1] as i32,
                 );
-                for (k, (p, sad)) in pts.iter().zip(sads).enumerate() {
-                    let cost = sad + self.mv_cost([p[0] * 4, p[1] * 4]);
-                    nb[k] = cost;
-                    if cost < best_cost {
-                        best_cost = cost;
-                        moved = Some(*p);
-                    }
+                let cx = [
+                    self.mvd_cost(dx - 4),
+                    self.mvd_cost(dx),
+                    self.mvd_cost(dx + 4),
+                ];
+                let cy = [
+                    self.mvd_cost(dy - 4),
+                    self.mvd_cost(dy),
+                    self.mvd_cost(dy + 4),
+                ];
+                nb = [
+                    sads[0] + cx[1] + cy[0],
+                    sads[1] + cx[0] + cy[1],
+                    sads[2] + cx[2] + cy[1],
+                    sads[3] + cx[1] + cy[2],
+                ];
+                // The first of the cheapest points, as a sequential strict comparison picks it.
+                let m = (0..4)
+                    .map(|k| nb[k] << 4 | k as u32)
+                    .min()
+                    .unwrap_or(u32::MAX);
+                if m >> 4 < best_cost {
+                    best_cost = m >> 4;
+                    moved = Some(pts[(m & 3) as usize]);
                 }
             } else {
                 nb = [u32::MAX; 4];
