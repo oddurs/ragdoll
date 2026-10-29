@@ -2485,7 +2485,9 @@ impl EncState {
             + lambda * (se_bits((mv[0] - mvp[0]) as i32) + se_bits((mv[1] - mvp[1]) as i32) + 1);
         if inter_satd > 24 * lambda {
             let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, !sl.fast);
-            if i16_satd + lambda * 8 < inter_cost {
+            // The Fast preset asks intra to win by twice the margin.
+            let bias = if sl.fast { 16 } else { 8 };
+            if i16_satd + lambda * bias < inter_cost {
                 self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
                 self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
                 return;
@@ -2935,8 +2937,18 @@ impl EncState {
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
-        let (chroma_mode, mut pu, mut pv) =
-            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
+        // In a P slice the Fast preset predicts chroma in the direction of the luma mode.
+        let (chroma_mode, mut pu, mut pv) = if sl.fast && !sl.is_idr {
+            let cm = [2u8, 1, 0, 3][mode as usize & 3];
+            let (tu, lu, tlu) = chroma_edges(&self.cur.u, mb_x, mb_y);
+            let (tv, lv, tlv) = chroma_edges(&self.cur.v, mb_x, mb_y);
+            let (mut pu, mut pv) = ([0u8; 64], [0u8; 64]);
+            pred_chroma(cm, tu.as_ref(), lu.as_ref(), tlu, &mut pu);
+            pred_chroma(cm, tv.as_ref(), lv.as_ref(), tlv, &mut pv);
+            (cm, pu, pv)
+        } else {
+            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast)
+        };
         self.mb_is_intra[mb_idx] = true;
         self.mb_is_i16x16[mb_idx] = true;
         self.mb_chroma_mode[mb_idx] = chroma_mode;
