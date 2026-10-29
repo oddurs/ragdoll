@@ -126,6 +126,19 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         field: cx.sh.field_pic,
         implicit,
         implicit_field,
+        unit_weights: cx.sh.weights.as_ref().map_or([0; 2], |t| {
+            [0, 1].map(|l| {
+                (0..32).fold(0u32, |m, r| {
+                    let unit = |(w, o): (i32, i32), log: u32| w == 1 << log && o == 0;
+                    let def = t.l[l].get(r).is_none_or(|e| {
+                        unit(e.luma, t.luma_log2)
+                            && unit(e.chroma[0], t.chroma_log2)
+                            && unit(e.chroma[1], t.chroma_log2)
+                    });
+                    m | (def as u32) << r
+                })
+            })
+        }),
         scratch: [[0; 256]; 2],
         partial_motion: false,
         simple: !st_mbaff
@@ -222,6 +235,9 @@ struct Dec<'a, 'c> {
     field: bool,
     implicit: Vec<[i32; 2]>,
     implicit_field: [Vec<[i32; 2]>; 2],
+    /// Explicit weights: per list, bit `r` set when reference index `r` (0..32) has default
+    /// weights and zero offsets in every component.
+    unit_weights: [u32; 2],
     /// Prediction samples of the second list, or of both for weighted prediction.
     scratch: [[u8; 256]; 2],
     /// The current MB's motion was stored for less than the whole MB, so it may vary.
@@ -2780,6 +2796,11 @@ impl<'a, 'c> Dec<'a, 'c> {
     #[inline(never)]
     fn explicit_weighting(&self, used: [bool; 2], refs: [i8; 2]) -> Option<Weighting> {
         if used == [false, false] {
+            return None;
+        }
+        // References with default weights in every component predict as without weights.
+        let unit = |l: usize| !used[l] || self.unit_weights[l] >> (refs[l] as u32 & 31) & 1 != 0;
+        if unit(0) && unit(1) {
             return None;
         }
         let eff = |c: usize| recon::effective_weighting(used, self.weighting(refs, c));
