@@ -198,6 +198,7 @@ const EMU_STRIDE: usize = 24;
 /// written to `dst` with stride `ds`. Blocks whose filter taps reach past the picture read an
 /// edge-extended copy (8.4.2.2.1 clamps reference coordinates to the picture).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn mc_luma<const AVG: bool>(
     src: &[u8],
     width: usize,
@@ -235,6 +236,33 @@ pub fn mc_luma<const AVG: bool>(
         );
         return;
     }
+    mc_luma_edge::<AVG>(src, width, height, ix, iy, w, h, (fx, fy), dst, ds);
+}
+
+/// [`mc_luma`] for a block whose filter taps reach past the picture, kept out of line.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn mc_luma_edge<const AVG: bool>(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    ix: isize,
+    iy: isize,
+    w: usize,
+    h: usize,
+    (fx, fy): (u8, u8),
+    dst: &mut [u8],
+    ds: usize,
+) {
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_luma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_luma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
+    };
+    let cols = luma_mc_cols(w);
     // Whole-sample blocks at the picture edge need no interpolation margins.
     if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
@@ -372,6 +400,7 @@ pub fn mc_chroma<const AVG: bool>(
 /// [`mc_chroma`] for the Cb and Cr blocks of one partition, which share position, vector and
 /// edge handling.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn mc_chroma_pair<const AVG: bool>(
     src: [&[u8]; 2],
     width: usize,
@@ -384,13 +413,6 @@ pub fn mc_chroma_pair<const AVG: bool>(
     dst: [&mut [u8]; 2],
     ds: usize,
 ) {
-    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
-        if AVG {
-            h264_chroma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
-        } else {
-            h264_chroma_mc(dst, ds, src, off, ss, w, h, fx, fy)
-        }
-    };
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
     let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
@@ -398,10 +420,33 @@ pub fn mc_chroma_pair<const AVG: bool>(
     if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
         let off = iy as usize * width + ix as usize;
         for (s, d) in src.into_iter().zip(dst) {
-            kernel(d, ds, s, off, width, w, h, fx, fy);
+            if AVG {
+                h264_chroma_mc_avg(d, ds, s, off, width, w, h, fx, fy)
+            } else {
+                h264_chroma_mc(d, ds, s, off, width, w, h, fx, fy)
+            }
         }
         return;
     }
+    mc_chroma_pair_edge::<AVG>(src, width, height, x, y, w, h, mv, dst, ds);
+}
+
+/// [`mc_chroma_pair`] for blocks reaching past the picture, kept out of line.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn mc_chroma_pair_edge<const AVG: bool>(
+    src: [&[u8]; 2],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    mv: [i16; 2],
+    dst: [&mut [u8]; 2],
+    ds: usize,
+) {
     for (s, d) in src.into_iter().zip(dst) {
         mc_chroma::<AVG>(s, width, height, x, y, w, h, mv, d, ds);
     }
