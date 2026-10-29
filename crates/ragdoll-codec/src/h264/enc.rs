@@ -15,7 +15,7 @@ use ragdoll_simd::{
     h264_luma_mc, hadamard4x4_16x4, hpel_hv_16x16, hpel_window, hpel_window_centre,
     intra_pred_plane, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16,
     pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
-    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -1328,12 +1328,10 @@ fn zero_sad_bound(q: &Quant4x4) -> u32 {
 
 /// Forward transforms of the sixteen $4\times4$ residual blocks of a macroblock, decoding order.
 fn dct_luma(src: &[u8; 256], pred: &[u8; 256], out: &mut [[i16; 16]; 16]) {
-    let mut strip = [[0i16; 16]; 4];
-    for s in 0..4 {
-        sub_dct4x4_16x4(&src[s * 64..], 16, &pred[s * 64..], 16, &mut strip);
-        for (bx, blk) in strip.iter().enumerate() {
-            out[Z_TO_RASTER[s * 4 + bx]] = *blk;
-        }
+    // Each 8x8 quadrant's four blocks come out in raster order, which is decoding order.
+    for (i8x8, group) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
+        sub_dct4x4_8x8(&src[o..], 16, &pred[o..], 16, group);
     }
 }
 
