@@ -99,6 +99,12 @@ pub fn resolve_thread_count(threads: usize) -> usize {
     CpuTopology::detect().optimal_threads(global_power_mode(), threads)
 }
 
+/// Frame threads of an H.264 decoder given `threads` (as for [`resolve_thread_count`]): at most
+/// 8, since each keeps up to two more pictures in flight and frame threading gains little more.
+pub(crate) fn h264_frame_threads(threads: usize) -> usize {
+    resolve_thread_count(threads).min(8)
+}
+
 /// Executes `worker_fn(index, &item)` across all items in `items` using a lock-free `AtomicUsize`
 /// work-stealing counter over `std::thread::scope`, returning results in exact deterministic index order `0..items.len()`.
 pub fn parallel_gop_map<T, R, F>(items: &[T], num_threads: usize, worker_fn: F) -> Vec<R>
@@ -2624,7 +2630,7 @@ fn decode_single_frame_at_mp4(in_p: &Path, target_sec: f64) -> Option<(VideoFram
         .iter()
         .find(|g| target_idx >= g.start && target_idx < g.end)?;
 
-    let mut dec = H264Decoder::new();
+    let mut dec = H264Decoder::new().with_threads(h264_frame_threads(0));
     if v_track.info.extra_data.len() >= 8 {
         let hdr = avcc_config_to_annex_b(&v_track.info.extra_data);
         let _ = dec.set_extradata(&hdr);
@@ -2642,6 +2648,8 @@ fn decode_single_frame_at_mp4(in_p: &Path, target_sec: f64) -> Option<(VideoFram
             gop_frames.push(f);
         }
     }
+    // Frame threads still hold the GOP's last pictures.
+    gop_frames.extend(dec.flush().unwrap_or_default());
     if gop_frames.is_empty() {
         return None;
     }
@@ -3449,6 +3457,7 @@ pub fn cut_media(
 
         if is_boundary_mid_gop && v_track.codec_id == CodecId::H264 {
             // Decode this single boundary GOP, keep frames in [from_s, to_s), and re-encode starting with an IDR keyframe
+            // One thread: each packet's picture comes back with it, to take its timing.
             let mut dec = H264Decoder::new();
             if v_track.extra_data.len() >= 8 {
                 let annex_b_hdr = avcc_config_to_annex_b(&v_track.extra_data);

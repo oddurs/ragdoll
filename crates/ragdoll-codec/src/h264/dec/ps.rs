@@ -39,8 +39,12 @@ impl WeightScales {
     }
 }
 
+/// `profile_idc` of the Baseline profile, whose streams have no B slices.
+pub const BASELINE: u8 = 66;
+
 #[derive(Clone, Debug)]
 pub struct Sps {
+    pub profile_idc: u8,
     pub id: u32,
     pub chroma_format_idc: u32,
     pub separate_colour_plane: bool,
@@ -204,6 +208,7 @@ impl Sps {
             }
         }
         let mut sps = Self {
+            profile_idc,
             id,
             chroma_format_idc,
             separate_colour_plane,
