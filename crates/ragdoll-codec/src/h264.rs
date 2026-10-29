@@ -3495,28 +3495,6 @@ fn pred_motion_partition(
     }
 }
 
-/// Computes the ITU-T H.264 8.4.1.1 `P_Skip` motion vector predictor on the $4\times4$ grid.
-#[inline]
-fn pred_pskip_motion_grid(
-    ref_grid: &[i8],
-    mv_grid: &[[i16; 2]],
-    g_stride: usize,
-    gx0: usize,
-    gy0: usize,
-) -> [i16; 2] {
-    if gx0 == 0 || gy0 == 0 {
-        return [0, 0];
-    }
-    let left_idx = gy0 * g_stride + (gx0 - 1);
-    let top_idx = (gy0 - 1) * g_stride + gx0;
-    if (ref_grid[left_idx] == 0 && mv_grid[left_idx] == [0, 0])
-        || (ref_grid[top_idx] == 0 && mv_grid[top_idx] == [0, 0])
-    {
-        return [0, 0];
-    }
-    pred_motion_partition(ref_grid, mv_grid, g_stride, gx0, gy0, 4, 0)
-}
-
 #[inline]
 fn neighbor_mvd_sum_16x16(
     mvd_grid: &[[i16; 2]],

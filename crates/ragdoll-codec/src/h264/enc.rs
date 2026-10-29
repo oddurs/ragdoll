@@ -2421,8 +2421,20 @@ impl EncState {
         let bounds = MvBounds::new(x0, y0, self.refp.y.w, self.refp.y.h);
         let lambda = LAMBDA[qp as usize] as u32;
 
-        let pskip_mv = pred_pskip_motion_grid(&self.ref_grid, &self.mv_grid, g_stride, gx0, gy0);
         let mvp = pred_motion_partition(&self.ref_grid, &self.mv_grid, g_stride, gx0, gy0, 4, 0);
+        // The P_Skip predictor (8.4.1.1): zero at the picture edge or next to a still neighbour,
+        // else the median predictor.
+        let pskip_mv = {
+            let (r, m) = (&self.ref_grid, &self.mv_grid);
+            let zero = |i: usize| r[i] == 0 && m[i] == [0, 0];
+            if gx0 == 0 || gy0 == 0 {
+                [0, 0]
+            } else if zero(gy0 * g_stride + gx0 - 1) || zero((gy0 - 1) * g_stride + gx0) {
+                [0, 0]
+            } else {
+                mvp
+            }
+        };
         let mut py = [0u8; 256];
         let mut pu = [0u8; 64];
         let mut pv = [0u8; 64];
