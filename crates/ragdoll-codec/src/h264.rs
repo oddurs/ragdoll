@@ -54,7 +54,7 @@ pub enum H264Speed {
     #[default]
     Balanced,
     /// Throughput first, like `x264 --preset ultrafast`: half-pel motion only, intra
-    /// macroblocks coded as $16\times16$ without the plane mode, deblocking disabled. Still smaller than `x264`
+    /// macroblocks coded as $16\times16$ and plane modes skipped, deblocking disabled. Still smaller than `x264`
     /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
     Fast,
 }

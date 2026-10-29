@@ -1079,12 +1079,14 @@ fn i4_edges(
     (top, left, tl)
 }
 
-/// Picks the intra chroma mode with the least SAD; returns it with both predictions.
+/// Picks the intra chroma mode with the least SAD (the plane mode only with `plane`); returns it
+/// with both predictions.
 fn analyse_chroma_intra(
     pic: &Pic,
     mb_x: usize,
     mb_y: usize,
     src: &MbSrc,
+    plane: bool,
 ) -> (u8, [u8; 64], [u8; 64]) {
     let (tu, lu, tlu) = chroma_edges(&pic.u, mb_x, mb_y);
     let (tv, lv, tlv) = chroma_edges(&pic.v, mb_x, mb_y);
@@ -1093,7 +1095,7 @@ fn analyse_chroma_intra(
         let ok = match mode {
             1 => lu.is_some(),
             2 => tu.is_some(),
-            3 => tu.is_some() && lu.is_some(),
+            3 => plane && tu.is_some() && lu.is_some(),
             _ => true,
         };
         if !ok {
@@ -2520,7 +2522,8 @@ impl EncState {
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
-        let (chroma_mode, mut pu, mut pv) = analyse_chroma_intra(&self.cur, mb_x, mb_y, src);
+        let (chroma_mode, mut pu, mut pv) =
+            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
         let c = quant_chroma(src, &pu, &pv, qpc, true);
         let cbp_chroma = c.cbp();
@@ -2662,7 +2665,8 @@ impl EncState {
         let mb_w = self.mb_w;
         let mb_idx = mb_y * mb_w + mb_x;
         let (g_stride, cg_stride) = (mb_w * 4, mb_w * 2);
-        let (chroma_mode, mut pu, mut pv) = analyse_chroma_intra(&self.cur, mb_x, mb_y, src);
+        let (chroma_mode, mut pu, mut pv) =
+            analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
         self.mb_is_intra[mb_idx] = true;
         self.mb_is_i16x16[mb_idx] = true;
         self.mb_chroma_mode[mb_idx] = chroma_mode;
