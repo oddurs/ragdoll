@@ -591,8 +591,7 @@ fn write_cavlc_residuals(
     cbp_luma: u8,
     cbp_chroma: u8,
     luma_q4: &[[i16; 16]; 16],
-    chroma_dc: &[[i16; 4]; 2],
-    chroma_ac: &[[[i16; 15]; 4]; 2],
+    chroma: &ChromaLevels,
     luma_nnz: &mut [u8],
     chroma_nnz: &mut [Vec<u8>; 2],
 ) {
@@ -617,41 +616,31 @@ fn write_cavlc_residuals(
             luma_nnz[g] = mask.count_ones() as u8;
         }
     }
-    write_cavlc_chroma(
-        w, mb_x, mb_y, mb_w, cbp_chroma, chroma_dc, chroma_ac, chroma_nnz,
-    );
+    write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, chroma, chroma_nnz);
 }
 
 /// Writes the CAVLC chroma DC and AC blocks that `cbp_chroma` signals.
-#[allow(clippy::too_many_arguments)]
 fn write_cavlc_chroma(
     w: &mut Bits,
     mb_x: usize,
     mb_y: usize,
     mb_w: usize,
     cbp_chroma: u8,
-    chroma_dc: &[[i16; 4]; 2],
-    chroma_ac: &[[[i16; 15]; 4]; 2],
+    chroma: &ChromaLevels,
     chroma_nnz: &mut [Vec<u8>; 2],
 ) {
     if cbp_chroma >= 1 {
-        for dc in chroma_dc {
+        for dc in &chroma.dc {
             write_cavlc_block(w, dc, 0);
         }
     }
     if cbp_chroma >= 2 {
         let cg_stride = mb_w * 2;
-        for (plane, nnz) in chroma_ac.iter().zip(chroma_nnz.iter_mut()) {
-            // Levels at 1..16 behind a zero DC slot, so the masks come from the SIMD kernel.
-            let mut padded = [[0i16; 16]; 4];
-            for (p, ac) in padded.iter_mut().zip(plane) {
-                p[1..].copy_from_slice(ac);
-            }
-            let masks = nonzero_mask_4x4_x4(&padded);
-            for (b, (p, &mask)) in padded.iter().zip(&masks).enumerate() {
+        for (p, nnz) in chroma_nnz.iter_mut().enumerate() {
+            for (b, (ac, &mask)) in chroma.ac[p].iter().zip(&chroma.ac_masks[p]).enumerate() {
                 let (cgx, cgy) = (mb_x * 2 + (b & 1), mb_y * 2 + (b >> 1));
                 let nc = predict_chroma_nc(nnz, cg_stride, cgx, cgy);
-                write_cavlc_masked::<15>(w, &p[1..], nc, mask >> 1);
+                write_cavlc_masked::<15>(w, ac, nc, mask);
                 nnz[cgy * cg_stride + cgx] = mask.count_ones() as u8;
             }
         }
@@ -1147,8 +1136,7 @@ struct InterResidual {
     luma_q8: [[i16; 64]; 4],
     use_8x8: bool,
     cbp_luma: u8,
-    chroma_dc: [[i16; 4]; 2],
-    chroma_ac: [[[i16; 15]; 4]; 2],
+    chroma: ChromaLevels,
     cbp_chroma: u8,
 }
 
@@ -1275,9 +1263,18 @@ struct ChromaLevels {
     ac: [[[i16; 15]; 4]; 2],
     /// Masks of the non-zero AC levels (bit `i` for `ac[..][..][i]`).
     ac_masks: [[u32; 4]; 2],
+    /// The AC levels in raster order; the DC slot holds no level.
+    raster: [[[i16; 16]; 4]; 2],
 }
 
 impl ChromaLevels {
+    const ZERO: Self = Self {
+        dc: [[0; 4]; 2],
+        ac: [[[0; 15]; 4]; 2],
+        ac_masks: [[0; 4]; 2],
+        raster: [[[0; 16]; 4]; 2],
+    };
+
     /// `coded_block_pattern` chroma: 2 with AC levels, 1 with DC levels only, else 0.
     fn cbp(&self) -> u8 {
         if self.ac_masks.iter().flatten().any(|&m| m != 0) {
@@ -1300,11 +1297,7 @@ impl ChromaLevels {
 /// Transforms and quantizes the chroma residual of both planes.
 fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool) -> ChromaLevels {
     let q = quant4(qpc, intra);
-    let mut out = ChromaLevels {
-        dc: [[0; 4]; 2],
-        ac: [[[0; 15]; 4]; 2],
-        ac_masks: [[0; 4]; 2],
-    };
+    let mut out = ChromaLevels::ZERO;
     for (p, (s, pred)) in [(&src.u, pu), (&src.v, pv)].into_iter().enumerate() {
         let mut c = [[0i16; 16]; 4];
         sub_dct4x4_8x8(s, 8, pred, 8, &mut c);
@@ -1316,6 +1309,7 @@ fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool)
             for (a, z) in out.ac[p].iter_mut().zip(&zz) {
                 a.copy_from_slice(&z[1..]);
             }
+            out.raster[p] = c;
         }
         out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
     }
@@ -1344,8 +1338,7 @@ fn recon_luma_4x4(pred: &mut [u8; 256], q4: &[[i16; 16]; 16], cbp: u8, qp: u8) {
 fn recon_chroma(
     pu: &mut [u8; 64],
     pv: &mut [u8; 64],
-    dc: &[[i16; 4]; 2],
-    ac: &[[[i16; 15]; 4]; 2],
+    chroma: &ChromaLevels,
     cbp_chroma: u8,
     qpc: u8,
 ) {
@@ -1354,14 +1347,10 @@ fn recon_chroma(
     }
     let scale = dequant4(qpc);
     for (p, pred) in [pu, pv].into_iter().enumerate() {
-        let dc_recon = dequantize_idct_chroma_dc2x2(&dc[p], qpc);
+        let dc_recon = dequantize_idct_chroma_dc2x2(&chroma.dc[p], qpc);
         let mut blocks = [[0i16; 16]; 4];
         if cbp_chroma >= 2 {
-            for (blk, levels) in blocks.iter_mut().zip(&ac[p]) {
-                for (k, &l) in levels.iter().enumerate() {
-                    blk[ZIGZAG_4X4[k + 1]] = l;
-                }
-            }
+            blocks = chroma.raster[p];
             dequant_4x4_x4(&mut blocks, scale);
         }
         for (blk, &d) in blocks.iter_mut().zip(&dc_recon) {
@@ -1404,6 +1393,7 @@ fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> Chr
         if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
             c.ac[p] = [[0; 15]; 4];
             c.ac_masks[p] = [0; 4];
+            c.raster[p] = [[0; 16]; 4];
         }
     }
     c
@@ -2122,8 +2112,7 @@ impl EncState {
             luma_q8: [[0; 64]; 4],
             use_8x8: false,
             cbp_luma: cbp4,
-            chroma_dc: [[0; 4]; 2],
-            chroma_ac: [[[0; 15]; 4]; 2],
+            chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
         if sl.t8x8 && sl.use_cabac && cbp4 != 0 {
@@ -2136,10 +2125,8 @@ impl EncState {
                 res.cbp_luma = cbp8;
             }
         }
-        let c = quant_chroma_inter(src, &pu, &pv, qpc);
-        res.cbp_chroma = c.cbp();
-        res.chroma_dc = c.dc;
-        res.chroma_ac = c.ac;
+        res.chroma = quant_chroma_inter(src, &pu, &pv, qpc);
+        res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);
             self.cur.store_mb(mb_x, mb_y, &py, &pu, &pv);
@@ -2147,7 +2134,7 @@ impl EncState {
         }
         self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
         self.code_inter(
-            sl, w, cabac, mb_x, mb_y, qp, mv, mvp, res, &mut py, &mut pu, &mut pv,
+            sl, w, cabac, mb_x, mb_y, qp, mv, mvp, &res, &mut py, &mut pu, &mut pv,
         );
     }
 
@@ -2163,7 +2150,7 @@ impl EncState {
         qp: u8,
         mv: [i16; 2],
         mvp: [i16; 2],
-        res: InterResidual,
+        res: &InterResidual,
         py: &mut [u8; 256],
         pu: &mut [u8; 64],
         pv: &mut [u8; 64],
@@ -2208,8 +2195,8 @@ impl EncState {
                     } else {
                         None
                     },
-                    &res.chroma_dc,
-                    &res.chroma_ac,
+                    &res.chroma.dc,
+                    &res.chroma.ac,
                     &mut self.luma_nnz,
                     &mut self.chroma_nnz,
                     &self.mb_is_intra,
@@ -2239,8 +2226,7 @@ impl EncState {
                         cbp_luma,
                         cbp_chroma,
                         &res.luma_q4,
-                        &res.chroma_dc,
-                        &res.chroma_ac,
+                        &res.chroma,
                         &mut self.luma_nnz,
                         &mut self.chroma_nnz,
                     );
@@ -2261,7 +2247,7 @@ impl EncState {
         } else {
             recon_luma_4x4(py, &res.luma_q4, cbp_luma, eff_qp);
         }
-        recon_chroma(pu, pv, &res.chroma_dc, &res.chroma_ac, cbp_chroma, eff_qpc);
+        recon_chroma(pu, pv, &res.chroma, cbp_chroma, eff_qpc);
         fill_grid_4x4(&mut self.ref_grid, g_stride, gx0, gy0, 4, 4, 0);
         fill_grid_4x4(&mut self.mv_grid, g_stride, gx0, gy0, 4, 4, mv);
         if cabac.is_some() {
@@ -2384,7 +2370,7 @@ impl EncState {
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
         let c = quant_chroma(src, &pu, &pv, qpc, true);
         let cbp_chroma = c.cbp();
-        let (chroma_dc, chroma_ac) = (c.dc, c.ac);
+        let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
         let qp_delta = if cbp != 0 { qp as i32 - sl.cur_qp } else { 0 };
         let eff_qp = (sl.cur_qp + qp_delta).clamp(0, 51) as u8;
@@ -2446,8 +2432,8 @@ impl EncState {
                     &mut sl.prev_qp_delta_nz,
                     &i4.q4,
                     None,
-                    &chroma_dc,
-                    &chroma_ac,
+                    chroma_dc,
+                    chroma_ac,
                     &mut self.luma_nnz,
                     &mut self.chroma_nnz,
                     &self.mb_is_intra,
@@ -2488,8 +2474,7 @@ impl EncState {
                         i4.cbp_luma,
                         cbp_chroma,
                         &i4.q4,
-                        &chroma_dc,
-                        &chroma_ac,
+                        &c,
                         &mut self.luma_nnz,
                         &mut self.chroma_nnz,
                     );
@@ -2500,9 +2485,7 @@ impl EncState {
         }
         sl.cur_qp = eff_qp as i32;
         self.mb_qps[mb_idx] = eff_qp;
-        recon_chroma(
-            &mut pu, &mut pv, &chroma_dc, &chroma_ac, cbp_chroma, eff_qpc,
-        );
+        recon_chroma(&mut pu, &mut pv, &c, cbp_chroma, eff_qpc);
         self.cur.store_mb(mb_x, mb_y, &i4.recon, &pu, &pv);
     }
 
@@ -2541,22 +2524,30 @@ impl EncState {
             dc_raw[Z_TO_RASTER[b]] = ac[0];
         }
         let q = quant4(eff_qp, true);
-        let mut any_ac = false;
+        // Zig-zag scanned AC levels (slot 0 empty) and masks of the non-zero ones.
+        let mut ac_zz = [[0i16; 16]; 16];
+        let mut ac_masks = [0u32; 16];
         for i8x8 in 0..4 {
             let group = group4(&mut ac_q4, i8x8);
             if quant_4x4_x4(group, q) != 0 {
                 for blk in group.iter_mut() {
                     blk[0] = 0;
-                    any_ac |= blk.iter().any(|&c| c != 0);
+                }
+                let zz = zigzag_4x4_x4(group);
+                let masks = nonzero_mask_4x4_x4(&zz);
+                for k in 0..4 {
+                    ac_zz[i8x8 * 4 + k] = zz[k];
+                    ac_masks[i8x8 * 4 + k] = masks[k] >> 1;
                 }
             }
         }
+        let any_ac = ac_masks.iter().any(|&m| m != 0);
         let dc_q = quantize_luma_dc4x4(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
         let c = quant_chroma(src, &pu, &pv, eff_qpc, true);
         let cbp_chroma = c.cbp();
-        let (chroma_dc, chroma_ac) = (c.dc, c.ac);
+        let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let mb_type = 1 + mode as u32 + 4 * cbp_chroma as u32 + if cbp_luma != 0 { 12 } else { 0 };
         self.mb_cbp_luma[mb_idx] = cbp_luma;
         self.mb_cbp_chroma[mb_idx] = cbp_chroma;
@@ -2593,10 +2584,10 @@ impl EncState {
                 );
                 self.mb_luma_dc_cbf[mb_idx] = dc_scanned.iter().any(|&c| c != 0);
                 if cbp_luma != 0 {
-                    for (b, ac) in ac_q4.iter().enumerate() {
+                    for (b, zz) in ac_zz.iter().enumerate() {
                         let (bx, by) = blk_xy(b);
                         let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
-                        let scanned: [i16; 15] = std::array::from_fn(|k| ac[ZIGZAG_4X4[k + 1]]);
+                        let scanned: &[i16; 15] = zz[1..].try_into().unwrap();
                         let nb = |left| {
                             luma_neighbor_cbf(
                                 &self.luma_nnz,
@@ -2612,9 +2603,8 @@ impl EncState {
                             )
                         };
                         let inc = cabac_cbf_ctx_inc(nb(true), nb(false), true);
-                        ce.encode_residual_block_cat(ctxs, 1, inc, &scanned);
-                        self.luma_nnz[gy * g_stride + gx] =
-                            scanned.iter().filter(|&&c| c != 0).count() as u8;
+                        ce.encode_residual_block_cat(ctxs, 1, inc, scanned);
+                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
                     }
                 }
                 encode_cabac_chroma_residuals(
@@ -2626,8 +2616,8 @@ impl EncState {
                     cg_stride,
                     true,
                     cbp_chroma,
-                    &chroma_dc,
-                    &chroma_ac,
+                    chroma_dc,
+                    chroma_ac,
                     &mut self.chroma_nnz,
                     &self.mb_is_intra,
                     &self.mb_is_skip,
@@ -2642,26 +2632,15 @@ impl EncState {
                 let nc_dc = predict_luma_nc(&self.luma_nnz, g_stride, mb_x * 4, mb_y * 4);
                 write_cavlc_block(w, &dc_scanned, nc_dc);
                 if cbp_luma != 0 {
-                    for (b, ac) in ac_q4.iter().enumerate() {
+                    for (b, zz) in ac_zz.iter().enumerate() {
                         let (bx, by) = blk_xy(b);
                         let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
-                        let scanned: [i16; 15] = std::array::from_fn(|k| ac[ZIGZAG_4X4[k + 1]]);
                         let nc = predict_luma_nc(&self.luma_nnz, g_stride, gx, gy);
-                        write_cavlc_block(w, &scanned, nc);
-                        self.luma_nnz[gy * g_stride + gx] =
-                            scanned.iter().filter(|&&c| c != 0).count() as u8;
+                        write_cavlc_masked::<15>(w, &zz[1..], nc, ac_masks[b]);
+                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
                     }
                 }
-                write_cavlc_chroma(
-                    w,
-                    mb_x,
-                    mb_y,
-                    mb_w,
-                    cbp_chroma,
-                    &chroma_dc,
-                    &chroma_ac,
-                    &mut self.chroma_nnz,
-                );
+                write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, &c, &mut self.chroma_nnz);
             }
         }
         sl.cur_qp = eff_qp as i32;
@@ -2682,9 +2661,7 @@ impl EncState {
                 add_idct4x4_8x8(&mut pred[o..], 16, group);
             }
         }
-        recon_chroma(
-            &mut pu, &mut pv, &chroma_dc, &chroma_ac, cbp_chroma, eff_qpc,
-        );
+        recon_chroma(&mut pu, &mut pv, &c, cbp_chroma, eff_qpc);
         self.cur.store_mb(mb_x, mb_y, &pred, &pu, &pv);
     }
 
