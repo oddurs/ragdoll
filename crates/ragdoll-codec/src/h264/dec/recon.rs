@@ -4,8 +4,8 @@
 
 use ragdoll_simd::{
     chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_chroma_mc_in_plane,
-    h264_idct4_add, h264_idct8_add, h264_luma_mc, h264_luma_mc_avg, h264_luma_mc_in_plane,
-    h264_weight_bi, h264_weight_uni, luma_mc_cols,
+    h264_chroma_pair_mc_in_plane, h264_idct4_add, h264_idct8_add, h264_luma_mc, h264_luma_mc_avg,
+    h264_luma_mc_in_plane, h264_weight_bi, h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -385,9 +385,7 @@ pub fn mc_chroma_pair<const AVG: bool>(
     ds: usize,
 ) {
     let [d0, d1] = dst;
-    if h264_chroma_mc_in_plane(d0, ds, src[0], width, height, (x, y), (w, h), mv, AVG) {
-        // The second plane has the first's size, so its block is inside too.
-        h264_chroma_mc_in_plane(d1, ds, src[1], width, height, (x, y), (w, h), mv, AVG);
+    if h264_chroma_pair_mc_in_plane([d0, d1], ds, src, width, height, (x, y), (w, h), mv, AVG) {
         return;
     }
     mc_chroma_pair_edge::<AVG>(src, width, height, x, y, w, h, mv, [d0, d1], ds);

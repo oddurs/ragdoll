@@ -77,6 +77,30 @@ impl Motion {
     }
 }
 
+impl Motion {
+    /// Starts loading the rows of the corner blocks of the frame macroblock at column `x`, row
+    /// `y` (`mb_w` macroblocks wide), which direct prediction reads.
+    #[inline(always)]
+    pub fn prefetch_corners(&self, x: usize, y: usize, mb_w: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (s, i) = (mb_w * 4, y * 4 * mb_w * 4 + x * 4);
+            if i + 3 * s < self.blocks.len() {
+                let p = self.blocks.as_ptr();
+                for r in [0, 3] {
+                    // Safety: inside the buffer (checked above); a prefetch only hints the cache.
+                    unsafe {
+                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(i + r * s) as *const i8);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (x, y, mb_w);
+    }
+}
+
 /// Ids of the pictures a slice's reference indices refer to, by list and index (up to 32 each,
 /// as field reference lists allow); [`NO_PIC`] beyond the lists.
 pub type RefIds = [[u32; 32]; 2];
@@ -217,6 +241,11 @@ impl PicPlanes {
             let (p, n) = self.raw(c);
             unsafe { std::slice::from_raw_parts_mut(p, n) }
         })
+    }
+
+    /// The three planes' pointers and lengths, writable as [`Self::chroma_mut`] is.
+    pub fn raw_all(&self) -> [(*mut u8, usize); 3] {
+        [0, 1, 2].map(|c| self.raw(c))
     }
 
     /// Plane `c`'s samples, through the pointer of the buffer's allocation (not one derived
@@ -1035,6 +1064,28 @@ impl PicState {
                 }
             }
         }
+    }
+
+    /// Starts loading the four [`BlockInfo`] rows (a cache line each) of the macroblock at
+    /// column `x`, row `y`, which its decoding writes: they are otherwise cold by then.
+    #[inline(always)]
+    pub fn prefetch_mb_blocks(&self, x: usize, y: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (i, s) = (self.b4(x * 4, y * 4), self.mb_w * 4);
+            if i + 3 * s < self.blocks.len() {
+                let p = self.blocks.as_ptr();
+                for r in 0..4 {
+                    // Safety: inside the buffer (checked above); a prefetch only hints the cache.
+                    unsafe {
+                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(i + r * s) as *const i8);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (x, y);
     }
 
     /// Index of the 4x4 block at absolute 4x4 coordinates.
