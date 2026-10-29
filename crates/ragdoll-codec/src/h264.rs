@@ -2302,285 +2302,600 @@ pub fn decode_cavlc_block(
     nc: u8,
     is_chroma_dc: bool,
 ) -> Result<usize> {
-    dst_scanned.fill(0);
-    cavlc_block(r, dst_scanned.len(), nc, is_chroma_dc, |pos, lv| {
-        dst_scanned[pos] = lv
-    })
+    // Fixed sizes for the common lengths, so the fill is a few stores rather than a call.
+    match dst_scanned.len() {
+        16 => dst_scanned.copy_from_slice(&[0; 16]),
+        4 => dst_scanned.copy_from_slice(&[0; 4]),
+        _ => dst_scanned.fill(0),
+    }
+    let (mut level, mut pos) = ([0i16; 16], [0u8; 32]);
+    let max_coeff = dst_scanned.len().min(16);
+    let n = r.with_local(|r| cavlc_block(r, max_coeff, nc, is_chroma_dc, &mut level, &mut pos))?;
+    for k in 0..n {
+        dst_scanned[pos[k] as usize] = level[k];
+    }
+    Ok(n)
 }
 
 /// [`decode_cavlc_block`] for a luma or chroma AC block of `max_coeff` (`1..=16`) coefficients,
 /// as its nonzero levels and their scan positions in `out` (any order); returns their count.
+/// Always inlined: for the many short blocks the call costs as much as the decoding.
+#[inline(always)]
 pub fn decode_cavlc_coeffs(
     r: &mut BitReader<'_>,
     max_coeff: usize,
     nc: u8,
     out: &mut crate::cabac::ResidualCoeffs,
 ) -> Result<usize> {
-    let mut k = 0;
-    cavlc_block(r, max_coeff.min(16), nc, false, |pos, lv| {
-        out.pos[k & 63] = pos as u8;
-        out.level[k & 63] = lv;
-        k += 1;
-    })
+    let level = out.level.first_chunk_mut::<16>().unwrap();
+    let pos = out.pos.first_chunk_mut::<32>().unwrap();
+    r.with_local(|r| cavlc_block(r, max_coeff.min(16), nc, false, level, pos))
 }
 
-/// The CAVLC residual_block syntax (7.3.5.3.2): calls `put(position, level)` for each nonzero
-/// coefficient, at positions below `max_coeff`.
+/// The CAVLC residual_block syntax (7.3.5.3.2): the block's nonzero coefficients as `level[k]`
+/// at scan position `pos[k]` (below `max_coeff`) for `k` below the returned count. Entries past
+/// the count may be overwritten.
 #[inline(always)]
 fn cavlc_block(
     r: &mut BitReader<'_>,
     max_coeff: usize,
     nc: u8,
     is_chroma_dc: bool,
-    mut put: impl FnMut(usize, i16),
+    level: &mut [i16; 16],
+    pos: &mut [u8; 32],
 ) -> Result<usize> {
-    let bad = |what| RagdollError::InvalidSyntax(what);
-    let tables = cavlc_tables();
-    // Every element is decoded from one 32-bit peek (zero past the end of the data, which
-    // consuming then rejects).
-    let (token, count) = if is_chroma_dc {
-        (&tables.chroma_dc_coeff_token, 20)
-    } else {
-        (&tables.coeff_token[nc_to_table_idx(nc)], 68)
+    use cavlc_tables as t;
+    // Every element is decoded from one 32-bit peek that holds at least its longest code until
+    // the end of the data, and zeros past it. Running past the end is checked once per block,
+    // and before reporting another error, which checking every element would have preceded
+    // with BitstreamEndOfData.
+    let fail = |r: &mut BitReader<'_>, what| match r.check_skipped() {
+        Err(e) => e,
+        Ok(()) => RagdollError::InvalidSyntax(what),
     };
-    let sym = token
-        .symbol(r, count)
-        .ok_or_else(|| bad("CAVLC invalid coeff_token"))??;
-    let (total_coeff, trailing_ones) = (sym / 4, sym % 4);
-
+    let class = if is_chroma_dc { 4 } else { nc_to_table_idx(nc) };
+    let e = t::coeff_token(class, r.peek32_min(16));
+    if e == 0 {
+        return Err(fail(r, "CAVLC invalid coeff_token"));
+    }
+    r.skip_peeked(e & 31);
+    let (total_coeff, trailing_ones) = ((e >> 7) as usize, ((e >> 5) & 3) as usize);
     if total_coeff == 0 {
+        r.check_skipped()?;
         return Ok(0);
     }
     if total_coeff > max_coeff {
-        return Err(bad(
+        return Err(fail(
+            r,
             "CAVLC total_coeff exceeds the block's coefficient count",
         ));
     }
 
-    let mut levels = [0i16; 16];
-    if trailing_ones > 0 {
-        let v = r.peek32();
-        for (k, lv) in levels.iter_mut().enumerate().take(trailing_ones) {
-            *lv = if (v << k) >> 31 != 0 { -1 } else { 1 };
-        }
-        r.consume_peeked(trailing_ones as u32)?;
-    }
+    // Up to three trailing +-1 levels from their sign bits; the level loop overwrites extras.
+    let v = r.peek32_min(3);
+    *level.first_chunk_mut::<4>().unwrap() = t::TRAILING_ONES[(v >> 29) as usize];
+    r.skip_peeked(trailing_ones as u32);
 
-    let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
-        1u32
-    } else {
-        0u32
-    };
-    #[allow(clippy::needless_range_loop)]
-    for i in trailing_ones..total_coeff {
-        let v = r.peek32();
-        let (level_prefix, level_suffix) = if v >> 16 != 0 {
-            // level_prefix <= 15: prefix, stop bit and suffix (at most 12 bits) are all in `v`.
-            let level_prefix = v.leading_zeros();
-            let size = if level_prefix == 14 && suffix_length == 0 {
-                4
-            } else if level_prefix == 15 {
-                12
-            } else {
-                suffix_length
-            };
-            let after = v << (level_prefix + 1);
-            let suffix = if size > 0 { after >> (32 - size) } else { 0 };
-            r.consume_peeked(level_prefix + 1 + size)?;
-            (level_prefix, suffix)
+    let mut lt = t::first_level_table(total_coeff, trailing_ones);
+    let mut k = trailing_ones;
+    while k < total_coeff {
+        let v = r.peek32_min(8);
+        let e = t::LEVEL_PAIR[(lt << 8 | (v >> 24) as usize) & 0xfff];
+        if e == 0 {
+            r.check_skipped()?;
+            // On a copy, so that `r` itself never leaves registers.
+            let mut esc = r.clone();
+            (level[k & 15], lt) = cavlc_level_escape(&mut esc, lt)?;
+            *r = esc;
+            k += 1;
+            continue;
+        }
+        // One or two levels; the second only when a coefficient is left for it.
+        level[k & 15] = e as i8 as i16;
+        if (e >> 20) & 15 != 0 && k + 1 < total_coeff {
+            level[(k + 1) & 15] = (e >> 8) as i8 as i16;
+            r.skip_peeked((e >> 20) & 15);
+            lt = (e >> 28) as usize;
+            k += 2;
         } else {
-            let level_prefix = r.read_unary_zeros()? as u32;
-            let size = if level_prefix == 14 && suffix_length == 0 {
-                4
-            } else if level_prefix >= 15 {
-                level_prefix - 3
-            } else {
-                suffix_length
-            };
-            let suffix = if size > 0 {
-                r.read_bits(size)? as u32
-            } else {
-                0
-            };
-            (level_prefix, suffix)
-        };
-        let mut code_u = (level_prefix.min(15) << suffix_length) + level_suffix;
-        if level_prefix >= 15 && suffix_length == 0 {
-            code_u += 15;
-        }
-        if level_prefix >= 16 {
-            code_u += (1u32 << (level_prefix - 3)) - 4096;
-        }
-        let mut level_code = code_u as i32;
-
-        if i == trailing_ones && trailing_ones < 3 {
-            level_code += 2;
-        }
-        let lv = if (level_code & 1) == 0 {
-            (level_code + 2) >> 1
-        } else {
-            -(level_code + 1) >> 1
-        };
-        levels[i] = lv as i16;
-
-        if suffix_length == 0 {
-            suffix_length = 1;
-        }
-        let threshold = 3i32 << (suffix_length - 1);
-        if lv.abs() > threshold && suffix_length < 6 {
-            suffix_length += 1;
+            r.skip_peeked((e >> 16) & 15);
+            lt = ((e >> 24) & 15) as usize;
+            k += 1;
         }
     }
 
-    let mut zeros_left = if total_coeff == max_coeff {
-        0usize
-    } else {
-        let count = max_coeff - total_coeff + 1;
-        let t = if is_chroma_dc {
-            &tables.chroma_dc_total_zeros[total_coeff - 1]
+    let zeros_left = if total_coeff < max_coeff {
+        let v = r.peek32_min(9);
+        let e = if is_chroma_dc {
+            t::CHROMA_DC_TOTAL_ZEROS[(total_coeff - 1) & 3][(v >> 29) as usize] as u32
         } else {
-            &tables.total_zeros[total_coeff - 1]
+            t::total_zeros(total_coeff, v)
         };
-        t.symbol(r, count)
-            .ok_or_else(|| bad("CAVLC invalid total_zeros"))??
+        let total_zeros = (e >> 5) as usize;
+        if e == 0 || total_zeros > max_coeff - total_coeff {
+            return Err(fail(r, "CAVLC invalid total_zeros"));
+        }
+        r.skip_peeked(e & 31);
+        total_zeros
+    } else {
+        0
     };
 
-    let mut pos = total_coeff + zeros_left - 1;
-    if pos >= max_coeff {
-        return Err(bad("CAVLC coefficient position exceeds block size"));
-    }
-    put(pos, levels[0]);
-    for &lv in &levels[1..total_coeff] {
-        let run_before = if zeros_left > 0 {
-            let t = &tables.run[(zeros_left - 1).min(6)];
-            t.symbol(r, zeros_left + 1)
-                .ok_or_else(|| bad("CAVLC invalid run_before"))??
-        } else {
-            0
-        };
-        if run_before > zeros_left || pos < 1 + run_before {
-            return Err(bad("CAVLC invalid run_before"));
+    // Positions from the last coefficient down; `p >= zl` throughout, so it cannot underflow.
+    let mut p = total_coeff + zeros_left - 1;
+    let mut zl = zeros_left;
+    pos[0] = p as u8;
+    let mut i = 1;
+    while i < total_coeff && zl > 0 {
+        let v = r.peek32_min(11);
+        let e = t::RUN_PAIR[zl & 15][(v >> 26) as usize] as usize;
+        if e == 0 {
+            // zeros_left > 6: `0001` is 7, ..., `00000000001` is 14.
+            let lz = v.leading_zeros();
+            if lz > 10 || lz as usize + 4 > zl {
+                return Err(fail(r, "CAVLC invalid run_before"));
+            }
+            r.skip_peeked(lz + 1);
+            zl -= lz as usize + 4;
+            p -= lz as usize + 5;
+            pos[i & 31] = p as u8;
+            i += 1;
+            continue;
         }
-        zeros_left -= run_before;
-        pos -= 1 + run_before;
-        put(pos, lv);
+        // One or two runs, both at most zeros_left by construction; the second only when a
+        // coefficient is left for it.
+        let run1 = e & 15;
+        p -= 1 + run1;
+        pos[i & 31] = p as u8;
+        if e >> 16 != 0 && i + 1 < total_coeff {
+            let run2 = (e >> 4) & 15;
+            r.skip_peeked(((e >> 12) & 15) as u32);
+            p -= 1 + run2;
+            pos[(i + 1) & 31] = p as u8;
+            zl -= run1 + run2;
+            i += 2;
+        } else {
+            r.skip_peeked(((e >> 8) & 15) as u32);
+            zl -= run1;
+            i += 1;
+        }
     }
-
+    if i < total_coeff {
+        // No zeros left: the rest are consecutive, written 16 at a time past the count.
+        let top = p as u8;
+        let tail: [u8; 16] = std::array::from_fn(|k| top.wrapping_sub(k as u8 + 1));
+        *pos[i & 15..].first_chunk_mut::<16>().unwrap() = tail;
+    }
+    r.check_skipped()?;
     Ok(total_coeff)
 }
 
-/// A CAVLC code table (`lens[i]`/`bits[i]` per symbol `i`) as two-level lookup tables: 8 bits,
-/// then a subtable for longer codes.
-struct VlcTable {
-    max_len: u32,
-    /// `(len << 16) | symbol` for a code of up to 8 bits, `SUB | offset` for a subtable, 0 for
-    /// no code.
-    l1: [u32; 256],
-    l2: Vec<u32>,
+/// A level the [`cavlc_tables::LEVEL_PAIR`] lookup does not cover (a long prefix or suffix), read with
+/// level table `lt`'s suffixLength; returns the level and the next level table.
+#[cold]
+#[inline(never)]
+fn cavlc_level_escape(r: &mut BitReader<'_>, lt: usize) -> Result<(i16, usize)> {
+    let (mut suffix_length, plus2) = cavlc_tables::LEVEL_MODE[lt];
+    let v = r.peek32();
+    let (level_prefix, level_suffix) = if v >> 16 != 0 {
+        // level_prefix <= 15: prefix, stop bit and suffix (at most 12 bits) are all in `v`.
+        let level_prefix = v.leading_zeros();
+        let size = if level_prefix == 14 && suffix_length == 0 {
+            4
+        } else if level_prefix == 15 {
+            12
+        } else {
+            suffix_length
+        };
+        let after = v << (level_prefix + 1);
+        let suffix = if size > 0 { after >> (32 - size) } else { 0 };
+        r.consume_peeked(level_prefix + 1 + size)?;
+        (level_prefix, suffix)
+    } else {
+        let level_prefix = r.read_unary_zeros()? as u32;
+        let size = if level_prefix == 14 && suffix_length == 0 {
+            4
+        } else if level_prefix >= 15 {
+            level_prefix - 3
+        } else {
+            suffix_length
+        };
+        let suffix = if size > 0 {
+            r.read_bits(size)? as u32
+        } else {
+            0
+        };
+        (level_prefix, suffix)
+    };
+    let mut code_u = (level_prefix.min(15) << suffix_length) + level_suffix;
+    if level_prefix >= 15 && suffix_length == 0 {
+        code_u += 15;
+    }
+    if level_prefix >= 16 {
+        code_u += (1u32 << (level_prefix - 3)) - 4096;
+    }
+    let mut level_code = code_u as i32;
+    if plus2 {
+        level_code += 2;
+    }
+    let lv = if (level_code & 1) == 0 {
+        (level_code + 2) >> 1
+    } else {
+        -(level_code + 1) >> 1
+    };
+    if suffix_length == 0 {
+        suffix_length = 1;
+    }
+    let threshold = 3i32 << (suffix_length - 1);
+    if lv.abs() > threshold && suffix_length < 6 {
+        suffix_length += 1;
+    }
+    Ok((lv as i16, suffix_length as usize - 1))
 }
 
-const VLC_SUB: u32 = 1 << 31;
+/// CAVLC decoding tables, built at compile time.
+mod cavlc_tables {
+    use super::{
+        CHROMA_DC_COEFF_TOKEN_BITS, CHROMA_DC_COEFF_TOKEN_LEN, CHROMA_DC_TOTAL_ZEROS_BITS,
+        CHROMA_DC_TOTAL_ZEROS_LEN, COEFF_TOKEN_BITS, COEFF_TOKEN_LEN, RUN_BITS, RUN_LEN,
+        TOTAL_ZEROS_BITS, TOTAL_ZEROS_LEN,
+    };
 
-impl VlcTable {
-    fn new(lens: &[u8], bits: &[u8]) -> Self {
-        let max_len = lens.iter().copied().max().unwrap_or(0).max(1) as u32;
-        let mut t = Self {
-            max_len,
-            l1: [0; 256],
-            l2: Vec::new(),
-        };
-        let sub_bits = max_len.saturating_sub(8);
-        for (sym, (&l, &b)) in lens.iter().zip(bits).enumerate() {
-            let (l, code) = (l as u32, b as u32);
-            if l == 0 {
-                continue;
+    /// Marks a first-level entry that points at a subtable (`VLC_SUB | offset`).
+    const VLC_SUB: u16 = 1 << 15;
+
+    pub(super) const fn max_len(lens: &[u8]) -> u32 {
+        let (mut m, mut i) = (0, 0);
+        while i < lens.len() {
+            if lens[i] > m {
+                m = lens[i];
             }
-            let entry = (l << 16) | sym as u32;
-            if l <= 8 {
-                // Every 8-bit prefix starting with the code; the first symbol wins, as in a scan.
-                let first = (code << (8 - l)) as usize;
-                for slot in &mut t.l1[first..first + (1 << (8 - l))] {
-                    if *slot == 0 {
-                        *slot = entry;
+            i += 1;
+        }
+        m as u32
+    }
+
+    /// The size [`vlc_table`] needs: `1 << top` entries, plus a `1 << (max_len - top)` subtable
+    /// for each first-level prefix of a longer code.
+    const fn vlc_table_len(lens: &[u8], bits: &[u8], top: u32) -> usize {
+        let max_len = max_len(lens);
+        let mut n = 1usize << top;
+        let mut seen = [false; 256];
+        let mut s = 0;
+        while s < lens.len() {
+            let l = lens[s] as u32;
+            if l > top {
+                let p = (bits[s] as usize) >> (l - top);
+                if !seen[p] {
+                    seen[p] = true;
+                    n += 1 << (max_len - top);
+                }
+            }
+            s += 1;
+        }
+        n
+    }
+
+    /// A two-level lookup table for the code of symbol `s` (`lens[s]` bits of value `bits[s]`):
+    /// indexed by the first `top` bits, then for longer codes a subtable over the next
+    /// `max_len - top` bits. An entry is `(symbol << 5) | len`, or 0 where no code starts; the
+    /// first symbol wins, as in a linear scan.
+    pub(super) const fn vlc_table<const N: usize>(lens: &[u8], bits: &[u8], top: u32) -> [u16; N] {
+        let max_len = max_len(lens);
+        let sub_bits = max_len.saturating_sub(top);
+        let mut t = [0u16; N];
+        let mut next = 1usize << top;
+        let mut s = 0;
+        while s < lens.len() {
+            let (l, code) = (lens[s] as u32, bits[s] as usize);
+            let entry = ((s as u16) << 5) | l as u16;
+            if l == 0 {
+                // no code
+            } else if l <= top {
+                let first = code << (top - l);
+                let mut j = 0;
+                while j < 1 << (top - l) {
+                    if t[first + j] == 0 {
+                        t[first + j] = entry;
                     }
+                    j += 1;
                 }
             } else {
-                let top = (code >> (l - 8)) as usize;
-                if t.l1[top] & VLC_SUB == 0 {
-                    if t.l1[top] != 0 {
-                        continue; // shadowed by a shorter code
+                let p = code >> (l - top);
+                let mut ok = true;
+                if t[p] & VLC_SUB == 0 {
+                    if t[p] != 0 {
+                        ok = false; // shadowed by a shorter code
+                    } else {
+                        t[p] = VLC_SUB | next as u16;
+                        next += 1 << sub_bits;
                     }
-                    t.l1[top] = VLC_SUB | t.l2.len() as u32;
-                    t.l2.resize(t.l2.len() + (1 << sub_bits), 0);
                 }
-                let base = (t.l1[top] & !VLC_SUB) as usize;
-                let rest = code & ((1 << (l - 8)) - 1);
-                let first = (rest << (sub_bits - (l - 8))) as usize;
-                for slot in &mut t.l2[base + first..base + first + (1 << (sub_bits - (l - 8)))] {
-                    if *slot == 0 {
-                        *slot = entry;
+                if ok {
+                    let base = (t[p] & !VLC_SUB) as usize;
+                    let rest = code & ((1 << (l - top)) - 1);
+                    let first = base + (rest << (sub_bits - (l - top)));
+                    let mut j = 0;
+                    while j < 1 << (sub_bits - (l - top)) {
+                        if t[first + j] == 0 {
+                            t[first + j] = entry;
+                        }
+                        j += 1;
                     }
                 }
             }
+            s += 1;
         }
+        assert!(next <= N);
         t
     }
 
-    /// The symbol of the next code, consumed, from a 32-bit peek; `None` when no code below
-    /// `count` starts there, an error when the code runs past the end of the data.
+    /// [`vlc_table`] lookup of the code at the top of `v`.
     #[inline(always)]
-    fn symbol(&self, r: &mut BitReader<'_>, count: usize) -> Option<Result<usize>> {
-        let v = r.peek32();
-        let e = self.l1[(v >> 24) as usize];
-        let e = if e & VLC_SUB != 0 {
-            let sub_bits = self.max_len - 8;
-            let sub = (v >> (32 - self.max_len)) & ((1 << sub_bits) - 1);
-            self.l2[(e & !VLC_SUB) as usize + sub as usize]
+    fn vlc_lookup(t: &[u16], top: u32, sub_bits: u32, v: u32) -> u32 {
+        let e = t[(v >> (32 - top)) as usize];
+        if e & VLC_SUB == 0 {
+            e as u32
         } else {
-            e
-        };
-        let sym = (e & 0xffff) as usize;
-        if e == 0 || sym >= count {
-            return None;
+            t[(e & !VLC_SUB) as usize + ((v << top) >> (32 - sub_bits)) as usize] as u32
         }
-        Some(r.consume_peeked(e >> 16).map(|()| sym))
     }
-}
 
-/// Lookup tables for the CAVLC codes, built on first use.
-struct CavlcTables {
-    coeff_token: [VlcTable; 4],
-    chroma_dc_coeff_token: VlcTable,
-    total_zeros: Vec<VlcTable>,
-    chroma_dc_total_zeros: Vec<VlcTable>,
-    run: Vec<VlcTable>,
-}
-
-fn cavlc_tables() -> &'static CavlcTables {
-    static TABLES: std::sync::OnceLock<CavlcTables> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| CavlcTables {
-        coeff_token: std::array::from_fn(|t| {
-            VlcTable::new(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
-        }),
-        chroma_dc_coeff_token: VlcTable::new(
+    const CT_TOP: u32 = 8;
+    const fn coeff_token_len() -> usize {
+        let mut n = vlc_table_len(
             &CHROMA_DC_COEFF_TOKEN_LEN,
             &CHROMA_DC_COEFF_TOKEN_BITS,
+            CT_TOP,
+        );
+        let mut k = 0;
+        while k < 4 {
+            let m = vlc_table_len(&COEFF_TOKEN_LEN[k], &COEFF_TOKEN_BITS[k], CT_TOP);
+            if m > n {
+                n = m;
+            }
+            k += 1;
+        }
+        n
+    }
+    const CT_N: usize = coeff_token_len();
+    /// `coeff_token` per nC class (0..4) and for chroma DC (4).
+    pub(super) static COEFF_TOKEN: [[u16; CT_N]; 5] = [
+        vlc_table(&COEFF_TOKEN_LEN[0], &COEFF_TOKEN_BITS[0], CT_TOP),
+        vlc_table(&COEFF_TOKEN_LEN[1], &COEFF_TOKEN_BITS[1], CT_TOP),
+        vlc_table(&COEFF_TOKEN_LEN[2], &COEFF_TOKEN_BITS[2], CT_TOP),
+        vlc_table(&COEFF_TOKEN_LEN[3], &COEFF_TOKEN_BITS[3], CT_TOP),
+        vlc_table(
+            &CHROMA_DC_COEFF_TOKEN_LEN,
+            &CHROMA_DC_COEFF_TOKEN_BITS,
+            CT_TOP,
         ),
-        total_zeros: (0..15)
-            .map(|i| VlcTable::new(&TOTAL_ZEROS_LEN[i], &TOTAL_ZEROS_BITS[i]))
-            .collect(),
-        chroma_dc_total_zeros: (0..3)
-            .map(|i| {
-                VlcTable::new(
-                    &CHROMA_DC_TOTAL_ZEROS_LEN[i],
-                    &CHROMA_DC_TOTAL_ZEROS_BITS[i],
-                )
-            })
-            .collect(),
-        run: (0..7)
-            .map(|i| VlcTable::new(&RUN_LEN[i], &RUN_BITS[i]))
-            .collect(),
-    })
+    ];
+    const CT_SUB_BITS: [u32; 5] = [
+        max_len(&COEFF_TOKEN_LEN[0]).saturating_sub(CT_TOP),
+        max_len(&COEFF_TOKEN_LEN[1]).saturating_sub(CT_TOP),
+        max_len(&COEFF_TOKEN_LEN[2]).saturating_sub(CT_TOP),
+        max_len(&COEFF_TOKEN_LEN[3]).saturating_sub(CT_TOP),
+        max_len(&CHROMA_DC_COEFF_TOKEN_LEN).saturating_sub(CT_TOP),
+    ];
+
+    /// The `coeff_token` entry (`(4 * total_coeff + trailing_ones) << 5 | len`, 0 for none) at
+    /// the top of `v` for table `class`.
+    #[inline(always)]
+    pub(super) fn coeff_token(class: usize, v: u32) -> u32 {
+        vlc_lookup(&COEFF_TOKEN[class], CT_TOP, CT_SUB_BITS[class], v)
+    }
+
+    const TZ_TOP: u32 = 6;
+    const TZ_N: usize = vlc_table_len(&TOTAL_ZEROS_LEN[0], &TOTAL_ZEROS_BITS[0], TZ_TOP);
+    const TZ_SUB_BITS: u32 = max_len(&TOTAL_ZEROS_LEN[0]) - TZ_TOP;
+    /// `total_zeros` for 15- and 16-coefficient blocks, per `total_coeff - 1` (row 15 unused).
+    pub(super) static TOTAL_ZEROS: [[u16; TZ_N]; 16] = {
+        let mut t = [[0u16; TZ_N]; 16];
+        let mut k = 0;
+        while k < 15 {
+            // Only the first table has codes beyond the first level.
+            assert!(k == 0 || max_len(&TOTAL_ZEROS_LEN[k]) <= TZ_TOP);
+            t[k] = vlc_table(&TOTAL_ZEROS_LEN[k], &TOTAL_ZEROS_BITS[k], TZ_TOP);
+            k += 1;
+        }
+        t
+    };
+
+    /// The `total_zeros` entry (`total_zeros << 5 | len`, 0 for none) at the top of `v` for
+    /// `total_coeff` (`1..=15`).
+    #[inline(always)]
+    pub(super) fn total_zeros(total_coeff: usize, v: u32) -> u32 {
+        vlc_lookup(&TOTAL_ZEROS[(total_coeff - 1) & 15], TZ_TOP, TZ_SUB_BITS, v)
+    }
+
+    /// Chroma DC `total_zeros` per `total_coeff - 1` (row 3 unused), all codes of 1 to 3 bits.
+    pub(super) static CHROMA_DC_TOTAL_ZEROS: [[u16; 8]; 4] = [
+        vlc_table(
+            &CHROMA_DC_TOTAL_ZEROS_LEN[0],
+            &CHROMA_DC_TOTAL_ZEROS_BITS[0],
+            3,
+        ),
+        vlc_table(
+            &CHROMA_DC_TOTAL_ZEROS_LEN[1],
+            &CHROMA_DC_TOTAL_ZEROS_BITS[1],
+            3,
+        ),
+        vlc_table(
+            &CHROMA_DC_TOTAL_ZEROS_LEN[2],
+            &CHROMA_DC_TOTAL_ZEROS_BITS[2],
+            3,
+        ),
+        [0; 8],
+    ];
+
+    /// `run_before` per zeros_left (`1..=15`) and the next 3 bits: `run << 4 | len`, or 0 for
+    /// the codes longer than 3 bits (`000` with zeros_left > 6).
+    pub(super) const RUN_BEFORE: [[u8; 8]; 16] = {
+        let mut t = [[0u8; 8]; 16];
+        let mut zl = 1;
+        while zl < 16 {
+            let k = if zl > 7 { 6 } else { zl - 1 };
+            let mut s = 0;
+            while s < 16 {
+                let l = RUN_LEN[k][s] as usize;
+                if l > 0 && l <= 3 {
+                    let first = (RUN_BITS[k][s] as usize) << (3 - l);
+                    let mut j = 0;
+                    while j < 1 << (3 - l) {
+                        t[zl][first + j] = ((s << 4) | l) as u8;
+                        j += 1;
+                    }
+                }
+                s += 1;
+            }
+            let mut j = 0;
+            while j < 8 {
+                // Complete codes for zeros_left <= 6, with no run beyond zeros_left.
+                assert!(k == 6 || (t[zl][j] != 0 && (t[zl][j] >> 4) as usize <= zl));
+                j += 1;
+            }
+            zl += 1;
+        }
+        t
+    };
+
+    /// Up to two `run_before` codes per zeros_left (`1..=15`) and the next 6 bits: `run1 |
+    /// run2 << 4 | len1 << 8 | (len1 + len2) << 12 | 1 << 16`, without the last part when the
+    /// second code is longer than 3 bits, or 0 when the first one is. A second run with no
+    /// zeros left is an empty code for 0.
+    pub(super) static RUN_PAIR: [[u32; 64]; 16] = {
+        let mut t = [[0u32; 64]; 16];
+        let mut zl = 1;
+        while zl < 16 {
+            let mut b = 0;
+            while b < 64 {
+                let e1 = RUN_BEFORE[zl][b >> 3] as u32;
+                if e1 != 0 {
+                    let (run1, len1) = (e1 >> 4, e1 & 15);
+                    let zl2 = zl - run1 as usize;
+                    let e2 = if zl2 == 0 {
+                        0
+                    } else {
+                        RUN_BEFORE[zl2][((b << len1) >> 3) & 7] as u32
+                    };
+                    t[zl][b] = run1 | len1 << 8;
+                    if zl2 == 0 {
+                        t[zl][b] |= len1 << 12 | 1 << 16;
+                    } else if e2 != 0 {
+                        t[zl][b] |= (e2 >> 4) << 4 | (len1 + (e2 & 15)) << 12 | 1 << 16;
+                    }
+                }
+                b += 1;
+            }
+            zl += 1;
+        }
+        t
+    };
+
+    /// The levels of three trailing ones from their sign bits (the next 3 bits).
+    pub(super) static TRAILING_ONES: [[i16; 4]; 8] = {
+        let mut t = [[0i16; 4]; 8];
+        let mut s = 0;
+        while s < 8 {
+            let mut k = 0;
+            while k < 3 {
+                t[s][k] = if (s >> (2 - k)) & 1 != 0 { -1 } else { 1 };
+                k += 1;
+            }
+            s += 1;
+        }
+        t
+    };
+
+    /// The suffixLength and whether 2 is added to levelCode (the first level after fewer than
+    /// three trailing ones), per level table.
+    pub(super) const LEVEL_MODE: [(u32, bool); 16] = {
+        let mut m = [(6, false); 16];
+        let mut k = 0;
+        while k < 6 {
+            m[k] = (k as u32 + 1, false);
+            k += 1;
+        }
+        m[6] = (0, false);
+        m[7] = (0, true);
+        m[8] = (1, true);
+        m
+    };
+
+    /// The level table for the first level that is not a trailing one.
+    #[inline(always)]
+    pub(super) fn first_level_table(total_coeff: usize, trailing_ones: usize) -> usize {
+        if trailing_ones == 3 {
+            6
+        } else if total_coeff > 10 {
+            8
+        } else {
+            7
+        }
+    }
+
+    /// Levels whose level_prefix, stop bit and suffix fit in 8 bits, per level table
+    /// ([`LEVEL_MODE`]) and the next 8 bits (`table << 8 | bits`): `level << 8 | next_table << 4
+    /// | len` (`level` as an `i8`), or 0 where the level is longer.
+    const LEVEL: [u16; 16 * 256] = {
+        let mut t = [0u16; 16 * 256];
+        let mut k = 0;
+        while k < 9 {
+            let (sl, plus2) = LEVEL_MODE[k];
+            let mut i = 1;
+            while i < 256 {
+                let prefix = (i as u8).leading_zeros();
+                let len = prefix + 1 + sl;
+                if len <= 8 {
+                    let suffix = (i as u32 >> (8 - len)) & ((1 << sl) - 1);
+                    let code = ((prefix << sl) + suffix + if plus2 { 2 } else { 0 }) as i32;
+                    let lv = if code & 1 == 0 {
+                        (code + 2) >> 1
+                    } else {
+                        -(code + 1) >> 1
+                    };
+                    let s = if sl == 0 { 1 } else { sl };
+                    let next = if lv.abs() > 3 << (s - 1) && s < 6 {
+                        s
+                    } else {
+                        s - 1
+                    };
+                    t[k << 8 | i] =
+                        ((lv as i8 as u8 as u16) << 8) | ((next as u16) << 4) | len as u16;
+                }
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
+
+    /// Up to two [`LEVEL`] codes in the next 8 bits, per level table: `level1 | level2 << 8 |
+    /// len1 << 16 | (len1 + len2) << 20 | next1 << 24 | next2 << 28` (levels as `i8`; `len1 +
+    /// len2` is 0 without a second code), or 0 where the first level is longer.
+    pub(super) static LEVEL_PAIR: [u32; 16 * 256] = {
+        let mut t = [0u32; 16 * 256];
+        let mut k = 0;
+        while k < 9 {
+            let mut i = 0;
+            while i < 256 {
+                let e1 = LEVEL[k << 8 | i] as u32;
+                if e1 != 0 {
+                    let (len1, next1) = (e1 & 15, (e1 >> 4) & 15);
+                    let mut e = (e1 >> 8) | len1 << 16 | next1 << 24;
+                    let e2 = LEVEL[(next1 as usize) << 8 | ((i << len1) & 0xff)] as u32;
+                    if e2 != 0 && (e2 & 15) <= 8 - len1 {
+                        e |= (e2 >> 8) << 8 | (len1 + (e2 & 15)) << 20 | ((e2 >> 4) & 15) << 28;
+                    }
+                    t[k << 8 | i] = e;
+                }
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
 }
 
 #[cfg(test)]
@@ -3370,50 +3685,421 @@ pub fn roundtrip_block4x4_dct(
 mod tests {
     use super::*;
 
+    /// The table-driven CAVLC decoder this module's one replaced, kept as the reference.
+    mod reference {
+        use super::*;
+
+        /// The CAVLC residual_block syntax (7.3.5.3.2): calls `put(position, level)` for each nonzero
+        /// coefficient, at positions below `max_coeff`.
+        pub(super) fn cavlc_block(
+            r: &mut BitReader<'_>,
+            max_coeff: usize,
+            nc: u8,
+            is_chroma_dc: bool,
+            mut put: impl FnMut(usize, i16),
+        ) -> Result<usize> {
+            let bad = |what| RagdollError::InvalidSyntax(what);
+            let tables = ref_tables();
+            // Every element is decoded from one 32-bit peek (zero past the end of the data, which
+            // consuming then rejects).
+            let (token, count) = if is_chroma_dc {
+                (&tables.chroma_dc_coeff_token, 20)
+            } else {
+                (&tables.coeff_token[nc_to_table_idx(nc)], 68)
+            };
+            let sym = token
+                .symbol(r, count)
+                .ok_or_else(|| bad("CAVLC invalid coeff_token"))??;
+            let (total_coeff, trailing_ones) = (sym / 4, sym % 4);
+
+            if total_coeff == 0 {
+                return Ok(0);
+            }
+            if total_coeff > max_coeff {
+                return Err(bad(
+                    "CAVLC total_coeff exceeds the block's coefficient count",
+                ));
+            }
+
+            let mut levels = [0i16; 16];
+            if trailing_ones > 0 {
+                let v = r.peek32();
+                for (k, lv) in levels.iter_mut().enumerate().take(trailing_ones) {
+                    *lv = if (v << k) >> 31 != 0 { -1 } else { 1 };
+                }
+                r.consume_peeked(trailing_ones as u32)?;
+            }
+
+            let mut suffix_length = if total_coeff > 10 && trailing_ones < 3 {
+                1u32
+            } else {
+                0u32
+            };
+            #[allow(clippy::needless_range_loop)]
+            for i in trailing_ones..total_coeff {
+                let v = r.peek32();
+                let (level_prefix, level_suffix) = if v >> 16 != 0 {
+                    // level_prefix <= 15: prefix, stop bit and suffix (at most 12 bits) are all in `v`.
+                    let level_prefix = v.leading_zeros();
+                    let size = if level_prefix == 14 && suffix_length == 0 {
+                        4
+                    } else if level_prefix == 15 {
+                        12
+                    } else {
+                        suffix_length
+                    };
+                    let after = v << (level_prefix + 1);
+                    let suffix = if size > 0 { after >> (32 - size) } else { 0 };
+                    r.consume_peeked(level_prefix + 1 + size)?;
+                    (level_prefix, suffix)
+                } else {
+                    let level_prefix = r.read_unary_zeros()? as u32;
+                    let size = if level_prefix == 14 && suffix_length == 0 {
+                        4
+                    } else if level_prefix >= 15 {
+                        level_prefix - 3
+                    } else {
+                        suffix_length
+                    };
+                    let suffix = if size > 0 {
+                        r.read_bits(size)? as u32
+                    } else {
+                        0
+                    };
+                    (level_prefix, suffix)
+                };
+                let mut code_u = (level_prefix.min(15) << suffix_length) + level_suffix;
+                if level_prefix >= 15 && suffix_length == 0 {
+                    code_u += 15;
+                }
+                if level_prefix >= 16 {
+                    code_u += (1u32 << (level_prefix - 3)) - 4096;
+                }
+                let mut level_code = code_u as i32;
+
+                if i == trailing_ones && trailing_ones < 3 {
+                    level_code += 2;
+                }
+                let lv = if (level_code & 1) == 0 {
+                    (level_code + 2) >> 1
+                } else {
+                    -(level_code + 1) >> 1
+                };
+                levels[i] = lv as i16;
+
+                if suffix_length == 0 {
+                    suffix_length = 1;
+                }
+                let threshold = 3i32 << (suffix_length - 1);
+                if lv.abs() > threshold && suffix_length < 6 {
+                    suffix_length += 1;
+                }
+            }
+
+            let mut zeros_left = if total_coeff == max_coeff {
+                0usize
+            } else {
+                let count = max_coeff - total_coeff + 1;
+                let t = if is_chroma_dc {
+                    &tables.chroma_dc_total_zeros[total_coeff - 1]
+                } else {
+                    &tables.total_zeros[total_coeff - 1]
+                };
+                t.symbol(r, count)
+                    .ok_or_else(|| bad("CAVLC invalid total_zeros"))??
+            };
+
+            let mut pos = total_coeff + zeros_left - 1;
+            if pos >= max_coeff {
+                return Err(bad("CAVLC coefficient position exceeds block size"));
+            }
+            put(pos, levels[0]);
+            for &lv in &levels[1..total_coeff] {
+                let run_before = if zeros_left > 0 {
+                    let t = &tables.run[(zeros_left - 1).min(6)];
+                    t.symbol(r, zeros_left + 1)
+                        .ok_or_else(|| bad("CAVLC invalid run_before"))??
+                } else {
+                    0
+                };
+                if run_before > zeros_left || pos < 1 + run_before {
+                    return Err(bad("CAVLC invalid run_before"));
+                }
+                zeros_left -= run_before;
+                pos -= 1 + run_before;
+                put(pos, lv);
+            }
+
+            Ok(total_coeff)
+        }
+
+        /// A CAVLC code table (`lens[i]`/`bits[i]` per symbol `i`) as two-level lookup tables: 8 bits,
+        /// then a subtable for longer codes.
+        struct VlcTable {
+            max_len: u32,
+            /// `(len << 16) | symbol` for a code of up to 8 bits, `SUB | offset` for a subtable, 0 for
+            /// no code.
+            l1: [u32; 256],
+            l2: Vec<u32>,
+        }
+
+        const VLC_SUB: u32 = 1 << 31;
+
+        impl VlcTable {
+            fn new(lens: &[u8], bits: &[u8]) -> Self {
+                let max_len = lens.iter().copied().max().unwrap_or(0).max(1) as u32;
+                let mut t = Self {
+                    max_len,
+                    l1: [0; 256],
+                    l2: Vec::new(),
+                };
+                let sub_bits = max_len.saturating_sub(8);
+                for (sym, (&l, &b)) in lens.iter().zip(bits).enumerate() {
+                    let (l, code) = (l as u32, b as u32);
+                    if l == 0 {
+                        continue;
+                    }
+                    let entry = (l << 16) | sym as u32;
+                    if l <= 8 {
+                        // Every 8-bit prefix starting with the code; the first symbol wins, as in a scan.
+                        let first = (code << (8 - l)) as usize;
+                        for slot in &mut t.l1[first..first + (1 << (8 - l))] {
+                            if *slot == 0 {
+                                *slot = entry;
+                            }
+                        }
+                    } else {
+                        let top = (code >> (l - 8)) as usize;
+                        if t.l1[top] & VLC_SUB == 0 {
+                            if t.l1[top] != 0 {
+                                continue; // shadowed by a shorter code
+                            }
+                            t.l1[top] = VLC_SUB | t.l2.len() as u32;
+                            t.l2.resize(t.l2.len() + (1 << sub_bits), 0);
+                        }
+                        let base = (t.l1[top] & !VLC_SUB) as usize;
+                        let rest = code & ((1 << (l - 8)) - 1);
+                        let first = (rest << (sub_bits - (l - 8))) as usize;
+                        for slot in
+                            &mut t.l2[base + first..base + first + (1 << (sub_bits - (l - 8)))]
+                        {
+                            if *slot == 0 {
+                                *slot = entry;
+                            }
+                        }
+                    }
+                }
+                t
+            }
+
+            /// The symbol of the next code, consumed, from a 32-bit peek; `None` when no code below
+            /// `count` starts there, an error when the code runs past the end of the data.
+            #[inline(always)]
+            fn symbol(&self, r: &mut BitReader<'_>, count: usize) -> Option<Result<usize>> {
+                let v = r.peek32();
+                let e = self.l1[(v >> 24) as usize];
+                let e = if e & VLC_SUB != 0 {
+                    let sub_bits = self.max_len - 8;
+                    let sub = (v >> (32 - self.max_len)) & ((1 << sub_bits) - 1);
+                    self.l2[(e & !VLC_SUB) as usize + sub as usize]
+                } else {
+                    e
+                };
+                let sym = (e & 0xffff) as usize;
+                if e == 0 || sym >= count {
+                    return None;
+                }
+                Some(r.consume_peeked(e >> 16).map(|()| sym))
+            }
+        }
+
+        /// Lookup tables for the CAVLC codes, built on first use.
+        struct CavlcTables {
+            coeff_token: [VlcTable; 4],
+            chroma_dc_coeff_token: VlcTable,
+            total_zeros: Vec<VlcTable>,
+            chroma_dc_total_zeros: Vec<VlcTable>,
+            run: Vec<VlcTable>,
+        }
+
+        fn ref_tables() -> &'static CavlcTables {
+            static TABLES: std::sync::OnceLock<CavlcTables> = std::sync::OnceLock::new();
+            TABLES.get_or_init(|| CavlcTables {
+                coeff_token: std::array::from_fn(|t| {
+                    VlcTable::new(&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
+                }),
+                chroma_dc_coeff_token: VlcTable::new(
+                    &CHROMA_DC_COEFF_TOKEN_LEN,
+                    &CHROMA_DC_COEFF_TOKEN_BITS,
+                ),
+                total_zeros: (0..15)
+                    .map(|i| VlcTable::new(&TOTAL_ZEROS_LEN[i], &TOTAL_ZEROS_BITS[i]))
+                    .collect(),
+                chroma_dc_total_zeros: (0..3)
+                    .map(|i| {
+                        VlcTable::new(
+                            &CHROMA_DC_TOTAL_ZEROS_LEN[i],
+                            &CHROMA_DC_TOTAL_ZEROS_BITS[i],
+                        )
+                    })
+                    .collect(),
+                run: (0..7)
+                    .map(|i| VlcTable::new(&RUN_LEN[i], &RUN_BITS[i]))
+                    .collect(),
+            })
+        }
+    }
+
     #[test]
     fn cavlc_lookup_tables_match_the_linear_scan() {
-        let t = cavlc_tables();
-        let mut tables: Vec<(&VlcTable, &[u8], &[u8])> = Vec::new();
-        for k in 0..4 {
-            tables.push((&t.coeff_token[k], &COEFF_TOKEN_LEN[k], &COEFF_TOKEN_BITS[k]));
-        }
-        tables.push((
-            &t.chroma_dc_coeff_token,
-            &CHROMA_DC_COEFF_TOKEN_LEN,
-            &CHROMA_DC_COEFF_TOKEN_BITS,
-        ));
-        for k in 0..15 {
-            tables.push((&t.total_zeros[k], &TOTAL_ZEROS_LEN[k], &TOTAL_ZEROS_BITS[k]));
-        }
-        for k in 0..3 {
-            tables.push((
-                &t.chroma_dc_total_zeros[k],
-                &CHROMA_DC_TOTAL_ZEROS_LEN[k],
-                &CHROMA_DC_TOTAL_ZEROS_BITS[k],
-            ));
-        }
-        for k in 0..7 {
-            tables.push((&t.run[k], &RUN_LEN[k], &RUN_BITS[k]));
-        }
+        use cavlc_tables as ct;
         let mut x = 0x2545_f491_u32;
         for _ in 0..20_000 {
             x ^= x << 13;
             x ^= x >> 17;
             x ^= x << 5;
             // Bias towards leading zeros so long codes occur.
-            let bytes = (x >> (x % 9)).to_be_bytes();
-            for &(table, lens, bits) in &tables {
-                for count in [lens.len(), lens.len() / 2 + 1, 1] {
-                    let (mut a, mut b) = (BitReader::new(&bytes), BitReader::new(&bytes));
-                    let fast = table.symbol(&mut a, count).and_then(|r| r.ok());
-                    let slow = match_vlc_index(&mut b, lens, bits, count).ok();
-                    if let Some(sym) = fast {
-                        assert_eq!(Some(sym), slow, "{bytes:?} count {count}");
-                        assert_eq!(a.read_bits(8).ok(), b.read_bits(8).ok());
-                    }
+            let v = x >> (x % 13);
+            let bytes = v.to_be_bytes();
+            let check = |e: u32, lens: &[u8], bits: &[u8]| {
+                let mut b = BitReader::new(&bytes);
+                let slow = match_vlc_index(&mut b, lens, bits, lens.len()).ok();
+                let fast = (e != 0).then_some((e >> 5) as usize);
+                assert_eq!(fast, slow, "{bytes:?}");
+                if fast.is_some() {
+                    assert_eq!(e & 31, b.bits_read() as u32);
+                }
+            };
+            for k in 0..4 {
+                check(
+                    ct::coeff_token(k, v),
+                    &COEFF_TOKEN_LEN[k],
+                    &COEFF_TOKEN_BITS[k],
+                );
+            }
+            check(
+                ct::coeff_token(4, v),
+                &CHROMA_DC_COEFF_TOKEN_LEN,
+                &CHROMA_DC_COEFF_TOKEN_BITS,
+            );
+            for k in 0..15 {
+                check(
+                    ct::total_zeros(k + 1, v),
+                    &TOTAL_ZEROS_LEN[k],
+                    &TOTAL_ZEROS_BITS[k],
+                );
+            }
+            for k in 0..3 {
+                check(
+                    ct::CHROMA_DC_TOTAL_ZEROS[k][(v >> 29) as usize] as u32,
+                    &CHROMA_DC_TOTAL_ZEROS_LEN[k],
+                    &CHROMA_DC_TOTAL_ZEROS_BITS[k],
+                );
+            }
+            for k in 0..7 {
+                let e = ct::RUN_BEFORE[k + 1][(v >> 29) as usize] as u32;
+                if e != 0 || k < 6 {
+                    let e = ((e >> 4) << 5) | (e & 15);
+                    check(e, &RUN_LEN[k], &RUN_BITS[k]);
                 }
             }
         }
+    }
+
+    /// Random bits and encoded blocks decode exactly as the reference decoder does: the same
+    /// coefficients, the same error and the same reader position.
+    #[test]
+    fn cavlc_decoder_matches_the_reference() {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut ok, mut errs) = (0, 0);
+        for iter in 0..300_000 {
+            let r = next();
+            let nc = (r % 17) as u8;
+            let chroma_dc = r >> 8 & 7 == 0;
+            let max = if chroma_dc {
+                4
+            } else {
+                [16, 15, 16, 4][(r >> 12 & 3) as usize]
+            };
+            let encoded = iter % 4 != 0;
+            let mut bytes = Vec::new();
+            if encoded {
+                // Blocks with a wide range of levels, then random bits.
+                let mut w = BitWriter::new();
+                for _ in 0..3 {
+                    let mut c = [0i16; 16];
+                    let density = next() % 17;
+                    for v in c.iter_mut().take(max) {
+                        let r = next();
+                        if r % 16 < density {
+                            let mag = match r >> 4 & 7 {
+                                0..=3 => 1 + (r >> 8) % 3,
+                                4 | 5 => 1 + (r >> 8) % 40,
+                                6 => 1 + (r >> 8) % 3000,
+                                _ => 1 + (r >> 8) % 30000,
+                            } as i16;
+                            *v = if r >> 40 & 1 == 0 { mag } else { -mag };
+                        }
+                    }
+                    encode_cavlc_block(&mut w, &c[..max], nc, chroma_dc);
+                }
+                bytes = w.finish();
+            }
+            let tail = (next() % 24) as usize;
+            for _ in 0..tail {
+                let r = next();
+                // Bias towards zero bytes so long codes and escapes occur, but keep level
+                // prefixes short enough for the reference's arithmetic.
+                let zeros = bytes.iter().rev().take_while(|&&b| b == 0).count();
+                let byte = if r & 3 == 0 {
+                    0
+                } else {
+                    (r >> 8) as u8 >> ((r >> 16) % 8)
+                };
+                bytes.push(if zeros >= 2 { byte | 1 } else { byte });
+            }
+            let skip = if encoded { 0 } else { ((r >> 20) % 9) as u32 };
+            let (mut a, mut b) = (BitReader::new(&bytes), BitReader::new(&bytes));
+            let _ = a.read_bits(skip);
+            let _ = b.read_bits(skip);
+            for _ in 0..4 {
+                let mut slow = [0i16; 16];
+                let sr = reference::cavlc_block(&mut b, max, nc, chroma_dc, |p, l| slow[p] = l);
+                let start = a.clone();
+                let mut fast = [0i16; 16];
+                let fr = decode_cavlc_block(&mut a, &mut fast[..max], nc, chroma_dc);
+                assert_eq!(format!("{fr:?}"), format!("{sr:?}"), "{bytes:?} nc {nc}");
+                // Running out of data leaves the reader at the end rather than before the code.
+                if !matches!(sr, Err(RagdollError::BitstreamEndOfData)) {
+                    assert_eq!(a.bits_read(), b.bits_read(), "{bytes:?} nc {nc}");
+                }
+                if sr.is_err() {
+                    errs += 1;
+                    break;
+                }
+                ok += 1;
+                assert_eq!(fast, slow, "{bytes:?} nc {nc}");
+                if !chroma_dc {
+                    // The sparse form, from the same position.
+                    let (mut c, mut d) = (crate::cabac::ResidualCoeffs::new(), start);
+                    let n = decode_cavlc_coeffs(&mut d, max, nc, &mut c).unwrap();
+                    let mut dense = [0i16; 16];
+                    for k in 0..n {
+                        assert_eq!(dense[c.pos[k] as usize], 0);
+                        dense[c.pos[k] as usize] = c.level[k];
+                    }
+                    assert_eq!((n, dense), (sr.unwrap(), slow), "{bytes:?} nc {nc}");
+                    assert_eq!(d.bits_read(), a.bits_read());
+                }
+            }
+        }
+        assert!(ok > 500_000 && errs > 50_000, "{ok} blocks, {errs} errors");
     }
 
     /// Moving diagonal gradient plus a drifting block, so P-frames carry real motion and residuals.

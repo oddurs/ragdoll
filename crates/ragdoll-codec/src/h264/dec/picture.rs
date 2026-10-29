@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use ragdoll_core::AlignedBuffer;
+
 use super::tables::Part;
 
 /// Macroblock prediction type after parsing.
@@ -91,14 +93,35 @@ pub const NO_BLOCK: BlockInfo = BlockInfo {
     direct: false,
 };
 
+/// A macroblock row of [`NO_BLOCK`], copied from memory rather than rebuilt for every row.
+static NO_BLOCK_ROW: [BlockInfo; 4] = [NO_BLOCK; 4];
+
 /// Sets the `W`x`h` rectangle of `v` whose rows start at `i`, `i + stride`, ... to `val`, with
 /// one bounds check (`h >= 1`).
 #[inline(always)]
 pub fn fill_rect<T: Copy, const W: usize>(v: &mut [T], i: usize, stride: usize, h: usize, val: T) {
     let s = &mut v[i..i + (h - 1) * stride + W];
-    for r in 0..h {
-        s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+    if size_of::<T>() <= 8 {
+        for r in 0..h {
+            s[r * stride..r * stride + W].copy_from_slice(&[val; W]);
+        }
+        return;
     }
+    // Later rows copy the first: a multi-field `T` is then built once, not once per row.
+    let (first, rest) = s.split_at_mut(W);
+    first.copy_from_slice(&[val; W]);
+    for r in 1..h {
+        rest[r * stride - W..r * stride].copy_from_slice(first);
+    }
+}
+
+/// A 64-byte-aligned picture plane of `n` samples set to `v`.
+pub fn plane_buf(n: usize, v: u8) -> AlignedBuffer {
+    let mut b = AlignedBuffer::new_zeroed(n);
+    if v != 0 {
+        b.fill(v);
+    }
+    b
 }
 
 /// [`PicState::motion_edges`] of a macroblock with unknown motion: every inner edge.
@@ -117,8 +140,8 @@ pub enum RefKind {
 #[derive(Clone, Debug)]
 pub struct FrameStore {
     pub id: u32,
-    pub planes: Arc<[Vec<u8>; 3]>,
-    field_planes: [OnceLock<Arc<[Vec<u8>; 3]>>; 2],
+    pub planes: Arc<[AlignedBuffer; 3]>,
+    field_planes: [OnceLock<Arc<[AlignedBuffer; 3]>>; 2],
     pub width: usize,
     pub height: usize,
     pub field_poc: [i32; 2],
@@ -135,9 +158,9 @@ impl FrameStore {
         Self {
             id,
             planes: Arc::new([
-                vec![0; width * height],
-                vec![128; width * height / 4],
-                vec![128; width * height / 4],
+                plane_buf(width * height, 0),
+                plane_buf(width * height / 4, 128),
+                plane_buf(width * height / 4, 128),
             ]),
             field_planes: Default::default(),
             width,
@@ -165,10 +188,19 @@ impl FrameStore {
         self.frame_num_wrap = 0;
         self.long_term_frame_idx = 0;
         if init {
-            let planes = Arc::make_mut(&mut self.planes);
-            planes[0].fill(0);
-            planes[1].fill(128);
-            planes[2].fill(128);
+            if let Some(planes) = Arc::get_mut(&mut self.planes) {
+                planes[0].fill(0);
+                planes[1].fill(128);
+                planes[2].fill(128);
+            } else {
+                // Frames handed out still read the old samples: start from new buffers rather
+                // than copying them.
+                let lens = self.planes.each_ref().map(|p| p.len());
+                self.planes = Arc::new(lens.map(|n| plane_buf(n, 0)));
+                let planes = Arc::get_mut(&mut self.planes).expect("new planes");
+                planes[1].fill(128);
+                planes[2].fill(128);
+            }
             let n = self.motion.mb_intra.len();
             let m = Arc::make_mut(&mut self.motion);
             m.blocks.fill(NO_BLOCK);
@@ -205,16 +237,12 @@ impl FrameStore {
     }
 
     /// The samples of one field as a half-height picture.
-    pub fn field_view(&self, parity: u8) -> Arc<[Vec<u8>; 3]> {
+    pub fn field_view(&self, parity: u8) -> Arc<[AlignedBuffer; 3]> {
         self.field_planes[parity as usize]
             .get_or_init(|| {
                 let p = parity as usize;
-                let extract = |plane: &[u8], w: usize, h: usize| -> Vec<u8> {
-                    let mut out = Vec::with_capacity(w * h / 2);
-                    for y in (p..h).step_by(2) {
-                        out.extend_from_slice(&plane[y * w..y * w + w]);
-                    }
-                    out
+                let extract = |plane: &[u8], w: usize, h: usize| -> AlignedBuffer {
+                    AlignedBuffer::from_rows(w, h / 2, |y| &plane[(2 * y + p) * w..][..w])
                 };
                 let (w, h) = (self.width, self.height);
                 Arc::new([
@@ -227,10 +255,16 @@ impl FrameStore {
     }
 
     /// Mutable access to the frame samples; drops cached field views of `parity`.
-    pub fn planes_mut(&mut self, parity: Option<u8>) -> &mut [Vec<u8>; 3] {
+    pub fn planes_mut(&mut self, parity: Option<u8>) -> &mut [AlignedBuffer; 3] {
         match parity {
             Some(p) => self.field_planes[p as usize] = OnceLock::new(),
             None => self.field_planes = Default::default(),
+        }
+        // A frame picture overwrites every sample: while handed-out frames still read the old
+        // ones, it takes new buffers instead of copying them.
+        if parity.is_none() && Arc::get_mut(&mut self.planes).is_none() {
+            let lens = self.planes.each_ref().map(|p| p.len());
+            self.planes = Arc::new(lens.map(|n| plane_buf(n, 0)));
         }
         Arc::make_mut(&mut self.planes)
     }
@@ -247,7 +281,7 @@ pub struct PicState {
     pub mb_h: usize,
     pub width: usize,
     pub height: usize,
-    pub planes: [Vec<u8>; 3],
+    pub planes: [AlignedBuffer; 3],
 
     pub slice_num: Vec<u32>,
     pub mb_type: Vec<MbType>,
@@ -291,7 +325,11 @@ impl PicState {
             mb_h,
             width: w,
             height: h,
-            planes: [vec![0; w * h], vec![128; w * h / 4], vec![128; w * h / 4]],
+            planes: [
+                plane_buf(w * h, 0),
+                plane_buf(w * h / 4, 128),
+                plane_buf(w * h / 4, 128),
+            ],
             slice_num: vec![u32::MAX; mbs],
             mb_type: vec![MbType::None; mbs],
             mb_field: vec![matches!(structure, Structure::Field(_)); mbs],
@@ -336,6 +374,22 @@ impl PicState {
     /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
     /// row `y`, to that of a new picture.
     pub fn clear_mb(&mut self, addr: usize, x: usize, y: usize) {
+        self.clear_mb_state(addr, x, y);
+        self.reset_mb_blocks(x, y);
+    }
+
+    /// Resets the [`BlockInfo`] of the 16 4x4 blocks of the macroblock at column `x`, row `y`.
+    pub fn reset_mb_blocks(&mut self, x: usize, y: usize) {
+        let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
+        let rows = &mut self.blocks[i..i + 3 * w + 4];
+        for r in 0..4 {
+            rows[r * w..r * w + 4].copy_from_slice(&NO_BLOCK_ROW);
+        }
+    }
+
+    /// [`Self::clear_mb`] but for the blocks' [`BlockInfo`], which macroblock decoding writes in
+    /// full.
+    pub fn clear_mb_state(&mut self, addr: usize, x: usize, y: usize) {
         self.cbp[addr] = 0;
         self.qp[addr] = 0;
         self.qpc[addr] = [0; 2];
@@ -346,7 +400,6 @@ impl PicState {
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
         fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
-        fill_rect::<_, 4>(&mut self.blocks, i, w, 4, NO_BLOCK);
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);

@@ -343,49 +343,39 @@ impl CabacContext {
     }
 }
 
-/// `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed context`; entries for
-/// packed values above 127 are never read.
-const DEC_RANGE_LPS: [u8; 512] = {
-    let mut t = [0u8; 512];
-    let mut i = 0;
-    while i < 512 {
-        let (q, s) = (i >> 7, i & 127);
-        t[i] = CABAC_RANGE_TAB_LPS[s >> 1][q];
-        i += 1;
-    }
-    t
-};
-
-/// Left shift that renormalises a range `r` (`2..=510`) back to `256..=511`, indexed by `r`.
-const DEC_NORM_SHIFT: [u8; 512] = {
-    let mut t = [0u8; 512];
+/// The decoder's tables in one array, so that a decision needs a single base address:
+///
+/// - `[0, 512)`: the left shift that renormalises a range `r` (`2..=510`) to `256..=511`,
+///   indexed by `r`;
+/// - `[DEC_LPS, +512)`: `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed
+///   context`, where packed values above 127 are never read;
+/// - `[DEC_NEXT, +256)`: the packed context after a decision (Table 9-45), indexed by the packed
+///   context after an MPS and by its complement `255 - context` after an LPS, so that the
+///   index's low bit is the decoded bin either way.
+static DEC_TAB: [u8; 1280] = {
+    let mut t = [0u8; 1280];
     let mut r = 1;
     while r < 512 {
         t[r] = ((r as u32).leading_zeros() - 23) as u8;
         r += 1;
     }
-    t
-};
-
-/// The packed context after a decision, indexed by `lps << 8 | packed context` (Table 9-45,
-/// with `valMPS` flipping on an LPS in state 0).
-const DEC_NEXT: [u8; 512] = {
-    let mut t = [0u8; 512];
     let mut i = 0;
     while i < 512 {
-        let (lps, s) = (i >> 8, i & 255);
-        if s < 128 {
-            let (st, mps) = (s >> 1, (s & 1) as u8);
-            t[i] = if lps == 0 {
-                (CABAC_TRANS_IDX_MPS[st] << 1) | mps
-            } else {
-                (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8)
-            };
-        }
+        let (q, s) = (i >> 7, i & 127);
+        t[DEC_LPS + i] = CABAC_RANGE_TAB_LPS[s >> 1][q];
         i += 1;
+    }
+    let mut s = 0;
+    while s < 128 {
+        let (st, mps) = (s >> 1, (s & 1) as u8);
+        t[DEC_NEXT + s] = (CABAC_TRANS_IDX_MPS[st] << 1) | mps;
+        t[DEC_NEXT + 255 - s] = (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8);
+        s += 1;
     }
     t
 };
+const DEC_LPS: usize = 512;
+const DEC_NEXT: usize = 1024;
 
 /// Standard 460-context CABAC context bank for H.264 Main/High 4:2:0 slice syntax and DCT residuals.
 pub const NUM_CABAC_CONTEXTS: usize = 460;
@@ -946,19 +936,20 @@ pub struct CabacDecoder<'a> {
     /// Next byte of `data` not yet in `value`.
     pos: usize,
     /// `codIOffset` in the top 10 bits (9 plus headroom for a bypass shift), followed by the
-    /// stream's next `bits` bits.
+    /// stream's next bits and then a single set marker bit with zeros below it (FFmpeg's
+    /// `CABAC_MASK` scheme): the marker's position counts the valid bits, and while it stays in
+    /// the low 32 bits at least [`Self::MIN_BITS`] of them remain, so a decision checks for a
+    /// refill with one test.
     value: u64,
-    /// Valid stream bits below the offset; at least [`Self::MIN_BITS`] between decisions.
-    bits: u32,
     range: u32,
 }
 
 impl<'a> CabacDecoder<'a> {
     /// Bit position of the offset's least significant bit in `value`.
     const SHIFT: u32 = 54;
-    /// Lookahead kept between bins: a decision consumes at most 7 bits (range is at least 6
-    /// after an LPS) and a bypass bin 1.
-    const MIN_BITS: u32 = 8;
+    /// Valid bits left when the marker is at bit 31, its highest position between bins: more
+    /// than a decision (at most 7, range being at least 6 after an LPS) or a bypass bin consume.
+    const MIN_BITS: u32 = Self::SHIFT - 1 - 31;
 
     /// Initializes a CABAC arithmetic decoder from byte-aligned slice payload `data` (ITU-T H.264 9.3.1.2).
     pub fn new(data: &'a [u8]) -> Result<Self> {
@@ -969,7 +960,6 @@ impl<'a> CabacDecoder<'a> {
             data,
             pos: 0,
             value: 0,
-            bits: 0,
             range: 510,
         };
         d.start();
@@ -978,55 +968,55 @@ impl<'a> CabacDecoder<'a> {
 
     /// Loads the 9-bit initial offset from `pos` (9.3.1.2).
     fn start(&mut self) {
-        self.value = 0;
-        self.bits = 0;
+        // No valid bits: the marker sits just below the offset.
+        self.value = 1 << (Self::SHIFT - 1);
         self.refill();
         self.consume(9);
         self.range = 510;
     }
 
-    /// Tops the lookahead up to at least 47 bits; past the end of `data` the stream reads as zeros.
+    /// Fills the bits below the valid ones with whole bytes, leaving the marker in the low byte;
+    /// past the end of `data` the stream reads as zeros.
     #[inline(always)]
     fn refill(&mut self) {
-        (self.pos, self.value, self.bits) =
-            Self::refilled(self.data, self.pos, self.value, self.bits);
+        (self.pos, self.value) = Self::refilled(self.data, self.pos, self.value);
     }
 
     /// [`Self::refill`] on values, so that the decoder state of a caller can stay in registers.
     #[cold]
     #[inline(never)]
-    fn refilled(data: &[u8], mut pos: usize, mut value: u64, mut bits: u32) -> (usize, u64, u32) {
+    fn refilled(data: &[u8], mut pos: usize, value: u64) -> (usize, u64) {
+        let m = value.trailing_zeros();
+        // Whole bytes fit above bit 0: the new marker lands at m - 8 * k, in 0..8.
+        let k = m / 8;
+        debug_assert!(k >= 1 && Self::SHIFT - 1 - (m - 8 * k) >= Self::MIN_BITS);
+        let mut value = value ^ (1 << m);
         if let Some(b) = data.get(pos..pos + 8) {
-            // Bits below the valid ones are the stream's own, so OR-ing them again later is harmless.
             let v = u64::from_be_bytes(b.try_into().expect("8 bytes"));
-            value |= (v >> (64 - Self::SHIFT)) >> bits;
-            let n = (Self::SHIFT - bits) >> 3;
-            pos += n as usize;
-            bits += n * 8;
+            value |= (v >> (64 - 8 * k)) << (m + 1 - 8 * k);
         } else {
-            while bits + 8 <= Self::SHIFT {
-                let b = data.get(pos).copied().unwrap_or(0) as u64;
-                value |= b << (Self::SHIFT - 8 - bits);
-                bits += 8;
-                pos += 1;
+            for j in 0..k {
+                let b = data.get(pos + j as usize).copied().unwrap_or(0) as u64;
+                value |= b << (m + 1 - 8 * (j + 1));
             }
         }
-        (pos, value, bits)
+        pos += k as usize;
+        (pos, value | 1 << (m - 8 * k))
     }
 
     /// Shifts `n` stream bits into the offset.
     #[inline(always)]
     fn consume(&mut self, n: u32) {
         self.value <<= n;
-        self.bits -= n;
-        if self.bits < Self::MIN_BITS {
+        if self.value as u32 == 0 {
             self.refill();
         }
     }
 
     /// Bit position in `data` of the next unread bit.
     fn bit_pos(&self) -> usize {
-        self.pos * 8 - self.bits as usize
+        let bits = Self::SHIFT - 1 - self.value.trailing_zeros();
+        self.pos * 8 - bits as usize
     }
 
     /// Decodes a single binary decision (`0` or `1`) using `ctx` (ITU-T H.264 9.3.3.2.1).
@@ -1036,19 +1026,21 @@ impl<'a> CabacDecoder<'a> {
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut CabacContext) -> u8 {
         let s = ctx.0 as usize;
-        let r_lps = DEC_RANGE_LPS[((self.range as usize & 0xC0) << 1) | s] as u32;
+        let r_lps = DEC_TAB[DEC_LPS + (((self.range as usize & 0xC0) << 1) | s)] as u32;
         let range = self.range - r_lps;
         let scaled = (range as u64) << Self::SHIFT;
-        let lps = (self.value >= scaled) as u32;
-        self.value -= scaled & (lps as u64).wrapping_neg();
-        let range = range ^ ((range ^ r_lps) & lps.wrapping_neg());
-        ctx.0 = DEC_NEXT[((lps as usize) << 8) | s];
-        let bin = (s as u8 ^ lps as u8) & 1;
+        let lps = self.value >= scaled;
+        let mask = (lps as u64).wrapping_neg();
+        self.value -= scaled & mask;
+        let range = if lps { r_lps } else { range };
+        // An LPS complements the index, which flips its low bit from valMPS to the bin.
+        let s = s ^ (mask as usize & 0xFF);
+        ctx.0 = DEC_TAB[DEC_NEXT + s];
         // range is at least 6 here; one shift restores 256..=511.
-        let n = DEC_NORM_SHIFT[range as usize & 511] as u32;
+        let n = DEC_TAB[range as usize & 511] as u32;
         self.range = range << n;
         self.consume(n);
-        bin
+        (s & 1) as u8
     }
 
     /// Decodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
@@ -1442,9 +1434,14 @@ impl<'a> CabacDecoder<'a> {
         field: bool,
         out: &mut ResidualCoeffs,
     ) -> usize {
-        // On a local copy the engine state stays in registers across the block.
+        // On a local copy the engine state stays in registers across the block. The common frame
+        // 4x4 block kinds get their own copies with the context bases and sizes as constants.
         let mut d = self.clone();
-        let n = d.residual_coeffs(ctxs, cat, cbf_cond, max_coeff, field, out);
+        let n = match (cat, max_coeff, field) {
+            (2, 16, false) => d.residual_coeffs(ctxs, 2, cbf_cond, 16, false, out),
+            (4, 15, false) => d.residual_coeffs(ctxs, 4, cbf_cond, 15, false, out),
+            _ => d.residual_coeffs(ctxs, cat, cbf_cond, max_coeff, field, out),
+        };
         *self = d;
         n
     }
@@ -1524,22 +1521,28 @@ impl<'a> CabacDecoder<'a> {
             n += 1;
         }
 
-        let mut num_eq1 = 0usize;
-        let mut num_gt1 = 0usize;
-        let gt_max = if cat == 3 { 3 } else { 4 };
-
+        // Level contexts by "node" (FFmpeg's node_ctx): the count of levels equal to 1 so far
+        // (0..=3) while none exceeded 1, else 4 + the count of levels above 1 (9.3.3.1.3).
+        const LEVEL1_CTX: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+        const LEVEL_GT1_CTX: [[u8; 8]; 2] = [[5, 5, 5, 5, 6, 7, 8, 9], [5, 5, 5, 5, 6, 7, 8, 8]];
+        const NEXT_NODE: [[u8; 8]; 2] = [[1, 2, 3, 3, 4, 5, 6, 7], [4, 4, 4, 4, 5, 6, 7, 7]];
+        // The 10 level contexts (16 taken so that a masked index needs no bounds check).
+        let lvl: &mut [CabacContext; 16] = (&mut ctxs[lvl_base..lvl_base + 16])
+            .try_into()
+            .expect("16 contexts");
+        let gt1_ctx = &LEVEL_GT1_CTX[(cat == 3) as usize];
+        let mut node = 0usize;
         for k in (0..n).rev() {
-            let c0 = if num_gt1 > 0 { 0 } else { (1 + num_eq1).min(4) };
-            let abs_m1 = if self.decode_decision(&mut ctxs[lvl_base + c0]) == 0 {
-                num_eq1 += 1;
-                0u32
+            let val = if self.decode_decision(&mut lvl[LEVEL1_CTX[node] as usize & 15]) == 0 {
+                node = NEXT_NODE[0][node] as usize & 7;
+                1
             } else {
-                let c1 = 5 + num_gt1.min(gt_max);
-                let mut v = 1u32;
-                while v < 14 && self.decode_decision(&mut ctxs[lvl_base + c1]) != 0 {
+                let c1 = &mut lvl[gt1_ctx[node] as usize & 15];
+                let mut v = 2u32;
+                while v < 15 && self.decode_decision(c1) != 0 {
                     v += 1;
                 }
-                if v == 14 {
+                if v == 15 {
                     let mut k = 0u32;
                     while k < 24 && self.decode_bypass() != 0 {
                         v += 1 << k;
@@ -1551,12 +1554,10 @@ impl<'a> CabacDecoder<'a> {
                     }
                     v += rem;
                 }
-                num_gt1 += 1;
-                v
+                node = NEXT_NODE[1][node] as usize & 7;
+                v.min(32767) as i16
             };
-            let sign = self.decode_bypass() != 0;
-            let val = (abs_m1 + 1).min(32767) as i16;
-            out.level[k] = if sign { -val } else { val };
+            out.level[k & 63] = if self.decode_bypass() != 0 { -val } else { val };
         }
         n
     }

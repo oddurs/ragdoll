@@ -14,7 +14,8 @@ mod tables;
 use std::sync::Arc;
 
 use ragdoll_core::{
-    PictureType, PixelFormat, RagdollError, Rational64, Result, Timestamp, VideoFrame,
+    CACHE_LINE_ALIGN, PictureType, PixelFormat, Plane, RagdollError, Rational64, Result, Timestamp,
+    VideoFrame,
 };
 
 use deblock::SliceDeblock;
@@ -625,18 +626,36 @@ fn make_output(
     let (x0, y0, w, h) = (x0 as usize, y0 as usize, w as usize, h as usize);
     let pw = store.width;
     let cw = w.div_ceil(2);
+    // Without a left or top crop, and with rows on 64-byte boundaries, the frame shares the
+    // picture's samples instead of copying them (they are copied on write instead).
+    let share = x0 == 0
+        && y0 == 0
+        && sps.chroma_array_type() == 1
+        && pw.is_multiple_of(2 * CACHE_LINE_ALIGN);
     let grey = vec![128u8; if sps.chroma_array_type() == 0 { cw } else { 0 }];
-    let mut f = VideoFrame::from_rows(w, h, PixelFormat::Yuv420p, |p, y| {
-        if p == 0 {
-            let o = (y0 + y) * pw + x0;
-            &store.planes[0][o..o + w]
-        } else if sps.chroma_array_type() == 0 {
-            &grey
-        } else {
-            let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
-            &store.planes[p][o..o + cw]
-        }
-    });
+    let mut f = if share {
+        let fmt = PixelFormat::Yuv420p;
+        let planes = (0..3)
+            .map(|p| {
+                let (w, h) = fmt.plane_dimensions(w, h, p);
+                let stride = if p == 0 { pw } else { pw / 2 };
+                Plane::shared(store.planes.clone(), p, w, h, 1, stride)
+            })
+            .collect();
+        VideoFrame::from_planes(w, h, fmt, planes)
+    } else {
+        VideoFrame::from_rows(w, h, PixelFormat::Yuv420p, |p, y| {
+            if p == 0 {
+                let o = (y0 + y) * pw + x0;
+                &store.planes[0][o..o + w]
+            } else if sps.chroma_array_type() == 0 {
+                &grey
+            } else {
+                let o = (y0 / 2 + y) * (pw / 2) + x0 / 2;
+                &store.planes[p][o..o + cw]
+            }
+        })
+    };
     f.colorimetry = sps.colorimetry;
     f.keyframe = idr;
     f.pict_type = pict_type;

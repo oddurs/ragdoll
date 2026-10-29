@@ -26,33 +26,40 @@ impl<'a> BitReader<'a> {
         reader
     }
 
-    /// Refills the 64-bit shift register so `bits_in_buf >= 57` whenever input bytes remain.
+    /// Refills the 64-bit shift register so `bits_in_buf >= 56` whenever input bytes remain.
+    ///
+    /// Bits of `bit_buf` below the `bits_in_buf` valid ones are either zero or the stream's
+    /// next bits, so loading a byte again over them is harmless.
     #[inline(always)]
     pub fn refill(&mut self) {
-        if self.bits_in_buf == 0 && self.byte_pos + 8 <= self.data.len() {
-            let chunk: [u8; 8] = self.data[self.byte_pos..self.byte_pos + 8]
-                .try_into()
-                .unwrap();
-            self.bit_buf = u64::from_be_bytes(chunk);
-            self.bits_in_buf = 64;
-            self.byte_pos += 8;
+        if self.byte_pos + 8 <= self.data.len() {
+            if self.bits_in_buf < 64 {
+                let chunk: [u8; 8] = self.data[self.byte_pos..self.byte_pos + 8]
+                    .try_into()
+                    .unwrap();
+                self.bit_buf |= u64::from_be_bytes(chunk) >> self.bits_in_buf;
+                let bytes = (63 - self.bits_in_buf) >> 3;
+                self.byte_pos += bytes as usize;
+                self.bits_in_buf += bytes * 8;
+            }
             return;
         }
-        if self.bits_in_buf <= 32 && self.byte_pos + 4 <= self.data.len() {
-            let chunk: [u8; 4] = self.data[self.byte_pos..self.byte_pos + 4]
-                .try_into()
-                .unwrap();
-            let word = u32::from_be_bytes(chunk) as u64;
-            self.bit_buf |= word << (32 - self.bits_in_buf);
-            self.bits_in_buf += 32;
-            self.byte_pos += 4;
-        }
-        while self.bits_in_buf <= 56 && self.byte_pos < self.data.len() {
-            let b = self.data[self.byte_pos] as u64;
-            self.bit_buf |= b << (56 - self.bits_in_buf);
-            self.bits_in_buf += 8;
-            self.byte_pos += 1;
-        }
+        // By value, so a reader copied into locals can stay in registers.
+        (self.bit_buf, self.bits_in_buf, self.byte_pos) =
+            refill_tail(self.data, self.bit_buf, self.bits_in_buf, self.byte_pos);
+    }
+
+    /// Runs `f` on a copy of the reader in locals and keeps its progress: a reader behind a
+    /// reference is reloaded from and stored to memory around every element, a local copy can
+    /// stay in registers across a tight decoding loop.
+    #[inline(always)]
+    pub fn with_local<R>(&mut self, f: impl FnOnce(&mut BitReader<'a>) -> R) -> R {
+        let mut local = self.clone();
+        let res = f(&mut local);
+        self.byte_pos = local.byte_pos;
+        self.bit_buf = local.bit_buf;
+        self.bits_in_buf = local.bits_in_buf;
+        res
     }
 
     /// Total number of unread bits remaining in the slice.
@@ -102,6 +109,17 @@ impl<'a> BitReader<'a> {
         (self.bit_buf >> 32) as u32
     }
 
+    /// The next 32 bits without consuming them, of which the first `need` (`0..=32`) are valid
+    /// until the end of the data (zero past it); the rest may read as zero. Refilling only when
+    /// fewer than `need` bits are buffered refills less often than [`Self::peek32`].
+    #[inline(always)]
+    pub fn peek32_min(&mut self, need: u32) -> u32 {
+        if self.bits_in_buf < need {
+            self.refill();
+        }
+        (self.bit_buf >> 32) as u32
+    }
+
     /// Consumes `n` (`0..=32`) bits seen by [`Self::peek32`]; fails if they run past the end of
     /// the data.
     #[inline(always)]
@@ -111,6 +129,28 @@ impl<'a> BitReader<'a> {
         }
         self.bit_buf <<= n & 63;
         self.bits_in_buf -= n;
+        Ok(())
+    }
+
+    /// Consumes `n` (`0..=32`) bits seen by [`Self::peek32`] (or valid ones of
+    /// [`Self::peek32_min`]) without checking for the end of the data. A decoder that consumes
+    /// a run of codes this way calls [`Self::check_skipped`] before it trusts what it read and
+    /// before any other method.
+    #[inline(always)]
+    pub fn skip_peeked(&mut self, n: u32) {
+        self.bit_buf <<= n & 63;
+        self.bits_in_buf = self.bits_in_buf.wrapping_sub(n);
+    }
+
+    /// Fails if [`Self::skip_peeked`] went past the end of the data, leaving the reader at its
+    /// end.
+    #[inline(always)]
+    pub fn check_skipped(&mut self) -> Result<()> {
+        if self.bits_in_buf > 64 {
+            self.bit_buf = 0;
+            self.bits_in_buf = 0;
+            return Err(RagdollError::BitstreamEndOfData);
+        }
         Ok(())
     }
 
@@ -205,14 +245,34 @@ impl<'a> BitReader<'a> {
     /// Decodes an H.264 / HEVC Unsigned Exp-Golomb code `ue(v)` using hardware `CLZ`.
     #[inline]
     pub fn read_ue(&mut self) -> Result<u64> {
+        // A code of up to 31 bits (a value below 65535) already in the register: its top
+        // `2 * lz + 1` bits are `value + 1`. Small enough to inline everywhere.
+        let lz = self.bit_buf.leading_zeros();
+        let n = 2 * lz + 1;
+        if lz < 16 && n <= self.bits_in_buf {
+            let code = self.bit_buf >> (64 - n);
+            self.bit_buf <<= n;
+            self.bits_in_buf -= n;
+            return Ok(code - 1);
+        }
+        self.read_ue_refill()
+    }
+
+    /// [`Self::read_ue`] after a refill, for long codes and the end of the data.
+    #[inline(never)]
+    fn read_ue_refill(&mut self) -> Result<u64> {
         if self.bits_in_buf < 32 {
             self.refill();
         }
-        if self.bits_in_buf == 0 {
-            return Err(RagdollError::BitstreamEndOfData);
-        }
         let lz = self.bit_buf.leading_zeros();
-        if lz >= self.bits_in_buf {
+        let n = 2 * lz + 1;
+        if lz < 16 && n <= self.bits_in_buf {
+            let code = self.bit_buf >> (64 - n);
+            self.bit_buf <<= n;
+            self.bits_in_buf -= n;
+            return Ok(code - 1);
+        }
+        if self.bits_in_buf == 0 || lz >= self.bits_in_buf {
             return Err(RagdollError::BitstreamEndOfData);
         }
         if lz > 32 {
@@ -220,21 +280,6 @@ impl<'a> BitReader<'a> {
                 "Exp-Golomb leading zeros exceed 32 bits",
             ));
         }
-        // Fast single-register path when both prefix (lz + 1) and payload (lz) are already buffered
-        let total_bits = 2 * lz + 1;
-        if total_bits <= self.bits_in_buf {
-            self.bit_buf <<= lz + 1;
-            self.bits_in_buf -= lz + 1;
-            if lz == 0 {
-                return Ok(0);
-            }
-            let info = self.bit_buf >> (64 - lz);
-            self.bit_buf <<= lz;
-            self.bits_in_buf -= lz;
-            return Ok(((1u64 << lz) - 1) + info);
-        }
-
-        // Fallback when lz is 16..=32 and buffer needs a refill for the info suffix
         self.consume_buffered(lz + 1);
         let info = self.read_bits(lz)?;
         Ok(((1u64 << lz) - 1) + info)
@@ -408,6 +453,17 @@ impl<'a> BitReader<'a> {
         let u = self.read_rice_unsigned(k)?;
         Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
     }
+}
+
+/// [`BitReader::refill`] within the last 8 bytes of the data: `(bit_buf, bits_in_buf, byte_pos)`.
+#[inline(never)]
+fn refill_tail(data: &[u8], mut buf: u64, mut bits: u32, mut pos: usize) -> (u64, u32, usize) {
+    while bits <= 56 && pos < data.len() {
+        buf |= (data[pos] as u64) << (56 - bits);
+        bits += 8;
+        pos += 1;
+    }
+    (buf, bits, pos)
 }
 
 /// High-throughput 64-bit accumulator bitstream writer.

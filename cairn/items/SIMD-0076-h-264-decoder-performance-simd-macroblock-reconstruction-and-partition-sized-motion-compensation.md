@@ -51,3 +51,11 @@ Round 2: CABAC engine packed (2*state+mps contexts, 64-bit offset window, state 
 ## 2026-10-29
 
 Round 3: CAVLC from 32-bit peeks with sparse coefficient lists; MC kernels that average into the destination (AVX2/NEON, differential-tested) and direct calls for default-weighted blocks; whole-macroblock spatial direct when the co-located MB has one motion (reference motion records it per MB); fixed-size CABAC significance/last context arrays and a renormalisation table; per-4x4 state (both lists' mv/ref_idx/ref_pic/mvd, nz, direct) as one Vec<BlockInfo>; division-free MB positions; fast left/top neighbours without MBAFF; no eager error values. Callgrind: 30 frames of 1080p High 2.06 G -> 1.67 G instructions (FFmpeg 1.22 G including its demux), 10.4 M -> 9.2 M mispredicts; 60 frames of 720p Baseline 1.28 G -> 1.04 G (FFmpeg 0.74 G including demux). The MC kernels now cost about what FFmpeg's assembly does; the remaining gap is per-call glue around them, CABAC residual (~320 M vs ~250 M) and direct/neighbour bookkeeping. All 166 JVT streams byte-identical.
+
+## 2026-10-29
+
+Round 4: CABAC engine with one-base tables, a refill marker bit and node-state level contexts, constant-folded for 4x4 luma and chroma AC; read_residual per entropy coder; progressive MC path; macroblock motion written once (no per-MB block reset); neighbour availability once per macroblock; Option-free vector prediction; SIMD idct8 and intra predictors (AVX2/NEON) with a per-MB intra mode grid; decoded frames share the decoder's picture planes (no output copy). Callgrind: 30 frames of 1080p High 1.658 G -> 1.389 G instructions (FFmpeg 1.12 G), D1 misses 12.8 M -> ~10.3 M; 60 frames of 720p Baseline 1.024 G -> 0.918 G (FFmpeg 0.68 G). All 166 JVT streams byte-identical.
+
+## 2026-10-29
+
+Round 4, merged: CAVLC residual decoding from compile-time tables with a register-resident reader, paired level/run_before lookups and an inlinable read_ue (720p Baseline CAVLC residual 151 M -> 57 M instructions). Totals: 1080p High 1.385 G, 720p Baseline 0.825 G instructions (FFmpeg 1.12 G and 0.68 G).
