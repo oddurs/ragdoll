@@ -10,7 +10,7 @@ claimed: 2026-10-28
 depends_on:
 - 75
 created: 2026-10-28
-updated: 2026-10-28
+updated: 2026-10-29
 priority: p1
 effort: l
 area: codec-video
@@ -47,3 +47,7 @@ Round 1 (this PR): partition-sized AVX2/NEON MC + weighting + avg kernels (ragdo
 ## 2026-10-28
 
 Round 2: CABAC engine packed (2*state+mps contexts, 64-bit offset window, state in registers across a residual block); residual blocks decoded as (scan position, level) lists dequantised into a persistent buffer that the IDCTs clear; MB-level direct/P_Skip neighbours and per-MB co-located resolution; rectangle motion stores; inner-edge motion mask and bitmask edge walk in deblocking; whole-sample copies instead of edge emulation. Callgrind on 30 frames of 1080p High: 2.58 G -> 2.06 G instructions (FFmpeg 1.22 G), mispredicts 12.5 M -> 10.4 M (FFmpeg 4.8 M), I1 misses 5.9 M (FFmpeg 1.4 M); data-cache misses are level (12.1 M vs 10.8 M), a fifth of ours from the output copy in make_output. Wall clock on a loaded 4-core VM, per access unit: 1080p 3.88 s -> 3.47 s per 300 frames (FFmpeg ~1.65 s); 720p Baseline 726 ms (FFmpeg ~330 ms), CAVLC path not yet reworked. All 166 JVT streams byte-identical, also under debug assertions.
+
+## 2026-10-29
+
+Round 3: CAVLC from 32-bit peeks with sparse coefficient lists; MC kernels that average into the destination (AVX2/NEON, differential-tested) and direct calls for default-weighted blocks; whole-macroblock spatial direct when the co-located MB has one motion (reference motion records it per MB); fixed-size CABAC significance/last context arrays and a renormalisation table; per-4x4 state (both lists' mv/ref_idx/ref_pic/mvd, nz, direct) as one Vec<BlockInfo>; division-free MB positions; fast left/top neighbours without MBAFF; no eager error values. Callgrind: 30 frames of 1080p High 2.06 G -> 1.67 G instructions (FFmpeg 1.22 G including its demux), 10.4 M -> 9.2 M mispredicts; 60 frames of 720p Baseline 1.28 G -> 1.04 G (FFmpeg 0.74 G including demux). The MC kernels now cost about what FFmpeg's assembly does; the remaining gap is per-call glue around them, CABAC residual (~320 M vs ~250 M) and direct/neighbour bookkeeping. All 166 JVT streams byte-identical.
