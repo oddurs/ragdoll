@@ -78,9 +78,10 @@ fn icwrs(n: usize, y: &[i32]) -> u32 {
         j -= 1;
         i = i.wrapping_add(pvq_u(n - j, k));
         k += y[j].unsigned_abs() as usize;
-        if y[j] < 0 {
-            i = i.wrapping_add(pvq_u(n - j, k + 1));
-        }
+        // U(n - j, k + 1) when y[j] < 0, without a branch on the sign (which is random). The
+        // entry is in the table either way: U(n, k + 1) is, for the whole codeword.
+        let neg = 0u32.wrapping_sub((y[j] < 0) as u32);
+        i = i.wrapping_add(pvq_u(n - j, k + 1) & neg);
         if j == 0 {
             break;
         }
@@ -492,10 +493,15 @@ fn extract_collapse_mask<T: Copy + Into<i32>>(iy: &[T], n: usize, b: usize) -> u
     mask
 }
 
-/// `op_pvq_search`: best `k`-pulse codeword for `x`; `x` is made non-negative in place.
+/// `op_pvq_search`: best `k`-pulse codeword for `x` into `iy[..n]` (further values of `iy`
+/// may be overwritten); `x` is made non-negative in place.
 pub fn pvq_search(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -> i32 {
     #[cfg(target_arch = "x86_64")]
-    if ragdoll_core::dispatch::avx2() && x.len() == n && (1..=MAX_BAND).contains(&n) {
+    if ragdoll_core::dispatch::avx2()
+        && x.len() == n
+        && (1..=MAX_BAND).contains(&n)
+        && iy.len() >= n.next_multiple_of(8)
+    {
         // Safety: avx2() is true only when the CPU supports AVX2; the sizes are checked.
         return unsafe { super::simd_enc::pvq_search_avx2(x, iy, k, n) };
     }

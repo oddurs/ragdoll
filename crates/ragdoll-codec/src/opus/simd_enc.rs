@@ -56,7 +56,26 @@ mod avx2_i32 {
     }
 }
 
-/// AVX2 [`super::vq::pvq_search_scalar`] for `x` of exactly `n <= MAX_BAND` values.
+/// `pshufb` masks moving the last `t` of eight 16-bit lanes down to the first `t`, zeroing
+/// the rest.
+#[cfg(target_arch = "x86_64")]
+static SHIFT_DOWN: [[i8; 16]; 9] = {
+    let mut m = [[-1i8; 16]; 9];
+    let mut t = 0;
+    while t <= 8 {
+        let mut b = 0;
+        while b < 2 * t {
+            m[t][b] = (b + 16 - 2 * t) as i8;
+            b += 1;
+        }
+        t += 1;
+    }
+    m
+};
+
+/// AVX2 [`super::vq::pvq_search_scalar`] for `x` of exactly `n <= MAX_BAND` values, with
+/// `iy` holding at least `n` rounded up to a multiple of 8 (the values past `n` are
+/// overwritten).
 ///
 /// Each pulse goes to the first `j` maximising `rxy_j / ryy_j`, which the scalar loop finds
 /// with the cross-multiplied test `best_den * rxy > ryy * best_num`. While every `ryy_j` is
@@ -78,8 +97,8 @@ pub unsafe fn pvq_search_avx2(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -
     use std::arch::x86_64::*;
     use std::mem::MaybeUninit;
     const C: usize = MAX_BAND / 8;
-    assert!(n >= 1 && n <= MAX_BAND && x.len() == n && iy.len() >= n);
     let chunks = n.div_ceil(8);
+    assert!(n >= 1 && n <= MAX_BAND && x.len() == n && iy.len() >= 8 * chunks);
     let tail = n - 8 * (chunks - 1);
     let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let pad = _mm256_cmpgt_epi32(lanes, _mm256_set1_epi32(tail as i32 - 1));
@@ -97,18 +116,38 @@ pub unsafe fn pvq_search_avx2(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -
         iyb.as_mut_ptr() as *mut __m256i,
     );
     let xp = x.as_mut_ptr();
-    // Safety: chunk `c < chunks` of the buffers is in bounds, and of `x` the first `len`
-    // values are; every buffer entry is written before it is read.
+    // Safety: chunk `c < chunks` of the buffers is in bounds, and so are the reads and writes
+    // of `x` (whole chunks, the last eight values, or a copy); every buffer entry is written
+    // before it is read.
     unsafe {
         for c in 0..chunks {
-            let len = if c + 1 == chunks { tail } else { 8 };
-            let mut t = [0i16; 8];
-            std::ptr::copy_nonoverlapping(xp.add(8 * c), t.as_mut_ptr(), len);
-            let v = _mm_loadu_si128(t.as_ptr() as *const __m128i);
-            // abs_epi16 wraps -32768 to itself, as `wrapping_abs` does.
-            let a = _mm_abs_epi16(v);
-            _mm_storeu_si128(t.as_mut_ptr() as *mut __m128i, a);
-            std::ptr::copy_nonoverlapping(t.as_ptr(), xp.add(8 * c), len);
+            let p = xp.add(8 * c) as *mut __m128i;
+            let a;
+            let v = if c + 1 < chunks || tail == 8 {
+                let v = _mm_loadu_si128(p);
+                // abs_epi16 wraps -32768 to itself, as `wrapping_abs` does.
+                a = _mm_abs_epi16(v);
+                _mm_storeu_si128(p, a);
+                v
+            } else if n >= 8 {
+                // The last eight values, whose first 8 - tail are already done (and abs
+                // leaves them so), moved down to the chunk's lanes.
+                let q = xp.add(n - 8) as *mut __m128i;
+                let w = _mm_loadu_si128(q);
+                _mm_storeu_si128(q, _mm_abs_epi16(w));
+                let sh = _mm_loadu_si128(SHIFT_DOWN[tail].as_ptr() as *const __m128i);
+                let v = _mm_shuffle_epi8(w, sh);
+                a = _mm_abs_epi16(v);
+                v
+            } else {
+                let mut t = [0i16; 8];
+                std::ptr::copy_nonoverlapping(xp, t.as_mut_ptr(), n);
+                let v = _mm_loadu_si128(t.as_ptr() as *const __m128i);
+                a = _mm_abs_epi16(v);
+                _mm_storeu_si128(t.as_mut_ptr() as *mut __m128i, a);
+                std::ptr::copy_nonoverlapping(t.as_ptr(), xp, n);
+                v
+            };
             xv.add(c).write(_mm256_cvtepi16_epi32(a));
             sv.add(c)
                 .write(_mm256_cvtepi16_epi32(_mm_srli_epi16::<15>(v)));
@@ -244,16 +283,9 @@ pub unsafe fn pvq_search_avx2(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -
         }
         let ip = iy.as_mut_ptr();
         for c in 0..chunks {
-            let len = if c + 1 == chunks { tail } else { 8 };
             let s = *sv.add(c);
             let v = _mm256_add_epi32(_mm256_xor_si256(*iyv.add(c), _mm256_sub_epi32(zero, s)), s);
-            if len == 8 {
-                _mm256_storeu_si256(ip.add(8 * c) as *mut __m256i, v);
-            } else {
-                let mut t = [0i32; 8];
-                _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, v);
-                std::ptr::copy_nonoverlapping(t.as_ptr(), ip.add(8 * c), len);
-            }
+            _mm256_storeu_si256(ip.add(8 * c) as *mut __m256i, v);
         }
         yy
     }
@@ -809,10 +841,15 @@ mod tests {
                 for (seed, amp) in [(1, 16384), (2, 3000), (3, 40), (4, 32768), (5, 1)] {
                     let x = signal16(n, seed * 977 + n as u32 + k as u32, amp);
                     let (mut xa, mut xb) = (x.clone(), x.clone());
-                    let (mut ia, mut ib) = (vec![7i32; n], vec![-7i32; n]);
+                    let m = n.next_multiple_of(8);
+                    let (mut ia, mut ib) = (vec![7i32; m], vec![-7i32; m]);
                     let ya = pvq_search(&mut xa, &mut ia, k as i32, n);
                     let yb = pvq_search_scalar(&mut xb, &mut ib, k as i32, n);
-                    assert_eq!((ya, &ia, &xa), (yb, &ib, &xb), "n {n} k {k} amp {amp}");
+                    assert_eq!(
+                        (ya, &ia[..n], &xa),
+                        (yb, &ib[..n], &xb),
+                        "n {n} k {k} amp {amp}"
+                    );
                 }
             }
         }

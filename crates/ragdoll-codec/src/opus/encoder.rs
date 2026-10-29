@@ -544,14 +544,28 @@ fn gen_toc(mode: i32, mut framerate: i32, bandwidth: i32, channels: usize) -> u8
 /// `dc_reject` (fixed point): a one-pole 3 Hz high-pass.
 fn dc_reject(input: &[i16], out: &mut [i16], hp_mem: &mut [i32; 4], len: usize, channels: usize) {
     let shift = ilog2(FS / (3 * 4));
-    for c in 0..channels {
-        for i in 0..len {
-            let x = (input[channels * i + c] as i32) << 14;
-            let y = x.wrapping_sub(hp_mem[2 * c]);
-            hp_mem[2 * c] =
-                hp_mem[2 * c].wrapping_add(pshr32(x.wrapping_sub(hp_mem[2 * c]), shift));
-            out[channels * i + c] = saturate(pshr32(y, 14), 32767) as i16;
+    // One sample through a channel's filter, whose state is `m`. The state is a serial
+    // recursion, so the channels of a frame advance side by side.
+    let step = |v: i16, m: &mut i32| {
+        let x = (v as i32) << 14;
+        let y = x.wrapping_sub(*m);
+        *m = m.wrapping_add(pshr32(x.wrapping_sub(*m), shift));
+        saturate(pshr32(y, 14), 32767) as i16
+    };
+    let (input, out) = (&input[..channels * len], &mut out[..channels * len]);
+    if channels == 2 {
+        let (mut m0, mut m1) = (hp_mem[0], hp_mem[2]);
+        for (o, x) in out.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
+            o[0] = step(x[0], &mut m0);
+            o[1] = step(x[1], &mut m1);
         }
+        (hp_mem[0], hp_mem[2]) = (m0, m1);
+    } else {
+        let mut m = hp_mem[0];
+        for (o, &x) in out.iter_mut().zip(input) {
+            *o = step(x, &mut m);
+        }
+        hp_mem[0] = m;
     }
 }
 
