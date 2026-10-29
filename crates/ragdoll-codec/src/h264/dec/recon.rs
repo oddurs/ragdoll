@@ -3,8 +3,9 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_idct4_add, h264_idct8_add,
-    h264_luma_mc, h264_luma_mc_avg, h264_weight_bi, h264_weight_uni, luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_chroma_mc_in_plane,
+    h264_idct4_add, h264_idct8_add, h264_luma_mc, h264_luma_mc_avg, h264_luma_mc_in_plane,
+    h264_weight_bi, h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -211,31 +212,12 @@ pub fn mc_luma<const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
 ) {
-    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
-        if AVG {
-            h264_luma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
-        } else {
-            h264_luma_mc(dst, ds, src, off, ss, w, h, fx, fy)
-        }
-    };
+    if h264_luma_mc_in_plane(dst, ds, src, width, height, (x, y), (w, h), mv, AVG) {
+        return;
+    }
     let ix = x as isize + (mv[0] as isize >> 2);
     let iy = y as isize + (mv[1] as isize >> 2);
     let (fx, fy) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
-    let cols = luma_mc_cols(w);
-    if ix >= 2 && iy >= 2 && ix as usize + cols <= width && iy as usize + h + 3 <= height {
-        kernel(
-            dst,
-            ds,
-            src,
-            iy as usize * width + ix as usize,
-            width,
-            w,
-            h,
-            fx,
-            fy,
-        );
-        return;
-    }
     mc_luma_edge::<AVG>(src, width, height, ix, iy, w, h, (fx, fy), dst, ds);
 }
 
@@ -371,24 +353,13 @@ pub fn mc_chroma<const AVG: bool>(
             h264_chroma_mc(dst, ds, src, off, ss, w, h, fx, fy)
         }
     };
+    if h264_chroma_mc_in_plane(dst, ds, src, width, height, (x, y), (w, h), mv, AVG) {
+        return;
+    }
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
     let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
     let cols = chroma_mc_cols(w);
-    if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
-        kernel(
-            dst,
-            ds,
-            src,
-            iy as usize * width + ix as usize,
-            width,
-            w,
-            h,
-            fx,
-            fy,
-        );
-        return;
-    }
     if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
     }
@@ -413,22 +384,13 @@ pub fn mc_chroma_pair<const AVG: bool>(
     dst: [&mut [u8]; 2],
     ds: usize,
 ) {
-    let ix = x as isize + (mv[0] as isize >> 3);
-    let iy = y as isize + (mv[1] as isize >> 3);
-    let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
-    let cols = chroma_mc_cols(w);
-    if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
-        let off = iy as usize * width + ix as usize;
-        for (s, d) in src.into_iter().zip(dst) {
-            if AVG {
-                h264_chroma_mc_avg(d, ds, s, off, width, w, h, fx, fy)
-            } else {
-                h264_chroma_mc(d, ds, s, off, width, w, h, fx, fy)
-            }
-        }
+    let [d0, d1] = dst;
+    if h264_chroma_mc_in_plane(d0, ds, src[0], width, height, (x, y), (w, h), mv, AVG) {
+        // The second plane has the first's size, so its block is inside too.
+        h264_chroma_mc_in_plane(d1, ds, src[1], width, height, (x, y), (w, h), mv, AVG);
         return;
     }
-    mc_chroma_pair_edge::<AVG>(src, width, height, x, y, w, h, mv, dst, ds);
+    mc_chroma_pair_edge::<AVG>(src, width, height, x, y, w, h, mv, [d0, d1], ds);
 }
 
 /// [`mc_chroma_pair`] for blocks reaching past the picture, kept out of line.

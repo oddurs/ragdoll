@@ -1966,11 +1966,36 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
-        let [a, b, c] = self.mb_neighbours()[0];
+        let [a, b, c] = if self.st.mbaff {
+            self.mb_neighbours()[0]
+        } else {
+            self.mb_neighbours_flat(0)
+        };
         if a.0 == UNAV || b.0 == UNAV || a == (0, [0, 0]) || b == (0, [0, 0]) {
             return [0, 0];
         }
         mvp_raw(a, b, c, 0)
+    }
+
+    /// [`Self::mb_neighbours`] of one list, without MBAFF.
+    #[inline]
+    fn mb_neighbours_flat(&self, list: usize) -> [Mv; 3] {
+        let (x, y, w) = (self.mb.x, self.mb.y, self.st.mb_w);
+        let i = self.st.b4(x * 4, y * 4);
+        let s = w * 4;
+        let st = &*self.st;
+        let at = |i: usize| (st.blocks[i].ref_idx[list], st.blocks[i].mv[list]);
+        let nb = self.nb;
+        let a = if nb & NB_L != 0 { at(i - 1) } else { NO_MV };
+        let b = if nb & NB_T != 0 { at(i - s) } else { NO_MV };
+        let c = if nb & NB_TR != 0 {
+            at(i - s + 4)
+        } else if nb & NB_TL != 0 {
+            at(i - s - 1)
+        } else {
+            NO_MV
+        };
+        [a, b, c]
     }
 
     /// Neighbours A, B and C (D where C is unavailable) of the whole macroblock in both lists,
