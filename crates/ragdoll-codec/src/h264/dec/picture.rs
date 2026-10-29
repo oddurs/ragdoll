@@ -43,7 +43,7 @@ pub enum Structure {
 #[derive(Clone, Debug)]
 pub struct Motion {
     /// Per 4x4 block.
-    pub blocks: Vec<BlockMotion>,
+    pub blocks: Vec<BlockInfo>,
     /// Per macroblock.
     pub mb_intra: Vec<bool>,
     /// Per macroblock: one motion for all 16 blocks (see [`PicState::motion_edges`]).
@@ -58,7 +58,7 @@ impl Motion {
     pub fn new(mb_w: usize, mb_h: usize) -> Self {
         let b4 = mb_w * mb_h * 16;
         Self {
-            blocks: vec![NO_MOTION; b4],
+            blocks: vec![NO_BLOCK; b4],
             mb_intra: vec![true; mb_w * mb_h],
             mb_uniform: vec![false; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
@@ -67,23 +67,28 @@ impl Motion {
     }
 }
 
-/// Motion of one 4x4 block, per list: the vector, the referenced picture id (see
-/// [`FrameStore::frame_ref_id`], or [`NO_PIC`]), the reference index (`-1` unused) and, for
-/// CABAC contexts, the absolute mvd components.
+/// What later blocks read of one 4x4 block. Per list: the vector, the referenced picture id
+/// (see [`FrameStore::frame_ref_id`], or [`NO_PIC`]), the reference index (`-1` unused) and, for
+/// CABAC contexts, the absolute mvd components. Then whether its transform block has nonzero
+/// coefficients (deblocking, CABAC cbf) and whether it was direct-predicted (CABAC ref_idx).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockMotion {
+pub struct BlockInfo {
     pub mv: [[i16; 2]; 2],
     pub ref_pic: [u32; 2],
     pub ref_idx: [i8; 2],
     pub mvd: [[u8; 2]; 2],
+    pub nz: bool,
+    pub direct: bool,
 }
 
-/// [`BlockMotion`] of a block with no prediction (intra, or not yet decoded).
-pub const NO_MOTION: BlockMotion = BlockMotion {
+/// [`BlockInfo`] of a block with no prediction (intra, or not yet decoded).
+pub const NO_BLOCK: BlockInfo = BlockInfo {
     mv: [[0; 2]; 2],
     ref_pic: [NO_PIC; 2],
     ref_idx: [-1; 2],
     mvd: [[0; 2]; 2],
+    nz: false,
+    direct: false,
 };
 
 /// Sets the `W`x`h` rectangle of `v` whose rows start at `i`, `i + stride`, ... to `val`, with
@@ -166,7 +171,7 @@ impl FrameStore {
             planes[2].fill(128);
             let n = self.motion.mb_intra.len();
             let m = Arc::make_mut(&mut self.motion);
-            m.blocks.fill(NO_MOTION);
+            m.blocks.fill(NO_BLOCK);
             m.mb_intra.fill(true);
             m.mb_uniform.fill(false);
             m.mb_field.fill(false);
@@ -259,12 +264,9 @@ pub struct PicState {
 
     /// Per 4x4 luma block: total_coeff (CAVLC nC) / coefficient count.
     pub nnz: Vec<u8>,
-    /// Per 4x4 luma block: non-zero coefficients in the transform block containing it (deblocking, CABAC cbf).
-    pub nz: Vec<bool>,
     pub intra_mode: Vec<i8>,
-    /// Per 4x4 block: motion of both lists.
-    pub blocks: Vec<BlockMotion>,
-    pub direct: Vec<bool>,
+    /// Per 4x4 block: motion of both lists and coefficient and direct flags.
+    pub blocks: Vec<BlockInfo>,
     /// Per macroblock: the inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which
     /// motion may differ; `0` when inter prediction used one motion for all 16 blocks.
     pub motion_edges: Vec<u8>,
@@ -300,10 +302,8 @@ impl PicState {
             chroma_pred_mode: vec![0; mbs],
             cbf_dc: vec![0; mbs],
             nnz: vec![0; b4],
-            nz: vec![false; b4],
             intra_mode: vec![-1; b4],
-            blocks: vec![NO_MOTION; b4],
-            direct: vec![false; b4],
+            blocks: vec![NO_BLOCK; b4],
             motion_edges: vec![ANY_INNER_EDGE; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
@@ -345,10 +345,8 @@ impl PicState {
         self.motion_edges[addr] = ANY_INNER_EDGE;
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
-        fill_rect::<_, 4>(&mut self.nz, i, w, 4, false);
         fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
-        fill_rect::<_, 4>(&mut self.direct, i, w, 4, false);
-        fill_rect::<_, 4>(&mut self.blocks, i, w, 4, NO_MOTION);
+        fill_rect::<_, 4>(&mut self.blocks, i, w, 4, NO_BLOCK);
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);

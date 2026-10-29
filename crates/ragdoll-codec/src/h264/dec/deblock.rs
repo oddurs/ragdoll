@@ -129,7 +129,7 @@ impl EdgeCtx {
         for (k, slot) in bs.iter_mut().enumerate() {
             let qi = q0 + k * along;
             let pi = qi - step;
-            let nz = st.nz[pi] | st.nz[qi];
+            let nz = st.blocks[pi].nz | st.blocks[qi].nz;
             *slot = 2 * nz as u8;
             if check_motion && !nz {
                 // Evaluated without short-circuits: one branch on the outcome.
@@ -442,7 +442,7 @@ fn mbaff_bs(
             3
         };
     }
-    if st.nz[pi] || st.nz[qi] {
+    if st.blocks[pi].nz || st.blocks[qi].nz {
         return 2;
     }
     // Mixed edge: a field pair next to a frame pair.

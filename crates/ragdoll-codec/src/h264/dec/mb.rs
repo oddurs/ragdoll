@@ -13,7 +13,7 @@ use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
 use super::intra::{self, Edges};
-use super::picture::{MbType, Motion, NO_MOTION, NO_PIC, PicState, Structure, fill_rect};
+use super::picture::{MbType, Motion, NO_BLOCK, NO_PIC, PicState, Structure, fill_rect};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
@@ -1052,7 +1052,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             for bx in 0..4 {
                 let i = self.st.b4(x4 + bx, y4 + by);
                 self.st.nnz[i] = 16;
-                self.st.nz[i] = true;
+                self.st.blocks[i].nz = true;
             }
         }
         for p in 0..2 {
@@ -1246,7 +1246,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn cbf_luma_inc(&self, bx: usize, by: usize, intra: bool) -> u8 {
         let [a, b] = self.nb_blocks(0, bx, by).map(|n| match n {
             Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
-            Some((_, i)) => self.st.nz[i] as u8,
+            Some((_, i)) => self.st.blocks[i].nz as u8,
             None => intra as u8,
         });
         a + 2 * b
@@ -1366,7 +1366,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     );
                     for j in [j0, j0 + 1, j1, j1 + 1] {
                         self.st.nnz[j] = total as u8;
-                        self.st.nz[j] = total > 0;
+                        self.st.blocks[j].nz = total > 0;
                     }
                     if total > 0 {
                         dq.scale8_coeffs(l8, qp, &coeffs, total, scan8, &mut res.luma8[b8]);
@@ -1396,7 +1396,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     for i in 0..4 {
                         let (bx, by) = BLK4_XY[b8 * 4 + i];
                         let j = self.st.b4(mx4 + bx, my4 + by);
-                        self.st.nz[j] = total > 0;
+                        self.st.blocks[j].nz = total > 0;
                     }
                 }
                 if total > 0 {
@@ -1429,7 +1429,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 };
                 let j = self.st.b4(x4, y4);
                 self.st.nnz[j] = n as u8;
-                self.st.nz[j] = n > 0;
+                self.st.blocks[j].nz = n > 0;
                 if n > 0 {
                     res.luma_coded |= 1 << blk;
                 }
@@ -1684,7 +1684,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             if t.is_skip() || t.is_intra() {
                 return 0;
             }
-            if is_b && self.st.direct[i] {
+            if is_b && self.st.blocks[i].direct {
                 return 0;
             }
             // A field neighbour of a frame MB counts reference indices in fields (9.3.3.1.1.6).
@@ -2093,7 +2093,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         refs: [i8; 2],
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
-        let mut b = NO_MOTION;
+        let mut b = NO_BLOCK;
+        b.direct = true;
         for list in 0..2 {
             if refs[list] >= 0 {
                 b.ref_idx[list] = refs[list];
@@ -2107,15 +2108,12 @@ impl<'a, 'c> Dec<'a, 'c> {
         match n {
             4 => {
                 fill_rect::<_, 4>(&mut self.st.blocks, i, s, 4, b);
-                fill_rect::<_, 4>(&mut self.st.direct, i, s, 4, true);
             }
             2 => {
                 fill_rect::<_, 2>(&mut self.st.blocks, i, s, 2, b);
-                fill_rect::<_, 2>(&mut self.st.direct, i, s, 2, true);
             }
             _ => {
                 fill_rect::<_, 1>(&mut self.st.blocks, i, s, 1, b);
-                fill_rect::<_, 1>(&mut self.st.direct, i, s, 1, true);
             }
         }
         Ok(())
