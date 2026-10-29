@@ -14,7 +14,8 @@ use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 use super::cabac_se;
 use super::intra;
 use super::picture::{
-    MbType, Motion, MotionView, NO_BLOCK, NO_PIC, PicState, PicSync, RefIds, Structure, fill_rect,
+    BlockInfo, MbType, Motion, MotionView, NO_BLOCK, NO_PIC, PicState, PicSync, RefIds, Structure,
+    fill_block_rect,
 };
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
@@ -372,7 +373,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                         // precede the skipped top MB's reconstruction.
                         self.begin_mb(addr);
                         let m = self.mb.addr;
-                        self.st.mb_type[m] = if slice_type.is_b() {
+                        self.st.mbs[m].mb_type = if slice_type.is_b() {
                             MbType::BSkip
                         } else {
                             MbType::PSkip
@@ -431,11 +432,11 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn inferred_field(&self, addr: usize) -> bool {
         let p = self.pos(addr);
         let w = self.st.mb_w;
-        let same = |a: usize| self.st.slice_num[a] == self.cx.slice_num;
+        let same = |a: usize| self.st.mbs[a].slice_num == self.cx.slice_num;
         if p.x > 0 && same(p.addr - 1) {
-            self.st.mb_field[p.addr - 1]
+            self.st.mbs[p.addr - 1].mb_field
         } else if p.y >= 2 && same(p.addr - 2 * w) {
-            self.st.mb_field[p.addr - 2 * w]
+            self.st.mbs[p.addr - 2 * w].mb_field
         } else {
             false
         }
@@ -445,8 +446,9 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn decode_field_flag(&mut self, addr: usize) -> bool {
         let p = self.pos(addr);
         let w = self.st.mb_w;
-        let cond =
-            |a: usize| (self.st.slice_num[a] == self.cx.slice_num && self.st.mb_field[a]) as usize;
+        let cond = |a: usize| {
+            (self.st.mbs[a].slice_num == self.cx.slice_num && self.st.mbs[a].mb_field) as usize
+        };
         let inc = if p.x > 0 { cond(p.addr - 1) } else { 0 }
             + if p.y >= 2 { cond(p.addr - 2 * w) } else { 0 };
         let (cd, ctxs) = self.cabac();
@@ -461,11 +463,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.set_mb(addr);
         let a = self
             .mb_left()
-            .filter(|&m| !self.st.mb_type[m].is_skip())
+            .filter(|&m| !self.st.mbs[m].mb_type.is_skip())
             .is_some() as u8;
         let b = self
             .mb_top()
-            .filter(|&m| !self.st.mb_type[m].is_skip())
+            .filter(|&m| !self.st.mbs[m].mb_type.is_skip())
             .is_some() as u8;
         if self.st.mbaff {
             (self.mb, self.nb) = saved;
@@ -556,6 +558,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.nb_addr = addr;
         self.st.row_mb(addr, x, y);
         self.st.prefetch_mb_blocks(x + 2, y);
+        if self.simple {
+            self.st.prefetch_mb_samples(x, y);
+        }
         // Direct prediction reads the co-located macroblock's corner blocks.
         if self.col_prefetch
             && let Some(m) = self.cx.refs[1].first().and_then(|r| r.motion.as_deref())
@@ -570,19 +575,19 @@ impl<'a, 'c> Dec<'a, 'c> {
                 | ((t && l) as u8 * NB_TL);
             return;
         }
-        let (sn, cur) = (&self.st.slice_num, self.cx.slice_num);
+        let (mbs, cur) = (&self.st.mbs, self.cx.slice_num);
         let mut nb = 0;
-        if x > 0 && sn[a - 1] == cur {
+        if x > 0 && mbs[a - 1].slice_num == cur {
             nb |= NB_L;
         }
         if y > 0 {
-            if sn[a - w] == cur {
+            if mbs[a - w].slice_num == cur {
                 nb |= NB_T;
             }
-            if x + 1 < w && sn[a - w + 1] == cur {
+            if x + 1 < w && mbs[a - w + 1].slice_num == cur {
                 nb |= NB_TR;
             }
-            if x > 0 && sn[a - w - 1] == cur {
+            if x > 0 && mbs[a - w - 1].slice_num == cur {
                 nb |= NB_TL;
             }
         }
@@ -600,17 +605,19 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         self.partial_motion = false;
         // The reference lists `refs` reads, as a table of `st.ref_tables`.
-        self.st.mb_table[a] = self.table_base
+        let table = self.table_base
             + match &self.cx.field_refs {
                 Some(_) if self.field => 1 + (self.mb.y & 1) as u16,
                 _ => 0,
             };
-        self.st.slice_num[a] = self.cx.slice_num;
-        self.st.mb_field[a] = self.field;
+        let m = &mut self.st.mbs[a];
+        m.mb_table = table;
+        m.slice_num = self.cx.slice_num;
+        m.mb_field = self.field;
     }
 
     fn mb_avail(&self, addr: usize) -> bool {
-        self.st.slice_num[addr] == self.cx.slice_num && addr != self.mb.addr
+        self.st.mbs[addr].slice_num == self.cx.slice_num && addr != self.mb.addr
     }
 
     /// Neighbouring location (6.4.12): the macroblock covering the luma (or, with `chroma`, 4:2:0
@@ -667,7 +674,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let pair_field = if pair_row == self.mb.y / 2 && nx == self.mb.x {
             self.field
         } else {
-            self.st.mb_field[top]
+            self.st.mbs[top].mb_field
         };
         let l = line % (2 * s);
         let (bottom, yw) = if pair_field {
@@ -787,7 +794,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             Some(a) if a == self.mb.addr => true,
             Some(a) => {
                 self.mb_avail(a)
-                    && !(self.cx.pps.constrained_intra_pred && !self.st.mb_type[a].is_intra())
+                    && !(self.cx.pps.constrained_intra_pred && !self.st.mbs[a].mb_type.is_intra())
             }
         }
     }
@@ -872,16 +879,17 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn decode_skip_mb(&mut self, addr: usize) -> Result<()> {
         self.begin_mb(addr);
         let a = self.mb.addr;
-        self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.qpc;
-        self.st.cbp[a] = 0;
-        self.st.t8x8[a] = false;
+        let is_b = self.cx.sh.slice_type.is_b();
+        let m = &mut self.st.mbs[a];
+        m.qp = self.qp as u8;
+        m.qpc = self.qpc;
+        m.cbp = 0;
+        m.t8x8 = false;
+        m.mb_type = if is_b { MbType::BSkip } else { MbType::PSkip };
         self.last_dqp_nz = false;
-        if self.cx.sh.slice_type.is_b() {
-            self.st.mb_type[a] = MbType::BSkip;
+        if is_b {
             self.direct_motion(0b1111)?;
         } else {
-            self.st.mb_type[a] = MbType::PSkip;
             let mv = self.p_skip_mv();
             self.check_ref(0, 0)?;
             self.fill_blocks(0, 0, 4, 4, 0, (0, mv), [0, 0]);
@@ -942,7 +950,8 @@ impl<'a, 'c> Dec<'a, 'c> {
             SliceType::I => {
                 let c = |m: Option<usize>| {
                     m.is_some_and(|a| {
-                        self.st.mb_type[a] != MbType::I4x4 && self.st.mb_type[a] != MbType::I8x8
+                        self.st.mbs[a].mb_type != MbType::I4x4
+                            && self.st.mbs[a].mb_type != MbType::I8x8
                     }) as u8
                 };
                 let (ca, cb) = (c(left), c(top));
@@ -952,7 +961,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             SliceType::B => {
                 let c = |m: Option<usize>| {
                     m.is_some_and(|a| {
-                        !matches!(self.st.mb_type[a], MbType::BSkip | MbType::BDirect16x16)
+                        !matches!(self.st.mbs[a].mb_type, MbType::BSkip | MbType::BDirect16x16)
                     }) as usize
                 };
                 let inc = c(left) + c(top);
@@ -970,7 +979,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if !self.is_cabac() {
             return self.reader().read_bit();
         }
-        let c = |m: Option<usize>| m.is_some_and(|a| self.st.t8x8[a]) as usize;
+        let c = |m: Option<usize>| m.is_some_and(|a| self.st.mbs[a].t8x8) as usize;
         let inc = c(self.mb_left()) + c(self.mb_top());
         let (cd, ctxs) = self.cabac();
         Ok(cabac_se::transform_8x8(cd, &mut ctxs[..], inc))
@@ -980,8 +989,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let m = if self.is_cabac() {
             let c = |m: Option<usize>| {
                 m.is_some_and(|a| {
-                    let t = self.st.mb_type[a];
-                    t.is_intra() && t != MbType::IPcm && self.st.chroma_pred_mode[a] != 0
+                    let t = self.st.mbs[a].mb_type;
+                    t.is_intra() && t != MbType::IPcm && self.st.mbs[a].chroma_pred_mode != 0
                 }) as u8
             };
             let (a, b) = (c(self.mb_left()), c(self.mb_top()));
@@ -1026,7 +1035,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if !self.mb_avail(addr) {
                     return None;
                 }
-                let t = self.st.mb_type[addr];
+                let t = self.st.mbs[addr].mb_type;
                 if !t.is_intra() && self.cx.pps.constrained_intra_pred {
                     return None;
                 }
@@ -1056,7 +1065,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             let Some(a) = mb else {
                 return [intra::NO_MODE; 4];
             };
-            let t = self.st.mb_type[a];
+            let t = self.st.mbs[a].mb_type;
             if !t.is_intra() && self.cx.pps.constrained_intra_pred {
                 [intra::NO_MODE; 4]
             } else if !matches!(t, MbType::I4x4 | MbType::I8x8) {
@@ -1095,10 +1104,10 @@ impl<'a, 'c> Dec<'a, 'c> {
             if !self.mb_avail(a) {
                 return 1;
             }
-            match self.st.mb_type[a] {
+            match self.st.mbs[a].mb_type {
                 MbType::IPcm => 1,
                 t if t.is_skip() => 0,
-                _ => (self.st.cbp[a] >> ((yw / 8) * 2 + xw / 8)) & 1,
+                _ => (self.st.mbs[a].cbp >> ((yw / 8) * 2 + xw / 8)) & 1,
             }
         };
         let (la, tb) = if self.st.mbaff {
@@ -1112,10 +1121,10 @@ impl<'a, 'c> Dec<'a, 'c> {
             let bits = |m: Option<usize>| -> u8 {
                 match m {
                     None => 0xF,
-                    Some(a) => match self.st.mb_type[a] {
+                    Some(a) => match self.st.mbs[a].mb_type {
                         MbType::IPcm => 0xF,
                         t if t.is_skip() => 0,
-                        _ => self.st.cbp[a] & 0xF,
+                        _ => self.st.mbs[a].cbp & 0xF,
                     },
                 }
             };
@@ -1125,9 +1134,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         let chroma_of = |m: Option<usize>| -> u8 {
             match m {
                 None => 0,
-                Some(a) if self.st.mb_type[a] == MbType::IPcm => 2,
-                Some(a) if self.st.mb_type[a].is_skip() => 0,
-                Some(a) => self.st.cbp[a] >> 4,
+                Some(a) if self.st.mbs[a].mb_type == MbType::IPcm => 2,
+                Some(a) if self.st.mbs[a].mb_type.is_skip() => 0,
+                Some(a) => self.st.mbs[a].cbp >> 4,
             }
         };
         let (left, top) = (self.mb_left(), self.mb_top());
@@ -1175,15 +1184,15 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     fn set_qp(&mut self) {
         let a = self.mb.addr;
-        self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.qpc;
+        self.st.mbs[a].qp = self.qp as u8;
+        self.st.mbs[a].qpc = self.qpc;
     }
 
     // ----- intra macroblocks ----------------------------------------------------------------
 
     fn decode_intra_mb(&mut self, t: u32) -> Result<()> {
         let a = self.mb.addr;
-        self.st.t8x8[a] = false;
+        self.st.mbs[a].t8x8 = false;
         if t == 25 {
             return self.decode_pcm();
         }
@@ -1193,8 +1202,8 @@ impl<'a, 'c> Dec<'a, 'c> {
             if self.cx.pps.transform_8x8_mode {
                 t8 = self.read_transform_8x8()?;
             }
-            self.st.t8x8[a] = t8;
-            self.st.mb_type[a] = if t8 { MbType::I8x8 } else { MbType::I4x4 };
+            self.st.mbs[a].t8x8 = t8;
+            self.st.mbs[a].mb_type = if t8 { MbType::I8x8 } else { MbType::I4x4 };
             let mut grid = self.intra_mode_grid();
             let (i0, w4) = (self.st.b4(self.mb.x * 4, self.mb.y * 4), self.st.mb_w * 4);
             if t8 {
@@ -1234,23 +1243,23 @@ impl<'a, 'c> Dec<'a, 'c> {
             } else {
                 0
             };
-            self.st.chroma_pred_mode[a] = chroma;
+            self.st.mbs[a].chroma_pred_mode = chroma;
             let cbp = self.read_cbp(true)?;
-            (cbp, self.st.mb_type[a])
+            (cbp, self.st.mbs[a].mb_type)
         } else {
             let pred = ((t - 1) % 4) as u8;
             let cbp_c = ((t - 1) / 4 % 3) as u8;
             let cbp_l = if t >= 13 { 0x0F } else { 0 };
-            self.st.mb_type[a] = MbType::I16x16(pred);
+            self.st.mbs[a].mb_type = MbType::I16x16(pred);
             let chroma = if self.cx.sps.chroma_array_type() != 0 {
                 self.read_chroma_pred_mode()?
             } else {
                 0
             };
-            self.st.chroma_pred_mode[a] = chroma;
+            self.st.mbs[a].chroma_pred_mode = chroma;
             (cbp_l | (cbp_c << 4), MbType::I16x16(pred))
         };
-        self.st.cbp[a] = cbp;
+        self.st.mbs[a].cbp = cbp;
         let is_i16 = matches!(kind, MbType::I16x16(_));
         let mut res = self.take_residual();
         if cbp != 0 || is_i16 {
@@ -1292,11 +1301,11 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             Entropy::Cabac(cd, _) => cd.align_for_pcm(&mut samples[..n])?,
         }
-        self.st.mb_type[a] = MbType::IPcm;
-        self.st.cbp[a] = 0x2F;
-        self.st.cbf_dc[a] = 7;
-        self.st.qp[a] = 0;
-        self.st.qpc[a] = self.chroma_qps(0);
+        self.st.mbs[a].mb_type = MbType::IPcm;
+        self.st.mbs[a].cbp = 0x2F;
+        self.st.mbs[a].cbf_dc = 7;
+        self.st.mbs[a].qp = 0;
+        self.st.mbs[a].qpc = self.chroma_qps(0);
         self.last_dqp_nz = false;
         let (x4, y4) = (self.mb.x * 4, self.mb.y * 4);
         for by in 0..4 {
@@ -1422,7 +1431,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                     self.intra_ok(self.mb_nb(-1, -1)),
                 ),
             };
-            let mode = self.st.chroma_pred_mode[self.mb.addr];
+            let mode = self.st.mbs[self.mb.addr].chroma_pred_mode;
             let as_block = [2, 1, 0, 3][mode as usize];
             if !intra::block_mode_ok(as_block, left[0] && left[1], mb_top, mb_tl) {
                 return Err(bad("H.264 chroma intra mode uses unavailable samples"));
@@ -1558,14 +1567,14 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn cbf_luma_inc(&self, bx: usize, by: usize, intra: bool) -> u8 {
         if !self.st.mbaff {
             let [a, b] = self.nb_flat(2, bx, by).map(|n| match n {
-                Some((_, true, m)) if self.st.mb_type[m] == MbType::IPcm => 1,
+                Some((_, true, m)) if self.st.mbs[m].mb_type == MbType::IPcm => 1,
                 Some((i, _, _)) => self.st.blocks[i].nz as u8,
                 None => intra as u8,
             });
             return a + 2 * b;
         }
         let [a, b] = self.nb_blocks(0, bx, by).map(|n| match n {
-            Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
+            Some((m, _)) if m != self.mb.addr && self.st.mbs[m].mb_type == MbType::IPcm => 1,
             Some((_, i)) => self.st.blocks[i].nz as u8,
             None => intra as u8,
         });
@@ -1576,14 +1585,14 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn cbf_chroma_ac_inc(&self, p: usize, bx: usize, by: usize, intra: bool) -> u8 {
         if !self.st.mbaff {
             let [a, b] = self.nb_flat(1, bx, by).map(|n| match n {
-                Some((_, true, m)) if self.st.mb_type[m] == MbType::IPcm => 1,
+                Some((_, true, m)) if self.st.mbs[m].mb_type == MbType::IPcm => 1,
                 Some((i, _, _)) => (self.st.nnz_c[p][i] > 0) as u8,
                 None => intra as u8,
             });
             return a + 2 * b;
         }
         let [a, b] = self.nb_blocks(1, bx, by).map(|n| match n {
-            Some((m, _)) if m != self.mb.addr && self.st.mb_type[m] == MbType::IPcm => 1,
+            Some((m, _)) if m != self.mb.addr && self.st.mbs[m].mb_type == MbType::IPcm => 1,
             Some((_, i)) => (self.st.nnz_c[p][i] > 0) as u8,
             None => intra as u8,
         });
@@ -1595,18 +1604,18 @@ impl<'a, 'c> Dec<'a, 'c> {
         match m {
             None => intra as u8,
             Some(a) => {
-                let t = self.st.mb_type[a];
+                let t = self.st.mbs[a].mb_type;
                 let has_dc = if bit == 0 {
                     matches!(t, MbType::I16x16(_))
                 } else {
-                    self.st.cbp[a] >> 4 != 0
+                    self.st.mbs[a].cbp >> 4 != 0
                 };
                 if t == MbType::IPcm {
                     1
                 } else if t.is_skip() || !has_dc {
                     0
                 } else {
-                    (self.st.cbf_dc[a] >> bit) & 1
+                    (self.st.mbs[a].cbf_dc >> bit) & 1
                 }
             }
         }
@@ -1668,7 +1677,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let lst = if intra { 0 } else { 3 };
         let cabac = CABAC;
         // DC coded_block_flags are set below as DC blocks are read.
-        self.st.cbf_dc[a] = 0;
+        self.st.mbs[a].cbf_dc = 0;
         let dq = self.cx.dq;
         let mut coeffs = ResidualCoeffs::new();
 
@@ -1682,7 +1691,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             let n = self.read_block(&mut sc, nc, false, 0, inc)?;
             if n > 0 {
-                self.st.cbf_dc[a] |= 1;
+                self.st.mbs[a].cbf_dc |= 1;
             }
             let mut c = [0i32; 16];
             for k in 0..16 {
@@ -1789,7 +1798,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if self.cx.sps.chroma_array_type() == 0 || cbp_c == 0 {
             return Ok(());
         }
-        let qpc = self.st.qpc[a];
+        let qpc = self.st.mbs[a].qpc;
         let mut dcs = [[0i32; 4]; 2];
         for p in 0..2 {
             let mut sc = [0i16; 4];
@@ -1801,7 +1810,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             let n = self.read_block(&mut sc, 0, true, 3, inc)?;
             if n > 0 {
-                self.st.cbf_dc[a] |= 2 << p;
+                self.st.mbs[a].cbf_dc |= 2 << p;
             }
             let c = [sc[0] as i32, sc[1] as i32, sc[2] as i32, sc[3] as i32];
             dcs[p] = recon::chroma_dc(dq, lst + 1 + p, qpc[p] as i32, &c);
@@ -1876,18 +1885,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         m: Mv,
         mvd: [u8; 2],
     ) {
-        let mut b = NO_BLOCK;
-        b.ref_idx[list] = m.0;
-        b.mv[list] = m.1;
-        b.mvd[list] = mvd;
+        // Built per list with constant indices, so that it stays in a register.
+        let b = if list == 0 {
+            BlockInfo {
+                mv: [m.1, [0, 0]],
+                ref_idx: [m.0, -1],
+                mvd: [mvd, [0, 0]],
+                ..NO_BLOCK
+            }
+        } else {
+            BlockInfo {
+                mv: [[0, 0], m.1],
+                ref_idx: [-1, m.0],
+                mvd: [[0, 0], mvd],
+                ..NO_BLOCK
+            }
+        };
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
         let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
         let s = self.st.mb_w * 4;
         match w {
-            1 => fill_rect::<_, 1>(&mut self.st.blocks, i, s, h, b),
-            2 => fill_rect::<_, 2>(&mut self.st.blocks, i, s, h, b),
-            3 => fill_rect::<_, 3>(&mut self.st.blocks, i, s, h, b),
-            _ => fill_rect::<_, 4>(&mut self.st.blocks, i, s, h, b),
+            1 => fill_block_rect::<1>(&mut self.st.blocks, i, s, h, b),
+            2 => fill_block_rect::<2>(&mut self.st.blocks, i, s, h, b),
+            3 => fill_block_rect::<3>(&mut self.st.blocks, i, s, h, b),
+            _ => fill_block_rect::<4>(&mut self.st.blocks, i, s, h, b),
         }
     }
 
@@ -1946,7 +1967,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             if r < 0 || !self.st.mbaff {
                 return Some((r, mv));
             }
-            Some(match (self.field, self.st.mb_field[a]) {
+            Some(match (self.field, self.st.mbs[a].mb_field) {
                 (true, false) => (r * 2, [mv[0], mv[1] / 2]),
                 (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
                 _ => (r, mv),
@@ -1963,7 +1984,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if r < 0 || !self.st.mbaff {
             return (r, mv);
         }
-        match (self.field, self.st.mb_field[a]) {
+        match (self.field, self.st.mbs[a].mb_field) {
             (true, false) => (r * 2, [mv[0], mv[1] / 2]),
             (false, true) => (r >> 1, [mv[0], mv[1].wrapping_mul(2)]),
             _ => (r, mv),
@@ -2122,7 +2143,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             let Some((addr, i)) = n else {
                 return 0;
             };
-            let t = self.st.mb_type[addr];
+            let t = self.st.mbs[addr].mb_type;
             if t.is_skip() || t.is_intra() {
                 return 0;
             }
@@ -2130,7 +2151,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 return 0;
             }
             // A field neighbour of a frame MB counts reference indices in fields (9.3.3.1.1.6).
-            let thresh = if self.st.mbaff && !self.field && self.st.mb_field[addr] {
+            let thresh = if self.st.mbaff && !self.field && self.st.mbs[addr].mb_field {
                 1
             } else {
                 0
@@ -2164,7 +2185,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             let v = self.st.blocks[i].mvd[list][comp] as u32;
             // Vertical components between frame and field MBs are rescaled (9.3.3.1.1.7).
-            match (comp, self.st.mbaff, self.field, self.st.mb_field[addr]) {
+            match (comp, self.st.mbaff, self.field, self.st.mbs[addr].mb_field) {
                 (1, true, false, true) => v * 2,
                 (1, true, true, false) => v / 2,
                 _ => v,
@@ -2189,11 +2210,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         if raw <= 2 {
             let part = [Part::P16x16, Part::P16x8, Part::P8x16][raw as usize];
-            self.st.mb_type[a] = MbType::Inter(part);
+            self.st.mbs[a].mb_type = MbType::Inter(part);
             self.decode_partitions(part, [PRED_L0, PRED_L0])?;
             return self.finish_inter(true);
         }
-        self.st.mb_type[a] = MbType::Inter(Part::P8x8);
+        self.st.mbs[a].mb_type = MbType::Inter(Part::P8x8);
         let mut subs = [0usize; 4];
         for s in &mut subs {
             *s = if self.is_cabac() {
@@ -2216,7 +2237,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn decode_b_mb(&mut self, raw: u32) -> Result<()> {
         let a = self.mb.addr;
         if raw == 0 {
-            self.st.mb_type[a] = MbType::BDirect16x16;
+            self.st.mbs[a].mb_type = MbType::BDirect16x16;
             self.direct_motion(0b1111)?;
             return self.finish_inter(self.cx.sps.direct_8x8_inference);
         }
@@ -2225,11 +2246,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         if raw < 22 {
             let (part, pred) = B_MB_TYPES[raw as usize];
-            self.st.mb_type[a] = MbType::Inter(part);
+            self.st.mbs[a].mb_type = MbType::Inter(part);
             self.decode_partitions(part, pred)?;
             return self.finish_inter(true);
         }
-        self.st.mb_type[a] = MbType::Inter(Part::P8x8);
+        self.st.mbs[a].mb_type = MbType::Inter(Part::P8x8);
         let mut subs = [0usize; 4];
         for s in &mut subs {
             *s = if self.is_cabac() {
@@ -2565,13 +2586,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         let s = self.st.mb_w * 4;
         match n {
             4 => {
-                fill_rect::<_, 4>(&mut self.st.blocks, i, s, 4, b);
+                fill_block_rect::<4>(&mut self.st.blocks, i, s, 4, b);
             }
             2 => {
-                fill_rect::<_, 2>(&mut self.st.blocks, i, s, 2, b);
+                fill_block_rect::<2>(&mut self.st.blocks, i, s, 2, b);
             }
             _ => {
-                fill_rect::<_, 1>(&mut self.st.blocks, i, s, 1, b);
+                fill_block_rect::<1>(&mut self.st.blocks, i, s, 1, b);
             }
         }
         Ok(())
@@ -2650,12 +2671,12 @@ impl<'a, 'c> Dec<'a, 'c> {
     fn finish_inter(&mut self, no_small: bool) -> Result<()> {
         let a = self.mb.addr;
         let cbp = self.read_cbp(false)?;
-        self.st.cbp[a] = cbp;
+        self.st.mbs[a].cbp = cbp;
         let mut t8 = false;
         if cbp & 0x0F != 0 && self.cx.pps.transform_8x8_mode && no_small {
             t8 = self.read_transform_8x8()?;
         }
-        self.st.t8x8[a] = t8;
+        self.st.mbs[a].t8x8 = t8;
         let mut res = self.take_residual();
         if cbp != 0 {
             self.read_qp_delta()?;
@@ -2774,7 +2795,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     /// [`Self::mc_direct`]: straight to [`Self::mc_pred`], or [`Self::mc_pred_weighted`].
     fn mc_whole(&mut self) -> Result<()> {
         let a = self.mb.addr;
-        self.st.motion_edges[a] = 0;
+        self.st.mbs[a].motion_edges = 0;
         let b = self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
         let lists = &self.cx.refs;
         let pic = |l: usize| -> Result<Option<&'c RefPic>> {
@@ -2788,6 +2809,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         let (x, y) = (self.mb.x * 16, self.mb.y * 16);
         let rp = [pic(0)?, pic(1)?];
+        for (r, mv) in rp.into_iter().zip(b.mv) {
+            if let Some(r) = r {
+                self.prefetch_ref(r, mv);
+            }
+        }
         if self.weighted
             && let Some(wt) = self.block_weights(rp.map(|r| r.is_some()), b.ref_idx)
         {
@@ -2795,16 +2821,9 @@ impl<'a, 'c> Dec<'a, 'c> {
             return Ok(());
         }
         match rp {
-            [Some(r), None] => {
-                self.prefetch_ref(r, b.mv[0]);
-                self.mc_pred(r, b.mv[0], x, y, 16, 16, false);
-            }
-            [None, Some(r)] => {
-                self.prefetch_ref(r, b.mv[1]);
-                self.mc_pred(r, b.mv[1], x, y, 16, 16, false);
-            }
+            [Some(r), None] => self.mc_pred(r, b.mv[0], x, y, 16, 16, false),
+            [None, Some(r)] => self.mc_pred(r, b.mv[1], x, y, 16, 16, false),
             [Some(r0), Some(r1)] => {
-                self.prefetch_ref(r0, b.mv[0]);
                 self.mc_pred(r0, b.mv[0], x, y, 16, 16, false);
                 self.mc_pred(r1, b.mv[1], x, y, 16, 16, true);
             }
@@ -2827,7 +2846,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         // Motion stored only for the whole MB (the other list left at its reset value) is one
         // motion without comparing.
         if !self.partial_motion || same(self.st, 0, 0, 4) {
-            self.st.motion_edges[self.mb.addr] = 0;
+            self.st.mbs[self.mb.addr].motion_edges = 0;
             let k = key(self.st, 0, 0);
             return self.mc_rect(0, 0, 4, 4, [k.0, k.2], [k.1, k.3]);
         }
@@ -2848,7 +2867,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if !(all && k8(0) == k8(2) && k8(1) == k8(3)) {
             m |= 1 << 6;
         }
-        self.st.motion_edges[self.mb.addr] = m;
+        self.st.mbs[self.mb.addr].motion_edges = m;
         for (b8, &uniform) in uni.iter().enumerate() {
             let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
             if uniform {
