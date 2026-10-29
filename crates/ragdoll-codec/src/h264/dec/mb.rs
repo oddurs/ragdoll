@@ -117,6 +117,10 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         st,
         ent,
         qp: sh.qp,
+        qpc: {
+            let o = cx.pps.chroma_qp_index_offset;
+            [chroma_qp(sh.qp, o[0]), chroma_qp(sh.qp, o[1])]
+        },
         last_dqp_nz: false,
         mb: MbPos {
             addr: 0,
@@ -229,6 +233,8 @@ struct Dec<'a, 'c> {
     st: &'c mut PicState,
     ent: Entropy<'a>,
     qp: i32,
+    /// Chroma QPs (Cb, Cr) of [`Self::qp`].
+    qpc: [u8; 2],
     last_dqp_nz: bool,
     mb: MbPos,
     /// The current macroblock is a field macroblock (field picture or MBAFF field pair).
@@ -818,7 +824,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.begin_mb(addr);
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.qpc[a] = self.qpc;
         self.st.cbp[a] = 0;
         self.st.t8x8[a] = false;
         self.last_dqp_nz = false;
@@ -1114,13 +1120,14 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         self.last_dqp_nz = d != 0;
         self.qp = (self.qp + d + 52) % 52;
+        self.qpc = self.chroma_qps(self.qp);
         Ok(())
     }
 
     fn set_qp(&mut self) {
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.qpc[a] = self.qpc;
     }
 
     // ----- intra macroblocks ----------------------------------------------------------------
