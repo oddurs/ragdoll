@@ -596,8 +596,10 @@ impl ChannelState {
         const RAND_ATT_UV_Q15: [i32; 2] = [32440, 29491];
         let ltp_mem = self.ltp_mem_length;
         let order = self.lpc_order;
-        let mut s_ltp_q14 = vec![0i32; ltp_mem + self.frame_length];
-        let mut s_ltp = vec![0i16; ltp_mem];
+        let mut s_ltp_q14 = [0i32; 2 * MAX_FRAME_LENGTH];
+        let s_ltp_q14 = &mut s_ltp_q14[..ltp_mem + self.frame_length];
+        let mut s_ltp = [0i16; MAX_FRAME_LENGTH];
+        let s_ltp = &mut s_ltp[..ltp_mem];
         let prev_gain_q10 = [
             self.plc.prev_gain_q16[0] >> 6,
             self.plc.prev_gain_q16[1] >> 6,
@@ -607,7 +609,8 @@ impl ChannelState {
         }
         // silk_PLC_energy
         let sub = self.subfr_length;
-        let mut exc_buf = vec![0i16; 2 * sub];
+        let mut exc_buf = [0i16; 2 * MAX_SUBFR_LENGTH];
+        let exc_buf = &mut exc_buf[..2 * sub];
         for k in 0..2 {
             for i in 0..sub {
                 exc_buf[k * sub + i] = sat16(
@@ -800,7 +803,8 @@ impl ChannelState {
             }
         }
         if self.loss_cnt != 0 {
-            let mut sig = vec![0i32; length + MAX_LPC_ORDER];
+            let mut sig = [0i32; MAX_FRAME_LENGTH + MAX_LPC_ORDER];
+            let sig = &mut sig[..length + MAX_LPC_ORDER];
             let mut gain_q16 = smulww(self.plc.rand_scale_q14 as i32, self.plc.prev_gain_q16[1]);
             let sg = self.cng.smth_gain_q16;
             if gain_q16 >= (1 << 21) || sg > (1 << 23) {

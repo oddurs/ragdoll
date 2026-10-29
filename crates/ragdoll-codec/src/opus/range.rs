@@ -41,8 +41,15 @@ pub struct Ec {
 impl Ec {
     /// Starts decoding `data` (`ec_dec_init`).
     pub fn decoder(data: &[u8]) -> Self {
+        Self::decoder_with(Vec::new(), data)
+    }
+
+    /// [`Self::decoder`] copying `data` into `buf`, so that a caller can reuse one allocation.
+    pub fn decoder_with(mut buf: Vec<u8>, data: &[u8]) -> Self {
+        buf.clear();
+        buf.extend_from_slice(data);
         let mut d = Self {
-            buf: data.to_vec(),
+            buf,
             storage: data.len() as u32,
             end_offs: 0,
             end_window: 0,

@@ -3,10 +3,11 @@ id: 91
 uid: 0b3d405c-48b7-4f73-a354-491304c8de38
 title: 'FLAC encoder: match FFmpeg level 5 compression while staying faster'
 type: kernel
-status: doing
+status: done
 milestone: m11-validation
 created: 2026-10-28
-updated: 2026-10-28
+updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p1
 area: codec-audio
 effort: l

@@ -3,10 +3,11 @@ id: 82
 uid: 18c32a99-2a85-4ec6-b621-783738fdbbd3
 title: AAC encoder ignores its target bitrate (no rate control; 35 kbit/s at 128k)
 type: bug
-status: doing
+status: done
 milestone: m11-validation
 created: 2026-10-28
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p2
 effort: m
 area: codec-audio

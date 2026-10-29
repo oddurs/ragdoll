@@ -47,6 +47,9 @@ pub enum CeltError {
 /// CELT decoder state (`OpusCustomDecoder` with the 48000/960 mode).
 #[derive(Clone)]
 pub struct CeltDecoder {
+    /// The range decoder's copy of a packet decoded without the caller's decoder (redundancy
+    /// frames), reused across packets.
+    ec_buf: Vec<u8>,
     pub channels: usize,
     pub stream_channels: usize,
     pub downsample: usize,
@@ -94,6 +97,7 @@ impl CeltDecoder {
     /// `celt_decoder_init` at output rate `rate` (48, 24, 16, 12 or 8 kHz).
     pub fn new(rate: u32, channels: usize) -> Self {
         let mut d = Self {
+            ec_buf: Vec::new(),
             channels,
             stream_channels: channels,
             downsample: resampling_factor(rate).max(1),
@@ -158,6 +162,15 @@ impl CeltDecoder {
         ec: Option<&mut Ec>,
         accum: bool,
     ) -> Result<usize, CeltError> {
+        // Without the caller's range decoder, decode from one over a reused copy of the packet.
+        if ec.is_none()
+            && let Some(d) = data.filter(|d| d.len() > 1 && d.len() <= 1275)
+        {
+            let mut own = Ec::decoder_with(std::mem::take(&mut self.ec_buf), d);
+            let r = self.decode(Some(d), pcm, frame_size, Some(&mut own), accum);
+            self.ec_buf = own.buf;
+            return r;
+        }
         let cc = self.channels;
         let frame_size = frame_size * self.downsample;
         let mut lm = 0i32;
@@ -607,11 +620,10 @@ impl CeltDecoder {
     /// `celt_plc_pitch_search`.
     fn plc_pitch_search(&self) -> usize {
         let c = self.channels;
-        let mut lp = vec![0i16; DECODE_BUFFER_SIZE >> 1];
-        let chans: Vec<&[i32]> = (0..c)
-            .map(|ch| &self.decode_mem[ch * STRIDE..ch * STRIDE + DECODE_BUFFER_SIZE])
-            .collect();
-        pitch_downsample(&chans, &mut lp, DECODE_BUFFER_SIZE);
+        let mut lp = [0i16; DECODE_BUFFER_SIZE >> 1];
+        let chan = |ch: usize| &self.decode_mem[ch * STRIDE..ch * STRIDE + DECODE_BUFFER_SIZE];
+        let chans = [chan(0), chan(c - 1)];
+        pitch_downsample(&chans[..c], &mut lp, DECODE_BUFFER_SIZE);
         let p = pitch_search(
             &lp[PLC_PITCH_LAG_MAX >> 1..],
             &lp,
@@ -630,7 +642,8 @@ impl CeltDecoder {
         if noise_based {
             let end = self.end;
             let eff_end = start.max(end.min(NB_EBANDS));
-            let mut x = vec![0i16; c * n];
+            let mut x = [0i16; 2 * 960];
+            let x = &mut x[..c * n];
             let decay: i32 = if loss_count == 0 { 1536 } else { 512 };
             for ch in 0..c {
                 for i in start..end {
@@ -658,7 +671,7 @@ impl CeltDecoder {
                 self.decode_mem
                     .copy_within(o + n..o + DECODE_BUFFER_SIZE + (OVERLAP >> 1), o);
             }
-            self.synthesis(&x, start, eff_end, c, false, lm, false);
+            self.synthesis(x, start, eff_end, c, false, lm, false);
         } else {
             let mut fade = 32767i32;
             let pitch_index = if loss_count == 0 {
@@ -670,9 +683,10 @@ impl CeltDecoder {
                 self.last_pitch_index
             };
             let exc_length = (2 * pitch_index).min(MAX_PERIOD);
-            let mut etmp = vec![0i32; OVERLAP];
-            let mut exc_buf = vec![0i16; MAX_PERIOD + LPC_ORDER];
-            let mut fir_tmp = vec![0i16; exc_length];
+            let mut etmp = [0i32; OVERLAP];
+            let mut exc_buf = [0i16; MAX_PERIOD + LPC_ORDER];
+            let mut fir_tmp = [0i16; MAX_PERIOD];
+            let fir_tmp = &mut fir_tmp[..exc_length];
             for ch in 0..c {
                 let base = ch * STRIDE;
                 for i in 0..MAX_PERIOD + LPC_ORDER {
@@ -715,8 +729,8 @@ impl CeltDecoder {
                 }
                 {
                     let fo = exc_off + MAX_PERIOD - exc_length;
-                    fir(&exc_buf, fo, lpc, &mut fir_tmp, exc_length, LPC_ORDER);
-                    exc_buf[fo..fo + exc_length].copy_from_slice(&fir_tmp);
+                    fir(&exc_buf, fo, lpc, fir_tmp, exc_length, LPC_ORDER);
+                    exc_buf[fo..fo + exc_length].copy_from_slice(fir_tmp);
                 }
                 let exc = |i: usize| exc_buf[exc_off + i] as i32;
                 let decay;

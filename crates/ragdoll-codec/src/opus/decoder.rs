@@ -97,7 +97,19 @@ fn parse_size(data: &[u8]) -> Option<(usize, usize)> {
 /// A parsed packet: TOC byte, payload offset and frame sizes (`opus_packet_parse`).
 pub struct ParsedPacket {
     pub toc: u8,
-    pub frames: Vec<(usize, usize)>,
+    /// `(offset, size)` of each frame; the first `count` entries are valid.
+    frames: [(usize, usize); MAX_FRAMES],
+    count: usize,
+}
+
+/// Frames in one packet: 120 ms of 2.5 ms frames.
+const MAX_FRAMES: usize = 48;
+
+impl ParsedPacket {
+    /// `(offset, size)` of each frame in the packet.
+    pub fn frames(&self) -> &[(usize, usize)] {
+        &self.frames[..self.count]
+    }
 }
 
 /// `opus_packet_parse_impl` without self-delimiting framing.
@@ -110,27 +122,30 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, OpusError> {
     let mut pos = 1usize;
     let mut len = data.len() as i32 - 1;
     let mut last_size = len;
-    let mut sizes: Vec<i32> = Vec::new();
-    let count;
+    // At most MAX_FRAMES sizes (code 3 checks the frame count against 120 ms).
+    let mut sizes = [0i32; MAX_FRAMES];
+    let mut nsizes = 0usize;
+    let mut push = |s: i32| {
+        sizes[nsizes] = s;
+        nsizes += 1;
+    };
     match toc & 0x3 {
-        0 => count = 1,
+        0 => {}
         1 => {
-            count = 2;
             if len & 1 != 0 {
                 return Err(OpusError::InvalidPacket);
             }
             last_size = len / 2;
-            sizes.push(last_size);
+            push(last_size);
         }
         2 => {
-            count = 2;
             let (s, bytes) = parse_size(&data[pos..]).ok_or(OpusError::InvalidPacket)?;
             len -= bytes as i32;
             if s as i32 > len {
                 return Err(OpusError::InvalidPacket);
             }
             pos += bytes;
-            sizes.push(s as i32);
+            push(s as i32);
             last_size = len - s as i32;
         }
         _ => {
@@ -139,7 +154,7 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, OpusError> {
             }
             let ch = data[pos];
             pos += 1;
-            count = (ch & 0x3f) as usize;
+            let count = (ch & 0x3f) as usize;
             if count == 0 || framesize * count as i32 > 5760 {
                 return Err(OpusError::InvalidPacket);
             }
@@ -173,7 +188,7 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, OpusError> {
                     }
                     pos += bytes;
                     last_size -= bytes as i32 + s as i32;
-                    sizes.push(s as i32);
+                    push(s as i32);
                 }
                 if last_size < 0 {
                     return Err(OpusError::InvalidPacket);
@@ -184,7 +199,7 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, OpusError> {
                     return Err(OpusError::InvalidPacket);
                 }
                 for _ in 0..count - 1 {
-                    sizes.push(last_size);
+                    push(last_size);
                 }
             }
         }
@@ -192,16 +207,20 @@ pub fn parse_packet(data: &[u8]) -> Result<ParsedPacket, OpusError> {
     if last_size > 1275 {
         return Err(OpusError::InvalidPacket);
     }
-    sizes.push(last_size);
-    let mut frames = Vec::with_capacity(count);
-    for &s in &sizes {
-        frames.push((pos, s as usize));
+    push(last_size);
+    let mut frames = [(0, 0); MAX_FRAMES];
+    for (f, &s) in frames.iter_mut().zip(&sizes[..nsizes]) {
+        *f = (pos, s as usize);
         pos += s as usize;
     }
     if pos > data.len() {
         return Err(OpusError::InvalidPacket);
     }
-    Ok(ParsedPacket { toc, frames })
+    Ok(ParsedPacket {
+        toc,
+        frames,
+        count: nsizes,
+    })
 }
 
 /// One Opus decoder (`OpusDecoder`): 16-bit output at 48, 24, 16, 12 or 8 kHz, mono or stereo.
@@ -221,6 +240,15 @@ pub struct OpusPacketDecoder {
     prev_redundancy: bool,
     last_packet_duration: i32,
     range_final: u32,
+    /// The range decoder's copy of the packet, reused across frames.
+    ec_buf: Vec<u8>,
+}
+
+/// Copies `src` (at most 2.5 ms of stereo at 48 kHz) into `buf`, returning the filled part.
+fn copy_short<'a>(buf: &'a mut [i16; 240], src: &[i16]) -> &'a [i16] {
+    let out = &mut buf[..src.len()];
+    out.copy_from_slice(src);
+    out
 }
 
 /// `smooth_fade`: cross-fade from `in1` to `in2` with the squared CELT window.
@@ -272,6 +300,7 @@ impl OpusPacketDecoder {
             prev_redundancy: false,
             last_packet_duration: 0,
             range_final: 0,
+            ec_buf: Vec::new(),
         })
     }
 
@@ -337,7 +366,7 @@ impl OpusPacketDecoder {
             self.bandwidth = packet_bandwidth;
             self.frame_size = packet_frame_size;
             self.stream_channels = packet_stream_channels;
-            let (off, size) = parsed.frames[0];
+            let (off, size) = parsed.frames()[0];
             let o = (frame_size - packet_frame_size) as usize * self.channels;
             self.decode_frame(
                 Some(&data[off..off + size]),
@@ -348,7 +377,7 @@ impl OpusPacketDecoder {
             self.last_packet_duration = frame_size;
             return Ok(frame_size as usize);
         }
-        if parsed.frames.len() as i32 * packet_frame_size > frame_size {
+        if parsed.frames().len() as i32 * packet_frame_size > frame_size {
             return Err(OpusError::BufferTooSmall);
         }
         self.mode = packet_mode;
@@ -356,7 +385,7 @@ impl OpusPacketDecoder {
         self.frame_size = packet_frame_size;
         self.stream_channels = packet_stream_channels;
         let mut nb_samples = 0i32;
-        for &(off, size) in &parsed.frames {
+        for &(off, size) in parsed.frames() {
             let o = nb_samples as usize * self.channels;
             let ret = self.decode_frame(
                 Some(&data[off..off + size]),
@@ -403,7 +432,7 @@ impl OpusPacketDecoder {
             audiosize = self.frame_size;
             mode = self.mode;
             bandwidth = self.bandwidth;
-            dec_storage = Some(Ec::decoder(d));
+            dec_storage = Some(Ec::decoder_with(std::mem::take(&mut self.ec_buf), d));
         } else {
             audiosize = frame_size;
             mode = self.prev_mode;
@@ -442,21 +471,28 @@ impl OpusPacketDecoder {
         {
             transition = true;
         }
-        let mut pcm_transition: Vec<i16> = Vec::new();
+        // 5 ms of up to two channels at up to 48 kHz.
+        let mut transition_buf = [0i16; 480];
+        let mut transition_len = 0usize;
         if transition && mode == MODE_CELT_ONLY {
-            pcm_transition = vec![0i16; f5 as usize * ch];
-            self.decode_frame(None, &mut pcm_transition, f5.min(audiosize), false)?;
+            transition_len = f5 as usize * ch;
+            let t = &mut transition_buf[..transition_len];
+            t.fill(0);
+            self.decode_frame(None, t, f5.min(audiosize), false)?;
         }
         if audiosize > frame_size {
             return Err(OpusError::BadArg);
         }
         frame_size = audiosize;
         let n = frame_size as usize * ch;
-        let mut pcm_silk: Vec<i16> = if mode != MODE_CELT_ONLY && !celt_accum {
-            vec![0i16; f10.max(frame_size) as usize * ch]
+        // SILK decodes into its own buffer only for frames shorter than 10 ms, so 10 ms of up
+        // to two channels at up to 48 kHz suffices.
+        let mut silk_buf = [0i16; 960];
+        let pcm_silk = &mut silk_buf[..if mode != MODE_CELT_ONLY && !celt_accum {
+            f10 as usize * ch
         } else {
-            Vec::new()
-        };
+            0
+        }];
         if mode != MODE_CELT_ONLY {
             if self.prev_mode == MODE_CELT_ONLY {
                 self.silk.reset();
@@ -546,8 +582,10 @@ impl OpusPacketDecoder {
             transition = false;
         }
         if transition && mode != MODE_CELT_ONLY {
-            pcm_transition = vec![0i16; f5 as usize * ch];
-            self.decode_frame(None, &mut pcm_transition, f5.min(audiosize), false)?;
+            transition_len = f5 as usize * ch;
+            let t = &mut transition_buf[..transition_len];
+            t.fill(0);
+            self.decode_frame(None, t, f5.min(audiosize), false)?;
         }
         if bandwidth != 0 {
             self.celt.end = match bandwidth {
@@ -558,11 +596,9 @@ impl OpusPacketDecoder {
             };
         }
         self.celt.stream_channels = self.stream_channels;
-        let mut redundant_audio: Vec<i16> = if redundancy {
-            vec![0i16; f5 as usize * ch]
-        } else {
-            Vec::new()
-        };
+        // 5 ms of up to two channels at up to 48 kHz.
+        let mut redundant_buf = [0i16; 480];
+        let redundant_audio = &mut redundant_buf[..if redundancy { f5 as usize * ch } else { 0 }];
         let mut redundant_rng = 0u32;
         let redundant_data = data.map(|d| {
             let s = len.max(0) as usize;
@@ -570,13 +606,9 @@ impl OpusPacketDecoder {
         });
         if redundancy && celt_to_silk {
             self.celt.start = 0;
-            let _ = self.celt.decode(
-                redundant_data,
-                &mut redundant_audio,
-                f5 as usize,
-                None,
-                false,
-            );
+            let _ = self
+                .celt
+                .decode(redundant_data, redundant_audio, f5 as usize, None, false);
             redundant_rng = self.celt.rng;
         }
         self.celt.start = start_band;
@@ -620,18 +652,15 @@ impl OpusPacketDecoder {
         if redundancy && !celt_to_silk {
             self.celt.reset();
             self.celt.start = 0;
-            let _ = self.celt.decode(
-                redundant_data,
-                &mut redundant_audio,
-                f5 as usize,
-                None,
-                false,
-            );
+            let _ = self
+                .celt
+                .decode(redundant_data, redundant_audio, f5 as usize, None, false);
             redundant_rng = self.celt.rng;
             let o = ch * (frame_size - f2_5) as usize;
-            let tail: Vec<i16> = pcm[o..o + f2_5 as usize * ch].to_vec();
+            let mut tail = [0i16; 240];
+            let tail = copy_short(&mut tail, &pcm[o..o + f2_5 as usize * ch]);
             smooth_fade(
-                &tail,
+                tail,
                 &redundant_audio[ch * f2_5 as usize..],
                 &mut pcm[o..],
                 f2_5 as usize,
@@ -646,10 +675,11 @@ impl OpusPacketDecoder {
                 }
             }
             let o = ch * f2_5 as usize;
-            let cur: Vec<i16> = pcm[o..o + f2_5 as usize * ch].to_vec();
+            let mut cur = [0i16; 240];
+            let cur = copy_short(&mut cur, &pcm[o..o + f2_5 as usize * ch]);
             smooth_fade(
                 &redundant_audio[o..],
-                &cur,
+                cur,
                 &mut pcm[o..],
                 f2_5 as usize,
                 ch,
@@ -659,19 +689,28 @@ impl OpusPacketDecoder {
         if transition {
             if audiosize >= f5 {
                 let k = ch * f2_5 as usize;
-                pcm[..k].copy_from_slice(&pcm_transition[..k]);
-                let cur: Vec<i16> = pcm[k..2 * k].to_vec();
+                pcm[..k].copy_from_slice(&transition_buf[..transition_len][..k]);
+                let mut cur = [0i16; 240];
+                let cur = copy_short(&mut cur, &pcm[k..2 * k]);
                 smooth_fade(
-                    &pcm_transition[k..],
-                    &cur,
+                    &transition_buf[..transition_len][k..],
+                    cur,
                     &mut pcm[k..],
                     f2_5 as usize,
                     ch,
                     self.fs,
                 );
             } else {
-                let cur: Vec<i16> = pcm[..ch * f2_5 as usize].to_vec();
-                smooth_fade(&pcm_transition, &cur, pcm, f2_5 as usize, ch, self.fs);
+                let mut cur = [0i16; 240];
+                let cur = copy_short(&mut cur, &pcm[..ch * f2_5 as usize]);
+                smooth_fade(
+                    &transition_buf[..transition_len],
+                    cur,
+                    pcm,
+                    f2_5 as usize,
+                    ch,
+                    self.fs,
+                );
             }
         }
         if self.decode_gain != 0 {
@@ -688,6 +727,9 @@ impl OpusPacketDecoder {
         };
         self.prev_mode = mode;
         self.prev_redundancy = redundancy && !celt_to_silk;
+        if let Some(d) = dec_storage {
+            self.ec_buf = d.buf;
+        }
         match celt_ret {
             Ok(_) => Ok(audiosize),
             Err(_) => Err(OpusError::InternalError),
