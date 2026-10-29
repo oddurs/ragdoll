@@ -3,10 +3,11 @@ id: 97
 uid: 77c63439-3605-48f0-a053-44e2863b05a4
 title: H.264 decoder panics on out-of-range slice deblocking offsets
 type: bug
-status: backlog
+status: done
 milestone: m11-validation
 created: 2026-10-28
-updated: 2026-10-28
+updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p1
 area: codec-video
 ---
@@ -23,5 +24,9 @@ Range-check the `i64` before narrowing, e.g. `let a = r.read_se()?; if !(-6..=6)
 
 ## Acceptance criteria
 
-- [ ] Out-of-range deblocking offsets return `InvalidSyntax` without arithmetic overflow.
-- [ ] `cargo test -p ragdoll-pipeline --lib malformed_bitstream_zero_panic_corpus` passes with the SIMD-0089 encoder.
+- [x] Out-of-range deblocking offsets return `InvalidSyntax` without arithmetic overflow.
+- [x] `cargo test -p ragdoll-pipeline --lib malformed_bitstream_zero_panic_corpus` passes with the SIMD-0089 encoder.
+
+## 2026-10-29
+
+Fixed by range-checking the decoded se(v) values in i64 before narrowing or doubling: slice_alpha_c0_offset_div2 and slice_beta_offset_div2 against -6..=6, slice_qp_delta through SliceQPY, and pic_init_qp_minus26 in the PPS (which fed the same add).

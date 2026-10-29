@@ -280,10 +280,11 @@ impl SliceHeader {
         } else {
             0
         };
-        let qp = pps.pic_init_qp + r.read_se()? as i32;
+        let qp = pps.pic_init_qp as i64 + r.read_se()?;
         if !(0..=51).contains(&qp) {
             return Err(RagdollError::InvalidSyntax("H.264 SliceQPY out of range"));
         }
+        let qp = qp as i32;
         if matches!(slice_type, SliceType::Sp | SliceType::Si) {
             return Err(RagdollError::Unsupported(
                 "H.264 SP and SI slices are not supported".into(),
@@ -300,13 +301,16 @@ impl SliceHeader {
                 ));
             }
             if disable_deblocking_filter_idc != 1 {
-                alpha_offset = 2 * r.read_se()? as i32;
-                beta_offset = 2 * r.read_se()? as i32;
-                if !(-12..=12).contains(&alpha_offset) || !(-12..=12).contains(&beta_offset) {
+                // Range-checked as decoded: a malformed se(v) must not overflow the doubling.
+                let alpha_div2 = r.read_se()?;
+                let beta_div2 = r.read_se()?;
+                if !(-6..=6).contains(&alpha_div2) || !(-6..=6).contains(&beta_div2) {
                     return Err(RagdollError::InvalidSyntax(
                         "H.264 deblocking offset out of range",
                     ));
                 }
+                alpha_offset = 2 * alpha_div2 as i32;
+                beta_offset = 2 * beta_div2 as i32;
             }
         }
         if pps.num_slice_groups > 1 {
