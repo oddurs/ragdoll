@@ -130,8 +130,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         partial_motion: false,
         simple: !st_mbaff
             && matches!(st_structure, Structure::Frame)
-            && cx.sps.chroma_array_type() == 1
-            && cx.sh.weights.is_none(),
+            && cx.sps.chroma_array_type() == 1,
         nb: 0,
         nb_addr: usize::MAX,
         table_base,
@@ -2760,10 +2759,39 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
-    /// [`Self::mc_rect`] when [`Self::simple`]: frame coordinates throughout, implicit weights
-    /// as the only non-default weighting.
+    /// [`Self::mc_rect_simple`] in a slice with explicit weights, kept apart so that the
+    /// unweighted path stays as it is.
+    #[inline(never)]
+    fn mc_rect_simple_explicit(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w4: usize,
+        h4: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        self.mc_rect_simple::<true>(bx, by, w4, h4, refs, mvs)
+    }
+
+    /// With explicit weights: the luma weighting of a block predicted from the lists in `used`
+    /// with `refs`, or `None` when every component reduces to default prediction (as for most
+    /// references of a P slice).
+    #[inline(never)]
+    fn explicit_weighting(&self, used: [bool; 2], refs: [i8; 2]) -> Option<Weighting> {
+        if used == [false, false] {
+            return None;
+        }
+        let eff = |c: usize| recon::effective_weighting(used, self.weighting(refs, c));
+        let wl = eff(0);
+        let default = |wt: Weighting| matches!(wt, Weighting::Default);
+        (!(default(wl) && default(eff(1)) && default(eff(2)))).then_some(wl)
+    }
+
+    /// [`Self::mc_rect`] when [`Self::simple`]: frame coordinates throughout; blocks whose
+    /// weights reduce to default prediction take the default path.
     #[inline(always)]
-    fn mc_rect_simple(
+    fn mc_rect_simple<const EXPLICIT: bool>(
         &mut self,
         bx: usize,
         by: usize,
@@ -2786,6 +2814,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         let rp = [pic(0)?, pic(1)?];
         let (pw, ph) = (self.st.width, self.st.height);
+        if EXPLICIT && let Some(wl) = self.explicit_weighting(rp.map(|r| r.is_some()), refs) {
+            self.mc_rect_weighted(rp, refs, wl, 0, pw, x, y, w, h, pw, ph, mvs);
+            return Ok(());
+        }
         match rp {
             [None, None] => return Err(bad("H.264 inter block without prediction")),
             [Some(_), Some(_)] if !self.implicit.is_empty() => {
@@ -2846,7 +2878,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
         if self.simple {
-            return self.mc_rect_simple(bx, by, w4, h4, refs, mvs);
+            if self.cx.sh.weights.is_some() {
+                return self.mc_rect_simple_explicit(bx, by, w4, h4, refs, mvs);
+            }
+            return self.mc_rect_simple::<false>(bx, by, w4, h4, refs, mvs);
         }
         let (w, h) = (w4 * 4, h4 * 4);
         let (o, ls, px, py) = self.view(0);
