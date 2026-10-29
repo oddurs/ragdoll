@@ -216,6 +216,141 @@ pub fn h264_luma_mc_scalar(
     }
 }
 
+/// [`h264_luma_mc`] (with `avg`, [`h264_luma_mc_avg`]) for the `w`x`h` block at `(x, y)` of a
+/// `width`x`height` plane displaced by the quarter-sample vector `mv`, when every sample its
+/// filter reads lies inside the plane; otherwise nothing is written and the result is `false`.
+/// One test of the block position covers the kernel's bounds.
+///
+/// # Panics
+/// If `w` or `h` is not 4, 8 or 16, `src` holds fewer than `width * height` samples or `dst`
+/// is too short for the block.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn h264_luma_mc_in_plane(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    width: usize,
+    height: usize,
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+    mv: [i16; 2],
+    avg: bool,
+) -> bool {
+    let ix = x as isize + (mv[0] as isize >> 2);
+    let iy = y as isize + (mv[1] as isize >> 2);
+    if !(ix >= 2
+        && iy >= 2
+        && ix as usize + luma_mc_cols(w) <= width
+        && iy as usize + h + 3 <= height)
+    {
+        return false;
+    }
+    // Rows iy - 2 ..= iy + h + 2 and columns ix - 2 .. ix + luma_mc_cols(w) lie in the plane.
+    assert!(matches!(w, 4 | 8 | 16) && matches!(h, 4 | 8 | 16));
+    assert!(width.checked_mul(height).is_some_and(|n| n <= src.len()));
+    assert!((h - 1) * ds + w <= dst.len());
+    let off = iy as usize * width + ix as usize;
+    let (mx, my) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds established above; NEON is baseline on aarch64.
+        unsafe {
+            if avg {
+                luma_neon::<true>(dst, ds, src, off, width, w, h, mx, my)
+            } else {
+                luma_neon::<false>(dst, ds, src, off, width, w, h, mx, my)
+            }
+        };
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds established above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            if avg {
+                luma_avx2::<true>(dst, ds, src, off, width, w, h, mx, my)
+            } else {
+                luma_avx2::<false>(dst, ds, src, off, width, w, h, mx, my)
+            }
+        };
+        return true;
+    }
+    if avg {
+        h264_luma_mc_avg_scalar(dst, ds, src, off, width, w, h, mx, my);
+    } else {
+        h264_luma_mc_scalar(dst, ds, src, off, width, w, h, mx, my);
+    }
+    true
+}
+
+/// [`h264_chroma_mc`] (with `avg`, [`h264_chroma_mc_avg`]) for the `w`x`h` block at `(x, y)`
+/// of a `width`x`height` plane displaced by the eighth-sample vector `mv`, when every sample
+/// it reads lies inside the plane; otherwise nothing is written and the result is `false`.
+///
+/// # Panics
+/// If `w` or `h` is not 2, 4 or 8, `src` holds fewer than `width * height` samples or `dst`
+/// is too short for the block.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn h264_chroma_mc_in_plane(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    width: usize,
+    height: usize,
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+    mv: [i16; 2],
+    avg: bool,
+) -> bool {
+    let ix = x as isize + (mv[0] as isize >> 3);
+    let iy = y as isize + (mv[1] as isize >> 3);
+    if !(ix >= 0
+        && iy >= 0
+        && ix as usize + chroma_mc_cols(w) <= width
+        && (iy as usize + h) < height)
+    {
+        return false;
+    }
+    // Rows iy ..= iy + h and columns ix .. ix + chroma_mc_cols(w) lie in the plane.
+    assert!(matches!(w, 2 | 4 | 8) && matches!(h, 2 | 4 | 8));
+    assert!(width.checked_mul(height).is_some_and(|n| n <= src.len()));
+    assert!((h - 1) * ds + w <= dst.len());
+    let off = iy as usize * width + ix as usize;
+    let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds established above; NEON is baseline on aarch64.
+        unsafe {
+            if avg {
+                chroma_neon::<true>(dst, ds, src, off, width, w, h, fx, fy)
+            } else {
+                chroma_neon::<false>(dst, ds, src, off, width, w, h, fx, fy)
+            }
+        };
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds established above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            if avg {
+                chroma_avx2::<true>(dst, ds, src, off, width, w, h, fx, fy)
+            } else {
+                chroma_avx2::<false>(dst, ds, src, off, width, w, h, fx, fy)
+            }
+        };
+        return true;
+    }
+    if avg {
+        h264_chroma_mc_avg_scalar(dst, ds, src, off, width, w, h, fx, fy);
+    } else {
+        h264_chroma_mc_scalar(dst, ds, src, off, width, w, h, fx, fy);
+    }
+    true
+}
+
 /// Writes the `w`x`h` chroma prediction at eighth-pel phase `(fx, fy)` (`0..=7`) for the block whose
 /// integer-sample origin is `src[off]`, into `dst` with stride `ds`.
 ///
@@ -1467,6 +1602,96 @@ mod tests {
                         h264_chroma_mc_avg(&mut a, ds, &src, off, pw, w, h, fx, fy);
                         h264_chroma_mc_avg_scalar(&mut b, ds, &src, off, pw, w, h, fx, fy);
                         assert_eq!(a, b, "avg {w}x{h} phase ({fx}, {fy}) at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_plane_entries_match_offset_entries() {
+        let (pw, ph) = (48, 40);
+        let src = plane(pw, ph, 29);
+        let mvs = [
+            [0, 0],
+            [5, -3],
+            [-9, 14],
+            [-27, -30],
+            [60, 50],
+            [3, 7],
+            [-1, -1],
+        ];
+        for &(w, h) in &[(16, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
+            for &(x, y) in &[(0, 0), (8, 4), (16, 16), (pw - w, ph - h)] {
+                for mv in mvs {
+                    for avg in [false, true] {
+                        let ds = 17;
+                        let mut a = plane(ds, 16, 3);
+                        let mut b = a.clone();
+                        let ok = h264_luma_mc_in_plane(
+                            &mut a,
+                            ds,
+                            &src,
+                            pw,
+                            ph,
+                            (x, y),
+                            (w, h),
+                            mv,
+                            avg,
+                        );
+                        let ix = x as isize + (mv[0] as isize >> 2);
+                        let iy = y as isize + (mv[1] as isize >> 2);
+                        let inside = ix >= 2
+                            && iy >= 2
+                            && ix as usize + luma_mc_cols(w) <= pw
+                            && iy as usize + h + 3 <= ph;
+                        assert_eq!(ok, inside, "luma {w}x{h} at ({x}, {y}) mv {mv:?}");
+                        if inside {
+                            let off = iy as usize * pw + ix as usize;
+                            let (mx, my) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
+                            if avg {
+                                h264_luma_mc_avg_scalar(&mut b, ds, &src, off, pw, w, h, mx, my);
+                            } else {
+                                h264_luma_mc_scalar(&mut b, ds, &src, off, pw, w, h, mx, my);
+                            }
+                        }
+                        assert_eq!(a, b, "luma {w}x{h} at ({x}, {y}) mv {mv:?} avg {avg}");
+                        let (cw, ch) = (w / 2, h / 2);
+                        let (cx, cy) = (x / 2, y / 2);
+                        let (cpw, cph) = (pw / 2, ph / 2);
+                        let csrc = &src[..cpw * cph];
+                        let mut a = plane(ds, 8, 4);
+                        let mut b = a.clone();
+                        let ok = h264_chroma_mc_in_plane(
+                            &mut a,
+                            ds,
+                            csrc,
+                            cpw,
+                            cph,
+                            (cx, cy),
+                            (cw, ch),
+                            mv,
+                            avg,
+                        );
+                        let ix = cx as isize + (mv[0] as isize >> 3);
+                        let iy = cy as isize + (mv[1] as isize >> 3);
+                        let inside = ix >= 0
+                            && iy >= 0
+                            && ix as usize + chroma_mc_cols(cw) <= cpw
+                            && (iy as usize + ch) < cph;
+                        assert_eq!(ok, inside, "chroma {cw}x{ch} at ({cx}, {cy}) mv {mv:?}");
+                        if inside {
+                            let off = iy as usize * cpw + ix as usize;
+                            let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
+                            if avg {
+                                h264_chroma_mc_avg_scalar(
+                                    &mut b, ds, csrc, off, cpw, cw, ch, fx, fy,
+                                );
+                            } else {
+                                h264_chroma_mc_scalar(&mut b, ds, csrc, off, cpw, cw, ch, fx, fy);
+                            }
+                        }
+                        assert_eq!(a, b, "chroma {cw}x{ch} at ({cx}, {cy}) mv {mv:?} avg {avg}");
                     }
                 }
             }

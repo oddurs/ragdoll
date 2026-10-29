@@ -19,7 +19,7 @@ use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
 use super::tables::{
     B_MB_TYPES, B_SUB_TYPES, BLK4_AT, BLK4_XY, CBP_ME_420, CBP_ME_MONO, FIELD_SCAN4X4,
-    FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN4X4, SCAN8X8, chroma_qp,
+    FIELD_SCAN8X8, P_SUB_TYPES, PRED_L0, Part, SCAN_MAP4, SCAN4X4, SCAN8X8, chroma_qp,
 };
 
 /// A reference picture as seen by one slice.
@@ -126,12 +126,24 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         field: cx.sh.field_pic,
         implicit,
         implicit_field,
+        unit_weights: cx.sh.weights.as_ref().map_or([0; 2], |t| {
+            [0, 1].map(|l| {
+                (0..32).fold(0u32, |m, r| {
+                    let unit = |(w, o): (i32, i32), log: u32| w == 1 << log && o == 0;
+                    let def = t.l[l].get(r).is_none_or(|e| {
+                        unit(e.luma, t.luma_log2)
+                            && unit(e.chroma[0], t.chroma_log2)
+                            && unit(e.chroma[1], t.chroma_log2)
+                    });
+                    m | (def as u32) << r
+                })
+            })
+        }),
         scratch: [[0; 256]; 2],
         partial_motion: false,
         simple: !st_mbaff
             && matches!(st_structure, Structure::Frame)
-            && cx.sps.chroma_array_type() == 1
-            && cx.sh.weights.is_none(),
+            && cx.sps.chroma_array_type() == 1,
         nb: 0,
         nb_addr: usize::MAX,
         table_base,
@@ -223,6 +235,9 @@ struct Dec<'a, 'c> {
     field: bool,
     implicit: Vec<[i32; 2]>,
     implicit_field: [Vec<[i32; 2]>; 2],
+    /// Explicit weights: per list, bit `r` set when reference index `r` (0..32) has default
+    /// weights and zero offsets in every component.
+    unit_weights: [u32; 2],
     /// Prediction samples of the second list, or of both for weighted prediction.
     scratch: [[u8; 256]; 2],
     /// The current MB's motion was stored for less than the whole MB, so it may vary.
@@ -1030,8 +1045,27 @@ impl<'a, 'c> Dec<'a, 'c> {
                 _ => (self.st.cbp[a] >> ((yw / 8) * 2 + xw / 8)) & 1,
             }
         };
-        let la = [nb_bit(-1, 0), nb_bit(-1, 8)];
-        let tb = [nb_bit(0, -1), nb_bit(8, -1)];
+        let (la, tb) = if self.st.mbaff {
+            (
+                [nb_bit(-1, 0), nb_bit(-1, 8)],
+                [nb_bit(0, -1), nb_bit(8, -1)],
+            )
+        } else {
+            // The left macroblock's right 8x8s (bits 1, 3) and the top one's bottom 8x8s
+            // (bits 2, 3); all set when unavailable or I_PCM, clear when skipped.
+            let bits = |m: Option<usize>| -> u8 {
+                match m {
+                    None => 0xF,
+                    Some(a) => match self.st.mb_type[a] {
+                        MbType::IPcm => 0xF,
+                        t if t.is_skip() => 0,
+                        _ => self.st.cbp[a] & 0xF,
+                    },
+                }
+            };
+            let (l, t) = (bits(self.mb_left()), bits(self.mb_top()));
+            ([(l >> 1) & 1, (l >> 3) & 1], [(t >> 2) & 1, (t >> 3) & 1])
+        };
         let chroma_of = |m: Option<usize>| -> u8 {
             match m {
                 None => 0,
@@ -1418,6 +1452,21 @@ impl<'a, 'c> Dec<'a, 'c> {
         ]
     }
 
+    /// Neighbours A and B of the luma 4x4 block at MB-relative `(bx, by)`, each `(macroblock,
+    /// block index)` when available (as [`Self::blk`], every block of the current macroblock
+    /// counting as decoded).
+    #[inline]
+    fn nb_ab(&self, bx: usize, by: usize) -> [Option<(usize, usize)>; 2] {
+        if !self.st.mbaff {
+            let a = self.mb.addr;
+            return self
+                .nb_flat(2, bx, by)
+                .map(|n| n.map(|(i, other, m)| (if other { m } else { a }, i)));
+        }
+        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
+        [self.blk(x - 1, y, 0xFFFF), self.blk(x, y - 1, 0xFFFF)]
+    }
+
     /// CAVLC `nC` for the luma 4x4 block at MB-relative 4x4 `(bx, by)` (9.2.1).
     #[inline]
     fn nc_luma(&self, bx: usize, by: usize) -> u8 {
@@ -1554,6 +1603,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             (&SCAN4X4, &SCAN8X8)
         };
+        let map4 = [&SCAN_MAP4[field as usize][0], &SCAN_MAP4[field as usize][1]];
         let a = self.mb.addr;
         let qp = self.qp;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
@@ -1659,13 +1709,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let (cd, ctxs) = self.cabac();
                     let n =
                         cd.decode_residual_coeffs(&mut ctxs[..], cat, inc, max, field, &mut coeffs);
-                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, map4[16 - max], out);
                     n
                 } else {
                     let nc = self.nc_luma(bx, by);
                     let r = self.reader();
                     let n = decode_cavlc_coeffs(r, max, nc, &mut coeffs)?;
-                    dq.scale4_coeffs(lst, qp, &coeffs, n, 16 - max, scan4, out);
+                    dq.scale4_coeffs(lst, qp, &coeffs, n, map4[16 - max], out);
                     n
                 };
                 let j = self.st.b4(x4, y4);
@@ -1720,13 +1770,13 @@ impl<'a, 'c> Dec<'a, 'c> {
                     let (cd, ctxs) = self.cabac();
                     let n =
                         cd.decode_residual_coeffs(&mut ctxs[..], 4, inc, 15, field, &mut coeffs);
-                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, map4[1], out);
                     n
                 } else {
                     let nc = self.nc_chroma(p, bx, by);
                     let r = self.reader();
                     let n = decode_cavlc_coeffs(r, 15, nc, &mut coeffs)?;
-                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, 1, scan4, out);
+                    dq.scale4_coeffs(lst + 1 + p, qpc[p] as i32, &coeffs, n, map4[1], out);
                     n
                 };
                 let j = self.st.c4(x4, y4);
@@ -1874,6 +1924,53 @@ impl<'a, 'c> Dec<'a, 'c> {
         part: Option<(Part, usize)>,
         done: u16,
     ) -> [i16; 2] {
+        if !self.st.mbaff {
+            // Neighbours by block coordinates: inside the macroblock when decoded (`done`),
+            // else in the left, top, top-right or top-left macroblock when available.
+            let st = &*self.st;
+            let s = st.mb_w * 4;
+            let i = st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+            let at = |j: usize| (st.blocks[j].ref_idx[list], st.blocks[j].mv[list]);
+            let inside = |x: usize, y: usize| done & (1 << BLK4_AT[y][x]) != 0;
+            let nb = self.nb;
+            let get = |ok: bool, j: usize| if ok { at(j) } else { NO_MV };
+            let a = get(
+                if bx > 0 {
+                    inside(bx - 1, by)
+                } else {
+                    nb & NB_L != 0
+                },
+                i.wrapping_sub(1),
+            );
+            let b = get(
+                if by > 0 {
+                    inside(bx, by - 1)
+                } else {
+                    nb & NB_T != 0
+                },
+                i.wrapping_sub(s),
+            );
+            let cx = bx + w;
+            let c_ok = match (by > 0, cx < 4) {
+                (true, true) => inside(cx, by - 1),
+                // The macroblock to the right follows in decoding order.
+                (true, false) => false,
+                (false, true) => nb & NB_T != 0,
+                (false, false) => nb & NB_TR != 0,
+            };
+            let c = if c_ok {
+                at((i + w).wrapping_sub(s))
+            } else {
+                let d_ok = match (bx > 0, by > 0) {
+                    (true, true) => inside(bx - 1, by - 1),
+                    (false, true) => nb & NB_L != 0,
+                    (true, false) => nb & NB_T != 0,
+                    (false, false) => nb & NB_TL != 0,
+                };
+                get(d_ok, i.wrapping_sub(s + 1))
+            };
+            return mvp_from(a, b, c, refidx, part);
+        }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let a = self.neighbour(list, x - 1, y, done);
         let b = self.neighbour(list, x, y - 1, done);
@@ -1885,11 +1982,36 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     fn p_skip_mv(&self) -> [i16; 2] {
-        let [a, b, c] = self.mb_neighbours()[0];
+        let [a, b, c] = if self.st.mbaff {
+            self.mb_neighbours()[0]
+        } else {
+            self.mb_neighbours_flat(0)
+        };
         if a.0 == UNAV || b.0 == UNAV || a == (0, [0, 0]) || b == (0, [0, 0]) {
             return [0, 0];
         }
         mvp_raw(a, b, c, 0)
+    }
+
+    /// [`Self::mb_neighbours`] of one list, without MBAFF.
+    #[inline]
+    fn mb_neighbours_flat(&self, list: usize) -> [Mv; 3] {
+        let (x, y, w) = (self.mb.x, self.mb.y, self.st.mb_w);
+        let i = self.st.b4(x * 4, y * 4);
+        let s = w * 4;
+        let st = &*self.st;
+        let at = |i: usize| (st.blocks[i].ref_idx[list], st.blocks[i].mv[list]);
+        let nb = self.nb;
+        let a = if nb & NB_L != 0 { at(i - 1) } else { NO_MV };
+        let b = if nb & NB_T != 0 { at(i - s) } else { NO_MV };
+        let c = if nb & NB_TR != 0 {
+            at(i - s + 4)
+        } else if nb & NB_TL != 0 {
+            at(i - s - 1)
+        } else {
+            NO_MV
+        };
+        [a, b, c]
     }
 
     /// Neighbours A, B and C (D where C is unavailable) of the whole macroblock in both lists,
@@ -1936,10 +2058,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         if !self.is_cabac() {
             return self.read_te(n - 1);
         }
-        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let is_b = self.cx.sh.slice_type.is_b();
-        let cond = |xn: isize, yn: isize| -> u8 {
-            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
+        let cond = |n: Option<(usize, usize)>| -> u8 {
+            let Some((addr, i)) = n else {
                 return 0;
             };
             let t = self.st.mb_type[addr];
@@ -1957,7 +2078,8 @@ impl<'a, 'c> Dec<'a, 'c> {
             };
             (self.st.blocks[i].ref_idx[list] > thresh) as u8
         };
-        let (ca, cb) = (cond(x - 1, y), cond(x, y - 1));
+        let [na, nb] = self.nb_ab(bx, by);
+        let (ca, cb) = (cond(na), cond(nb));
         let (cd, ctxs) = self.cabac();
         let v = cd.decode_ref_idx(&mut ctxs[..], ca, cb);
         if v as u32 >= n {
@@ -1976,9 +2098,9 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             return Ok(([x as i16, y as i16], [0, 0]));
         }
-        let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
-        let absn = |xn: isize, yn: isize, comp: usize| -> u32 {
-            let Some((addr, i)) = self.blk(xn, yn, 0xFFFF) else {
+        let [na, nb] = self.nb_ab(bx, by);
+        let absn = |n: Option<(usize, usize)>, comp: usize| -> u32 {
+            let Some((addr, i)) = n else {
                 return 0;
             };
             let v = self.st.blocks[i].mvd[list][comp] as u32;
@@ -1989,7 +2111,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 _ => v,
             }
         };
-        let sums = [0, 1].map(|comp| absn(x - 1, y, comp) + absn(x, y - 1, comp));
+        let sums = [0, 1].map(|comp| absn(na, comp) + absn(nb, comp));
         let mut mvd = [0i16; 2];
         let mut amvd = [0u8; 2];
         for comp in 0..2 {
@@ -2256,11 +2378,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         if spatial && inference && mask == 0xF {
             let col = if need_col {
                 let c = col_mb.get_or_insert_with(|| self.colocated_mb());
-                c.uniform().then(|| c.block(0, 0))
+                c.uniform().then(|| c.ref_mv(0, 0))
             } else {
-                Some((-1, [0, 0], NO_PIC, 0))
+                Some((-1, [0, 0]))
             };
-            if let Some((col_ref, col_mv, _, _)) = col {
+            if let Some((col_ref, col_mv)) = col {
                 return self.store_direct(0, 0, 4, sp_ref, spatial_mvs(col_ref, col_mv));
             }
         }
@@ -2283,12 +2405,17 @@ impl<'a, 'c> Dec<'a, 'c> {
                 } else {
                     (bx, by)
                 };
-                let (col_ref, col_mv, col_pic, vscale) = if need_col {
+                let (col_ref, col_mv, col_pic, vscale) = if !need_col {
+                    (-1, [0, 0], NO_PIC, 0)
+                } else if spatial {
+                    let (r, mv) = col_mb
+                        .get_or_insert_with(|| self.colocated_mb())
+                        .ref_mv(cbx, cby);
+                    (r, mv, NO_PIC, 0)
+                } else {
                     col_mb
                         .get_or_insert_with(|| self.colocated_mb())
                         .block(cbx, cby)
-                } else {
-                    (-1, [0, 0], NO_PIC, 0)
                 };
                 let (refs, mvs) = if spatial {
                     (sp_ref, spatial_mvs(col_ref, col_mv))
@@ -2654,10 +2781,44 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
-    /// [`Self::mc_rect`] when [`Self::simple`]: frame coordinates throughout, implicit weights
-    /// as the only non-default weighting.
+    /// [`Self::mc_rect_simple`] in a slice with explicit weights, kept apart so that the
+    /// unweighted path stays as it is.
+    #[inline(never)]
+    fn mc_rect_simple_explicit(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w4: usize,
+        h4: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        self.mc_rect_simple::<true>(bx, by, w4, h4, refs, mvs)
+    }
+
+    /// With explicit weights: the luma weighting of a block predicted from the lists in `used`
+    /// with `refs`, or `None` when every component reduces to default prediction (as for most
+    /// references of a P slice).
+    #[inline(never)]
+    fn explicit_weighting(&self, used: [bool; 2], refs: [i8; 2]) -> Option<Weighting> {
+        if used == [false, false] {
+            return None;
+        }
+        // References with default weights in every component predict as without weights.
+        let unit = |l: usize| !used[l] || self.unit_weights[l] >> (refs[l] as u32 & 31) & 1 != 0;
+        if unit(0) && unit(1) {
+            return None;
+        }
+        let eff = |c: usize| recon::effective_weighting(used, self.weighting(refs, c));
+        let wl = eff(0);
+        let default = |wt: Weighting| matches!(wt, Weighting::Default);
+        (!(default(wl) && default(eff(1)) && default(eff(2)))).then_some(wl)
+    }
+
+    /// [`Self::mc_rect`] when [`Self::simple`]: frame coordinates throughout; blocks whose
+    /// weights reduce to default prediction take the default path.
     #[inline(always)]
-    fn mc_rect_simple(
+    fn mc_rect_simple<const EXPLICIT: bool>(
         &mut self,
         bx: usize,
         by: usize,
@@ -2680,6 +2841,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         };
         let rp = [pic(0)?, pic(1)?];
         let (pw, ph) = (self.st.width, self.st.height);
+        if EXPLICIT && let Some(wl) = self.explicit_weighting(rp.map(|r| r.is_some()), refs) {
+            self.mc_rect_weighted(rp, refs, wl, 0, pw, x, y, w, h, pw, ph, mvs);
+            return Ok(());
+        }
         match rp {
             [None, None] => return Err(bad("H.264 inter block without prediction")),
             [Some(_), Some(_)] if !self.implicit.is_empty() => {
@@ -2740,7 +2905,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
         if self.simple {
-            return self.mc_rect_simple(bx, by, w4, h4, refs, mvs);
+            if self.cx.sh.weights.is_some() {
+                return self.mc_rect_simple_explicit(bx, by, w4, h4, refs, mvs);
+            }
+            return self.mc_rect_simple::<false>(bx, by, w4, h4, refs, mvs);
         }
         let (w, h) = (w4 * 4, h4 * 4);
         let (o, ls, px, py) = self.view(0);
@@ -2890,6 +3058,27 @@ impl ColMb<'_> {
         let mb = row * self.mb_w + self.mbx;
         m.mb_intra.get(mb).copied().unwrap_or(true)
             || m.mb_uniform.get(mb).copied().unwrap_or(false)
+    }
+
+    /// `(refIdxCol, mvCol)` of MB-relative 4x4 block `(cbx, cby)`: [`Self::block`] without the
+    /// picture and scale, which spatial direct prediction does not use.
+    #[inline]
+    fn ref_mv(&self, cbx: usize, cby: usize) -> (i8, [i16; 2]) {
+        let Some(m) = self.m else {
+            return (-1, [0, 0]);
+        };
+        let (row, by) = match self.layout {
+            ColLayout::Same(row) => (row, cby),
+            ColLayout::FrameFromField(row, half) => (row, half + cby / 2),
+            ColLayout::FieldFromFrame(r2) => (r2 + cby / 2, 2 * (cby % 2)),
+        };
+        let mb = row * self.mb_w + self.mbx;
+        if mb >= m.mb_intra.len() || m.mb_intra[mb] {
+            return (-1, [0, 0]);
+        }
+        let b = &m.blocks[(row * 4 + by) * self.mb_w * 4 + self.mbx * 4 + cbx];
+        let l = if b.ref_idx[0] >= 0 { 0 } else { 1 };
+        (b.ref_idx[l], b.mv[l])
     }
 
     /// `(refIdxCol, mvCol, referenced picture id, vertical scale)` of MB-relative 4x4 block

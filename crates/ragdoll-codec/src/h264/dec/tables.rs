@@ -320,6 +320,23 @@ pub const BLK4_XY: [(usize, usize); 16] = [
 pub const BLK4_AT: [[usize; 4]; 4] = [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
 
 /// Field scan of a 4x4 block: scan index -> raster index (Table 8-13, field macroblocks).
+/// Raster position of 4x4 scan position `k` of a block whose scan starts at `off` (0, or 1 for
+/// AC blocks): `[field][off][k]`.
+pub static SCAN_MAP4: [[[u8; 16]; 2]; 2] = {
+    let mut t = [[[0u8; 16]; 2]; 2];
+    let mut off = 0;
+    while off < 2 {
+        let mut k = 0;
+        while k < 16 {
+            t[0][off][k] = SCAN4X4[(k + off) & 15] as u8;
+            t[1][off][k] = FIELD_SCAN4X4[(k + off) & 15] as u8;
+            k += 1;
+        }
+        off += 1;
+    }
+    t
+};
+
 pub const FIELD_SCAN4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Field scan of an 8x8 block: scan index -> raster index (Table 8-14, field macroblocks).
