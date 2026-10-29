@@ -3389,6 +3389,7 @@ mod tests {
                 y0,
                 mvp: [0, 0],
                 lambda: 1,
+                mv_costs: &[],
                 bounds,
                 qpel_iters: 2,
             };
