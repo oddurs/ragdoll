@@ -411,6 +411,49 @@ pub unsafe fn post_rotate_forward_avx2(f2: &[i32], out: &mut [i32], t: &[i16]) -
     i
 }
 
+/// AVX2 [`super::celt_enc::preemphasis_scalar`] of samples `1..`, eight at a time (each needs
+/// only its input and the one before); returns the first sample it left (at least 1).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn preemphasis_avx2(pcm: &[i16], cc: usize, ch: usize, out: &mut [i32]) -> usize {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    assert!((1..=2).contains(&cc) && ch < cc && pcm.len() >= cc * n);
+    let coef = _mm256_set1_epi32(27853);
+    let (pp, op) = (pcm.as_ptr(), out.as_mut_ptr());
+    // Samples i..i + 8 of the channel, sign-extended.
+    let load = |i: usize| {
+        // Safety: the callers' samples are below n, so the reads below cc * n.
+        unsafe {
+            if cc == 1 {
+                _mm256_cvtepi16_epi32(_mm_loadu_si128(pp.add(i) as *const __m128i))
+            } else {
+                let v = _mm256_loadu_si256(pp.add(2 * i) as *const __m256i);
+                if ch == 0 {
+                    _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(v))
+                } else {
+                    _mm256_srai_epi32::<16>(v)
+                }
+            }
+        }
+    };
+    let mut i = 1;
+    while i + 8 <= n {
+        let (x, prev) = (load(i), load(i - 1));
+        // SHL32(x, SIG_SHIFT) - MULT16_16(PREEMPH, prev) >> (15 - SIG_SHIFT).
+        let m = _mm256_srai_epi32::<3>(_mm256_mullo_epi32(prev, coef));
+        let v = _mm256_sub_epi32(_mm256_slli_epi32::<12>(x), m);
+        // Safety: out[i..i + 8] is in `out`.
+        unsafe { _mm256_storeu_si256(op.add(i) as *mut __m256i, v) };
+        i += 8;
+    }
+    i
+}
+
 /// AVX2 `celt_maxabs32`.
 ///
 /// # Safety
@@ -847,6 +890,24 @@ mod tests {
                 fir5(&mut a, &num, n);
                 fir5_scalar(&mut b, &num, n);
                 assert_eq!(a, b, "fir5 n {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn preemphasis_matches_scalar() {
+        use super::super::celt_enc::{preemphasis, preemphasis_scalar};
+        for n in (1..40).chain([120, 240, 480, 960]) {
+            for cc in [1usize, 2] {
+                let pcm = signal16(cc * n, (n * cc) as u32, 32768);
+                for ch in 0..cc {
+                    for mem in [0, 12345, -(1 << 20), i32::MIN] {
+                        let (mut a, mut b) = (vec![0i32; n], vec![0i32; n]);
+                        let ma = preemphasis(&pcm, cc, ch, &mut a, mem);
+                        let mb = preemphasis_scalar(&pcm, cc, ch, &mut b, mem, 0);
+                        assert_eq!((ma, &a), (mb, &b), "n {n} cc {cc} ch {ch}");
+                    }
+                }
             }
         }
     }

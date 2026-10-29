@@ -295,15 +295,14 @@ impl CeltEncoder {
             enc.nbits_total += tell - enc.tell();
         }
         for ch in 0..cc {
-            // celt_preemphasis, fast path (no clipping, no upsampling).
-            let mut mm = self.preemph_mem_e[ch];
             let base = ch * (n + OVERLAP) + OVERLAP;
-            for i in 0..n {
-                let x = pcm[cc * i + ch] as i32;
-                inb[base + i] = shl32(x, SIG_SHIFT).wrapping_sub(mm);
-                mm = mul16(PREEMPH, x) >> (15 - SIG_SHIFT);
-            }
-            self.preemph_mem_e[ch] = mm;
+            self.preemph_mem_e[ch] = preemphasis(
+                &pcm[..cc * n],
+                cc,
+                ch,
+                &mut inb[base..base + n],
+                self.preemph_mem_e[ch],
+            );
         }
         let mut pitch_index = MINPERIOD as i32;
         let mut gain1 = 0i32;
@@ -924,6 +923,43 @@ impl CeltEncoder {
     }
 }
 
+/// `celt_preemphasis`, fast path (no clipping, no upsampling): channel `ch` of the `cc`
+/// interleaved channels of `pcm` into `out`, from and returning the filter memory.
+pub fn preemphasis(pcm: &[i16], cc: usize, ch: usize, out: &mut [i32], mem: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() && !out.is_empty() {
+        out[0] = shl32(pcm[ch] as i32, SIG_SHIFT).wrapping_sub(mem);
+        // Safety: avx2() is true only when the CPU supports AVX2.
+        let done = unsafe { super::simd_enc::preemphasis_avx2(pcm, cc, ch, out) };
+        return preemphasis_scalar(pcm, cc, ch, out, mem, done);
+    }
+    preemphasis_scalar(pcm, cc, ch, out, mem, 0)
+}
+
+/// Scalar reference of [`preemphasis`], from sample `i0` on (whose memory is that of
+/// sample `i0 - 1`, or `mem` for the first).
+pub fn preemphasis_scalar(
+    pcm: &[i16],
+    cc: usize,
+    ch: usize,
+    out: &mut [i32],
+    mem: i32,
+    i0: usize,
+) -> i32 {
+    let mem_of = |x: i32| mul16(PREEMPH, x) >> (15 - SIG_SHIFT);
+    let mut mm = if i0 == 0 {
+        mem
+    } else {
+        mem_of(pcm[cc * (i0 - 1) + ch] as i32)
+    };
+    for (i, o) in out.iter_mut().enumerate().skip(i0) {
+        let x = pcm[cc * i + ch] as i32;
+        *o = shl32(x, SIG_SHIFT).wrapping_sub(mm);
+        mm = mem_of(x);
+    }
+    mm
+}
+
 fn compute_mdcts(
     short_blocks: usize,
     inb: &[i32],
@@ -977,20 +1013,33 @@ fn transient_analysis(
         5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
         4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
     ];
-    let tmp = sized(tmp, len);
+    let tmps = sized(tmp, c * len);
     let forward_shift = 4;
     let len2 = len / 2;
     let mut mask_metric = 0i32;
-    for ch in 0..c {
-        let mut mem0 = 0i32;
-        let mut mem1 = 0i32;
-        for i in 0..len {
-            let x = inb[i + ch * len] >> SIG_SHIFT;
-            let y = mem0.wrapping_add(x);
-            mem0 = mem1.wrapping_add(y).wrapping_sub(shl32(x, 1));
-            mem1 = x.wrapping_sub(y >> 1);
-            tmp[i] = sround16(y, 2);
+    // The high-pass filter: a serial recursion per channel, so two channels run side by side.
+    #[inline(always)]
+    fn hp(v: i32, mem: &mut (i32, i32)) -> i16 {
+        let x = v >> SIG_SHIFT;
+        let y = mem.0.wrapping_add(x);
+        mem.0 = mem.1.wrapping_add(y).wrapping_sub(shl32(x, 1));
+        mem.1 = x.wrapping_sub(y >> 1);
+        sround16(y, 2)
+    }
+    if c == 2 {
+        let (t0, t1) = tmps.split_at_mut(len);
+        let (mut m0, mut m1) = ((0, 0), (0, 0));
+        for (((a, b), &u), &v) in t0.iter_mut().zip(t1).zip(&inb[..len]).zip(&inb[len..]) {
+            *a = hp(u, &mut m0);
+            *b = hp(v, &mut m1);
         }
+    } else {
+        let mut m = (0, 0);
+        for (a, &u) in tmps.iter_mut().zip(&inb[..len]) {
+            *a = hp(u, &mut m);
+        }
+    }
+    for (ch, tmp) in tmps.chunks_exact_mut(len).enumerate() {
         tmp[..12].fill(0);
         let shift = 14 - ilog2(1.max(maxabs16(tmp)));
         if shift != 0 {
@@ -998,17 +1047,21 @@ fn transient_analysis(
                 *v = shl16(*v as i32, shift) as i16;
             }
         }
+        // Energies of sample pairs, then their forward smoothing (in place: the pair of
+        // output i is at 2i >= i).
+        let mut x2 = [0i16; (960 + OVERLAP) / 2];
+        let x2 = &mut x2[..len2];
+        for (e, p) in x2.iter_mut().zip(tmp.chunks_exact(2)) {
+            let (a, b) = (p[0] as i32, p[1] as i32);
+            *e = pshr32(mul16(a, a) + mul16(b, b), 16) as i16;
+        }
         let mut mean = 0i32;
-        mem0 = 0;
-        for i in 0..len2 {
-            let x2 = pshr32(
-                mul16(tmp[2 * i] as i32, tmp[2 * i] as i32)
-                    + mul16(tmp[2 * i + 1] as i32, tmp[2 * i + 1] as i32),
-                16,
-            ) as i16 as i32;
+        let mut mem0 = 0i32;
+        for (t, &e) in tmp.iter_mut().zip(x2.iter()) {
+            let x2 = e as i32;
             mean += x2;
-            tmp[i] = (mem0 + pshr32(x2 - mem0, forward_shift)) as i16;
-            mem0 = tmp[i] as i32;
+            *t = (mem0 + pshr32(x2 - mem0, forward_shift)) as i16;
+            mem0 = *t as i32;
         }
         mem0 = 0;
         let mut max_e = 0i32;
