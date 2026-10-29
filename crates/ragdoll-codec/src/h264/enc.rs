@@ -563,17 +563,17 @@ static TOTAL_ZEROS: [[[u32; 16]; 16]; 2] = {
 /// The non-zero counts of a macroblock's $4\times4$ luma blocks with those of the blocks above
 /// and to the left, `0x80` where unavailable, so `nC` is one sum and a mask
 /// (`x264_mb_predict_non_zero_code` on `non_zero_count` in the macroblock cache).
-struct NnzCache([u8; 25]);
+struct NnzCache([u8; 32]);
 
 impl NnzCache {
     /// Cache index of block `b` (decoding order): row-major 5x5 with the neighbours in row and
     /// column 0.
-    const AT: [usize; 16] = {
-        let mut t = [0usize; 16];
+    const AT: [u8; 16] = {
+        let mut t = [0u8; 16];
         let mut b = 0;
         while b < 16 {
             let (x, y) = ((b & 1) + ((b >> 1) & 2), ((b >> 1) & 1) + ((b >> 2) & 2));
-            t[b] = (y + 1) * 5 + x + 1;
+            t[b] = ((y + 1) * 5 + x + 1) as u8;
             b += 1;
         }
         t
@@ -581,7 +581,7 @@ impl NnzCache {
 
     #[inline(always)]
     fn load(nnz: &[u8], g_stride: usize, mb_x: usize, mb_y: usize) -> Self {
-        let mut c = [0x80u8; 25];
+        let mut c = [0x80u8; 32];
         let (gx, gy) = (mb_x * 4, mb_y * 4);
         if mb_y > 0 {
             c[1..5].copy_from_slice(&nnz[(gy - 1) * g_stride + gx..][..4]);
@@ -597,14 +597,15 @@ impl NnzCache {
     /// `nC` of block `b` (ITU-T H.264 9.2.1).
     #[inline(always)]
     fn nc(&self, b: usize) -> u8 {
-        let i = Self::AT[b & 15];
-        let s = self.0[i - 1] as u32 + self.0[i - 5] as u32;
+        // Indices stay below 25: masking them only drops the bound checks.
+        let i = Self::AT[b & 15] as usize;
+        let s = self.0[(i - 1) & 31] as u32 + self.0[(i - 5) & 31] as u32;
         ((if s < 0x80 { (s + 1) >> 1 } else { s }) & 0x7F) as u8
     }
 
     #[inline(always)]
     fn set(&mut self, b: usize, n: u8) {
-        self.0[Self::AT[b & 15]] = n;
+        self.0[Self::AT[b & 15] as usize & 31] = n;
     }
 
     /// Writes the macroblock's counts back to the grid.
@@ -617,9 +618,19 @@ impl NnzCache {
     }
 }
 
-/// `coeff_token` table of each `nC` (0..=16; larger ones share the last), as
-/// `nc_to_table_idx`, without the branches.
-const NC_CLASS: [u8; 17] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+/// `coeff_token` table of each `nC` below 128, as `nc_to_table_idx`, without the branches.
+const NC_CLASS: [u8; 128] = {
+    let mut t = [3u8; 128];
+    t[0] = 0;
+    t[1] = 0;
+    t[2] = 1;
+    t[3] = 1;
+    t[4] = 2;
+    t[5] = 2;
+    t[6] = 2;
+    t[7] = 2;
+    t
+};
 
 /// CAVLC `residual_block` of a zig-zag scanned block of `N` = 16 or 15 coefficients (`nc` selects
 /// the `coeff_token` table), or of the 4 chroma DC coefficients (`N` = 4); the bits equal
@@ -641,7 +652,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     let tokens = &COEFF_TOKEN[if N == 4 {
         4
     } else {
-        NC_CLASS[nc.min(16) as usize] as usize
+        NC_CLASS[nc as usize & 127] as usize
     }];
     if mask == 0 {
         w.put32(tokens[0] >> 8, tokens[0] & 0xFF);
