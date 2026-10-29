@@ -90,6 +90,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         Some(f) => [0, 1].map(|p| build_implicit_weights(cx, &f[p], cx.field_poc[p])),
         None => [Vec::new(), Vec::new()],
     };
+    let (st_mbaff, st_structure) = (st.mbaff, st.structure);
     let mut d = Dec {
         cx,
         st,
@@ -106,6 +107,10 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         implicit_field,
         scratch: [[0; 256]; 2],
         partial_motion: false,
+        simple: !st_mbaff
+            && matches!(st_structure, Structure::Frame)
+            && cx.sps.chroma_array_type() == 1
+            && cx.sh.weights.is_none(),
         res: None,
     };
     d.run(first, total)
@@ -197,6 +202,9 @@ struct Dec<'a, 'c> {
     scratch: [[u8; 256]; 2],
     /// The current MB's motion was stored for less than the whole MB, so it may vary.
     partial_motion: bool,
+    /// Progressive 4:2:0 frame without MBAFF or explicit weights: inter prediction takes
+    /// [`Self::mc_rect_simple`].
+    simple: bool,
     /// Residual blocks, kept zeroed between macroblocks: the inverse transforms clear what they
     /// read, so only coded coefficients are ever written.
     res: Option<Box<Residual>>,
@@ -1309,6 +1317,22 @@ impl<'a, 'c> Dec<'a, 'c> {
         intra: bool,
         res: &mut Residual,
     ) -> Result<()> {
+        // One instance per entropy coder keeps each one's hot code small.
+        if self.is_cabac() {
+            self.read_residual_with::<true>(cbp, is_i16, t8, intra, res)
+        } else {
+            self.read_residual_with::<false>(cbp, is_i16, t8, intra, res)
+        }
+    }
+
+    fn read_residual_with<const CABAC: bool>(
+        &mut self,
+        cbp: u8,
+        is_i16: bool,
+        t8: bool,
+        intra: bool,
+        res: &mut Residual,
+    ) -> Result<()> {
         let field = self.field_mb();
         let (scan4, scan8) = if field {
             (&FIELD_SCAN4X4, &FIELD_SCAN8X8)
@@ -1319,7 +1343,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let qp = self.qp;
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let lst = if intra { 0 } else { 3 };
-        let cabac = self.is_cabac();
+        let cabac = CABAC;
         let dq = self.cx.dq;
         let mut coeffs = ResidualCoeffs::new();
 
@@ -2379,6 +2403,82 @@ impl<'a, 'c> Dec<'a, 'c> {
         Ok(())
     }
 
+    /// [`Self::mc_rect`] when [`Self::simple`]: frame coordinates throughout, implicit weights
+    /// as the only non-default weighting.
+    #[inline(always)]
+    fn mc_rect_simple(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w4: usize,
+        h4: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
+        let (w, h) = (w4 * 4, h4 * 4);
+        let (x, y) = (self.mb.x * 16 + bx * 4, self.mb.y * 16 + by * 4);
+        let lists = &self.cx.refs;
+        let pic = |l: usize| -> Result<Option<&'c RefPic>> {
+            if refs[l] < 0 {
+                return Ok(None);
+            }
+            match lists[l].get(refs[l] as usize) {
+                Some(r) => Ok(Some(r)),
+                None => Err(bad("H.264 ref_idx beyond list")),
+            }
+        };
+        let rp = [pic(0)?, pic(1)?];
+        let (pw, ph) = (self.st.width, self.st.height);
+        match rp {
+            [None, None] => return Err(bad("H.264 inter block without prediction")),
+            [Some(_), Some(_)] if !self.implicit.is_empty() => {
+                let n1 = lists[1].len();
+                let [w0, w1] = self.implicit[refs[0] as usize * n1 + refs[1] as usize];
+                // Implicit weights of 32 each are default bi-prediction (8.4.2.3).
+                if (w0, w1) != (32, 32) {
+                    let wt = Weighting::Weighted(5, [(w0, 0), (w1, 0)]);
+                    self.mc_rect_weighted(rp, refs, wt, 0, pw, x, y, w, h, pw, ph, mvs);
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        let dst = &mut self.st.planes[0][y * pw + x..];
+        match rp {
+            [Some(r), None] | [None, Some(r)] => {
+                let l = rp[0].is_none() as usize;
+                recon::mc_luma::<false>(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, pw);
+            }
+            [Some(r0), Some(r1)] => {
+                recon::mc_luma::<false>(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, pw);
+                recon::mc_luma::<true>(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], dst, pw);
+            }
+            [None, None] => {}
+        }
+        let (cs, cph) = (pw / 2, ph / 2);
+        let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
+        let d = cy * cs + cx;
+        let [_, pcb, pcr] = &mut self.st.planes;
+        let (dcb, dcr) = (&mut pcb[d..], &mut pcr[d..]);
+        fn src(r: &RefPic) -> [&[u8]; 2] {
+            [&r.planes[1], &r.planes[2]]
+        }
+        match rp {
+            [Some(r), None] | [None, Some(r)] => {
+                let mv = mvs[rp[0].is_none() as usize];
+                recon::mc_chroma_pair::<false>(src(r), cs, cph, cx, cy, cw, ch, mv, [dcb, dcr], cs);
+            }
+            [Some(r0), Some(r1)] => {
+                let dst = [&mut *dcb, &mut *dcr];
+                recon::mc_chroma_pair::<false>(src(r0), cs, cph, cx, cy, cw, ch, mvs[0], dst, cs);
+                let dst = [dcb, dcr];
+                recon::mc_chroma_pair::<true>(src(r1), cs, cph, cx, cy, cw, ch, mvs[1], dst, cs);
+            }
+            [None, None] => {}
+        }
+        Ok(())
+    }
+
     fn mc_rect(
         &mut self,
         bx: usize,
@@ -2388,6 +2488,9 @@ impl<'a, 'c> Dec<'a, 'c> {
         refs: [i8; 2],
         mvs: [[i16; 2]; 2],
     ) -> Result<()> {
+        if self.simple {
+            return self.mc_rect_simple(bx, by, w4, h4, refs, mvs);
+        }
         let (w, h) = (w4 * 4, h4 * 4);
         let (o, ls, px, py) = self.view(0);
         let (x, y) = (px + bx * 4, py + by * 4);
@@ -2415,6 +2518,30 @@ impl<'a, 'c> Dec<'a, 'c> {
         if self.cx.sh.weights.is_none() && matches!(wt, Weighting::Default) {
             return self.mc_rect_default(rp, x, y, w, h, pw, ph, mvs);
         }
+        self.mc_rect_weighted(rp, refs, wt, o, ls, x, y, w, h, pw, ph, mvs);
+        Ok(())
+    }
+
+    /// [`Self::mc_rect`] with explicit or implicit weights, kept out of line: the default path
+    /// stays small.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn mc_rect_weighted(
+        &mut self,
+        rp: [Option<&RefPic>; 2],
+        refs: [i8; 2],
+        wt: Weighting,
+        o: usize,
+        ls: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        pw: usize,
+        ph: usize,
+        mvs: [[i16; 2]; 2],
+    ) {
+        let used = rp.map(|r| r.is_some());
         let planes = |list: usize| &rp[list].expect("used list").planes;
         let d = o + y * ls + x;
         recon::predict_block(
@@ -2430,7 +2557,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             },
         );
         if self.cx.sps.chroma_array_type() == 0 {
-            return Ok(());
+            return;
         }
         let (co, cs, _, _) = self.view(1);
         let (cw, ch, cpw, cph) = (w / 2, h / 2, pw / 2, ph / 2);
@@ -2476,7 +2603,6 @@ impl<'a, 'c> Dec<'a, 'c> {
                 },
             );
         }
-        Ok(())
     }
 }
 

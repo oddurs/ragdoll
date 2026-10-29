@@ -343,49 +343,39 @@ impl CabacContext {
     }
 }
 
-/// `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed context`; entries for
-/// packed values above 127 are never read.
-const DEC_RANGE_LPS: [u8; 512] = {
-    let mut t = [0u8; 512];
-    let mut i = 0;
-    while i < 512 {
-        let (q, s) = (i >> 7, i & 127);
-        t[i] = CABAC_RANGE_TAB_LPS[s >> 1][q];
-        i += 1;
-    }
-    t
-};
-
-/// Left shift that renormalises a range `r` (`2..=510`) back to `256..=511`, indexed by `r`.
-const DEC_NORM_SHIFT: [u8; 512] = {
-    let mut t = [0u8; 512];
+/// The decoder's tables in one array, so that a decision needs a single base address:
+///
+/// - `[0, 512)`: the left shift that renormalises a range `r` (`2..=510`) to `256..=511`,
+///   indexed by `r`;
+/// - `[DEC_LPS, +512)`: `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed
+///   context`, where packed values above 127 are never read;
+/// - `[DEC_NEXT, +256)`: the packed context after a decision (Table 9-45), indexed by the packed
+///   context after an MPS and by its complement `255 - context` after an LPS, so that the
+///   index's low bit is the decoded bin either way.
+static DEC_TAB: [u8; 1280] = {
+    let mut t = [0u8; 1280];
     let mut r = 1;
     while r < 512 {
         t[r] = ((r as u32).leading_zeros() - 23) as u8;
         r += 1;
     }
-    t
-};
-
-/// The packed context after a decision, indexed by `lps << 8 | packed context` (Table 9-45,
-/// with `valMPS` flipping on an LPS in state 0).
-const DEC_NEXT: [u8; 512] = {
-    let mut t = [0u8; 512];
     let mut i = 0;
     while i < 512 {
-        let (lps, s) = (i >> 8, i & 255);
-        if s < 128 {
-            let (st, mps) = (s >> 1, (s & 1) as u8);
-            t[i] = if lps == 0 {
-                (CABAC_TRANS_IDX_MPS[st] << 1) | mps
-            } else {
-                (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8)
-            };
-        }
+        let (q, s) = (i >> 7, i & 127);
+        t[DEC_LPS + i] = CABAC_RANGE_TAB_LPS[s >> 1][q];
         i += 1;
+    }
+    let mut s = 0;
+    while s < 128 {
+        let (st, mps) = (s >> 1, (s & 1) as u8);
+        t[DEC_NEXT + s] = (CABAC_TRANS_IDX_MPS[st] << 1) | mps;
+        t[DEC_NEXT + 255 - s] = (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8);
+        s += 1;
     }
     t
 };
+const DEC_LPS: usize = 512;
+const DEC_NEXT: usize = 1024;
 
 /// Standard 460-context CABAC context bank for H.264 Main/High 4:2:0 slice syntax and DCT residuals.
 pub const NUM_CABAC_CONTEXTS: usize = 460;
@@ -1036,19 +1026,21 @@ impl<'a> CabacDecoder<'a> {
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut CabacContext) -> u8 {
         let s = ctx.0 as usize;
-        let r_lps = DEC_RANGE_LPS[((self.range as usize & 0xC0) << 1) | s] as u32;
+        let r_lps = DEC_TAB[DEC_LPS + (((self.range as usize & 0xC0) << 1) | s)] as u32;
         let range = self.range - r_lps;
         let scaled = (range as u64) << Self::SHIFT;
-        let lps = (self.value >= scaled) as u32;
-        self.value -= scaled & (lps as u64).wrapping_neg();
-        let range = range ^ ((range ^ r_lps) & lps.wrapping_neg());
-        ctx.0 = DEC_NEXT[((lps as usize) << 8) | s];
-        let bin = (s as u8 ^ lps as u8) & 1;
+        let lps = self.value >= scaled;
+        let mask = (lps as u64).wrapping_neg();
+        self.value -= scaled & mask;
+        let range = if lps { r_lps } else { range };
+        // An LPS complements the index, which flips its low bit from valMPS to the bin.
+        let s = s ^ (mask as usize & 0xFF);
+        ctx.0 = DEC_TAB[DEC_NEXT + s];
         // range is at least 6 here; one shift restores 256..=511.
-        let n = DEC_NORM_SHIFT[range as usize & 511] as u32;
+        let n = DEC_TAB[range as usize & 511] as u32;
         self.range = range << n;
         self.consume(n);
-        bin
+        (s & 1) as u8
     }
 
     /// Decodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
