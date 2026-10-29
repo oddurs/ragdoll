@@ -2314,6 +2314,8 @@ pub fn decode_cavlc_block(
 
 /// [`decode_cavlc_block`] for a luma or chroma AC block of `max_coeff` (`1..=16`) coefficients,
 /// as its nonzero levels and their scan positions in `out` (any order); returns their count.
+/// Always inlined: for the many short blocks the call costs as much as the decoding.
+#[inline(always)]
 pub fn decode_cavlc_coeffs(
     r: &mut BitReader<'_>,
     max_coeff: usize,
