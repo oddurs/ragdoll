@@ -6,24 +6,29 @@
 //! must not touch the heap.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use ragdoll_codec::opus::decoder::OpusPacketDecoder;
 
 struct Counting;
 
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-/// Held by each test while it counts, as the counter is shared.
-static SERIAL: Mutex<()> = Mutex::new(());
+thread_local! {
+    /// Set while a test counts its own thread's allocations (the test harness and other tests
+    /// allocate on other threads meanwhile).
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn count() {
+    if COUNTING.try_with(Cell::get).unwrap_or(false) {
+        ALLOCS.with(|a| a.set(a.get() + 1));
+    }
+}
 
 // Safety: forwards to the system allocator, only counting calls.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        count();
         unsafe { System.alloc(layout) }
     }
 
@@ -32,9 +37,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        count();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -56,7 +59,6 @@ fn read_bit(data: &[u8]) -> Vec<&[u8]> {
 
 #[test]
 fn decoding_allocates_nothing_per_packet() {
-    let _serial = SERIAL.lock().unwrap();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/opus");
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
@@ -73,16 +75,16 @@ fn decoding_allocates_nothing_per_packet() {
             let mut pcm = vec![0i16; rate as usize * 120 / 1000 * ch];
             let max = pcm.len() / ch;
             for pass in 0..2 {
-                ALLOCS.store(0, Ordering::Relaxed);
-                COUNTING.store(pass == 1, Ordering::Relaxed);
+                ALLOCS.with(|a| a.set(0));
+                COUNTING.with(|c| c.set(pass == 1));
                 for (i, p) in packets.iter().enumerate() {
                     // Every seventh packet is lost, exercising concealment too.
                     let pkt = (i % 7 != 3).then_some(*p);
                     let _ = dec.decode(pkt, &mut pcm, max, false);
                 }
-                COUNTING.store(false, Ordering::Relaxed);
+                COUNTING.with(|c| c.set(false));
             }
-            let n = ALLOCS.load(Ordering::Relaxed);
+            let n = ALLOCS.with(Cell::get);
             assert_eq!(
                 n,
                 0,
@@ -97,7 +99,6 @@ fn decoding_allocates_nothing_per_packet() {
 /// mono and stereo, tonal input with clicks (so transients), several rates and complexities.
 #[test]
 fn encoding_allocates_nothing_per_frame() {
-    let _serial = SERIAL.lock().unwrap();
     use ragdoll_codec::opus::encoder::OpusPacketEncoder;
     let mut seed = 1u32;
     let pcm: Vec<i16> = (0..48000 * 2)
@@ -118,13 +119,13 @@ fn encoding_allocates_nothing_per_frame() {
                 enc.set_complexity(complexity);
                 let chunks: Vec<&[i16]> = pcm.chunks_exact(frame * ch).collect();
                 enc.encode(chunks[0], frame, &mut out).unwrap();
-                ALLOCS.store(0, Ordering::Relaxed);
-                COUNTING.store(true, Ordering::Relaxed);
+                ALLOCS.with(|a| a.set(0));
+                COUNTING.with(|c| c.set(true));
                 for c in &chunks[1..] {
                     enc.encode(c, frame, &mut out).unwrap();
                 }
-                COUNTING.store(false, Ordering::Relaxed);
-                let n = ALLOCS.load(Ordering::Relaxed);
+                COUNTING.with(|c| c.set(false));
+                let n = ALLOCS.with(Cell::get);
                 assert_eq!(n, 0, "{ch} ch {bps} bit/s {frame} samples: {n} allocations");
             }
         }
