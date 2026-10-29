@@ -63,3 +63,7 @@ Round 4, merged: CAVLC residual decoding from compile-time tables with a registe
 ## 2026-10-29
 
 Round 5: deblocking kernels take edge direction and strong/normal filter as const generics (h264_luma_deblock_edge::<HORIZONTAL,STRONG>); bS intra/motion conditions computed without short-circuit branches; BlockInfo shrunk to 16 B by dropping ref_pic in favour of per-slice RefIds tables (mb_table index per MB; deblock compares (list,idx) when one table without duplicates covers both MBs). The diet costs ~+25M Ir in strengths but cuts D1 misses ~15%: wall 1080p 152.4 -> 148.4 ms (FFmpeg 120), 720p 76.4 -> 77.3 ms (FFmpeg 54.5). Conformance: 166 JVT streams identical.
+
+## 2026-10-29
+
+Round 6 (instruction counts, callgrind; wall clock not measured: the machine was shared with two benchmark agents). Deblocking visits only the edges it filters (edge 0, then set inner-edge bits) and reads bS blocks with one bounds check per edge; tc0 from a table with -1 for bS 0. Per-MB reset limited to coefficient counts; Intra4x4/8x8 modes never reset. MC entry (mc_luma, mc_chroma_pair) inlined with edge paths cold. CAVLC nC and CABAC cbf contexts from block coordinates without MBAFF. 1080p CABAC 1402 -> 1312M (FFmpeg 1122M), 720p CAVLC 842 -> 761M (FFmpeg 682M). Tried and dropped: branch-free bS for all segments (+116M), fused CABAC dequant (spills, +4.5M), chroma pair kernel (+10M), chunks_mut row fills (+19M). Row-lagged deblocking cut simulated L2 misses 19% at 1080p but its wall-clock effect could not be measured on the loaded machine; parked.
