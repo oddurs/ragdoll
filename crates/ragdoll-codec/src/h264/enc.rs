@@ -2427,9 +2427,11 @@ impl EncState {
         let pskip_mv = {
             let (r, m) = (&self.ref_grid, &self.mv_grid);
             let zero = |i: usize| r[i] == 0 && m[i] == [0, 0];
-            if gx0 == 0 || gy0 == 0 {
-                [0, 0]
-            } else if zero(gy0 * g_stride + gx0 - 1) || zero((gy0 - 1) * g_stride + gx0) {
+            if gx0 == 0
+                || gy0 == 0
+                || zero(gy0 * g_stride + gx0 - 1)
+                || zero((gy0 - 1) * g_stride + gx0)
+            {
                 [0, 0]
             } else {
                 mvp
