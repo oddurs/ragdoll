@@ -306,6 +306,8 @@ type Cabac = Option<(CabacEncoder, [CabacContext; NUM_CABAC_CONTEXTS])>;
 /// Slice-level coding state carried from macroblock to macroblock.
 struct SliceState {
     is_idr: bool,
+    /// [`H264Speed::Fast`]: half-pel motion and intra 16x16 only.
+    fast: bool,
     use_cabac: bool,
     t8x8: bool,
     chroma_qp_offset: i32,
@@ -733,6 +735,8 @@ struct MotionSearch<'a> {
     mvp: [i16; 2],
     lambda: u32,
     bounds: MvBounds,
+    /// Quarter-pel refinement iterations after the half-pel step.
+    qpel_iters: u32,
 }
 
 impl MotionSearch<'_> {
@@ -846,7 +850,7 @@ impl MotionSearch<'_> {
         let mut best = center;
         let mut best_cost = full_cost;
         let mut have_centre = false;
-        for (step, iters) in [(2i32, 1), (1, 2)] {
+        for (step, iters) in [(2i32, 1), (1, self.qpel_iters)] {
             for _ in 0..iters {
                 let from = best;
                 for d in [[0, -step], [-step, 0], [step, 0], [0, step]] {
@@ -1564,6 +1568,7 @@ impl H264Encoder {
             nal_unit_type: nal_type,
         };
         let fps = self.sps.fps.unwrap_or(Rational64::FPS_30).as_f64().max(1.0);
+        let fast = self.speed == H264Speed::Fast;
 
         // Per-MB spatial variance and its geometric mean drive CRF variance-adaptive quantization.
         let mut avg_log_var = 0.0f32;
@@ -1614,7 +1619,7 @@ impl H264Encoder {
             cabac_init_idc: 0,
             slice_qp_delta: slice_qp_delta.clamp(-51, 51) as i8,
             slice_qp,
-            disable_deblocking_filter_idc: if slice_qp == 0 { 1 } else { 0 },
+            disable_deblocking_filter_idc: if slice_qp == 0 || fast { 1 } else { 0 },
             slice_alpha_c0_offset_div2: 0,
             slice_beta_offset_div2: 0,
         };
@@ -1638,6 +1643,7 @@ impl H264Encoder {
         self.state.prepare(mb_w, mb_h, slice_qp, use_cabac);
         let mut sl = SliceState {
             is_idr,
+            fast,
             use_cabac,
             t8x8: self.pps.transform_8x8_mode_flag,
             chroma_qp_offset: self.pps.chroma_qp_index_offset as i32,
@@ -2131,6 +2137,7 @@ impl EncState {
             mvp,
             lambda,
             bounds,
+            qpel_iters: if sl.fast { 0 } else { 2 },
         };
         let (full, full_cost) = ms.full_pel(&cands[..n]);
         // A full-pel match whose luma residual already quantizes to nothing needs no refinement.
@@ -2322,7 +2329,8 @@ impl EncState {
     ) {
         let lambda = LAMBDA[qp as usize] as u32;
         let (i16_satd, i16_mode) = analyse_i16(&self.cur, mb_x, mb_y, src);
-        if i16_satd > 40 * lambda
+        if !sl.fast
+            && i16_satd > 40 * lambda
             && let Some(i4) = self.analyse_i4(mb_x, mb_y, qp, src, i16_satd + lambda * 4)
         {
             self.code_i4(sl, w, cabac, mb_x, mb_y, qp, src, i4);
@@ -3035,6 +3043,7 @@ mod tests {
                 mvp: [0, 0],
                 lambda: 1,
                 bounds,
+                qpel_iters: 2,
             };
             let lo = [(bounds.min[0] + 3) >> 2, (bounds.min[1] + 3) >> 2];
             let hi = [bounds.max[0] >> 2, bounds.max[1] >> 2];

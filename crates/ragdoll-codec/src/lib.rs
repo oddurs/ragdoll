@@ -32,7 +32,7 @@ pub use flac::{
     compute_flac_pcm_md5_planar, md5_digest, parse_flac_stream_header,
 };
 pub use h264::{
-    H264Decoder, H264Encoder, H264Profile, NalHeader, NalUnitType, Pps, RateControlMode,
+    H264Decoder, H264Encoder, H264Profile, H264Speed, NalHeader, NalUnitType, Pps, RateControlMode,
     SeiMessage, SliceHeader, Sps, decode_cavlc_block, dequantize_block4x4, dequantize_block8x8,
     encode_annex_b_nal, encode_cavlc_block, parse_nal_rbsp, predict_intra_16x16,
     predict_intra_16x16_scalar, predict_intra_chroma_8x8, predict_intra_chroma_8x8_scalar,

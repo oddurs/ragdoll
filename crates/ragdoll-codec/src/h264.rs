@@ -47,6 +47,18 @@ impl H264Profile {
     }
 }
 
+/// Encoder effort of [`H264Encoder`] (`SIMD-0089`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum H264Speed {
+    /// Quarter-pel motion, intra $4\times4$ analysis and the in-loop deblocking filter.
+    #[default]
+    Balanced,
+    /// Throughput first, like `x264 --preset ultrafast`: half-pel motion only, intra
+    /// macroblocks coded as $16\times16$, deblocking disabled. Still smaller than `x264`
+    /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
+    Fast,
+}
+
 /// Rate control mode for [`H264Encoder`] (`0041`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RateControlMode {
@@ -2933,6 +2945,7 @@ pub struct H264Encoder {
     pub rate_control: RateControlMode,
     pub qp: u8,
     pub keyint: u32,
+    pub speed: H264Speed,
     frame_count: u32,
     state: enc::EncState,
     vbv_buffer_bits: f64,
@@ -2953,6 +2966,7 @@ impl H264Encoder {
             rate_control: RateControlMode::FixedQp(qp),
             qp,
             keyint: 30,
+            speed: H264Speed::Balanced,
             frame_count: 0,
             state: enc::EncState::default(),
             vbv_buffer_bits: 0.0,
@@ -2969,6 +2983,12 @@ impl H264Encoder {
         self.sps = Sps::new_profile(self.sps.width(), self.sps.height(), fps, profile);
         self.sps.colorimetry = c;
         self.pps = Pps::new_profile(self.qp, profile);
+        self
+    }
+
+    /// Configures the encoder effort ([`H264Speed`]).
+    pub fn with_speed(mut self, speed: H264Speed) -> Self {
+        self.speed = speed;
         self
     }
 
@@ -4130,10 +4150,17 @@ mod tests {
     #[test]
     fn encoder_reconstruction_matches_decoder_every_frame() {
         let (w, h) = (64, 48);
-        for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+        for (profile, speed) in [
+            (H264Profile::Baseline, H264Speed::Balanced),
+            (H264Profile::Main, H264Speed::Balanced),
+            (H264Profile::High, H264Speed::Balanced),
+            (H264Profile::Baseline, H264Speed::Fast),
+            (H264Profile::High, H264Speed::Fast),
+        ] {
             for qp in [10u8, 22, 30, 40] {
                 let mut enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, qp)
-                    .with_profile(profile);
+                    .with_profile(profile)
+                    .with_speed(speed);
                 enc.keyint = 4;
                 let mut dec = H264Decoder::new();
                 for t in 0..10 {
@@ -4146,7 +4173,7 @@ mod tests {
                             assert_eq!(
                                 &decoded.plane(p).row(y)[..pw],
                                 &recon.plane(p).row(y)[..pw],
-                                "{profile:?} qp {qp} frame {t} plane {p} row {y}"
+                                "{profile:?} {speed:?} qp {qp} frame {t} plane {p} row {y}"
                             );
                         }
                     }
