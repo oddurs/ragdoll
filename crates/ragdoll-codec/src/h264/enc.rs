@@ -560,6 +560,63 @@ static TOTAL_ZEROS: [[[u32; 16]; 15]; 2] = {
     t
 };
 
+/// The non-zero counts of a macroblock's $4\times4$ luma blocks with those of the blocks above
+/// and to the left, `0x80` where unavailable, so `nC` is one sum and a mask
+/// (`x264_mb_predict_non_zero_code` on `non_zero_count` in the macroblock cache).
+struct NnzCache([u8; 25]);
+
+impl NnzCache {
+    /// Cache index of block `b` (decoding order): row-major 5x5 with the neighbours in row and
+    /// column 0.
+    const AT: [usize; 16] = {
+        let mut t = [0usize; 16];
+        let mut b = 0;
+        while b < 16 {
+            let (x, y) = ((b & 1) + ((b >> 1) & 2), ((b >> 1) & 1) + ((b >> 2) & 2));
+            t[b] = (y + 1) * 5 + x + 1;
+            b += 1;
+        }
+        t
+    };
+
+    #[inline(always)]
+    fn load(nnz: &[u8], g_stride: usize, mb_x: usize, mb_y: usize) -> Self {
+        let mut c = [0x80u8; 25];
+        let (gx, gy) = (mb_x * 4, mb_y * 4);
+        if mb_y > 0 {
+            c[1..5].copy_from_slice(&nnz[(gy - 1) * g_stride + gx..][..4]);
+        }
+        if mb_x > 0 {
+            for y in 0..4 {
+                c[(y + 1) * 5] = nnz[(gy + y) * g_stride + gx - 1];
+            }
+        }
+        Self(c)
+    }
+
+    /// `nC` of block `b` (ITU-T H.264 9.2.1).
+    #[inline(always)]
+    fn nc(&self, b: usize) -> u8 {
+        let i = Self::AT[b & 15];
+        let s = self.0[i - 1] as u32 + self.0[i - 5] as u32;
+        ((if s < 0x80 { (s + 1) >> 1 } else { s }) & 0x7F) as u8
+    }
+
+    #[inline(always)]
+    fn set(&mut self, b: usize, n: u8) {
+        self.0[Self::AT[b & 15]] = n;
+    }
+
+    /// Writes the macroblock's counts back to the grid.
+    #[inline(always)]
+    fn store(&self, nnz: &mut [u8], g_stride: usize, mb_x: usize, mb_y: usize) {
+        for y in 0..4 {
+            let o = (mb_y * 4 + y) * g_stride + mb_x * 4;
+            nnz[o..o + 4].copy_from_slice(&self.0[(y + 1) * 5 + 1..(y + 1) * 5 + 5]);
+        }
+    }
+}
+
 /// `coeff_token` table of each `nC` (0..=16; larger ones share the last), as
 /// `nc_to_table_idx`, without the branches.
 const NC_CLASS: [u8; 17] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
@@ -708,11 +765,11 @@ fn write_cavlc_residuals(
     chroma_nnz: &mut [Vec<u8>; 2],
 ) {
     let g_stride = mb_w * 4;
+    let mut cache = NnzCache::load(luma_nnz, g_stride, mb_x, mb_y);
     for i8x8 in 0..4 {
         if cbp_luma & (1 << i8x8) == 0 {
             for k in 0..4 {
-                let (bx, by) = blk_xy(i8x8 * 4 + k);
-                luma_nnz[(mb_y * 4 + by) * g_stride + mb_x * 4 + bx] = 0;
+                cache.set(i8x8 * 4 + k, 0);
             }
             continue;
         }
@@ -720,13 +777,12 @@ fn write_cavlc_residuals(
         let zz = zigzag_4x4_x4(group);
         let masks = nonzero_mask_4x4_x4(&zz);
         for (k, (zz, &mask)) in zz.iter().zip(&masks).enumerate() {
-            let (bx, by) = blk_xy(i8x8 * 4 + k);
-            let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
-            let nc = predict_luma_nc(luma_nnz, g_stride, gx, gy);
-            write_cavlc_masked::<16>(w, zz, nc, mask);
-            luma_nnz[gy * g_stride + gx] = pop16(mask);
+            let b = i8x8 * 4 + k;
+            write_cavlc_masked::<16>(w, zz, cache.nc(b), mask);
+            cache.set(b, pop16(mask));
         }
     }
+    cache.store(luma_nnz, g_stride, mb_x, mb_y);
     write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, chroma, chroma_nnz);
 }
 
@@ -3102,16 +3158,14 @@ impl EncState {
                 w.write_ue((if sl.is_idr { 0 } else { 5 }) + mb_type as u64);
                 w.write_ue(chroma_mode as u64);
                 w.write_se(qp_delta as i64);
-                let nc_dc = predict_luma_nc(&self.luma_nnz, g_stride, mb_x * 4, mb_y * 4);
-                write_cavlc_block(w, &dc_scanned, nc_dc);
+                let mut cache = NnzCache::load(&self.luma_nnz, g_stride, mb_x, mb_y);
+                write_cavlc_block(w, &dc_scanned, cache.nc(0));
                 if cbp_luma != 0 {
                     for (b, zz) in ac_zz.iter().enumerate() {
-                        let (bx, by) = blk_xy(b);
-                        let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
-                        let nc = predict_luma_nc(&self.luma_nnz, g_stride, gx, gy);
-                        write_cavlc_masked::<15>(w, &zz[1..], nc, ac_masks[b]);
-                        self.luma_nnz[gy * g_stride + gx] = pop16(ac_masks[b]);
+                        write_cavlc_masked::<15>(w, &zz[1..], cache.nc(b), ac_masks[b]);
+                        cache.set(b, pop16(ac_masks[b]));
                     }
+                    cache.store(&mut self.luma_nnz, g_stride, mb_x, mb_y);
                 }
                 write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, &c, &mut self.chroma_nnz);
             }

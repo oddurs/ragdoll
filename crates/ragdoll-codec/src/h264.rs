@@ -2041,26 +2041,6 @@ const fn nc_to_table_idx(nc: u8) -> usize {
 }
 
 #[inline]
-fn predict_luma_nc(luma_nnz: &[u8], g_stride: usize, gx: usize, gy: usize) -> u8 {
-    let left = if gx > 0 {
-        Some(luma_nnz[gy * g_stride + (gx - 1)] as u16)
-    } else {
-        None
-    };
-    let top = if gy > 0 {
-        Some(luma_nnz[(gy - 1) * g_stride + gx] as u16)
-    } else {
-        None
-    };
-    match (left, top) {
-        (Some(l), Some(t)) => ((l + t + 1) >> 1) as u8,
-        (Some(l), None) => l as u8,
-        (None, Some(t)) => t as u8,
-        (None, None) => 0,
-    }
-}
-
-#[inline]
 fn predict_chroma_nc(chroma_nnz: &[u8], cg_stride: usize, cgx: usize, cgy: usize) -> u8 {
     let left = if cgx > 0 {
         Some(chroma_nnz[cgy * cg_stride + (cgx - 1)] as u16)
