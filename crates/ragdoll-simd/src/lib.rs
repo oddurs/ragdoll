@@ -52,7 +52,8 @@ pub use flac_lpc::{
     flac_rice_partition_sums, flac_rice_partition_sums_scalar,
 };
 pub use h264_deblock::{
-    h264_chroma_deblock, h264_chroma_deblock_scalar, h264_luma_deblock, h264_luma_deblock_scalar,
+    h264_chroma_deblock, h264_chroma_deblock_edge, h264_chroma_deblock_scalar, h264_luma_deblock,
+    h264_luma_deblock_edge, h264_luma_deblock_scalar,
 };
 pub use h264_dsp::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, h264_deblock_chroma_line,

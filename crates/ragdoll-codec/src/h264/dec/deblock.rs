@@ -2,7 +2,7 @@
 
 use super::picture::{MbType, NO_PIC, PicState, Structure};
 use super::tables::{ALPHA, BETA, TC0};
-use ragdoll_simd::{h264_chroma_deblock, h264_luma_deblock};
+use ragdoll_simd::{h264_chroma_deblock_edge, h264_luma_deblock_edge};
 
 /// Per-slice deblocking controls.
 #[derive(Clone, Copy, Debug)]
@@ -47,29 +47,43 @@ pub fn deblock_picture(st: &mut PicState, slices: &[SliceDeblock], has_chroma: b
             if t8 {
                 todo &= !0xAA;
             }
-            while todo != 0 {
-                let k = todo.trailing_zeros() as usize;
-                todo &= todo - 1;
-                let (dir, edge) = (k >> 2, k & 3);
-                {
-                    let bs = local.strengths(st, dir, edge);
-                    if bs == [0; 4] {
-                        continue;
-                    }
-                    let p_addr = match (edge, dir) {
-                        (0, 0) => addr - 1,
-                        (0, _) => addr - mb_w,
-                        _ => addr,
-                    };
-                    let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
-                    filter_luma_edge(st, mb_x, mb_y, dir, edge, bs, qp, sl);
-                    if has_chroma && edge % 2 == 0 {
-                        for c in 0..2 {
-                            let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
-                            filter_chroma_edge(st, c, mb_x, mb_y, dir, edge / 2, bs, qp, sl);
-                        }
-                    }
-                }
+            // Vertical edges, then horizontal ones, each with its direction known at compile time.
+            let at = (mb_x, mb_y, addr);
+            filter_mb_dir::<0>(st, &local, at, todo & 0xF, sl, has_chroma);
+            filter_mb_dir::<1>(st, &local, at, todo >> 4, sl, has_chroma);
+        }
+    }
+}
+
+/// Filters the edges of one direction (`DIR` 0 vertical, 1 horizontal) of the macroblock at
+/// `(mb_x, mb_y, addr)`: edge `e` when bit `e` of `todo` is set.
+fn filter_mb_dir<const DIR: usize>(
+    st: &mut PicState,
+    local: &EdgeCtx,
+    (mb_x, mb_y, addr): (usize, usize, usize),
+    todo: u8,
+    sl: SliceDeblock,
+    has_chroma: bool,
+) {
+    for edge in 0..4 {
+        if todo & (1 << edge) == 0 {
+            continue;
+        }
+        let bs = local.strengths(st, DIR, edge);
+        if bs == [0; 4] {
+            continue;
+        }
+        let p_addr = match (edge, DIR) {
+            (0, 0) => addr - 1,
+            (0, _) => addr - st.mb_w,
+            _ => addr,
+        };
+        let qp = (st.qp[p_addr] as i32 + st.qp[addr] as i32 + 1) >> 1;
+        filter_luma_edge::<DIR>(st, mb_x, mb_y, edge, bs, qp, sl);
+        if has_chroma && edge % 2 == 0 {
+            for c in 0..2 {
+                let qp = (st.qpc[p_addr][c] as i32 + st.qpc[addr][c] as i32 + 1) >> 1;
+                filter_chroma_edge::<DIR>(st, c, mb_x, mb_y, edge / 2, bs, qp, sl);
             }
         }
     }
@@ -281,11 +295,10 @@ fn thresholds(qp: i32, sl: SliceDeblock) -> (usize, i32, i32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_luma_edge(
+fn filter_luma_edge<const DIR: usize>(
     st: &mut PicState,
     mb_x: usize,
     mb_y: usize,
-    dir: usize,
     edge: usize,
     bs: [u8; 4],
     qp: i32,
@@ -296,29 +309,32 @@ fn filter_luma_edge(
         return;
     }
     let w = st.width;
-    let (q0, xstride, ystride) = if dir == 0 {
+    let (q0, xstride, ystride) = if DIR == 0 {
         (mb_y * 16 * w + mb_x * 16 + edge * 4, 1, w)
     } else {
         ((mb_y * 16 + edge * 4) * w + mb_x * 16, w, 1)
     };
     // bS 4 belongs to whole macroblock edges, so an edge is either all bS 4 or all below.
-    let strong = bs == [4; 4];
-    if strong || !bs.contains(&4) {
+    if bs == [4; 4] {
+        let plane = &mut st.planes[0];
+        if DIR == 0 {
+            h264_luma_deblock_edge::<false, true>(plane, q0, w, alpha, beta, [0; 4]);
+        } else {
+            h264_luma_deblock_edge::<true, true>(plane, q0, w, alpha, beta, [0; 4]);
+        }
+        return;
+    }
+    if !bs.contains(&4) {
         let tc0 = bs.map(|b| match b {
             0 => -1,
-            4 => 0,
             _ => TC0[ia][b as usize - 1] as i8,
         });
-        h264_luma_deblock(
-            &mut st.planes[0],
-            q0,
-            xstride,
-            ystride,
-            alpha,
-            beta,
-            tc0,
-            strong,
-        );
+        let plane = &mut st.planes[0];
+        if DIR == 0 {
+            h264_luma_deblock_edge::<false, false>(plane, q0, w, alpha, beta, tc0);
+        } else {
+            h264_luma_deblock_edge::<true, false>(plane, q0, w, alpha, beta, tc0);
+        }
         return;
     }
     for (k, &b) in bs.iter().enumerate() {
@@ -338,12 +354,11 @@ fn filter_luma_edge(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn filter_chroma_edge(
+fn filter_chroma_edge<const DIR: usize>(
     st: &mut PicState,
     c: usize,
     mb_x: usize,
     mb_y: usize,
-    dir: usize,
     cedge: usize,
     bs: [u8; 4],
     qp: i32,
@@ -354,20 +369,30 @@ fn filter_chroma_edge(
         return;
     }
     let w = st.width / 2;
-    let (q0, xstride, ystride) = if dir == 0 {
+    let (q0, xstride, ystride) = if DIR == 0 {
         (mb_y * 8 * w + mb_x * 8 + cedge * 4, 1, w)
     } else {
         ((mb_y * 8 + cedge * 4) * w + mb_x * 8, w, 1)
     };
-    let strong = bs == [4; 4];
-    if strong || !bs.contains(&4) {
+    let plane = &mut st.planes[1 + c];
+    if bs == [4; 4] {
+        if DIR == 0 {
+            h264_chroma_deblock_edge::<false, true>(plane, q0, w, alpha, beta, [0; 4]);
+        } else {
+            h264_chroma_deblock_edge::<true, true>(plane, q0, w, alpha, beta, [0; 4]);
+        }
+        return;
+    }
+    if !bs.contains(&4) {
         let tc0 = bs.map(|b| match b {
             0 => -1,
-            4 => 0,
             _ => TC0[ia][b as usize - 1] as i8,
         });
-        let plane = &mut st.planes[1 + c];
-        h264_chroma_deblock(plane, q0, xstride, ystride, alpha, beta, tc0, strong);
+        if DIR == 0 {
+            h264_chroma_deblock_edge::<false, false>(plane, q0, w, alpha, beta, tc0);
+        } else {
+            h264_chroma_deblock_edge::<true, false>(plane, q0, w, alpha, beta, tc0);
+        }
         return;
     }
     for k in 0..8 {
