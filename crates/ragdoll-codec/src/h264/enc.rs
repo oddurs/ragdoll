@@ -1132,16 +1132,10 @@ impl MotionSearch<'_> {
         let (up, left) = (nb[0] < nb[3], nb[1] < nb[2]);
         let off = self.full_off(full[0], full[1]);
         let (r, st) = (&self.r.buf, self.r.stride);
-        let estimate = |mv: [i32; 2], other: usize| {
-            if self.bounds.clamp(mv) != mv {
-                return u32::MAX;
-            }
-            pixel_sad_avg_16x16(self.src, &r[off..], st, &r[other..], st) + self.mv_cost(mv)
-        };
         let mv_v = [center[0], center[1] + if up { -2 } else { 2 }];
         let mv_h = [center[0] + if left { -2 } else { 2 }, center[1]];
-        let est_v = estimate(mv_v, if up { off - st } else { off + st });
-        let est_h = estimate(mv_h, if left { off - 1 } else { off + 1 });
+        let est_v = self.half_estimate(mv_v, off, if up { off - st } else { off + st });
+        let est_h = self.half_estimate(mv_h, off, if left { off - 1 } else { off + 1 });
         let (mv, vertical, back, est) = if est_v <= est_h {
             (mv_v, true, up, est_v)
         } else {
@@ -1158,6 +1152,17 @@ impl MotionSearch<'_> {
         }
         self.r.load::<16>(off, pred);
         ([center[0] as i16, center[1] as i16], full_cost)
+    }
+
+    /// Cost of half-pel vector `mv` estimated by the SAD against the average of the integer
+    /// blocks at offsets `a` and `b` (`u32::MAX` outside the bounds).
+    #[inline(always)]
+    fn half_estimate(&self, mv: [i32; 2], a: usize, b: usize) -> u32 {
+        if self.bounds.clamp(mv) != mv {
+            return u32::MAX;
+        }
+        let (r, st) = (&self.r.buf, self.r.stride);
+        pixel_sad_avg_16x16(self.src, &r[a..], st, &r[b..], st) + self.mv_cost(mv)
     }
 
     /// The block or pair of blocks whose (rounded) average is the prediction at quarter-pel
