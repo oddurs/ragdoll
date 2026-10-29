@@ -555,7 +555,12 @@ fn dc_reject(input: &[i16], out: &mut [i16], hp_mem: &mut [i32; 4], len: usize, 
     let (input, out) = (&input[..channels * len], &mut out[..channels * len]);
     if channels == 2 {
         let (mut m0, mut m1) = (hp_mem[0], hp_mem[2]);
-        for (o, x) in out.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
+        for (o, x) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<2>().0)
+        {
             o[0] = step(x[0], &mut m0);
             o[1] = step(x[1], &mut m1);
         }

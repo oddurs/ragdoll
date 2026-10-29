@@ -1,5 +1,7 @@
 //! AVX2 and NEON kernels of the fixed-point CELT encoder, each bit-exact with the scalar
-//! reference it replaces: the PVQ pulse search and the pitch analysis correlations.
+//! reference it replaces: the PVQ pulse search, the forward MDCT's folding and rotations,
+//! pre-emphasis, and the pitch analysis (decimation, whitening filter and correlations). The
+//! correlations, also used by the decoder's concealment, have NEON versions too.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -98,7 +100,7 @@ pub unsafe fn pvq_search_avx2(x: &mut [i16], iy: &mut [i32], k: i32, n: usize) -
     use std::mem::MaybeUninit;
     const C: usize = MAX_BAND / 8;
     let chunks = n.div_ceil(8);
-    assert!(n >= 1 && n <= MAX_BAND && x.len() == n && iy.len() >= 8 * chunks);
+    assert!((1..=MAX_BAND).contains(&n) && x.len() == n && iy.len() >= 8 * chunks);
     let tail = n - 8 * (chunks - 1);
     let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let pad = _mm256_cmpgt_epi32(lanes, _mm256_set1_epi32(tail as i32 - 1));
@@ -495,9 +497,9 @@ pub unsafe fn preemphasis_avx2(pcm: &[i16], cc: usize, ch: usize, out: &mut [i32
 #[target_feature(enable = "avx2")]
 pub unsafe fn maxabs32_avx2(x: &[i32]) -> i32 {
     use std::arch::x86_64::*;
-    let n8 = x.len() & !7;
+    let (chunks, rest) = x.as_chunks::<8>();
     let (mut hi, mut lo) = (_mm256_setzero_si256(), _mm256_setzero_si256());
-    for c in x[..n8].chunks_exact(8) {
+    for c in chunks {
         // Safety: `c` holds 8 values.
         let v = unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) };
         hi = _mm256_max_epi32(hi, v);
@@ -511,7 +513,7 @@ pub unsafe fn maxabs32_avx2(x: &[i32]) -> i32 {
     }
     let mut maxval = a.iter().fold(0, |m, &v| v.max(m));
     let mut minval = b.iter().fold(0, |m, &v| v.min(m));
-    for &v in &x[n8..] {
+    for &v in rest {
         maxval = maxval.max(v);
         minval = minval.min(v);
     }
@@ -812,6 +814,44 @@ pub unsafe fn dot16_neon(a: &[i16], b: &[i16]) -> i32 {
         .wrapping_add(vgetq_lane_s32::<3>(s));
     for j in n8..n {
         v = v.wrapping_add(a[j] as i32 * b[j] as i32);
+    }
+    v
+}
+
+/// NEON `sum_j (a[j] * b[j]) >> shift` (wrapping) of equal-length slices, `shift < 32`.
+///
+/// # Safety
+///
+/// NEON must be available (it is on every aarch64 CPU).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn dot16_shr_neon(a: &[i16], b: &[i16], shift: i32) -> i32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    assert!(b.len() == n && (0..32).contains(&shift));
+    let n8 = n & !7;
+    // A shift left by -shift is an arithmetic shift right by shift.
+    let sh = vdupq_n_s32(-shift);
+    let mut s = vdupq_n_s32(0);
+    // Safety: every load is of 8 values below `n`.
+    unsafe {
+        let mut j = 0;
+        while j < n8 {
+            let av = vld1q_s16(a.as_ptr().add(j));
+            let bv = vld1q_s16(b.as_ptr().add(j));
+            // The 32-bit products, each shifted on its own.
+            let p0 = vshlq_s32(vmull_s16(vget_low_s16(av), vget_low_s16(bv)), sh);
+            let p1 = vshlq_s32(vmull_high_s16(av, bv), sh);
+            s = vaddq_s32(s, vaddq_s32(p0, p1));
+            j += 8;
+        }
+    }
+    let mut v = vgetq_lane_s32::<0>(s)
+        .wrapping_add(vgetq_lane_s32::<1>(s))
+        .wrapping_add(vgetq_lane_s32::<2>(s))
+        .wrapping_add(vgetq_lane_s32::<3>(s));
+    for j in n8..n {
+        v = v.wrapping_add((a[j] as i32 * b[j] as i32) >> shift);
     }
     v
 }

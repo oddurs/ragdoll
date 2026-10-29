@@ -1051,7 +1051,7 @@ fn transient_analysis(
         // output i is at 2i >= i).
         let mut x2 = [0i16; (960 + OVERLAP) / 2];
         let x2 = &mut x2[..len2];
-        for (e, p) in x2.iter_mut().zip(tmp.chunks_exact(2)) {
+        for (e, p) in x2.iter_mut().zip(tmp.as_chunks::<2>().0) {
             let (a, b) = (p[0] as i32, p[1] as i32);
             *e = pshr32(mul16(a, a) + mul16(b, b), 16) as i16;
         }

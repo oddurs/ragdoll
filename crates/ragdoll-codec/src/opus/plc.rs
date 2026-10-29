@@ -308,6 +308,11 @@ pub fn dot_shr(a: &[i16], b: &[i16], shift: i32) -> i32 {
         // Safety: avx2() is true only when the CPU supports AVX2.
         return unsafe { super::simd_enc::dot16_shr_avx2(a, b, shift) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: NEON is baseline on aarch64.
+        return unsafe { super::simd_enc::dot16_shr_neon(a, b, shift) };
+    }
     dot_shr_scalar(a, b, shift)
 }
 
