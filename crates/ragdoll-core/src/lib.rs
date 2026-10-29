@@ -34,8 +34,9 @@ pub use crc::{
 pub use error::{RagdollError, Result};
 pub use format::{ChannelLayout, PixelFormat, SampleFormat};
 pub use frame::{
-    AlignedBuffer, AudioFrame, CACHE_LINE_ALIGN, FramePool, INPUT_BUFFER_PADDING_SIZE, PictureType,
-    Plane, PooledVideoFrame, SharedPlanes, VideoFrame, align_up_64, optimal_plane_stride,
+    AlignedBuffer, AlignedVec, AudioFrame, CACHE_LINE_ALIGN, FramePool, INPUT_BUFFER_PADDING_SIZE,
+    PictureType, Plane, PooledVideoFrame, SharedPlanes, VideoFrame, align_up_64,
+    optimal_plane_stride,
 };
 pub use packet::{
     AudioTrackParams, CodecId, PacketFlags, PacketPayload, PacketSlice, SampleEntry, TrackInfo,
