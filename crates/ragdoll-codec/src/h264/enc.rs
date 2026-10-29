@@ -11,7 +11,7 @@ use super::*;
 use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
-    add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
+    add_idct4x4_8x8, chroma_mc_8x8_x2, dequant_4x4_x4, h264_chroma_deblock, h264_luma_deblock,
     h264_luma_mc, hadamard4x4_16x4, hpel_hv_16x16, hpel_window, hpel_window_centre,
     intra_pred_plane, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16,
     pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
@@ -737,8 +737,8 @@ fn mc_chroma(p: &Pic, cx0: usize, cy0: usize, mv: [i16; 2], u: &mut [u8; 64], v:
         p.v.load::<8>(off, v);
         return;
     }
-    h264_chroma_mc(u, 8, &p.u.buf, off, p.u.stride, 8, 8, fx, fy);
-    h264_chroma_mc(v, 8, &p.v.buf, off, p.v.stride, 8, 8, fx, fy);
+    // Both planes share one layout.
+    chroma_mc_8x8_x2(&p.u.buf, &p.v.buf, off, p.u.stride, fx, fy, u, v);
 }
 
 /// Quarter-pel motion vector bounds of one macroblock that keep compensation inside the padding.
@@ -803,17 +803,20 @@ impl MotionSearch<'_> {
         )
     }
 
+    /// SAD and motion cost of full-pel vector `m`.
+    #[inline(always)]
+    fn cost_at(&self, m: [i32; 2]) -> u32 {
+        let off = self.full_off(m[0], m[1]);
+        pixel_sad_16x16(self.src, 16, &self.r.buf[off..], self.r.stride)
+            + self.mv_cost([m[0] * 4, m[1] * 4])
+    }
+
     /// Integer-pel diamond search seeded by the best of `cands` (quarter-pel); returns the
     /// full-pel vector and its cost.
     #[inline(always)]
     fn full_pel(&self, cands: &[[i16; 2]]) -> ([i32; 2], u32, [u32; 4]) {
         let int_min = [(self.bounds.min[0] + 3) >> 2, (self.bounds.min[1] + 3) >> 2];
         let int_max = [self.bounds.max[0] >> 2, self.bounds.max[1] >> 2];
-        let cost_at = |m: [i32; 2]| {
-            let off = self.full_off(m[0], m[1]);
-            pixel_sad_16x16(self.src, 16, &self.r.buf[off..], self.r.stride)
-                + self.mv_cost([m[0] * 4, m[1] * 4])
-        };
         let mut best = [0i32; 2];
         let mut best_cost = u32::MAX;
         let mut seen = [[i32::MAX; 2]; 8];
@@ -826,7 +829,7 @@ impl MotionSearch<'_> {
                 continue;
             }
             seen[k] = m;
-            let cost = cost_at(m);
+            let cost = self.cost_at(m);
             if cost < best_cost {
                 best_cost = cost;
                 best = m;
@@ -866,7 +869,7 @@ impl MotionSearch<'_> {
                     if (int_min[0]..=int_max[0]).contains(&p[0])
                         && (int_min[1]..=int_max[1]).contains(&p[1])
                     {
-                        let cost = cost_at(p);
+                        let cost = self.cost_at(p);
                         nb[k] = cost;
                         if cost < best_cost {
                             best_cost = cost;
@@ -1408,7 +1411,10 @@ fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8, q4: &mut [[i1
         }
         let zz = zigzag_4x4_x4(group);
         let masks = nonzero_mask_4x4_x4(&zz);
-        let score: u32 = (0..4).map(|b| decimate_masked(&zz[b], masks[b])).sum();
+        let mut score = 0;
+        for (z, &m) in zz.iter().zip(&masks) {
+            score += decimate_masked(z, m);
+        }
         if score < 4 {
             *group = [[0; 16]; 4];
         } else {
@@ -1458,9 +1464,11 @@ impl ChromaLevels {
     /// The decimation score of plane `p`'s AC levels.
     #[inline(always)]
     fn ac_score(&self, p: usize) -> u32 {
-        (0..4)
-            .map(|b| decimate_masked(&self.ac[p][b], self.ac_masks[p][b]))
-            .sum()
+        let mut score = 0;
+        for (ac, &m) in self.ac[p].iter().zip(&self.ac_masks[p]) {
+            score += decimate_masked(ac, m);
+        }
+        score
     }
 }
 

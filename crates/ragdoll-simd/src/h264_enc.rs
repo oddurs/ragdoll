@@ -847,6 +847,83 @@ pub fn intra4x4_pred_dir_scalar(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 
     })
 }
 
+/// Chroma motion compensation of the $8\times8$ blocks of both planes (ITU-T H.264 8.4.2.2.2):
+/// `out = (wa A + wb B + wc C + wd D + 32) >> 6` with the bilinear weights of the eighth-sample
+/// fractions `fx`, `fy` (`& 7`), where `A` is `u[off]` / `v[off]` (stride `ss`).
+///
+/// # Panics
+/// If a plane is shorter than `off + 8 * ss + 16` (the vector kernels read 16 samples per row).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_8x8_x2(
+    u: &[u8],
+    v: &[u8],
+    off: usize,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    let end = ss.checked_mul(8).and_then(|d| d.checked_add(off + 16));
+    assert!(end.is_some_and(|e| e <= u.len() && e <= v.len()));
+    let (fx, fy) = (fx & 7, fy & 7);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            chroma_mc_neon(u.as_ptr().add(off), ss, fx, fy, out_u);
+            chroma_mc_neon(v.as_ptr().add(off), ss, fx, fy, out_v);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            chroma_mc_avx2(
+                u.as_ptr().add(off),
+                v.as_ptr().add(off),
+                ss,
+                fx,
+                fy,
+                out_u,
+                out_v,
+            )
+        };
+        return;
+    }
+    chroma_mc_8x8_x2_scalar(u, v, off, ss, fx, fy, out_u, out_v);
+}
+
+/// Scalar reference for [`chroma_mc_8x8_x2`].
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_8x8_x2_scalar(
+    u: &[u8],
+    v: &[u8],
+    off: usize,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    let (fx, fy) = ((fx & 7) as u32, (fy & 7) as u32);
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    for (src, out) in [(u, out_u), (v, out_v)] {
+        for r in 0..8 {
+            let (s0, s1) = (&src[off + r * ss..], &src[off + (r + 1) * ss..]);
+            for c in 0..8 {
+                let x = wa * s0[c] as u32
+                    + wb * s0[c + 1] as u32
+                    + wc * s1[c] as u32
+                    + wd * s1[c + 1] as u32;
+                out[r * 8 + c] = ((x + 32) >> 6) as u8;
+            }
+        }
+    }
+}
+
 /// The two half-sample $16\times16$ predictions next to the block whose top-left integer sample
 /// is `src[off]` (stride `ss`): `out_h` the `b` samples half a sample left (`left`) or right of
 /// it, `out_v` the `h` samples half a sample above (`up`) or below it (ITU-T H.264 8.4.2.2.1).
@@ -1778,6 +1855,56 @@ unsafe fn pred4_dir_neon(edge: &[u8; 16]) -> [[u8; 16]; 6] {
     }
 }
 
+/// [`chroma_mc_8x8_x2`]: `u` rows in the low lane, `v` rows in the high lane; each row's
+/// sample pairs `(A, B)` meet their weights in one `pmaddubsw`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn chroma_mc_avx2(
+    u: *const u8,
+    v: *const u8,
+    ss: usize,
+    fx: u8,
+    fy: u8,
+    out_u: &mut [u8; 64],
+    out_v: &mut [u8; 64],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let (fx, fy) = (fx as i16, fy as i16);
+        let pair = |a: i16, b: i16| _mm256_set1_epi16((b << 8) | a);
+        let top = pair((8 - fx) * (8 - fy), fx * (8 - fy));
+        let bottom = pair((8 - fx) * fy, fx * fy);
+        let r32 = _mm256_set1_epi16(32);
+        // The (A, B) byte pairs of row r of both planes.
+        let pairs = |r: usize| {
+            let x = _mm256_inserti128_si256::<1>(
+                _mm256_castsi128_si256(_mm_loadu_si128(u.add(r * ss) as *const __m128i)),
+                _mm_loadu_si128(v.add(r * ss) as *const __m128i),
+            );
+            _mm256_unpacklo_epi8(x, _mm256_srli_si256::<1>(x))
+        };
+        let mut cur = pairs(0);
+        for r in 0..8 {
+            let next = pairs(r + 1);
+            let sum = _mm256_add_epi16(
+                _mm256_maddubs_epi16(cur, top),
+                _mm256_maddubs_epi16(next, bottom),
+            );
+            let x = _mm256_srli_epi16::<6>(_mm256_add_epi16(sum, r32));
+            let packed = _mm256_packus_epi16(x, x);
+            _mm_storel_epi64(
+                out_u.as_mut_ptr().add(r * 8) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
+            _mm_storel_epi64(
+                out_v.as_mut_ptr().add(r * 8) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(packed),
+            );
+            cur = next;
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hv_avx2(
@@ -1997,6 +2124,32 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 let v = tap6([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
                 vst1_u8(out.v.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(v));
             }
+        }
+    }
+}
+
+/// One plane of [`chroma_mc_8x8_x2`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn chroma_mc_neon(src: *const u8, ss: usize, fx: u8, fy: u8, out: &mut [u8; 64]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let w = |x: u8| vdup_n_u8(x);
+        let (wa, wb) = (w((8 - fx) * (8 - fy)), w(fx * (8 - fy)));
+        let (wc, wd) = (w((8 - fx) * fy), w(fx * fy));
+        let row = |r: usize| {
+            let x = vld1q_u8(src.add(r * ss));
+            (vget_low_u8(x), vget_low_u8(vextq_u8::<1>(x, x)))
+        };
+        let mut cur = row(0);
+        for r in 0..8 {
+            let next = row(r + 1);
+            let mut acc = vmull_u8(cur.0, wa);
+            acc = vmlal_u8(acc, cur.1, wb);
+            acc = vmlal_u8(acc, next.0, wc);
+            acc = vmlal_u8(acc, next.1, wd);
+            vst1_u8(out.as_mut_ptr().add(r * 8), vrshrn_n_u16::<6>(acc));
+            cur = next;
         }
     }
 }
@@ -2601,6 +2754,28 @@ mod tests {
             add_idct4x4_8x8(&mut p, ds, &a);
             add_idct4x4_8x8_scalar(&mut q, ds, &a);
             assert_eq!(p, q, "round {round}");
+        }
+    }
+
+    #[test]
+    fn chroma_mc_matches_scalar_and_the_generic_kernel() {
+        let (pw, ph) = (40usize, 24usize);
+        let (u, v) = (plane(pw, ph, 71), plane(pw, ph, 72));
+        for (x, y) in [(0usize, 0usize), (5, 3), (17, 9), (24, 6)] {
+            let off = y * pw + x;
+            for fx in 0..8u8 {
+                for fy in 0..8u8 {
+                    let (mut a, mut b, mut c, mut d) = ([0u8; 64], [0u8; 64], [0u8; 64], [0u8; 64]);
+                    chroma_mc_8x8_x2(&u, &v, off, pw, fx, fy, &mut a, &mut b);
+                    chroma_mc_8x8_x2_scalar(&u, &v, off, pw, fx, fy, &mut c, &mut d);
+                    assert_eq!((a, b), (c, d), "({x}, {y}) {fx} {fy}");
+                    let mut g = [0u8; 64];
+                    crate::h264_chroma_mc_scalar(&mut g, 8, &u, off, pw, 8, 8, fx, fy);
+                    assert_eq!(a, g);
+                    crate::h264_chroma_mc_scalar(&mut g, 8, &v, off, pw, 8, 8, fx, fy);
+                    assert_eq!(b, g);
+                }
+            }
         }
     }
 
