@@ -2670,7 +2670,43 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Motion-compensated prediction of the whole macroblock from the stored motion. Blocks with
     /// identical motion are predicted together; the result is the same for any grouping.
+    /// FFmpeg's `prefetch_motion`: starts loading the reference samples a macroblock four to
+    /// the right will likely read, from the motion of this one's first block in `list` (four
+    /// luma rows, staggered by column so that four macroblocks cover sixteen, and a chroma row).
+    #[inline]
+    fn prefetch_motion(&self, list: usize) {
+        if !self.simple {
+            return;
+        }
+        let b = &self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
+        let Some(r) = usize::try_from(b.ref_idx[list])
+            .ok()
+            .and_then(|r| self.cx.refs[list].get(r))
+        else {
+            return;
+        };
+        let w = self.st.width;
+        let mx = (b.mv[list][0] >> 2) as isize + (self.mb.x * 16) as isize + 8;
+        let my = (b.mv[list][1] >> 2) as isize + (self.mb.y * 16) as isize;
+        let row = my + (self.mb.x & 3) as isize * 4;
+        if let Ok(off) = usize::try_from(row * w as isize + mx + 64) {
+            ragdoll_simd::prefetch_rows(&r.planes[0], off, w, 4);
+        }
+        let row = (my >> 1) + (self.mb.x & 7) as isize;
+        if let Ok(off) = usize::try_from(row * (w / 2) as isize + (mx >> 1) + 64) {
+            ragdoll_simd::prefetch_rows(&r.planes[1], off, w / 2, 1);
+            ragdoll_simd::prefetch_rows(&r.planes[2], off, w / 2, 1);
+        }
+    }
+
     fn inter_predict_mb(&mut self) -> Result<()> {
+        self.prefetch_motion(0);
+        let r = self.inter_predict_parts();
+        self.prefetch_motion(1);
+        r
+    }
+
+    fn inter_predict_parts(&mut self) -> Result<()> {
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let key = |s: &PicState, bx: usize, by: usize| {
             let j = s.b4(mx4 + bx, my4 + by);

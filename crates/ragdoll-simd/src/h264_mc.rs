@@ -351,6 +351,26 @@ pub fn h264_chroma_mc_in_plane(
     true
 }
 
+/// Asks the CPU to start loading `rows` rows of `buf`, the first at `off`, `stride` apart, into
+/// its caches (FFmpeg's `prefetch`); rows past the end of `buf` are skipped. Results do not
+/// depend on it.
+#[inline]
+pub fn prefetch_rows(buf: &[u8], off: usize, stride: usize, rows: usize) {
+    #[cfg(target_arch = "x86_64")]
+    for r in 0..rows {
+        let o = off + r * stride;
+        if o < buf.len() {
+            // Safety: a prefetch only hints the cache; the address lies inside `buf`.
+            unsafe {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                _mm_prefetch::<_MM_HINT_T0>(buf.as_ptr().add(o) as *const i8);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (buf, off, stride, rows);
+}
+
 /// Writes the `w`x`h` chroma prediction at eighth-pel phase `(fx, fy)` (`0..=7`) for the block whose
 /// integer-sample origin is `src[off]`, into `dst` with stride `ds`.
 ///
