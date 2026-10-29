@@ -12,10 +12,10 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hpel_window, hpel_window_centre, intra_pred_plane, intra_satd_x3_16x16,
-    nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16,
-    pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8,
-    sub_dct4x4_16x4, zigzag_4x4_x4,
+    h264_luma_mc, hadamard4x4_16x4, hpel_window, hpel_window_centre, intra_pred_plane,
+    intra_satd_x3_16x16, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16,
+    pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16, pixel_ssd,
+    quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -1134,6 +1134,52 @@ fn analyse_i16(pic: &Pic, mb_x: usize, mb_y: usize, src: &MbSrc) -> (u32, u8) {
         }
     }
     best
+}
+
+/// SATDs, as [`pixel_satd_4x4`], of a block with Hadamard transform `had` (from
+/// [`hadamard4x4_16x4`]) against its vertical, horizontal and DC intra $4\times4$ predictions;
+/// unavailable edges leave their mode's cost meaningless.
+fn intra_satd_x3_4x4(had: &[i16; 16], top: Option<&[u8; 8]>, left: Option<&[u8; 4]>) -> [u32; 3] {
+    let h1 = |x: [i32; 4]| {
+        let (s01, d01, s23, d23) = (x[0] + x[1], x[0] - x[1], x[2] + x[3], x[2] - x[3]);
+        [s01 + s23, s01 - s23, d01 + d23, d01 - d23].map(|c| 4 * c)
+    };
+    let c = |i: usize| had[i] as i32;
+    let total: i32 = had.iter().map(|&v| (v as i32).abs()).sum();
+    let sum = |e: &[u8]| e.iter().take(4).map(|&v| v as i32).sum::<i32>();
+    let dc = match (top, left) {
+        (Some(t), Some(l)) => (sum(t) + sum(l) + 4) >> 3,
+        (Some(t), None) => (sum(t) + 2) >> 2,
+        (None, Some(l)) => (sum(l) + 2) >> 2,
+        (None, None) => 128,
+    };
+    let sd = total - c(0).abs() + (c(0) - 16 * dc).abs();
+    let sv = top.map_or(0, |t| {
+        let p = h1([t[0], t[1], t[2], t[3]].map(i32::from));
+        total
+            + (0..4)
+                .map(|h| (c(h) - p[h]).abs() - c(h).abs())
+                .sum::<i32>()
+    });
+    let sh = left.map_or(0, |l| {
+        let p = h1(l.map(i32::from));
+        total
+            + (0..4)
+                .map(|v| (c(4 * v) - p[v]).abs() - c(4 * v).abs())
+                .sum::<i32>()
+    });
+    [sv, sh, sd].map(|x| (x >> 1) as u32)
+}
+
+/// `quantize_block4x4` with a precomputed quantizer; also reports whether a level is non-zero.
+#[inline]
+fn quant_one(c: &[i16; 16], q: &Quant4x4) -> ([i16; 16], bool) {
+    let mut out = [0i16; 16];
+    for i in 0..16 {
+        let l = ((c[i].unsigned_abs() as u32 * q.mf[i] as u32 + q.bias) >> q.shift) as i16;
+        out[i] = if c[i] < 0 { -l } else { l };
+    }
+    (out, out.iter().any(|&l| l != 0))
 }
 
 /// Residual of an inter-predicted macroblock after quantization and decimation.
@@ -2308,6 +2354,14 @@ impl EncState {
             let (bx, by) = blk_xy(b);
             *s = self.intra4x4_modes[(mb_y * 4 + by) * g_stride + mb_x * 4 + bx];
         }
+        // Hadamard transforms of the source blocks (raster order) give the vertical, horizontal
+        // and DC SATDs without building those predictions (`x264_intra_satd_x3_4x4`).
+        let mut had = [[0i16; 16]; 16];
+        for (strip, h) in had.chunks_exact_mut(4).enumerate() {
+            hadamard4x4_16x4(&src.y[strip * 64..], 16, h.try_into().unwrap());
+        }
+        let quant = quant4(qp, true);
+        let scale = dequant4(qp);
         let mut total = lambda * 24;
         for b in 0..16 {
             let (bx, by) = blk_xy(b);
@@ -2316,19 +2370,31 @@ impl EncState {
             let (top, left, tl) = i4_edges(&self.cur.y, px, py, b, mb_x, self.mb_w);
             let pred_mode = pred_intra4x4_mode(&self.intra4x4_modes, g_stride, gx, gy);
             let so = by * 64 + bx * 4;
-            let mut best = (u32::MAX, 2u8, [0u8; 16]);
+            let mode_bits = |m: u8| lambda * if m == pred_mode { 1 } else { 4 };
+            let [sv, sh, sd] = intra_satd_x3_4x4(&had[by * 4 + bx], top.as_ref(), left.as_ref());
+            // Modes in order, so ties keep the lowest mode as before.
+            let mut best = (u32::MAX, 2u8);
+            for (m, ok, satd) in [
+                (0, top.is_some(), sv),
+                (1, left.is_some(), sh),
+                (2, true, sd),
+            ] {
+                if ok && satd + mode_bits(m) < best.0 {
+                    best = (satd + mode_bits(m), m);
+                }
+            }
             let mut pred = [0u8; 16];
-            for m in 0..=8u8 {
+            for m in 3..=8u8 {
                 if !intra4x4_mode_available(m, top.is_some(), left.is_some()) {
                     continue;
                 }
                 predict_intra_4x4_u8(m, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
-                let cost = pixel_satd_4x4(&src.y[so..], 16, &pred, 4)
-                    + lambda * if m == pred_mode { 1 } else { 4 };
+                let cost = pixel_satd_4x4(&src.y[so..], 16, &pred, 4) + mode_bits(m);
                 if cost < best.0 {
-                    best = (cost, m, pred);
+                    best = (cost, m);
                 }
             }
+            predict_intra_4x4_u8(best.1, top.as_ref(), left.as_ref(), tl, &mut pred, 4);
             total += best.0;
             if total >= budget {
                 for (b, &m) in saved.iter().enumerate() {
@@ -2339,11 +2405,14 @@ impl EncState {
             }
             ch.modes[b] = best.1;
             self.intra4x4_modes[gy * g_stride + gx] = best.1;
-            let q = quantize_block4x4(&sub4x4_dct_u8(&src.y[so..], 16, &best.2, 4), qp, true);
-            let mut rec = best.2;
-            if q.iter().any(|&c| c != 0) {
+            let (q, nz) = quant_one(&sub4x4_dct_u8(&src.y[so..], 16, &pred, 4), quant);
+            let mut rec = pred;
+            if nz {
                 ch.cbp_luma |= 1 << (b >> 2);
-                add4x4_idct_u8(&mut rec, 4, &dequantize_block4x4(&q, qp));
+                let d: [i16; 16] = std::array::from_fn(|i| {
+                    (q[i] as i32 * scale[i]).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                });
+                add4x4_idct_u8(&mut rec, 4, &d);
             }
             ch.q4[b] = q;
             let o = self.cur.y.idx(px, py);
