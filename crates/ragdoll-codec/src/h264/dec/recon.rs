@@ -3,8 +3,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use ragdoll_simd::{
-    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_idct4_add, h264_luma_mc, h264_weight_bi,
-    h264_weight_uni, luma_mc_cols,
+    chroma_mc_cols, h264_avg, h264_chroma_mc, h264_chroma_mc_avg, h264_idct4_add, h264_luma_mc,
+    h264_luma_mc_avg, h264_weight_bi, h264_weight_uni, luma_mc_cols,
 };
 
 use super::ps::WeightScales;
@@ -44,36 +44,8 @@ impl Dequant {
         Self { ls4, ls8 }
     }
 
-    /// Scales scanned 4x4 coefficients `sc[k]` (raster position `scan[k + off]`) into `out`
-    /// (8.5.12.1). Every position is written: a zero coefficient scales to zero, so no branch
-    /// on the (unpredictable) coefficient values is needed.
-    #[inline]
-    pub fn scale4_block(
-        &self,
-        list: usize,
-        qp: i32,
-        sc: &[i16],
-        off: usize,
-        scan: &[usize; 16],
-        out: &mut [i32; 16],
-    ) {
-        let ls = &self.ls4[list][(qp % 6) as usize];
-        let scan = &scan[off..off + sc.len()];
-        if qp >= 24 {
-            let sh = qp / 6 - 4;
-            for (&c, &pos) in sc.iter().zip(scan) {
-                out[pos] = (c as i32 * ls[pos]) << sh;
-            }
-        } else {
-            let (sh, rnd) = (4 - qp / 6, 1 << (3 - qp / 6));
-            for (&c, &pos) in sc.iter().zip(scan) {
-                out[pos] = (c as i32 * ls[pos] + rnd) >> sh;
-            }
-        }
-    }
-
-    /// [`Dequant::scale4_block`] for the `n` nonzero coefficients of `c`, whose scan positions
-    /// start at `off`; other positions of `out` are left as they are.
+    /// Scales the `n` nonzero 4x4 coefficients of `c` into `out` (8.5.12.1): level `k` goes to
+    /// raster position `scan[c.pos[k] + off]`; other positions of `out` are left as they are.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn scale4_coeffs(
@@ -103,7 +75,7 @@ impl Dequant {
         }
     }
 
-    /// [`Dequant::scale4_coeffs`] for an 8x8 block.
+    /// [`Dequant::scale4_coeffs`] for an 8x8 block (8.5.13.1).
     #[inline]
     pub fn scale8_coeffs(
         &self,
@@ -131,7 +103,7 @@ impl Dequant {
         }
     }
 
-    /// [`Dequant::scale4_block`] for an 8x8 block (8.5.13.1).
+    /// Scales scanned 8x8 coefficients `sc[k]` (raster position `scan[k]`) into `out` (8.5.13.1).
     #[inline]
     pub fn scale8_block(
         &self,
@@ -271,7 +243,7 @@ const EMU_STRIDE: usize = 24;
 /// written to `dst` with stride `ds`. Blocks whose filter taps reach past the picture read an
 /// edge-extended copy (8.4.2.2.1 clamps reference coordinates to the picture).
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma(
+pub fn mc_luma<const AVG: bool>(
     src: &[u8],
     width: usize,
     height: usize,
@@ -283,12 +255,19 @@ pub fn mc_luma(
     dst: &mut [u8],
     ds: usize,
 ) {
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_luma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_luma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
+    };
     let ix = x as isize + (mv[0] as isize >> 2);
     let iy = y as isize + (mv[1] as isize >> 2);
     let (fx, fy) = ((mv[0] & 3) as u8, (mv[1] & 3) as u8);
     let cols = luma_mc_cols(w);
     if ix >= 2 && iy >= 2 && ix as usize + cols <= width && iy as usize + h + 3 <= height {
-        h264_luma_mc(
+        kernel(
             dst,
             ds,
             src,
@@ -302,7 +281,7 @@ pub fn mc_luma(
         return;
     }
     // Whole-sample blocks at the picture edge need no interpolation margins.
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 21];
@@ -316,11 +295,12 @@ pub fn mc_luma(
         cols + 2,
         h + 5,
     );
-    h264_luma_mc(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
+    kernel(dst, ds, &win, 2 * EMU_STRIDE + 2, EMU_STRIDE, w, h, fx, fy);
 }
 
 /// Whole-sample prediction: copies the `w`x`h` block at `(x, y)` of a `width`x`height` plane to
-/// `dst` when it lies inside the plane, which needs none of the interpolation margins.
+/// `dst` (or, with `avg`, averages it into `dst`) when it lies inside the plane, which needs none
+/// of the interpolation margins.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn copy_inside(
@@ -333,11 +313,16 @@ fn copy_inside(
     h: usize,
     dst: &mut [u8],
     ds: usize,
+    avg: bool,
 ) -> bool {
     if x < 0 || y < 0 || x as usize + w > width || y as usize + h > height {
         return false;
     }
     let o = y as usize * width + x as usize;
+    if avg {
+        h264_avg(dst, ds, &src[o..], width, w, h);
+        return true;
+    }
     fn rows<const W: usize>(src: &[u8], o: usize, ss: usize, h: usize, dst: &mut [u8], ds: usize) {
         for r in 0..h {
             let s: &[u8; W] = src[o + r * ss..][..W].try_into().expect("W samples");
@@ -384,7 +369,7 @@ fn edge_window(
 /// Chroma (4:2:0) prediction samples for a `w`x`h` chroma block at chroma pixel `(x, y)`,
 /// written to `dst` with stride `ds`.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma(
+pub fn mc_chroma<const AVG: bool>(
     src: &[u8],
     width: usize,
     height: usize,
@@ -396,12 +381,19 @@ pub fn mc_chroma(
     dst: &mut [u8],
     ds: usize,
 ) {
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_chroma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_chroma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
+    };
     let ix = x as isize + (mv[0] as isize >> 3);
     let iy = y as isize + (mv[1] as isize >> 3);
     let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
     let cols = chroma_mc_cols(w);
     if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
-        h264_chroma_mc(
+        kernel(
             dst,
             ds,
             src,
@@ -414,12 +406,12 @@ pub fn mc_chroma(
         );
         return;
     }
-    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds) {
+    if fx == 0 && fy == 0 && copy_inside(src, width, height, ix, iy, w, h, dst, ds, AVG) {
         return;
     }
     let mut win = [0u8; EMU_STRIDE * 9];
     edge_window(&mut win, src, width, height, ix, iy, cols, h + 1);
-    h264_chroma_mc(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
+    kernel(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
 }
 
 /// Predicts a `w`x`h` block from the lists in `used` and combines them into `dst` (stride `ds`)
@@ -435,18 +427,7 @@ pub fn predict_block(
     scratch: &mut [[u8; 256]; 2],
     mut predict: impl FnMut(usize, &mut [u8], usize),
 ) {
-    // Weights equal to 2^logWD with zero offsets reduce exactly to default prediction:
-    // ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
-    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
-    let wt = match (used, wt) {
-        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
-            Weighting::Default
-        }
-        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
-        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
-        _ => wt,
-    };
-    match (used, wt) {
+    match (used, effective_weighting(used, wt)) {
         ([true, false], Weighting::Default) => predict(0, dst, ds),
         ([false, true], Weighting::Default) => predict(1, dst, ds),
         ([true, true], Weighting::Default) => {
@@ -473,6 +454,21 @@ pub fn predict_block(
             }
         }
         ([false, false], Weighting::Default) => {}
+    }
+}
+
+/// `wt` for the lists in `used`, with weights that reduce exactly to default prediction
+/// (2^logWD with zero offsets) replaced by [`Weighting::Default`]:
+/// ((a + b + 1) * 2^L) >> (L + 1) = (a + b + 1) >> 1, and (a * 2^L + 2^(L-1)) >> L = a.
+pub fn effective_weighting(used: [bool; 2], wt: Weighting) -> Weighting {
+    let unit = |l: u32, (w, o): (i32, i32)| w == 1 << l && o == 0;
+    match (used, wt) {
+        ([true, true], Weighting::Weighted(l, [e0, e1])) if unit(l, e0) && unit(l, e1) => {
+            Weighting::Default
+        }
+        ([true, false], Weighting::Weighted(l, [e0, _])) if unit(l, e0) => Weighting::Default,
+        ([false, true], Weighting::Weighted(l, [_, e1])) if unit(l, e1) => Weighting::Default,
+        _ => wt,
     }
 }
 

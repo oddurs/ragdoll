@@ -356,6 +356,17 @@ const DEC_RANGE_LPS: [u8; 512] = {
     t
 };
 
+/// Left shift that renormalises a range `r` (`2..=510`) back to `256..=511`, indexed by `r`.
+const DEC_NORM_SHIFT: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut r = 1;
+    while r < 512 {
+        t[r] = ((r as u32).leading_zeros() - 23) as u8;
+        r += 1;
+    }
+    t
+};
+
 /// The packed context after a decision, indexed by `lps << 8 | packed context` (Table 9-45,
 /// with `valMPS` flipping on an LPS in state 0).
 const DEC_NEXT: [u8; 512] = {
@@ -1032,11 +1043,12 @@ impl<'a> CabacDecoder<'a> {
         self.value -= scaled & (lps as u64).wrapping_neg();
         let range = range ^ ((range ^ r_lps) & lps.wrapping_neg());
         ctx.0 = DEC_NEXT[((lps as usize) << 8) | s];
+        let bin = (s as u8 ^ lps as u8) & 1;
         // range is at least 6 here; one shift restores 256..=511.
-        let n = range.leading_zeros() - 23;
+        let n = DEC_NORM_SHIFT[range as usize & 511] as u32;
         self.range = range << n;
         self.consume(n);
-        (s as u8 ^ lps as u8) & 1
+        bin
     }
 
     /// Decodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
@@ -1490,11 +1502,17 @@ impl<'a> CabacDecoder<'a> {
                 }
             }
         } else {
-            for i in 0..max_coeff - 1 {
-                if self.decode_decision(&mut ctxs[sig_base + i]) != 0 {
-                    out.pos[n] = i as u8;
+            // Up to 15 significance and last contexts each, in disjoint ranges.
+            let (lo, hi) = ctxs.split_at_mut(last_base);
+            let sig: &mut [CabacContext; 15] = (&mut lo[sig_base..sig_base + 15])
+                .try_into()
+                .expect("15 contexts");
+            let last: &mut [CabacContext; 15] = (&mut hi[..15]).try_into().expect("15 contexts");
+            for i in 0..max_coeff.min(16) - 1 {
+                if self.decode_decision(&mut sig[i]) != 0 {
+                    out.pos[n & 63] = i as u8;
                     n += 1;
-                    if self.decode_decision(&mut ctxs[last_base + i]) != 0 {
+                    if self.decode_decision(&mut last[i]) != 0 {
                         ended = true;
                         break;
                     }

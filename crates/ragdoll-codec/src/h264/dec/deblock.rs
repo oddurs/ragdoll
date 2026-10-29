@@ -129,15 +129,12 @@ impl EdgeCtx {
         for (k, slot) in bs.iter_mut().enumerate() {
             let qi = q0 + k * along;
             let pi = qi - step;
-            let nz = st.nz[pi] | st.nz[qi];
+            let nz = st.blocks[pi].nz | st.blocks[qi].nz;
             *slot = 2 * nz as u8;
             if check_motion && !nz {
                 // Evaluated without short-circuits: one branch on the outcome.
-                let (rp, rq) = (
-                    [st.ref_pic[0][pi], st.ref_pic[1][pi]],
-                    [st.ref_pic[0][qi], st.ref_pic[1][qi]],
-                );
-                let (mp, mq) = ([st.mv[0][pi], st.mv[1][pi]], [st.mv[0][qi], st.mv[1][qi]]);
+                let (rp, rq) = (st.blocks[pi].ref_pic, st.blocks[qi].ref_pic);
+                let (mp, mq) = (st.blocks[pi].mv, st.blocks[qi].mv);
                 let same =
                     (rp[0] == rq[0]) & (rp[1] == rq[1]) & (mp[0] == mq[0]) & (mp[1] == mq[1]);
                 if !same {
@@ -197,10 +194,10 @@ fn motion_differs(
 /// [`motion_differs`] between 4x4 blocks `p` and `q` of `st`.
 fn blocks_differ(st: &PicState, p: usize, q: usize, ylim: i32) -> bool {
     motion_differs(
-        [st.ref_pic[0][p], st.ref_pic[1][p]],
-        [st.mv[0][p], st.mv[1][p]],
-        [st.ref_pic[0][q], st.ref_pic[1][q]],
-        [st.mv[0][q], st.mv[1][q]],
+        st.blocks[p].ref_pic,
+        st.blocks[p].mv,
+        st.blocks[q].ref_pic,
+        st.blocks[q].mv,
         ylim,
     )
 }
@@ -445,7 +442,7 @@ fn mbaff_bs(
             3
         };
     }
-    if st.nz[pi] || st.nz[qi] {
+    if st.blocks[pi].nz || st.blocks[qi].nz {
         return 2;
     }
     // Mixed edge: a field pair next to a frame pair.

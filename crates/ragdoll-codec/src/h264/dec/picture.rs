@@ -42,13 +42,12 @@ pub enum Structure {
 /// macroblock rows of field pictures are interleaved (field row `r` of parity `p` is frame row `2r + p`).
 #[derive(Clone, Debug)]
 pub struct Motion {
-    /// Per 4x4 block, per list.
-    pub mv: [Vec<[i16; 2]>; 2],
-    pub ref_idx: [Vec<i8>; 2],
-    /// Reference id of the picture each block references (see [`FrameStore::frame_ref_id`]), or [`NO_PIC`].
-    pub ref_pic: [Vec<u32>; 2],
+    /// Per 4x4 block.
+    pub blocks: Vec<BlockInfo>,
     /// Per macroblock.
     pub mb_intra: Vec<bool>,
+    /// Per macroblock: one motion for all 16 blocks (see [`PicState::motion_edges`]).
+    pub mb_uniform: Vec<bool>,
     /// Per macroblock: decoded as a field macroblock (field picture or field MB pair).
     pub mb_field: Vec<bool>,
     /// Decoded as an MBAFF frame (rather than as a frame or two field pictures).
@@ -59,15 +58,38 @@ impl Motion {
     pub fn new(mb_w: usize, mb_h: usize) -> Self {
         let b4 = mb_w * mb_h * 16;
         Self {
-            mv: [vec![[0; 2]; b4], vec![[0; 2]; b4]],
-            ref_idx: [vec![-1; b4], vec![-1; b4]],
-            ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
+            blocks: vec![NO_BLOCK; b4],
             mb_intra: vec![true; mb_w * mb_h],
+            mb_uniform: vec![false; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
             mbaff: false,
         }
     }
 }
+
+/// What later blocks read of one 4x4 block. Per list: the vector, the referenced picture id
+/// (see [`FrameStore::frame_ref_id`], or [`NO_PIC`]), the reference index (`-1` unused) and, for
+/// CABAC contexts, the absolute mvd components. Then whether its transform block has nonzero
+/// coefficients (deblocking, CABAC cbf) and whether it was direct-predicted (CABAC ref_idx).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockInfo {
+    pub mv: [[i16; 2]; 2],
+    pub ref_pic: [u32; 2],
+    pub ref_idx: [i8; 2],
+    pub mvd: [[u8; 2]; 2],
+    pub nz: bool,
+    pub direct: bool,
+}
+
+/// [`BlockInfo`] of a block with no prediction (intra, or not yet decoded).
+pub const NO_BLOCK: BlockInfo = BlockInfo {
+    mv: [[0; 2]; 2],
+    ref_pic: [NO_PIC; 2],
+    ref_idx: [-1; 2],
+    mvd: [[0; 2]; 2],
+    nz: false,
+    direct: false,
+};
 
 /// Sets the `W`x`h` rectangle of `v` whose rows start at `i`, `i + stride`, ... to `val`, with
 /// one bounds check (`h >= 1`).
@@ -149,12 +171,9 @@ impl FrameStore {
             planes[2].fill(128);
             let n = self.motion.mb_intra.len();
             let m = Arc::make_mut(&mut self.motion);
-            for l in 0..2 {
-                m.mv[l].fill([0; 2]);
-                m.ref_idx[l].fill(-1);
-                m.ref_pic[l].fill(NO_PIC);
-            }
+            m.blocks.fill(NO_BLOCK);
             m.mb_intra.fill(true);
+            m.mb_uniform.fill(false);
             m.mb_field.fill(false);
             debug_assert_eq!(m.mb_intra.len(), n);
         }
@@ -245,14 +264,9 @@ pub struct PicState {
 
     /// Per 4x4 luma block: total_coeff (CAVLC nC) / coefficient count.
     pub nnz: Vec<u8>,
-    /// Per 4x4 luma block: non-zero coefficients in the transform block containing it (deblocking, CABAC cbf).
-    pub nz: Vec<bool>,
     pub intra_mode: Vec<i8>,
-    pub mv: [Vec<[i16; 2]>; 2],
-    pub mvd: [Vec<[u8; 2]>; 2],
-    pub ref_idx: [Vec<i8>; 2],
-    pub ref_pic: [Vec<u32>; 2],
-    pub direct: Vec<bool>,
+    /// Per 4x4 block: motion of both lists and coefficient and direct flags.
+    pub blocks: Vec<BlockInfo>,
     /// Per macroblock: the inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which
     /// motion may differ; `0` when inter prediction used one motion for all 16 blocks.
     pub motion_edges: Vec<u8>,
@@ -288,13 +302,8 @@ impl PicState {
             chroma_pred_mode: vec![0; mbs],
             cbf_dc: vec![0; mbs],
             nnz: vec![0; b4],
-            nz: vec![false; b4],
             intra_mode: vec![-1; b4],
-            mv: [vec![[0; 2]; b4], vec![[0; 2]; b4]],
-            mvd: [vec![[0; 2]; b4], vec![[0; 2]; b4]],
-            ref_idx: [vec![-1; b4], vec![-1; b4]],
-            ref_pic: [vec![NO_PIC; b4], vec![NO_PIC; b4]],
-            direct: vec![false; b4],
+            blocks: vec![NO_BLOCK; b4],
             motion_edges: vec![ANY_INNER_EDGE; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
@@ -324,8 +333,9 @@ impl PicState {
         }
     }
 
-    /// Restores macroblock `addr`'s coding state (all but availability) to that of a new picture.
-    pub fn clear_mb(&mut self, addr: usize) {
+    /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
+    /// row `y`, to that of a new picture.
+    pub fn clear_mb(&mut self, addr: usize, x: usize, y: usize) {
         self.cbp[addr] = 0;
         self.qp[addr] = 0;
         self.qpc[addr] = [0; 2];
@@ -333,18 +343,10 @@ impl PicState {
         self.chroma_pred_mode[addr] = 0;
         self.cbf_dc[addr] = 0;
         self.motion_edges[addr] = ANY_INNER_EDGE;
-        let (x, y) = (addr % self.mb_w, addr / self.mb_w);
         let (i, w) = (self.b4(x * 4, y * 4), self.mb_w * 4);
         fill_rect::<_, 4>(&mut self.nnz, i, w, 4, 0);
-        fill_rect::<_, 4>(&mut self.nz, i, w, 4, false);
         fill_rect::<_, 4>(&mut self.intra_mode, i, w, 4, -1);
-        fill_rect::<_, 4>(&mut self.direct, i, w, 4, false);
-        for l in 0..2 {
-            fill_rect::<_, 4>(&mut self.mv[l], i, w, 4, [0; 2]);
-            fill_rect::<_, 4>(&mut self.mvd[l], i, w, 4, [0; 2]);
-            fill_rect::<_, 4>(&mut self.ref_idx[l], i, w, 4, -1);
-            fill_rect::<_, 4>(&mut self.ref_pic[l], i, w, 4, NO_PIC);
-        }
+        fill_rect::<_, 4>(&mut self.blocks, i, w, 4, NO_BLOCK);
         let i = self.c4(x * 2, y * 2);
         for c in &mut self.nnz_c {
             fill_rect::<_, 2>(c, i, self.mb_w * 2, 2, 0);
@@ -362,8 +364,8 @@ impl PicState {
             if self.mb_type[addr] != MbType::None {
                 continue;
             }
-            self.clear_mb(addr);
             let (x, y) = (addr % self.mb_w, addr / self.mb_w);
+            self.clear_mb(addr, x, y);
             // Frame lines the macroblock covers: in an MBAFF frame a field pair interleaves.
             // The pair's other macroblock decides whether the pair is a field pair.
             let pair_field = self.mbaff && {
@@ -433,14 +435,11 @@ impl PicState {
         let m = Arc::make_mut(&mut store.motion);
         m.mbaff = self.mbaff;
         let stride = self.mb_w * 4;
-        if parity.is_none() && m.mv[0].len() == self.mv[0].len() {
-            for l in 0..2 {
-                std::mem::swap(&mut m.mv[l], &mut self.mv[l]);
-                std::mem::swap(&mut m.ref_idx[l], &mut self.ref_idx[l]);
-                std::mem::swap(&mut m.ref_pic[l], &mut self.ref_pic[l]);
-            }
+        if parity.is_none() && m.blocks.len() == self.blocks.len() {
+            std::mem::swap(&mut m.blocks, &mut self.blocks);
             for (i, t) in self.mb_type.iter().enumerate() {
                 m.mb_intra[i] = t.is_intra();
+                m.mb_uniform[i] = self.motion_edges[i] == 0;
             }
             m.mb_field.copy_from_slice(&self.mb_field);
             return;
@@ -454,15 +453,12 @@ impl PicState {
                 let src_mb = mby * self.mb_w + mbx;
                 let dst_mb = fy * self.mb_w + mbx;
                 m.mb_intra[dst_mb] = self.mb_type[src_mb].is_intra();
+                m.mb_uniform[dst_mb] = self.motion_edges[src_mb] == 0;
                 m.mb_field[dst_mb] = self.mb_field[src_mb];
                 for r in 0..4 {
                     let s = (mby * 4 + r) * stride + mbx * 4;
                     let d = (fy * 4 + r) * stride + mbx * 4;
-                    for l in 0..2 {
-                        m.mv[l][d..d + 4].copy_from_slice(&self.mv[l][s..s + 4]);
-                        m.ref_idx[l][d..d + 4].copy_from_slice(&self.ref_idx[l][s..s + 4]);
-                        m.ref_pic[l][d..d + 4].copy_from_slice(&self.ref_pic[l][s..s + 4]);
-                    }
+                    m.blocks[d..d + 4].copy_from_slice(&self.blocks[s..s + 4]);
                 }
             }
         }

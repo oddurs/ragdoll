@@ -65,20 +65,79 @@ pub fn h264_luma_mc(
     mx: u8,
     my: u8,
 ) {
+    luma_mc::<false>(dst, ds, src, off, ss, w, h, mx, my);
+}
+
+/// [`h264_luma_mc`] averaged into `dst`: `dst = (dst + pred + 1) >> 1`, the second list of
+/// default bi-prediction (8.4.2.3.1).
+///
+/// # Panics
+/// As [`h264_luma_mc`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn h264_luma_mc_avg(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: u8,
+    my: u8,
+) {
+    luma_mc::<true>(dst, ds, src, off, ss, w, h, mx, my);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn luma_mc<const AVG: bool>(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: u8,
+    my: u8,
+) {
     check_luma(dst, ds, src, off, ss, w, h);
     #[cfg(target_arch = "aarch64")]
     if ragdoll_core::dispatch::neon() {
         // Safety: bounds checked above; NEON is baseline on aarch64.
-        unsafe { luma_neon(dst, ds, src, off, ss, w, h, mx & 3, my & 3) };
+        unsafe { luma_neon::<AVG>(dst, ds, src, off, ss, w, h, mx & 3, my & 3) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { luma_avx2(dst, ds, src, off, ss, w, h, mx & 3, my & 3) };
+        unsafe { luma_avx2::<AVG>(dst, ds, src, off, ss, w, h, mx & 3, my & 3) };
         return;
     }
-    h264_luma_mc_scalar(dst, ds, src, off, ss, w, h, mx, my);
+    if AVG {
+        h264_luma_mc_avg_scalar(dst, ds, src, off, ss, w, h, mx, my);
+    } else {
+        h264_luma_mc_scalar(dst, ds, src, off, ss, w, h, mx, my);
+    }
+}
+
+/// Scalar reference for [`h264_luma_mc_avg`].
+#[allow(clippy::too_many_arguments)]
+pub fn h264_luma_mc_avg_scalar(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: u8,
+    my: u8,
+) {
+    let mut t = [0u8; 256];
+    h264_luma_mc_scalar(&mut t, 16, src, off, ss, w, h, mx, my);
+    h264_avg_scalar(dst, ds, &t, 16, w, h);
 }
 
 /// Scalar reference for [`h264_luma_mc`].
@@ -175,20 +234,78 @@ pub fn h264_chroma_mc(
     fx: u8,
     fy: u8,
 ) {
+    chroma_mc::<false>(dst, ds, src, off, ss, w, h, fx, fy);
+}
+
+/// [`h264_chroma_mc`] averaged into `dst`: `dst = (dst + pred + 1) >> 1`.
+///
+/// # Panics
+/// As [`h264_chroma_mc`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn h264_chroma_mc_avg(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    fx: u8,
+    fy: u8,
+) {
+    chroma_mc::<true>(dst, ds, src, off, ss, w, h, fx, fy);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn chroma_mc<const AVG: bool>(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    fx: u8,
+    fy: u8,
+) {
     check_chroma(dst, ds, src, off, ss, w, h);
     #[cfg(target_arch = "aarch64")]
     if ragdoll_core::dispatch::neon() {
         // Safety: bounds checked above; NEON is baseline on aarch64.
-        unsafe { chroma_neon(dst, ds, src, off, ss, w, h, fx & 7, fy & 7) };
+        unsafe { chroma_neon::<AVG>(dst, ds, src, off, ss, w, h, fx & 7, fy & 7) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { chroma_avx2(dst, ds, src, off, ss, w, h, fx & 7, fy & 7) };
+        unsafe { chroma_avx2::<AVG>(dst, ds, src, off, ss, w, h, fx & 7, fy & 7) };
         return;
     }
-    h264_chroma_mc_scalar(dst, ds, src, off, ss, w, h, fx, fy);
+    if AVG {
+        h264_chroma_mc_avg_scalar(dst, ds, src, off, ss, w, h, fx, fy);
+    } else {
+        h264_chroma_mc_scalar(dst, ds, src, off, ss, w, h, fx, fy);
+    }
+}
+
+/// Scalar reference for [`h264_chroma_mc_avg`].
+#[allow(clippy::too_many_arguments)]
+pub fn h264_chroma_mc_avg_scalar(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    w: usize,
+    h: usize,
+    fx: u8,
+    fy: u8,
+) {
+    let mut t = [0u8; 64];
+    h264_chroma_mc_scalar(&mut t, 8, src, off, ss, w, h, fx, fy);
+    h264_avg_scalar(dst, ds, &t, 8, w, h);
 }
 
 /// Scalar reference for [`h264_chroma_mc`].
@@ -448,7 +565,7 @@ pub fn h264_weight_uni_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn luma_avx2(
+unsafe fn luma_avx2<const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
     src: &[u8],
@@ -460,9 +577,9 @@ unsafe fn luma_avx2(
     my: u8,
 ) {
     if w == 16 {
-        unsafe { luma_avx2_w::<16>(dst, ds, src, off, ss, w, h, mx, my) }
+        unsafe { luma_avx2_w::<16, AVG>(dst, ds, src, off, ss, w, h, mx, my) }
     } else {
-        unsafe { luma_avx2_w::<8>(dst, ds, src, off, ss, w, h, mx, my) }
+        unsafe { luma_avx2_w::<8, AVG>(dst, ds, src, off, ss, w, h, mx, my) }
     }
 }
 
@@ -657,7 +774,7 @@ unsafe fn copy_avx2<const W: usize>(t: *mut u8, ts: usize, s: *const u8, ss: usi
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn luma_avx2_w<const W: usize>(
+unsafe fn luma_avx2_w<const W: usize, const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
     src: &[u8],
@@ -678,7 +795,7 @@ unsafe fn luma_avx2_w<const W: usize>(
     let (t0, t1) = (b0.as_mut_ptr() as *mut u8, b1.as_mut_ptr() as *mut u8);
     // A phase that is one filter's output is written straight to `dst` when the block is as
     // wide as the vectors; otherwise t0 (and t1 when two samples are averaged) per Table 8-12.
-    let direct = w == W && matches!((mx, my), (0, 0) | (2, 0) | (0, 2) | (2, 2));
+    let direct = !AVG && w == W && matches!((mx, my), (0, 0) | (2, 0) | (0, 2) | (2, 2));
     let (o, os) = if direct {
         (dst.as_mut_ptr(), ds)
     } else {
@@ -736,9 +853,25 @@ unsafe fn luma_avx2_w<const W: usize>(
             }
             let d = dst.as_mut_ptr().add(r * ds);
             match w {
-                16 => _mm_storeu_si128(d as *mut __m128i, v),
-                8 => _mm_storel_epi64(d as *mut __m128i, v),
-                _ => (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
+                16 => {
+                    if AVG {
+                        v = _mm_avg_epu8(v, _mm_loadu_si128(d as *const __m128i));
+                    }
+                    _mm_storeu_si128(d as *mut __m128i, v)
+                }
+                8 => {
+                    if AVG {
+                        v = _mm_avg_epu8(v, _mm_loadl_epi64(d as *const __m128i));
+                    }
+                    _mm_storel_epi64(d as *mut __m128i, v)
+                }
+                _ => {
+                    if AVG {
+                        let p = _mm_cvtsi32_si128((d as *const i32).read_unaligned());
+                        v = _mm_avg_epu8(v, p);
+                    }
+                    (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v))
+                }
             }
         }
     }
@@ -747,7 +880,7 @@ unsafe fn luma_avx2_w<const W: usize>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn chroma_avx2(
+unsafe fn chroma_avx2<const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
     src: &[u8],
@@ -765,9 +898,31 @@ unsafe fn chroma_avx2(
     let mut store = |r: usize, v: __m128i| unsafe {
         let d = dst.as_mut_ptr().add(r * ds);
         match w {
-            8 => _mm_storel_epi64(d as *mut __m128i, v),
-            4 => (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
-            _ => (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16),
+            8 => {
+                let v = if AVG {
+                    _mm_avg_epu8(v, _mm_loadl_epi64(d as *const __m128i))
+                } else {
+                    v
+                };
+                _mm_storel_epi64(d as *mut __m128i, v)
+            }
+            4 => {
+                let v = if AVG {
+                    _mm_avg_epu8(v, _mm_cvtsi32_si128((d as *const i32).read_unaligned()))
+                } else {
+                    v
+                };
+                (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v))
+            }
+            _ => {
+                let v = if AVG {
+                    let p = (d as *const u16).read_unaligned() as i32;
+                    _mm_avg_epu8(v, _mm_cvtsi32_si128(p))
+                } else {
+                    v
+                };
+                (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16)
+            }
         }
     };
     let ld = |r: usize, c: usize| unsafe { _mm_loadl_epi64(s.add(r * ss + c) as *const __m128i) };
@@ -968,7 +1123,7 @@ mod neon {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn luma_neon(
+unsafe fn luma_neon<const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
     src: &[u8],
@@ -1095,6 +1250,9 @@ unsafe fn luma_neon(
                     if two {
                         v = vrhaddq_u8(v, vld1q_u8(b));
                     }
+                    if AVG {
+                        v = vrhaddq_u8(v, vld1q_u8(d));
+                    }
                     vst1q_u8(d, v);
                 }
                 8 => {
@@ -1102,12 +1260,19 @@ unsafe fn luma_neon(
                     if two {
                         v = vrhadd_u8(v, vld1_u8(b));
                     }
+                    if AVG {
+                        v = vrhadd_u8(v, vld1_u8(d));
+                    }
                     vst1_u8(d, v);
                 }
                 _ => {
                     let mut v = vld1_u8(a);
                     if two {
                         v = vrhadd_u8(v, vld1_u8(b));
+                    }
+                    if AVG {
+                        let p = vdup_n_u32((d as *const u32).read_unaligned());
+                        v = vrhadd_u8(v, vreinterpret_u8_u32(p));
                     }
                     (d as *mut u32).write_unaligned(vget_lane_u32::<0>(vreinterpret_u32_u8(v)));
                 }
@@ -1119,7 +1284,7 @@ unsafe fn luma_neon(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn chroma_neon(
+unsafe fn chroma_neon<const AVG: bool>(
     dst: &mut [u8],
     ds: usize,
     src: &[u8],
@@ -1143,12 +1308,29 @@ unsafe fn chroma_neon(
             acc = vmlal_u8(acc, vld1_u8(p.add(1)), wb);
             acc = vmlal_u8(acc, vld1_u8(p.add(ss)), wc);
             acc = vmlal_u8(acc, vld1_u8(p.add(ss + 1)), wd);
-            let v = vrshrn_n_u16::<6>(acc);
+            let mut v = vrshrn_n_u16::<6>(acc);
             let d = dst.as_mut_ptr().add(r * ds);
             match w {
-                8 => vst1_u8(d, v),
-                4 => (d as *mut u32).write_unaligned(vget_lane_u32::<0>(vreinterpret_u32_u8(v))),
-                _ => (d as *mut u16).write_unaligned(vget_lane_u16::<0>(vreinterpret_u16_u8(v))),
+                8 => {
+                    if AVG {
+                        v = vrhadd_u8(v, vld1_u8(d));
+                    }
+                    vst1_u8(d, v)
+                }
+                4 => {
+                    if AVG {
+                        let p = vdup_n_u32((d as *const u32).read_unaligned());
+                        v = vrhadd_u8(v, vreinterpret_u8_u32(p));
+                    }
+                    (d as *mut u32).write_unaligned(vget_lane_u32::<0>(vreinterpret_u32_u8(v)))
+                }
+                _ => {
+                    if AVG {
+                        let p = vdup_n_u16((d as *const u16).read_unaligned());
+                        v = vrhadd_u8(v, vreinterpret_u8_u16(p));
+                    }
+                    (d as *mut u16).write_unaligned(vget_lane_u16::<0>(vreinterpret_u16_u8(v)))
+                }
             }
         }
     }
@@ -1188,6 +1370,12 @@ mod tests {
                         h264_luma_mc(&mut a, ds, &src, off, pw, w, h, mx, my);
                         h264_luma_mc_scalar(&mut b, ds, &src, off, pw, w, h, mx, my);
                         assert_eq!(a, b, "{w}x{h} phase ({mx}, {my}) at ({x}, {y})");
+                        // Averaged into an existing prediction.
+                        let mut a = plane(ds, 16, (x * 7 + y) as u32);
+                        let mut b = a.clone();
+                        h264_luma_mc_avg(&mut a, ds, &src, off, pw, w, h, mx, my);
+                        h264_luma_mc_avg_scalar(&mut b, ds, &src, off, pw, w, h, mx, my);
+                        assert_eq!(a, b, "avg {w}x{h} phase ({mx}, {my}) at ({x}, {y})");
                     }
                 }
             }
@@ -1227,6 +1415,11 @@ mod tests {
                         h264_chroma_mc(&mut a, ds, &src, off, pw, w, h, fx, fy);
                         h264_chroma_mc_scalar(&mut b, ds, &src, off, pw, w, h, fx, fy);
                         assert_eq!(a, b, "{w}x{h} phase ({fx}, {fy}) at ({x}, {y})");
+                        let mut a = plane(ds, 8, (x * 5 + y) as u32);
+                        let mut b = a.clone();
+                        h264_chroma_mc_avg(&mut a, ds, &src, off, pw, w, h, fx, fy);
+                        h264_chroma_mc_avg_scalar(&mut b, ds, &src, off, pw, w, h, fx, fy);
+                        assert_eq!(a, b, "avg {w}x{h} phase ({fx}, {fy}) at ({x}, {y})");
                     }
                 }
             }
