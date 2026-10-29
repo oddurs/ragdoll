@@ -12,7 +12,7 @@ use crate::cabac::{
 use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
-use super::intra::{self, Edges};
+use super::intra;
 use super::picture::{MbType, Motion, NO_BLOCK, NO_PIC, PicState, Structure, fill_rect};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
@@ -921,6 +921,28 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Predicted Intra4x4/Intra8x8 mode for the block whose top-left 4x4 is at MB-relative `(bx, by)` (8.3.1.1).
     fn predicted_intra_mode(&self, bx: usize, by: usize) -> u8 {
+        if !self.st.mbaff {
+            // Neighbours A and B are the 4x4 blocks left of and above this one.
+            let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
+            let mode = |inside: bool, mb: fn(&Self) -> Option<usize>, j: usize| -> Option<i8> {
+                if !inside {
+                    let t = self.st.mb_type[mb(self)?];
+                    if !t.is_intra() && self.cx.pps.constrained_intra_pred {
+                        return None;
+                    }
+                    if !matches!(t, MbType::I4x4 | MbType::I8x8) {
+                        return Some(2);
+                    }
+                }
+                Some(self.st.intra_mode[j])
+            };
+            let a = mode(bx > 0, Self::mb_left, i.wrapping_sub(1));
+            let b = mode(by > 0, Self::mb_top, i.wrapping_sub(self.st.mb_w * 4));
+            return match (a, b) {
+                (Some(a), Some(b)) => a.min(b) as u8,
+                _ => 2,
+            };
+        }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let fetch = |xn: isize, yn: isize| -> Option<i8> {
             let (addr, xw, yw) = self.locate(xn, yn, false)?;
@@ -1174,57 +1196,66 @@ impl<'a, 'c> Dec<'a, 'c> {
         res: &mut Residual,
     ) -> Result<()> {
         let (off, ls, px, py) = self.view(0);
+        // Intra availability of the neighbouring macroblocks as intra::INTRA_* flags; without
+        // MBAFF it is the same for all their rows.
+        let nb = (!self.st.mbaff).then(|| {
+            intra::flags((
+                self.intra_ok(self.mb_left()),
+                self.intra_ok(self.mb_top()),
+                self.intra_ok(self.mb_nb(16, -1)),
+                self.intra_ok(self.mb_nb(-1, -1)),
+            ))
+        });
         match kind {
             MbType::I4x4 => {
                 for (blk, &mode) in modes.iter().enumerate() {
                     let (bx, by) = BLK4_XY[blk];
-                    let (l, t, tr, tl) = self.intra_edges(bx, by, 1, blk);
-                    let (x, y) = (px + bx * 4, py + by * 4);
+                    let avail = match nb {
+                        Some(nb) => intra::AVAIL4[blk][nb as usize],
+                        None => intra::flags(self.intra_edges(bx, by, 1, blk)),
+                    };
+                    let o = (py + by * 4) * ls + px + bx * 4;
                     let plane = &mut self.st.planes[0][off..];
-                    let e = Edges::gather(plane, ls, x, y, 4, l, t, tr && t, tl);
-                    let mut out = [0u8; 16];
-                    intra::predict_nxn(4, mode, &e, &mut out);
-                    for r in 0..4 {
-                        plane[(y + r) * ls + x..(y + r) * ls + x + 4]
-                            .copy_from_slice(&out[r * 4..r * 4 + 4]);
-                    }
+                    intra::pred4x4(plane, o, ls, mode, avail);
                     if res.luma_coded & (1 << blk) != 0 {
-                        recon::idct4_add(&mut plane[y * ls + x..], ls, &mut res.luma[blk]);
+                        recon::idct4_add(&mut plane[o..], ls, &mut res.luma[blk]);
                     }
                 }
             }
             MbType::I8x8 => {
                 for b8 in 0..4 {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-                    let (l, t, tr, tl) = self.intra_edges(bx, by, 2, b8 * 4);
-                    let (x, y) = (px + bx * 4, py + by * 4);
+                    let avail = match nb {
+                        Some(nb) => intra::AVAIL8[b8][nb as usize],
+                        None => intra::flags(self.intra_edges(bx, by, 2, b8 * 4)),
+                    };
+                    let o = (py + by * 4) * ls + px + bx * 4;
                     let plane = &mut self.st.planes[0][off..];
-                    let e = Edges::gather(plane, ls, x, y, 8, l, t, tr && t, tl).filter8();
-                    let mut out = [0u8; 64];
-                    intra::predict_nxn(8, modes[b8], &e, &mut out);
-                    for r in 0..8 {
-                        plane[(y + r) * ls + x..(y + r) * ls + x + 8]
-                            .copy_from_slice(&out[r * 8..r * 8 + 8]);
-                    }
+                    intra::pred8x8l(plane, o, ls, modes[b8], avail);
                     if res.luma_coded & (0xF << (b8 * 4)) != 0 {
-                        recon::idct8_add(&mut plane[y * ls + x..], ls, &mut res.luma8[b8]);
+                        recon::idct8_add(&mut plane[o..], ls, &mut res.luma8[b8]);
                     }
                 }
             }
             MbType::I16x16(mode) => {
-                let mb_top = self.intra_ok(self.mb_top());
-                let mb_left = self.left_ok(0, 16);
-                let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
+                let (mb_left, mb_top, mb_tl) = match nb {
+                    Some(nb) => (
+                        nb & intra::INTRA_LEFT != 0,
+                        nb & intra::INTRA_TOP != 0,
+                        nb & intra::INTRA_TOP_LEFT != 0,
+                    ),
+                    None => (
+                        self.left_ok(0, 16),
+                        self.intra_ok(self.mb_top()),
+                        self.intra_ok(self.mb_nb(-1, -1)),
+                    ),
+                };
                 if !intra::block_mode_ok(mode, mb_left, mb_top, mb_tl) {
                     return Err(bad("H.264 Intra16x16 mode uses unavailable samples"));
                 }
-                let mut out = [0u8; 256];
                 let plane = &mut self.st.planes[0][off..];
-                intra::predict_16x16(plane, ls, px, py, mode, mb_left, mb_top, mb_tl, &mut out);
-                for r in 0..16 {
-                    plane[(py + r) * ls + px..(py + r) * ls + px + 16]
-                        .copy_from_slice(&out[r * 16..r * 16 + 16]);
-                }
+                let avail = intra::flags((mb_left, mb_top, false, mb_tl));
+                intra::pred16x16(plane, py * ls + px, ls, mode, avail);
                 for blk in 0..16 {
                     if res.luma_coded & (1 << blk) != 0 {
                         let (bx, by) = BLK4_XY[blk];
@@ -1236,23 +1267,31 @@ impl<'a, 'c> Dec<'a, 'c> {
             _ => unreachable!(),
         }
         if self.cx.sps.chroma_array_type() != 0 {
-            let mb_top = self.intra_ok(self.mb_top());
-            let left = [self.left_ok(0, 8), self.left_ok(8, 8)];
-            let mb_tl = self.intra_ok(self.mb_nb(-1, -1));
+            let (left, mb_top, mb_tl) = match nb {
+                Some(nb) => (
+                    [nb & intra::INTRA_LEFT != 0; 2],
+                    nb & intra::INTRA_TOP != 0,
+                    nb & intra::INTRA_TOP_LEFT != 0,
+                ),
+                None => (
+                    [self.left_ok(0, 8), self.left_ok(8, 8)],
+                    self.intra_ok(self.mb_top()),
+                    self.intra_ok(self.mb_nb(-1, -1)),
+                ),
+            };
             let mode = self.st.chroma_pred_mode[self.mb.addr];
             let as_block = [2, 1, 0, 3][mode as usize];
             if !intra::block_mode_ok(as_block, left[0] && left[1], mb_top, mb_tl) {
                 return Err(bad("H.264 chroma intra mode uses unavailable samples"));
             }
+            let mut avail = intra::flags((left[0], mb_top, false, mb_tl));
+            if left[1] {
+                avail |= intra::INTRA_LEFT_LOWER;
+            }
             let (off, cs, cx, cy) = self.view(1);
             for p in 0..2 {
-                let mut out = [0u8; 64];
                 let plane = &mut self.st.planes[1 + p][off..];
-                intra::predict_chroma(plane, cs, cx, cy, mode, left, mb_top, mb_tl, &mut out);
-                for r in 0..8 {
-                    let o = (cy + r) * cs + cx;
-                    plane[o..o + 8].copy_from_slice(&out[r * 8..r * 8 + 8]);
-                }
+                intra::pred_chroma(plane, cy * cs + cx, cs, as_block, avail);
             }
             self.add_chroma_residual(res);
         }
