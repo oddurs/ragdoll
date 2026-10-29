@@ -72,6 +72,10 @@ impl PicJob {
         self.sync.complete();
     }
 
+    fn is_ref(&self) -> bool {
+        self.slices.first().is_some_and(|s| s.sh.nal_ref_idc > 0)
+    }
+
     fn decode(&mut self, st: &mut PicState) -> Result<()> {
         let mut res = Ok(());
         for s in &mut self.slices {
@@ -153,7 +157,9 @@ fn work(shared: &Shared) {
         let job = {
             let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(job) = q.jobs.pop_front() {
+                // Reference pictures first: later pictures wait on them, and on nothing else.
+                let i = q.jobs.iter().position(PicJob::is_ref).unwrap_or(0);
+                if let Some(job) = q.jobs.remove(i) {
                     break job;
                 }
                 if q.stop {

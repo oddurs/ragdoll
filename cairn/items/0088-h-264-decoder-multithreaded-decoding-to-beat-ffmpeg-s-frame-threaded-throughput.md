@@ -41,3 +41,7 @@ Frame threading, as FFmpeg does it, with the decoder's output unchanged for any 
 - [ ] Decoding with `with_threads(n)` gives byte-identical output to single-threaded decoding for every supported stream (x264 reference set, 166 JVT conformance streams) at 2 and 4 threads.
 - [ ] At 4 threads the decoder is faster than FFmpeg's 4-thread frame threading on the benchmark suite's 1080p High CABAC and 720p Baseline CAVLC streams.
 - [ ] The CLI and pipeline decode H.264 with frame threads by default.
+
+## 2026-10-29
+
+Workers take reference pictures before non-reference ones (earliest first). Each reference picture waits only on earlier ones, so this cannot deadlock, and P pictures no longer queue behind the B pictures between them: worker line waits at 4 threads on 1080p High fell from ~1000 to ~670 ms of worker time (wall ~0.97x FFmpeg's 4 threads in paired runs). Running twice as many workers as cores, handing cores off around waits, was tried and dropped: the extra wake-ups and cache churn cost more than the waits.

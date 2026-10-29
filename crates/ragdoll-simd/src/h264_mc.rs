@@ -112,7 +112,10 @@ fn luma_mc<const AVG: bool>(
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { luma_avx2::<AVG>(dst, ds, src, off, ss, w, h, mx & 3, my & 3) };
+        unsafe {
+            let (d, s) = (dst.as_mut_ptr(), src.as_ptr().add(off));
+            luma_avx2::<AVG>(d, ds, s, ss, w, h, mx & 3, my & 3)
+        };
         return;
     }
     if AVG {
@@ -268,10 +271,11 @@ pub fn h264_luma_mc_in_plane(
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds established above; avx2() is true only when the CPU supports AVX2.
         unsafe {
+            let (d, s) = (dst.as_mut_ptr(), src.as_ptr().add(off));
             if avg {
-                luma_avx2::<true>(dst, ds, src, off, width, w, h, mx, my)
+                luma_avx2::<true>(d, ds, s, width, w, h, mx, my)
             } else {
-                luma_avx2::<false>(dst, ds, src, off, width, w, h, mx, my)
+                luma_avx2::<false>(d, ds, s, width, w, h, mx, my)
             }
         };
         return true;
@@ -349,6 +353,241 @@ pub fn h264_chroma_mc_in_plane(
         h264_chroma_mc_scalar(dst, ds, src, off, width, w, h, fx, fy);
     }
     true
+}
+
+/// [`h264_chroma_mc_in_plane`] for both chroma planes of a block at once (the same position,
+/// size and vector in two planes of the same size), `dst[0]` from `src[0]` and `dst[1]` from
+/// `src[1]`; `false`, with nothing written, when the block reaches past the planes.
+///
+/// # Panics
+/// As [`h264_chroma_mc_in_plane`], for either plane.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn h264_chroma_pair_mc_in_plane(
+    dst: [&mut [u8]; 2],
+    ds: usize,
+    src: [&[u8]; 2],
+    width: usize,
+    height: usize,
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+    mv: [i16; 2],
+    avg: bool,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        let ix = x as isize + (mv[0] as isize >> 3);
+        let iy = y as isize + (mv[1] as isize >> 3);
+        if !(ix >= 0
+            && iy >= 0
+            && ix as usize + chroma_mc_cols(w) <= width
+            && (iy as usize + h) < height)
+        {
+            return false;
+        }
+        assert!(matches!(w, 2 | 4 | 8) && matches!(h, 2 | 4 | 8));
+        let n = width.checked_mul(height);
+        assert!(n.is_some_and(|n| n <= src[0].len() && n <= src[1].len()));
+        let [d0, d1] = dst;
+        // Rows are read 16 bytes at a time, up to 7 bytes past what the block reads: at the
+        // planes' end the planes go one at a time.
+        let end = (iy as usize + h) * width + ix as usize + 16;
+        if end > src[0].len() || end > src[1].len() {
+            h264_chroma_mc_in_plane(d0, ds, src[0], width, height, (x, y), (w, h), mv, avg);
+            h264_chroma_mc_in_plane(d1, ds, src[1], width, height, (x, y), (w, h), mv, avg);
+            return true;
+        }
+        assert!((h - 1) * ds + w <= d0.len() && (h - 1) * ds + w <= d1.len());
+        let off = iy as usize * width + ix as usize;
+        let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
+        // Safety: bounds established above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            let d = [d0.as_mut_ptr(), d1.as_mut_ptr()];
+            let s = [src[0].as_ptr().add(off), src[1].as_ptr().add(off)];
+            if avg {
+                chroma_pair_avx2::<true>(d, ds, s, width, w, h, fx, fy)
+            } else {
+                chroma_pair_avx2::<false>(d, ds, s, width, w, h, fx, fy)
+            }
+        };
+        return true;
+    }
+    let [d0, d1] = dst;
+    if !h264_chroma_mc_in_plane(d0, ds, src[0], width, height, (x, y), (w, h), mv, avg) {
+        return false;
+    }
+    h264_chroma_mc_in_plane(d1, ds, src[1], width, height, (x, y), (w, h), mv, avg)
+}
+
+/// A luma kernel on raw pointers: `(dst, ds, src, ss, w, h, mx, my)`, `src` at the block's
+/// integer-sample origin.
+type LumaPtrFn = unsafe fn(*mut u8, usize, *const u8, usize, usize, usize, u8, u8);
+
+/// A chroma kernel for two planes on raw pointers: `(dst, ds, src, ss, w, h, fx, fy)`.
+type ChromaPairPtrFn = unsafe fn([*mut u8; 2], usize, [*const u8; 2], usize, usize, usize, u8, u8);
+
+/// H.264 inter-prediction kernels on raw pointers, chosen once for the CPU, for callers that
+/// establish a block's reach into its planes themselves: they skip the per-call checks and
+/// dispatch of [`h264_luma_mc_in_plane`] and [`h264_chroma_pair_mc_in_plane`].
+#[derive(Clone, Copy, Debug)]
+pub struct H264McKernels {
+    luma: [LumaPtrFn; 2],
+    chroma_pair: [ChromaPairPtrFn; 2],
+}
+
+impl Default for H264McKernels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H264McKernels {
+    pub fn new() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if ragdoll_core::dispatch::avx2() {
+            return Self {
+                luma: [luma_avx2::<false>, luma_avx2::<true>],
+                chroma_pair: [chroma_pair_avx2::<false>, chroma_pair_avx2::<true>],
+            };
+        }
+        Self {
+            luma: [luma_ptr::<false>, luma_ptr::<true>],
+            chroma_pair: [chroma_pair_ptr::<false>, chroma_pair_ptr::<true>],
+        }
+    }
+
+    /// [`h264_luma_mc`] (with `avg`, [`h264_luma_mc_avg`]) of the `w`x`h` block whose
+    /// integer-sample origin is `src`, stride `ss`, into `dst`, stride `ds`.
+    ///
+    /// # Safety
+    /// `w` and `h` are 4, 8 or 16; rows `-2..h + 3` of `src`, columns `-2..luma_mc_cols(w)`
+    /// (see [`luma_mc_cols`]), are readable; rows `0..h` of `dst`, `w` samples each, are
+    /// writable and overlap none of them.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub unsafe fn luma(
+        &self,
+        avg: bool,
+        dst: *mut u8,
+        ds: usize,
+        src: *const u8,
+        ss: usize,
+        w: usize,
+        h: usize,
+        mx: u8,
+        my: u8,
+    ) {
+        // Whole-sample blocks (most of them) are plain copies, made here without a call.
+        if (mx | my) == 0 && !avg {
+            unsafe {
+                match (w, h) {
+                    (16, 16) => copy_rows::<16>(dst, ds, src, ss, 16),
+                    (16, _) => copy_rows::<16>(dst, ds, src, ss, h),
+                    (8, _) => copy_rows::<8>(dst, ds, src, ss, h),
+                    _ => copy_rows::<4>(dst, ds, src, ss, h),
+                }
+            }
+            return;
+        }
+        unsafe { (self.luma[avg as usize])(dst, ds, src, ss, w, h, mx, my) }
+    }
+
+    /// [`h264_chroma_mc`] (with `avg`, [`h264_chroma_mc_avg`]) of the `w`x`h` blocks of two
+    /// planes, at the same place in each, whose origins are `src[0]` and `src[1]` (stride `ss`),
+    /// into `dst[0]` and `dst[1]` (stride `ds`).
+    ///
+    /// # Safety
+    /// `w` and `h` are 2, 4 or 8; 16 bytes from the start of rows `0..=h` of each `src` are
+    /// readable; rows `0..h` of each `dst`, `w` samples each, are writable and overlap no other.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub unsafe fn chroma_pair(
+        &self,
+        avg: bool,
+        dst: [*mut u8; 2],
+        ds: usize,
+        src: [*const u8; 2],
+        ss: usize,
+        w: usize,
+        h: usize,
+        fx: u8,
+        fy: u8,
+    ) {
+        if (fx | fy) == 0 && !avg {
+            unsafe {
+                for (d, s) in dst.into_iter().zip(src) {
+                    match (w, h) {
+                        (8, 8) => copy_rows::<8>(d, ds, s, ss, 8),
+                        (8, _) => copy_rows::<8>(d, ds, s, ss, h),
+                        (4, _) => copy_rows::<4>(d, ds, s, ss, h),
+                        _ => copy_rows::<2>(d, ds, s, ss, h),
+                    }
+                }
+            }
+            return;
+        }
+        unsafe { (self.chroma_pair[avg as usize])(dst, ds, src, ss, w, h, fx, fy) }
+    }
+}
+
+/// Copies `h` rows of `W` bytes from `s` (stride `ss`) to `d` (stride `ds`).
+///
+/// # Safety
+/// The rows are readable at `s` and writable at `d`, and do not overlap.
+#[inline(always)]
+unsafe fn copy_rows<const W: usize>(d: *mut u8, ds: usize, s: *const u8, ss: usize, h: usize) {
+    for r in 0..h {
+        unsafe {
+            let v = (s.add(r * ss) as *const [u8; W]).read_unaligned();
+            (d.add(r * ds) as *mut [u8; W]).write_unaligned(v);
+        }
+    }
+}
+
+/// [`H264McKernels::luma`] through the slice kernels, over slices spanning what it reads.
+#[allow(clippy::too_many_arguments)]
+unsafe fn luma_ptr<const AVG: bool>(
+    d: *mut u8,
+    ds: usize,
+    s: *const u8,
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: u8,
+    my: u8,
+) {
+    // Safety: the caller's contract covers these spans.
+    let (src, dst) = unsafe {
+        (
+            std::slice::from_raw_parts(s.sub(2 * ss + 2), (h + 4) * ss + 2 + luma_mc_cols(w)),
+            std::slice::from_raw_parts_mut(d, (h - 1) * ds + w),
+        )
+    };
+    luma_mc::<AVG>(dst, ds, src, 2 * ss + 2, ss, w, h, mx, my);
+}
+
+/// [`H264McKernels::chroma_pair`] through the slice kernels, a plane at a time.
+#[allow(clippy::too_many_arguments)]
+unsafe fn chroma_pair_ptr<const AVG: bool>(
+    d: [*mut u8; 2],
+    ds: usize,
+    s: [*const u8; 2],
+    ss: usize,
+    w: usize,
+    h: usize,
+    fx: u8,
+    fy: u8,
+) {
+    for (d, s) in d.into_iter().zip(s) {
+        // Safety: the caller's contract covers these spans.
+        let (src, dst) = unsafe {
+            (
+                std::slice::from_raw_parts(s, h * ss + chroma_mc_cols(w)),
+                std::slice::from_raw_parts_mut(d, (h - 1) * ds + w),
+            )
+        };
+        chroma_mc::<AVG>(dst, ds, src, 0, ss, w, h, fx, fy);
+    }
 }
 
 /// Asks the CPU to start loading `ROWS` rows of `buf`, the first at `off`, `stride` apart, into
@@ -732,10 +971,9 @@ pub fn h264_weight_uni_scalar(
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn luma_avx2<const AVG: bool>(
-    dst: &mut [u8],
+    d: *mut u8,
     ds: usize,
-    src: &[u8],
-    off: usize,
+    s: *const u8,
     ss: usize,
     w: usize,
     h: usize,
@@ -744,55 +982,20 @@ unsafe fn luma_avx2<const AVG: bool>(
 ) {
     if (mx, my) == (0, 0) {
         // Whole-sample blocks (the most common kind): copied, or averaged into `dst`, straight
-        // from the reference, two rows per step (`h` is even).
-        use std::arch::x86_64::*;
+        // from the reference, four rows per step (`h` is 4, 8 or 16).
         unsafe {
-            let (mut d, mut s) = (dst.as_mut_ptr(), src.as_ptr().add(off));
-            for _ in 0..h / 2 {
-                match w {
-                    16 => {
-                        let mut a = _mm_loadu_si128(s as *const __m128i);
-                        let mut b = _mm_loadu_si128(s.add(ss) as *const __m128i);
-                        if AVG {
-                            a = _mm_avg_epu8(a, _mm_loadu_si128(d as *const __m128i));
-                            b = _mm_avg_epu8(b, _mm_loadu_si128(d.add(ds) as *const __m128i));
-                        }
-                        _mm_storeu_si128(d as *mut __m128i, a);
-                        _mm_storeu_si128(d.add(ds) as *mut __m128i, b);
-                    }
-                    8 => {
-                        let mut a = _mm_loadl_epi64(s as *const __m128i);
-                        let mut b = _mm_loadl_epi64(s.add(ss) as *const __m128i);
-                        if AVG {
-                            a = _mm_avg_epu8(a, _mm_loadl_epi64(d as *const __m128i));
-                            b = _mm_avg_epu8(b, _mm_loadl_epi64(d.add(ds) as *const __m128i));
-                        }
-                        _mm_storel_epi64(d as *mut __m128i, a);
-                        _mm_storel_epi64(d.add(ds) as *mut __m128i, b);
-                    }
-                    _ => {
-                        let ld =
-                            |p: *const u8| _mm_cvtsi32_si128((p as *const i32).read_unaligned());
-                        let mut a = ld(s);
-                        let mut b = ld(s.add(ss));
-                        if AVG {
-                            a = _mm_avg_epu8(a, ld(d));
-                            b = _mm_avg_epu8(b, ld(d.add(ds)));
-                        }
-                        (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(a));
-                        (d.add(ds) as *mut i32).write_unaligned(_mm_cvtsi128_si32(b));
-                    }
-                }
-                s = s.add(2 * ss);
-                d = d.add(2 * ds);
+            match w {
+                16 => copy_rows_avx2::<16, AVG>(d, ds, s, ss, h),
+                8 => copy_rows_avx2::<8, AVG>(d, ds, s, ss, h),
+                _ => copy_rows_avx2::<4, AVG>(d, ds, s, ss, h),
             }
         }
         return;
     }
     if w == 16 {
-        unsafe { luma_avx2_w::<16, AVG>(dst, ds, src, off, ss, w, h, mx, my) }
+        unsafe { luma_avx2_w::<16, AVG>(d, ds, s, ss, w, h, mx, my) }
     } else {
-        unsafe { luma_avx2_w::<8, AVG>(dst, ds, src, off, ss, w, h, mx, my) }
+        unsafe { luma_avx2_w::<8, AVG>(d, ds, s, ss, w, h, mx, my) }
     }
 }
 
@@ -974,6 +1177,50 @@ unsafe fn hv_lowpass_avx2<const W: usize>(
     }
 }
 
+/// Copies (with `AVG`, averages into `d`) `h` rows of `W` samples, `h` a multiple of 4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn copy_rows_avx2<const W: usize, const AVG: bool>(
+    mut d: *mut u8,
+    ds: usize,
+    mut s: *const u8,
+    ss: usize,
+    h: usize,
+) {
+    use std::arch::x86_64::*;
+    let ld = |p: *const u8| unsafe {
+        match W {
+            16 => _mm_loadu_si128(p as *const __m128i),
+            8 => _mm_loadl_epi64(p as *const __m128i),
+            _ => _mm_cvtsi32_si128((p as *const i32).read_unaligned()),
+        }
+    };
+    let st = |p: *mut u8, v: __m128i| unsafe {
+        match W {
+            16 => _mm_storeu_si128(p as *mut __m128i, v),
+            8 => _mm_storel_epi64(p as *mut __m128i, v),
+            _ => (p as *mut i32).write_unaligned(_mm_cvtsi128_si32(v)),
+        }
+    };
+    for _ in 0..h / 4 {
+        for r in 0..4 {
+            unsafe {
+                let (dr, sr) = (d.add(r * ds), s.add(r * ss));
+                let mut v = ld(sr);
+                if AVG {
+                    v = _mm_avg_epu8(v, ld(dr));
+                }
+                st(dr, v);
+            }
+        }
+        unsafe {
+            d = d.add(4 * ds);
+            s = s.add(4 * ss);
+        }
+    }
+}
+
 /// Copies `rows` rows of `W` samples from `s` into `t` (stride 16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -988,10 +1235,9 @@ unsafe fn copy_avx2<const W: usize>(t: *mut u8, ts: usize, s: *const u8, ss: usi
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn luma_avx2_w<const W: usize, const AVG: bool>(
-    dst: &mut [u8],
+    dst: *mut u8,
     ds: usize,
-    src: &[u8],
-    off: usize,
+    s: *const u8,
     ss: usize,
     w: usize,
     h: usize,
@@ -1000,7 +1246,6 @@ unsafe fn luma_avx2_w<const W: usize, const AVG: bool>(
 ) {
     use std::arch::x86_64::*;
     use x86::*;
-    let s = unsafe { src.as_ptr().add(off) };
     // Scratch rows are only read after being written, through raw pointers, so they need no
     // initialisation.
     let mut b0 = std::mem::MaybeUninit::<[u8; 256]>::uninit();
@@ -1009,11 +1254,7 @@ unsafe fn luma_avx2_w<const W: usize, const AVG: bool>(
     // A phase that is one filter's output is written straight to `dst` when the block is as
     // wide as the vectors; otherwise t0 (and t1 when two samples are averaged) per Table 8-12.
     let direct = !AVG && w == W && matches!((mx, my), (0, 0) | (2, 0) | (0, 2) | (2, 2));
-    let (o, os) = if direct {
-        (dst.as_mut_ptr(), ds)
-    } else {
-        (t0, 16)
-    };
+    let (o, os) = if direct { (dst, ds) } else { (t0, 16) };
     let two = unsafe {
         match (mx, my) {
             (0, 0) => {
@@ -1064,7 +1305,7 @@ unsafe fn luma_avx2_w<const W: usize, const AVG: bool>(
             if two {
                 v = _mm_avg_epu8(v, load::<W>(t1.add(r * 16)));
             }
-            let d = dst.as_mut_ptr().add(r * ds);
+            let d = dst.add(r * ds);
             match w {
                 16 => {
                     if AVG {
@@ -1180,6 +1421,109 @@ unsafe fn chroma_avx2<const AVG: bool>(
             for r in 0..h {
                 let bot = row(r + 1);
                 let v = _mm_add_epi16(_mm_maddubs_epi16(top, ab), _mm_maddubs_epi16(bot, cd));
+                store(r, round(v));
+                top = bot;
+            }
+        }
+    }
+}
+
+/// [`chroma_avx2`] for two planes at once: each 256-bit row holds the first plane's row in its
+/// low lane and the second's in its high lane, so one multiply-add filters both.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn chroma_pair_avx2<const AVG: bool>(
+    [d0, d1]: [*mut u8; 2],
+    ds: usize,
+    [s0, s1]: [*const u8; 2],
+    ss: usize,
+    w: usize,
+    h: usize,
+    fx: u8,
+    fy: u8,
+) {
+    use std::arch::x86_64::*;
+    let (fx, fy) = (fx as i16, fy as i16);
+    // Row `r` of both planes, 16 bytes from column 0 of the block.
+    let ld = |r: usize| unsafe {
+        _mm256_loadu2_m128i(
+            s1.add(r * ss) as *const __m128i,
+            s0.add(r * ss) as *const __m128i,
+        )
+    };
+    // The block's `w` samples of both planes' row `r`, from the low 8 bytes of each lane.
+    let store = |r: usize, v: __m256i| unsafe {
+        let (lo, hi) = (_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        for (d, v) in [(d0.add(r * ds), lo), (d1.add(r * ds), hi)] {
+            match w {
+                8 => {
+                    let v = if AVG {
+                        _mm_avg_epu8(v, _mm_loadl_epi64(d as *const __m128i))
+                    } else {
+                        v
+                    };
+                    _mm_storel_epi64(d as *mut __m128i, v)
+                }
+                4 => {
+                    let v = if AVG {
+                        _mm_avg_epu8(v, _mm_cvtsi32_si128((d as *const i32).read_unaligned()))
+                    } else {
+                        v
+                    };
+                    (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(v))
+                }
+                _ => {
+                    let v = if AVG {
+                        let p = (d as *const u16).read_unaligned() as i32;
+                        _mm_avg_epu8(v, _mm_cvtsi32_si128(p))
+                    } else {
+                        v
+                    };
+                    (d as *mut u16).write_unaligned(_mm_cvtsi128_si32(v) as u16)
+                }
+            }
+        }
+    };
+    let r32 = _mm256_set1_epi16(32);
+    let round = |v: __m256i| {
+        let v = _mm256_srli_epi16::<6>(_mm256_add_epi16(v, r32));
+        _mm256_packus_epi16(v, v)
+    };
+    // (s[c], s[c + 1]) byte pairs of a row, per lane.
+    let pairs = |v: __m256i| _mm256_unpacklo_epi8(v, _mm256_srli_si256::<1>(v));
+    match (fx, fy) {
+        (0, 0) => {
+            for r in 0..h {
+                store(r, ld(r));
+            }
+        }
+        (_, 0) => {
+            let ab = _mm256_set1_epi16((fx << 11) | ((8 - fx) << 3));
+            for r in 0..h {
+                store(r, round(_mm256_maddubs_epi16(pairs(ld(r)), ab)));
+            }
+        }
+        (0, _) => {
+            let ac = _mm256_set1_epi16((fy << 11) | ((8 - fy) << 3));
+            let mut top = ld(0);
+            for r in 0..h {
+                let bot = ld(r + 1);
+                store(
+                    r,
+                    round(_mm256_maddubs_epi16(_mm256_unpacklo_epi8(top, bot), ac)),
+                );
+                top = bot;
+            }
+        }
+        _ => {
+            let ab = _mm256_set1_epi16(((fx * (8 - fy)) << 8) | ((8 - fx) * (8 - fy)));
+            let cd = _mm256_set1_epi16(((fx * fy) << 8) | ((8 - fx) * fy));
+            let mut top = pairs(ld(0));
+            for r in 0..h {
+                let bot = pairs(ld(r + 1));
+                let v =
+                    _mm256_add_epi16(_mm256_maddubs_epi16(top, ab), _mm256_maddubs_epi16(bot, cd));
                 store(r, round(v));
                 top = bot;
             }
@@ -1633,6 +1977,131 @@ mod tests {
                         h264_chroma_mc_avg(&mut a, ds, &src, off, pw, w, h, fx, fy);
                         h264_chroma_mc_avg_scalar(&mut b, ds, &src, off, pw, w, h, fx, fy);
                         assert_eq!(a, b, "avg {w}x{h} phase ({fx}, {fy}) at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_table_matches_slice_kernels() {
+        let k = H264McKernels::new();
+        let (ss, rows) = (40, 32);
+        let src = plane(ss, rows, 7);
+        let src2 = plane(ss, rows, 11);
+        for avg in [false, true] {
+            for &(w, h) in &[(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
+                for mx in 0..4u8 {
+                    for my in 0..4u8 {
+                        let off = 3 * ss + 5;
+                        let init = plane(17, 16, (w * h) as u32 + mx as u32);
+                        let mut a = init.clone();
+                        let mut b = init.clone();
+                        unsafe {
+                            k.luma(
+                                avg,
+                                a.as_mut_ptr(),
+                                17,
+                                src.as_ptr().add(off),
+                                ss,
+                                w,
+                                h,
+                                mx,
+                                my,
+                            )
+                        };
+                        if avg {
+                            h264_luma_mc_avg(&mut b, 17, &src, off, ss, w, h, mx, my);
+                        } else {
+                            h264_luma_mc(&mut b, 17, &src, off, ss, w, h, mx, my);
+                        }
+                        assert_eq!(a, b, "luma {w}x{h} ({mx}, {my}) avg {avg}");
+                    }
+                }
+            }
+            for &(w, h) in &[(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)] {
+                for fx in 0..8u8 {
+                    for fy in 0..8u8 {
+                        let off = 2 * ss + 3;
+                        let init = plane(9, 8, (w * h) as u32 + fy as u32);
+                        let (mut a0, mut a1) = (init.clone(), init.clone());
+                        let (mut b0, mut b1) = (init.clone(), init.clone());
+                        unsafe {
+                            let src = [src.as_ptr().add(off), src2.as_ptr().add(off)];
+                            k.chroma_pair(
+                                avg,
+                                [a0.as_mut_ptr(), a1.as_mut_ptr()],
+                                9,
+                                src,
+                                ss,
+                                w,
+                                h,
+                                fx,
+                                fy,
+                            )
+                        };
+                        for (b, s) in [(&mut b0, &src), (&mut b1, &src2)] {
+                            if avg {
+                                h264_chroma_mc_avg(b, 9, s, off, ss, w, h, fx, fy);
+                            } else {
+                                h264_chroma_mc(b, 9, s, off, ss, w, h, fx, fy);
+                            }
+                        }
+                        assert_eq!((a0, a1), (b0, b1), "chroma {w}x{h} ({fx}, {fy}) avg {avg}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_pair_matches_two_single_planes() {
+        let (pw, ph) = (37, 29);
+        // Without padding, and with the padding past the planes that decoders' buffers have.
+        for pad in [0, 64] {
+            let mut s0 = plane(pw, ph, 13);
+            let mut s1 = plane(pw, ph, 17);
+            s0.resize(pw * ph + pad, 0);
+            s1.resize(pw * ph + pad, 0);
+            for &(w, h) in &[(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)] {
+                for &(x, y) in &[(0, 0), (3, 5), (pw - 9, ph - h - 1), (pw - w, ph - h)] {
+                    for mvx in -9..9i16 {
+                        for mvy in [-9i16, -3, 0, 1, 5, 8] {
+                            for avg in [false, true] {
+                                let ds = 11;
+                                let mv = [mvx, mvy];
+                                let init = plane(ds, 8, (x * 3 + y) as u32);
+                                let (mut a0, mut a1) = (init.clone(), init.clone());
+                                let (mut b0, mut b1) = (init.clone(), init.clone());
+                                let at = ((x, y), (w, h));
+                                let ok = h264_chroma_pair_mc_in_plane(
+                                    [&mut a0, &mut a1],
+                                    ds,
+                                    [&s0, &s1],
+                                    pw,
+                                    ph,
+                                    at.0,
+                                    at.1,
+                                    mv,
+                                    avg,
+                                );
+                                let ok0 = h264_chroma_mc_in_plane(
+                                    &mut b0, ds, &s0, pw, ph, at.0, at.1, mv, avg,
+                                );
+                                let ok1 = h264_chroma_mc_in_plane(
+                                    &mut b1, ds, &s1, pw, ph, at.0, at.1, mv, avg,
+                                );
+                                assert_eq!((ok, ok), (ok0, ok1), "{w}x{h} at ({x}, {y}) mv {mv:?}");
+                                assert_eq!(
+                                    a0, b0,
+                                    "plane 0 {w}x{h} at ({x}, {y}) mv {mv:?} avg {avg}"
+                                );
+                                assert_eq!(
+                                    a1, b1,
+                                    "plane 1 {w}x{h} at ({x}, {y}) mv {mv:?} avg {avg}"
+                                );
+                            }
+                        }
                     }
                 }
             }

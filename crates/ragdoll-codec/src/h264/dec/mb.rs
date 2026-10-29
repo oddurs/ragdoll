@@ -150,7 +150,20 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         whole: cx.slice_num == 0 && cx.sh.first_mb == 0,
         res: None,
         waits: cx.refs.iter().flatten().any(|r| r.sync.is_some()),
+        col_prefetch: cx.sh.slice_type.is_b() && !st_mbaff && st_structure == Structure::Frame,
+        mck: ragdoll_simd::H264McKernels::new(),
+        mc_fast: false,
+        mc_direct: false,
+        weighted: false,
     };
+    let n = d.st.width * d.st.height;
+    d.mc_fast = d.simple
+        && d.st.planes[0].len() >= n
+        && d.cx.refs.iter().flatten().all(|r| {
+            r.planes[0].len() >= n && r.planes[1].len() >= n / 4 && r.planes[2].len() >= n / 4
+        });
+    d.mc_direct = d.mc_fast && !d.waits;
+    d.weighted = d.cx.sh.weights.is_some() || !d.implicit.is_empty();
     let r = d.run(first, total);
     if r.is_err() {
         // Filtering resumes after undecoded macroblocks are restored.
@@ -281,6 +294,18 @@ struct Dec<'a, 'c> {
     /// Some reference picture is still being decoded on another thread: inter prediction waits
     /// for the rows it reads.
     waits: bool,
+    /// A frame B slice: direct prediction reads RefPicList1[0]'s motion, prefetched ahead.
+    col_prefetch: bool,
+    /// Inter-prediction kernels of [`Self::mc_pred`].
+    mck: ragdoll_simd::H264McKernels,
+    /// [`Self::simple`], and every reference picture's planes are as large as the picture's:
+    /// inter prediction takes [`Self::mc_rect_simple`].
+    mc_fast: bool,
+    /// [`Self::mc_fast`] without references still being decoded: macroblocks of one motion
+    /// take [`Self::mc_whole`].
+    mc_direct: bool,
+    /// The slice has explicit or implicit weights.
+    weighted: bool,
 }
 
 impl<'a, 'c> Dec<'a, 'c> {
@@ -530,6 +555,13 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (x, y, w, a) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
         self.nb_addr = addr;
         self.st.row_mb(addr, x, y);
+        self.st.prefetch_mb_blocks(x + 2, y);
+        // Direct prediction reads the co-located macroblock's corner blocks.
+        if self.col_prefetch
+            && let Some(m) = self.cx.refs[1].first().and_then(|r| r.motion.as_deref())
+        {
+            m.prefetch_corners(x + 2, y, w);
+        }
         if self.whole {
             let (l, t, r) = (x > 0, y > 0, x + 1 < w);
             self.nb = (l as u8 * NB_L)
@@ -1614,6 +1646,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
     }
 
+    #[inline(never)]
     fn read_residual_with<const CABAC: bool>(
         &mut self,
         cbp: u8,
@@ -2041,6 +2074,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Neighbours A, B and C (D where C is unavailable) of the whole macroblock in both lists,
     /// as for a 16x16 partition's predictor (8.4.1.3.2).
+    #[inline(always)]
     fn mb_neighbours(&self) -> [[Mv; 3]; 2] {
         if self.st.mbaff {
             let a = self.neighbour_pair(-1, 0, 0);
@@ -2706,26 +2740,77 @@ impl<'a, 'c> Dec<'a, 'c> {
         if r < 0 || !self.simple {
             return;
         }
-        let Some(rp) = self.cx.refs[list].get(r as usize) else {
-            return;
-        };
+        if let Some(rp) = self.cx.refs[list].get(r as usize) {
+            self.prefetch_ref(rp, b.mv[list]);
+        }
+    }
+
+    /// [`Self::prefetch_motion`] from reference `r` and vector `mv`.
+    #[inline(always)]
+    fn prefetch_ref(&self, r: &RefPic, mv: [i16; 2]) {
         let w = self.st.width as isize;
         let (x, y) = ((self.mb.x * 16) as isize, (self.mb.y * 16) as isize);
-        let mx = (b.mv[list][0] >> 2) as isize + x + 8;
-        let my = (b.mv[list][1] >> 2) as isize + y;
+        let mx = (mv[0] >> 2) as isize + x + 8;
+        let my = (mv[1] >> 2) as isize + y;
         // Negative offsets wrap to huge ones, which the prefetch skips.
         let luma = (my + (self.mb.x & 3) as isize * 4) * w + mx + 64;
-        ragdoll_simd::prefetch_rows::<4>(&rp.planes[0], luma as usize, w as usize);
+        ragdoll_simd::prefetch_rows::<4>(&r.planes[0], luma as usize, w as usize);
         let chroma = ((my >> 1) + (self.mb.x & 7) as isize) * (w / 2) + (mx >> 1) + 64;
-        ragdoll_simd::prefetch_rows::<1>(&rp.planes[1], chroma as usize, 0);
-        ragdoll_simd::prefetch_rows::<1>(&rp.planes[2], chroma as usize, 0);
+        ragdoll_simd::prefetch_rows::<1>(&r.planes[1], chroma as usize, 0);
+        ragdoll_simd::prefetch_rows::<1>(&r.planes[2], chroma as usize, 0);
     }
 
     fn inter_predict_mb(&mut self) -> Result<()> {
+        if self.mc_direct && !self.partial_motion {
+            return self.mc_whole();
+        }
         self.prefetch_motion(0);
         let r = self.inter_predict_parts();
         self.prefetch_motion(1);
         r
+    }
+
+    /// [`Self::inter_predict_mb`] for a macroblock with one motion throughout when
+    /// [`Self::mc_direct`]: straight to [`Self::mc_pred`], or [`Self::mc_pred_weighted`].
+    fn mc_whole(&mut self) -> Result<()> {
+        let a = self.mb.addr;
+        self.st.motion_edges[a] = 0;
+        let b = self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
+        let lists = &self.cx.refs;
+        let pic = |l: usize| -> Result<Option<&'c RefPic>> {
+            match b.ref_idx[l] {
+                r if r < 0 => Ok(None),
+                r => lists[l]
+                    .get(r as usize)
+                    .map(Some)
+                    .ok_or_else(|| bad("H.264 ref_idx beyond list")),
+            }
+        };
+        let (x, y) = (self.mb.x * 16, self.mb.y * 16);
+        let rp = [pic(0)?, pic(1)?];
+        if self.weighted
+            && let Some(wt) = self.block_weights(rp.map(|r| r.is_some()), b.ref_idx)
+        {
+            self.mc_pred_weighted(rp, b.mv, x, y, 16, 16, wt);
+            return Ok(());
+        }
+        match rp {
+            [Some(r), None] => {
+                self.prefetch_ref(r, b.mv[0]);
+                self.mc_pred(r, b.mv[0], x, y, 16, 16, false);
+            }
+            [None, Some(r)] => {
+                self.prefetch_ref(r, b.mv[1]);
+                self.mc_pred(r, b.mv[1], x, y, 16, 16, false);
+            }
+            [Some(r0), Some(r1)] => {
+                self.prefetch_ref(r0, b.mv[0]);
+                self.mc_pred(r0, b.mv[0], x, y, 16, 16, false);
+                self.mc_pred(r1, b.mv[1], x, y, 16, 16, true);
+            }
+            [None, None] => return Err(bad("H.264 inter block without prediction")),
+        }
+        Ok(())
     }
 
     fn inter_predict_parts(&mut self) -> Result<()> {
@@ -2906,9 +2991,13 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         };
         let rp = [pic(0)?, pic(1)?];
-        let (pw, ph) = (self.st.width, self.st.height);
-        if EXPLICIT && let Some(wl) = self.explicit_weighting(rp.map(|r| r.is_some()), refs) {
-            self.mc_rect_weighted(rp, refs, wl, 0, pw, x, y, w, h, pw, ph, mvs);
+        if EXPLICIT
+            && self
+                .explicit_weighting(rp.map(|r| r.is_some()), refs)
+                .is_some()
+        {
+            let wt = [0, 1, 2].map(|c| self.weighting(refs, c));
+            self.mc_pred_weighted(rp, mvs, x, y, w, h, wt);
             return Ok(());
         }
         match rp {
@@ -2919,46 +3008,248 @@ impl<'a, 'c> Dec<'a, 'c> {
                 // Implicit weights of 32 each are default bi-prediction (8.4.2.3).
                 if (w0, w1) != (32, 32) {
                     let wt = Weighting::Weighted(5, [(w0, 0), (w1, 0)]);
-                    self.mc_rect_weighted(rp, refs, wt, 0, pw, x, y, w, h, pw, ph, mvs);
+                    self.mc_pred_weighted(rp, mvs, x, y, w, h, [wt; 3]);
                     return Ok(());
                 }
             }
             _ => {}
         }
-        let dst = &mut self.st.planes[0][y * pw + x..];
         match rp {
-            [Some(r), None] | [None, Some(r)] => {
-                let l = rp[0].is_none() as usize;
-                recon::mc_luma::<false>(&r.planes[0], pw, ph, x, y, w, h, mvs[l], dst, pw);
-            }
+            [Some(r), None] => self.mc_pred(r, mvs[0], x, y, w, h, false),
+            [None, Some(r)] => self.mc_pred(r, mvs[1], x, y, w, h, false),
             [Some(r0), Some(r1)] => {
-                recon::mc_luma::<false>(&r0.planes[0], pw, ph, x, y, w, h, mvs[0], dst, pw);
-                recon::mc_luma::<true>(&r1.planes[0], pw, ph, x, y, w, h, mvs[1], dst, pw);
-            }
-            [None, None] => {}
-        }
-        let (cs, cph) = (pw / 2, ph / 2);
-        let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
-        let d = cy * cs + cx;
-        let [pcb, pcr] = self.st.planes.chroma_mut();
-        let (dcb, dcr) = (&mut pcb[d..], &mut pcr[d..]);
-        fn src(r: &RefPic) -> [&[u8]; 2] {
-            [&r.planes[1], &r.planes[2]]
-        }
-        match rp {
-            [Some(r), None] | [None, Some(r)] => {
-                let mv = mvs[rp[0].is_none() as usize];
-                recon::mc_chroma_pair::<false>(src(r), cs, cph, cx, cy, cw, ch, mv, [dcb, dcr], cs);
-            }
-            [Some(r0), Some(r1)] => {
-                let dst = [&mut *dcb, &mut *dcr];
-                recon::mc_chroma_pair::<false>(src(r0), cs, cph, cx, cy, cw, ch, mvs[0], dst, cs);
-                let dst = [dcb, dcr];
-                recon::mc_chroma_pair::<true>(src(r1), cs, cph, cx, cy, cw, ch, mvs[1], dst, cs);
+                self.mc_pred(r0, mvs[0], x, y, w, h, false);
+                self.mc_pred(r1, mvs[1], x, y, w, h, true);
             }
             [None, None] => {}
         }
         Ok(())
+    }
+
+    /// Predicts the `w`x`h` luma block at `(x, y)` and its chroma blocks from `r` displaced by
+    /// `mv`, written to the picture (with `avg`, averaged into it), for a progressive 4:2:0
+    /// frame whose references' planes are as large as its own ([`Self::mc_fast`]).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn mc_pred(&self, r: &RefPic, mv: [i16; 2], x: usize, y: usize, w: usize, h: usize, avg: bool) {
+        let pw = self.st.width;
+        let [(dy, _), (dcb, _), (dcr, _)] = self.st.planes.raw_all();
+        let (cs, cx, cy) = (pw / 2, x / 2, y / 2);
+        // Safety: the destination blocks lie inside the picture's planes, which no reference
+        // shares.
+        unsafe {
+            self.luma_into(r, mv, x, y, w, h, avg, dy.add(y * pw + x), pw);
+            let d = cy * cs + cx;
+            self.chroma_into(
+                r,
+                mv,
+                cx,
+                cy,
+                w / 2,
+                h / 2,
+                avg,
+                [dcb.add(d), dcr.add(d)],
+                cs,
+            );
+        }
+    }
+
+    /// [`Self::mc_pred`] with weighted prediction `wt` (luma, Cb, Cr) from the references in
+    /// `rp`: each list is predicted into scratch blocks, which the weights then combine.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn mc_pred_weighted(
+        &self,
+        rp: [Option<&RefPic>; 2],
+        mvs: [[i16; 2]; 2],
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        wt: [Weighting; 3],
+    ) {
+        let pw = self.st.width;
+        let [(dy, ny), (dcb, nc), (dcr, _)] = self.st.planes.raw_all();
+        let (cs, cx, cy, cw, ch) = (pw / 2, x / 2, y / 2, w / 2, h / 2);
+        let used = rp.map(|r| r.is_some());
+        // Per list: luma at 0 (stride 16), or Cb at 0 and Cr at 128 (stride 16, 8 rows).
+        let mut t = [[0u8; 256]; 2];
+        for (l, r) in rp.iter().enumerate() {
+            if let Some(r) = r {
+                // Safety: the scratch block holds `h` rows of 16.
+                unsafe { self.luma_into(r, mvs[l], x, y, w, h, false, t[l].as_mut_ptr(), 16) };
+            }
+        }
+        let d = y * pw + x;
+        // Safety: the destination block lies inside the picture's plane, which no reference
+        // shares.
+        let dst = unsafe { std::slice::from_raw_parts_mut(dy.add(d), ny - d) };
+        combine(dst, pw, [&t[0][..], &t[1][..]], w, h, used, wt[0]);
+        for (l, r) in rp.iter().enumerate() {
+            if let Some(r) = r {
+                let p = t[l].as_mut_ptr();
+                // Safety: the scratch blocks hold `ch` rows of 16 each.
+                unsafe { self.chroma_into(r, mvs[l], cx, cy, cw, ch, false, [p, p.add(128)], 16) };
+            }
+        }
+        let d = cy * cs + cx;
+        for (c, base) in [(1, dcb), (2, dcr)] {
+            // Safety: as for luma.
+            let dst = unsafe { std::slice::from_raw_parts_mut(base.add(d), nc - d) };
+            let o = (c - 1) * 128;
+            combine(
+                dst,
+                cs,
+                [&t[0][o..o + 128], &t[1][o..o + 128]],
+                cw,
+                ch,
+                used,
+                wt[c],
+            );
+        }
+
+        /// `dst = ` the lists' predictions `t` combined per `wt` (8.4.2.3).
+        fn combine(
+            dst: &mut [u8],
+            ds: usize,
+            t: [&[u8]; 2],
+            w: usize,
+            h: usize,
+            used: [bool; 2],
+            wt: Weighting,
+        ) {
+            use ragdoll_simd::{h264_avg, h264_weight_bi, h264_weight_uni};
+            match (used, recon::effective_weighting(used, wt)) {
+                ([true, true], Weighting::Weighted(lw, [(w0, o0), (w1, o1)])) => h264_weight_bi(
+                    dst,
+                    ds,
+                    t[0],
+                    t[1],
+                    16,
+                    w,
+                    h,
+                    lw,
+                    w0,
+                    w1,
+                    (o0 + o1 + 1) >> 1,
+                ),
+                ([true, false], Weighting::Weighted(lw, [(w0, o0), _])) => {
+                    h264_weight_uni(dst, ds, t[0], 16, w, h, lw, w0, o0)
+                }
+                ([false, true], Weighting::Weighted(lw, [_, (w1, o1)])) => {
+                    h264_weight_uni(dst, ds, t[1], 16, w, h, lw, w1, o1)
+                }
+                (u, _) => {
+                    let first = if u[0] { 0 } else { 1 };
+                    for r in 0..h {
+                        dst[r * ds..r * ds + w].copy_from_slice(&t[first][r * 16..r * 16 + w]);
+                    }
+                    if u == [true, true] {
+                        h264_avg(dst, ds, t[1], 16, w, h);
+                    }
+                }
+            }
+        }
+    }
+
+    /// When [`Self::weighted`]: the weights (luma, Cb, Cr) of a block predicted from the lists
+    /// in `used` with `refs`, or `None` when they reduce to default prediction.
+    #[inline]
+    fn block_weights(&self, used: [bool; 2], refs: [i8; 2]) -> Option<[Weighting; 3]> {
+        if self.cx.sh.weights.is_some() {
+            self.explicit_weighting(used, refs)?;
+            return Some([0, 1, 2].map(|c| self.weighting(refs, c)));
+        }
+        if used != [true, true] || self.implicit.is_empty() {
+            return None;
+        }
+        let n1 = self.cx.refs[1].len();
+        let [w0, w1] = self.implicit[refs[0] as usize * n1 + refs[1] as usize];
+        // Implicit weights of 32 each are default bi-prediction (8.4.2.3).
+        ((w0, w1) != (32, 32)).then_some([Weighting::Weighted(5, [(w0, 0), (w1, 0)]); 3])
+    }
+
+    /// Luma inter prediction of the `w`x`h` block at `(x, y)` from `r` displaced by `mv`, into
+    /// `dst` (stride `ds`; with `avg`, averaged into it).
+    ///
+    /// # Safety
+    /// Rows `0..h` of `dst`, `w` samples each, are writable and are no reference's samples.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn luma_into(
+        &self,
+        r: &RefPic,
+        mv: [i16; 2],
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        avg: bool,
+        dst: *mut u8,
+        ds: usize,
+    ) {
+        let (pw, ph) = (self.st.width, self.st.height);
+        let (mvx, mvy) = (mv[0] as isize, mv[1] as isize);
+        let (ix, iy) = (x as isize + (mvx >> 2), y as isize + (mvy >> 2));
+        if ix >= 2
+            && iy >= 2
+            && ix as usize + ragdoll_simd::h264_mc::luma_mc_cols(w) <= pw
+            && iy as usize + h + 3 <= ph
+        {
+            // Safety: the reads lie inside the reference's plane, as large as the picture's
+            // (`mc_fast`); the caller vouches for `dst`.
+            unsafe {
+                let src = r.planes[0].as_ptr().add(iy as usize * pw + ix as usize);
+                let (mx, my) = ((mvx & 3) as u8, (mvy & 3) as u8);
+                self.mck.luma(avg, dst, ds, src, pw, w, h, mx, my);
+            }
+        } else {
+            // Safety: as the caller vouches.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst, (h - 1) * ds + w) };
+            mc_luma_edge(r, mv, (pw, ph), x, y, w, h, avg, dst, ds);
+        }
+    }
+
+    /// [`Self::luma_into`] for the `w`x`h` chroma blocks at `(x, y)` of both chroma planes.
+    ///
+    /// # Safety
+    /// As [`Self::luma_into`], for each of `dst`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn chroma_into(
+        &self,
+        r: &RefPic,
+        mv: [i16; 2],
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        avg: bool,
+        dst: [*mut u8; 2],
+        ds: usize,
+    ) {
+        let (cs, cph) = (self.st.width / 2, self.st.height / 2);
+        let (mvx, mvy) = (mv[0] as isize, mv[1] as isize);
+        let (ix, iy) = (x as isize + (mvx >> 3), y as isize + (mvy >> 3));
+        if ix >= 0
+            && iy >= 0
+            && ix as usize + ragdoll_simd::h264_mc::chroma_mc_cols(w) <= cs
+            && iy as usize + h < cph
+        {
+            // Safety: as for luma. The kernel reads 16 bytes from each row's start, up to 7
+            // past the block's last column: inside the plane, or in the zeroed padding every
+            // `AlignedBuffer` has past its end.
+            unsafe {
+                let o = iy as usize * cs + ix as usize;
+                let src = [r.planes[1].as_ptr().add(o), r.planes[2].as_ptr().add(o)];
+                let (fx, fy) = ((mvx & 7) as u8, (mvy & 7) as u8);
+                self.mck.chroma_pair(avg, dst, ds, src, cs, w, h, fx, fy);
+            }
+        } else {
+            // Safety: as the caller vouches.
+            let dst = dst.map(|d| unsafe { std::slice::from_raw_parts_mut(d, (h - 1) * ds + w) });
+            mc_chroma_edge(r, mv, (cs, cph), x, y, w, h, avg, dst, ds);
+        }
     }
 
     fn mc_rect(
@@ -2974,11 +3265,29 @@ impl<'a, 'c> Dec<'a, 'c> {
             if self.waits {
                 self.wait_refs(by, h4, refs, mvs);
             }
-            if self.cx.sh.weights.is_some() {
+            if self.cx.sh.weights.is_some() && self.mc_fast {
                 return self.mc_rect_simple_explicit(bx, by, w4, h4, refs, mvs);
             }
-            return self.mc_rect_simple::<false>(bx, by, w4, h4, refs, mvs);
+            if self.mc_fast {
+                return self.mc_rect_simple::<false>(bx, by, w4, h4, refs, mvs);
+            }
         }
+        self.mc_rect_general(bx, by, w4, h4, refs, mvs)
+    }
+
+    /// [`Self::mc_rect`] for fields, MBAFF and 4:0:0, kept out of line so that the progressive
+    /// path stays small.
+    #[cold]
+    #[inline(never)]
+    fn mc_rect_general(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w4: usize,
+        h4: usize,
+        refs: [i8; 2],
+        mvs: [[i16; 2]; 2],
+    ) -> Result<()> {
         let (w, h) = (w4 * 4, h4 * 4);
         let (o, ls, px, py) = self.view(0);
         let (x, y) = (px + bx * 4, py + by * 4);
@@ -3265,4 +3574,51 @@ fn rect_mask(bx: usize, by: usize, w: usize, h: usize) -> u16 {
         }
     }
     m
+}
+
+/// [`Dec::luma_into`] for a block reading past the reference picture (`pw`x`ph`).
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn mc_luma_edge(
+    r: &RefPic,
+    mv: [i16; 2],
+    (pw, ph): (usize, usize),
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    avg: bool,
+    dst: &mut [u8],
+    ds: usize,
+) {
+    if avg {
+        recon::mc_luma::<true>(&r.planes[0], pw, ph, x, y, w, h, mv, dst, ds);
+    } else {
+        recon::mc_luma::<false>(&r.planes[0], pw, ph, x, y, w, h, mv, dst, ds);
+    }
+}
+
+/// [`Dec::chroma_into`] for blocks reading past the reference picture (chroma `cw`x`ch`).
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn mc_chroma_edge(
+    r: &RefPic,
+    mv: [i16; 2],
+    (cw, ch): (usize, usize),
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    avg: bool,
+    dst: [&mut [u8]; 2],
+    ds: usize,
+) {
+    let src = [&r.planes[1][..], &r.planes[2][..]];
+    if avg {
+        recon::mc_chroma_pair::<true>(src, cw, ch, x, y, w, h, mv, dst, ds);
+    } else {
+        recon::mc_chroma_pair::<false>(src, cw, ch, x, y, w, h, mv, dst, ds);
+    }
 }

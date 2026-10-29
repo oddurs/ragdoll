@@ -84,11 +84,11 @@ pub use h264_intra::{
     h264_pred8x8l_scalar, h264_pred16x16, h264_pred16x16_scalar,
 };
 pub use h264_mc::{
-    chroma_mc_cols, h264_avg, h264_avg_scalar, h264_chroma_mc, h264_chroma_mc_avg,
-    h264_chroma_mc_avg_scalar, h264_chroma_mc_in_plane, h264_chroma_mc_scalar, h264_luma_mc,
-    h264_luma_mc_avg, h264_luma_mc_avg_scalar, h264_luma_mc_in_plane, h264_luma_mc_scalar,
-    h264_weight_bi, h264_weight_bi_scalar, h264_weight_uni, h264_weight_uni_scalar, luma_mc_cols,
-    prefetch_rows,
+    H264McKernels, chroma_mc_cols, h264_avg, h264_avg_scalar, h264_chroma_mc, h264_chroma_mc_avg,
+    h264_chroma_mc_avg_scalar, h264_chroma_mc_in_plane, h264_chroma_mc_scalar,
+    h264_chroma_pair_mc_in_plane, h264_luma_mc, h264_luma_mc_avg, h264_luma_mc_avg_scalar,
+    h264_luma_mc_in_plane, h264_luma_mc_scalar, h264_weight_bi, h264_weight_bi_scalar,
+    h264_weight_uni, h264_weight_uni_scalar, luma_mc_cols, prefetch_rows,
 };
 pub use metrics::{
     SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, flac_eval_fixed_orders_l1,
