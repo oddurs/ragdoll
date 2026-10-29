@@ -2214,11 +2214,22 @@ impl EncState {
         let mut pu = [0u8; 64];
         let mut pv = [0u8; 64];
 
-        // 1. Skip probe: the skip prediction's residual must decimate to nothing.
+        // 1. Skip probe: the skip prediction's residual must decimate to nothing. The Fast preset
+        // probes only next to a skipped macroblock (`x264` fast P_Skip detection without
+        // sub-pel refinement); elsewhere a vanishing residual at the skip vector is still caught
+        // after the motion search.
         if sl.skip_bounds.qp != qp {
             sl.skip_bounds = SkipBounds::new(qp, qpc);
         }
-        if bounds.contains(pskip_mv) {
+        let probe = !sl.fast || {
+            let (skip, i) = (&self.mb_is_skip, mb_y * mb_w + mb_x);
+            (mb_x > 0 && skip[i - 1])
+                || (mb_y > 0
+                    && (skip[i - mb_w]
+                        || (mb_x > 0 && skip[i - mb_w - 1])
+                        || (mb_x + 1 < mb_w && skip[i - mb_w + 1])))
+        };
+        if probe && bounds.contains(pskip_mv) {
             // Whole-sample vectors are measured on the reference planes in place, and the
             // prediction is copied only when a probe or the reconstruction needs it.
             let int_y = (pskip_mv[0] | pskip_mv[1]) & 3 == 0;
