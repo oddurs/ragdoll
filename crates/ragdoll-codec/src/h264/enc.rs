@@ -519,6 +519,47 @@ static LEVEL_TAB: [[u32; 2 * LEVEL_TAB_MAX as usize]; 7] = {
     t
 };
 
+/// `coeff_token` codes by `nC` class (as [`NC_CLASS`], then chroma DC) and `TotalCoeff * 4 +
+/// TrailingOnes`, packed as `bits << 8 | length`.
+static COEFF_TOKEN: [[u32; 68]; 5] = {
+    let mut t = [[0u32; 68]; 5];
+    let mut c = 0;
+    while c < 4 {
+        let mut k = 0;
+        while k < 68 {
+            t[c][k] = (COEFF_TOKEN_BITS[c][k] as u32) << 8 | COEFF_TOKEN_LEN[c][k] as u32;
+            k += 1;
+        }
+        c += 1;
+    }
+    let mut k = 0;
+    while k < 20 {
+        t[4][k] = (CHROMA_DC_COEFF_TOKEN_BITS[k] as u32) << 8 | CHROMA_DC_COEFF_TOKEN_LEN[k] as u32;
+        k += 1;
+    }
+    t
+};
+
+/// `total_zeros` codes of $4\times4$ blocks, then of chroma DC, by `TotalCoeff - 1` and
+/// `total_zeros`, packed as `bits << 8 | length`.
+static TOTAL_ZEROS: [[[u32; 16]; 15]; 2] = {
+    let mut t = [[[0u32; 16]; 15]; 2];
+    let mut n = 0;
+    while n < 15 {
+        let mut z = 0;
+        while z < 16 {
+            t[0][n][z] = (TOTAL_ZEROS_BITS[n][z] as u32) << 8 | TOTAL_ZEROS_LEN[n][z] as u32;
+            if n < 3 && z < 4 {
+                t[1][n][z] = (CHROMA_DC_TOTAL_ZEROS_BITS[n][z] as u32) << 8
+                    | CHROMA_DC_TOTAL_ZEROS_LEN[n][z] as u32;
+            }
+            z += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
 /// `coeff_token` table of each `nC` (0..=16; larger ones share the last), as
 /// `nc_to_table_idx`, without the branches.
 const NC_CLASS: [u8; 17] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
@@ -540,14 +581,13 @@ fn write_cavlc_block<const N: usize>(w: &mut Bits, coeffs: &[i16; N], nc: u8) {
 /// the mask, so the cost follows the number of coded levels.
 #[inline(always)]
 fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask: u32) {
-    let (token_len, token_bits): (&[u8], &[u8]) = if N == 4 {
-        (&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS)
+    let tokens = &COEFF_TOKEN[if N == 4 {
+        4
     } else {
-        let t = NC_CLASS[nc.min(16) as usize] as usize;
-        (&COEFF_TOKEN_LEN[t], &COEFF_TOKEN_BITS[t])
-    };
+        NC_CLASS[nc.min(16) as usize] as usize
+    }];
     if mask == 0 {
-        w.put32(token_bits[0] as u32, token_len[0] as u32);
+        w.put32(tokens[0] >> 8, tokens[0] & 0xFF);
         return;
     }
     let n = pop16(mask) as usize;
@@ -568,10 +608,10 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         trailing_ones += 1;
         m ^= 1 << p;
     }
-    let tok = n * 4 + trailing_ones;
+    let e = tokens[n * 4 + trailing_ones];
     w.put32(
-        ((token_bits[tok] as u32) << trailing_ones) | signs,
-        token_len[tok] as u32 + trailing_ones as u32,
+        ((e >> 8) << trailing_ones) | signs,
+        (e & 0xFF) + trailing_ones as u32,
     );
 
     if m != 0 {
@@ -612,24 +652,15 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
     }
 
     if n < N {
-        let (l, b) = if N == 4 {
-            (
-                CHROMA_DC_TOTAL_ZEROS_LEN[n - 1][total_zeros],
-                CHROMA_DC_TOTAL_ZEROS_BITS[n - 1][total_zeros],
-            )
-        } else {
-            (
-                TOTAL_ZEROS_LEN[n - 1][total_zeros],
-                TOTAL_ZEROS_BITS[n - 1][total_zeros],
-            )
-        };
+        let tz = TOTAL_ZEROS[usize::from(N == 4)][n - 1][total_zeros & 15];
+        let (l, b) = (tz & 0xFF, tz >> 8);
         // The run_before codes follow (empty without zeros); one write while both fit.
         let e = RUN_BEFORE[mask as usize & 0xFFFF];
         let (rb, rl) = (e >> 5, e & 31);
-        if l as u32 + rl <= 32 {
-            w.put32(((b as u32) << rl) | rb, l as u32 + rl);
+        if l + rl <= 32 {
+            w.put32((b << rl) | rb, l + rl);
         } else {
-            w.put32(b as u32, l as u32);
+            w.put32(b, l);
             w.put32(rb, rl);
         }
     }
@@ -1537,9 +1568,10 @@ impl ChromaLevels {
     /// `coded_block_pattern` chroma: 2 with AC levels, 1 with DC levels only, else 0.
     #[inline(always)]
     fn cbp(&self) -> u8 {
-        if self.ac_masks.iter().flatten().any(|&m| m != 0) {
+        // Folds rather than any(), so the tests vectorize.
+        if self.ac_masks.iter().flatten().fold(0, |a, &m| a | m) != 0 {
             2
-        } else if self.dc.iter().flatten().any(|&c| c != 0) {
+        } else if self.dc.iter().flatten().fold(0, |a, &c| a | c) != 0 {
             1
         } else {
             0
@@ -2981,7 +3013,7 @@ impl EncState {
                 }
             }
         }
-        let any_ac = ac_masks.iter().any(|&m| m != 0);
+        let any_ac = ac_masks.iter().fold(0, |a, &m| a | m) != 0;
         let dc_q = quant_luma_dc(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
@@ -3097,7 +3129,7 @@ impl EncState {
             for (k, blk) in group.iter_mut().enumerate() {
                 blk[0] = dc_recon[Z_TO_RASTER[i8x8 * 4 + k]];
             }
-            if group.iter().flatten().any(|&c| c != 0) {
+            if group.iter().flatten().fold(0, |a, &c| a | c) != 0 {
                 let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
                 add_idct4x4_8x8(&mut pred[o..], 16, group);
             }
