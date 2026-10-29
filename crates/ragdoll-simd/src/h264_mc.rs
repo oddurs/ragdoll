@@ -576,6 +576,53 @@ unsafe fn luma_avx2<const AVG: bool>(
     mx: u8,
     my: u8,
 ) {
+    if (mx, my) == (0, 0) {
+        // Whole-sample blocks (the most common kind): copied, or averaged into `dst`, straight
+        // from the reference, two rows per step (`h` is even).
+        use std::arch::x86_64::*;
+        unsafe {
+            let (mut d, mut s) = (dst.as_mut_ptr(), src.as_ptr().add(off));
+            for _ in 0..h / 2 {
+                match w {
+                    16 => {
+                        let mut a = _mm_loadu_si128(s as *const __m128i);
+                        let mut b = _mm_loadu_si128(s.add(ss) as *const __m128i);
+                        if AVG {
+                            a = _mm_avg_epu8(a, _mm_loadu_si128(d as *const __m128i));
+                            b = _mm_avg_epu8(b, _mm_loadu_si128(d.add(ds) as *const __m128i));
+                        }
+                        _mm_storeu_si128(d as *mut __m128i, a);
+                        _mm_storeu_si128(d.add(ds) as *mut __m128i, b);
+                    }
+                    8 => {
+                        let mut a = _mm_loadl_epi64(s as *const __m128i);
+                        let mut b = _mm_loadl_epi64(s.add(ss) as *const __m128i);
+                        if AVG {
+                            a = _mm_avg_epu8(a, _mm_loadl_epi64(d as *const __m128i));
+                            b = _mm_avg_epu8(b, _mm_loadl_epi64(d.add(ds) as *const __m128i));
+                        }
+                        _mm_storel_epi64(d as *mut __m128i, a);
+                        _mm_storel_epi64(d.add(ds) as *mut __m128i, b);
+                    }
+                    _ => {
+                        let ld =
+                            |p: *const u8| _mm_cvtsi32_si128((p as *const i32).read_unaligned());
+                        let mut a = ld(s);
+                        let mut b = ld(s.add(ss));
+                        if AVG {
+                            a = _mm_avg_epu8(a, ld(d));
+                            b = _mm_avg_epu8(b, ld(d.add(ds)));
+                        }
+                        (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(a));
+                        (d.add(ds) as *mut i32).write_unaligned(_mm_cvtsi128_si32(b));
+                    }
+                }
+                s = s.add(2 * ss);
+                d = d.add(2 * ds);
+            }
+        }
+        return;
+    }
     if w == 16 {
         unsafe { luma_avx2_w::<16, AVG>(dst, ds, src, off, ss, w, h, mx, my) }
     } else {
