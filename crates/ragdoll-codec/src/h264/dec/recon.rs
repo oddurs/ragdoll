@@ -414,6 +414,44 @@ pub fn mc_chroma<const AVG: bool>(
     kernel(dst, ds, &win, 0, EMU_STRIDE, w, h, fx, fy);
 }
 
+/// [`mc_chroma`] for the Cb and Cr blocks of one partition, which share position, vector and
+/// edge handling.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_pair<const AVG: bool>(
+    src: [&[u8]; 2],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    mv: [i16; 2],
+    dst: [&mut [u8]; 2],
+    ds: usize,
+) {
+    let kernel = |dst: &mut [u8], ds, src: &[u8], off, ss, w, h, fx, fy| {
+        if AVG {
+            h264_chroma_mc_avg(dst, ds, src, off, ss, w, h, fx, fy)
+        } else {
+            h264_chroma_mc(dst, ds, src, off, ss, w, h, fx, fy)
+        }
+    };
+    let ix = x as isize + (mv[0] as isize >> 3);
+    let iy = y as isize + (mv[1] as isize >> 3);
+    let (fx, fy) = ((mv[0] & 7) as u8, (mv[1] & 7) as u8);
+    let cols = chroma_mc_cols(w);
+    if ix >= 0 && iy >= 0 && ix as usize + cols <= width && iy as usize + h < height {
+        let off = iy as usize * width + ix as usize;
+        for (s, d) in src.into_iter().zip(dst) {
+            kernel(d, ds, s, off, width, w, h, fx, fy);
+        }
+        return;
+    }
+    for (s, d) in src.into_iter().zip(dst) {
+        mc_chroma::<AVG>(s, width, height, x, y, w, h, mv, d, ds);
+    }
+}
+
 /// Predicts a `w`x`h` block from the lists in `used` and combines them into `dst` (stride `ds`)
 /// per 8.4.2.3. `predict(list, out, stride)` writes one list's prediction samples.
 #[allow(clippy::too_many_arguments)]

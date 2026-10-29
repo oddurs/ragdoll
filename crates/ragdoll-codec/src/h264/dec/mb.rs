@@ -2359,21 +2359,25 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
         }
         let d = co + cy * cs + cx;
-        for p in 1..3 {
-            let dst = &mut self.st.planes[p][d..];
-            match rp {
-                [Some(r), None] | [None, Some(r)] => {
-                    let l = rp[0].is_none() as usize;
-                    let mv = cmv[l];
-                    recon::mc_chroma::<false>(&r.planes[p], cpw, cph, cx, cy, cw, ch, mv, dst, cs);
-                }
-                [Some(r0), Some(r1)] => {
-                    let (m0, m1) = (cmv[0], cmv[1]);
-                    recon::mc_chroma::<false>(&r0.planes[p], cpw, cph, cx, cy, cw, ch, m0, dst, cs);
-                    recon::mc_chroma::<true>(&r1.planes[p], cpw, cph, cx, cy, cw, ch, m1, dst, cs);
-                }
-                [None, None] => {}
+        let [_, pcb, pcr] = &mut self.st.planes;
+        let (dcb, dcr) = (&mut pcb[d..], &mut pcr[d..]);
+        fn src(r: &RefPic) -> [&[u8]; 2] {
+            [&r.planes[1], &r.planes[2]]
+        }
+        match rp {
+            [Some(r), None] | [None, Some(r)] => {
+                let mv = cmv[rp[0].is_none() as usize];
+                let dst = [dcb, dcr];
+                recon::mc_chroma_pair::<false>(src(r), cpw, cph, cx, cy, cw, ch, mv, dst, cs);
             }
+            [Some(r0), Some(r1)] => {
+                let (m0, m1) = (cmv[0], cmv[1]);
+                let dst = [&mut *dcb, &mut *dcr];
+                recon::mc_chroma_pair::<false>(src(r0), cpw, cph, cx, cy, cw, ch, m0, dst, cs);
+                let dst = [dcb, dcr];
+                recon::mc_chroma_pair::<true>(src(r1), cpw, cph, cx, cy, cw, ch, m1, dst, cs);
+            }
+            [None, None] => {}
         }
         Ok(())
     }
