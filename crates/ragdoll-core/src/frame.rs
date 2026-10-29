@@ -219,11 +219,32 @@ impl Drop for AlignedBuffer {
     }
 }
 
+/// Three planes of one picture shared between a producer and the frames it hands out (a
+/// decoder's reference picture, for example); see [`Plane::shared`].
+pub type SharedPlanes = Arc<[AlignedBuffer; 3]>;
+
+/// Storage of a [`Plane`]: its own buffer, or one plane of [`SharedPlanes`].
+#[derive(Clone, Debug)]
+enum PlaneBuf {
+    Owned(AlignedBuffer),
+    Shared(SharedPlanes, usize),
+}
+
+impl PlaneBuf {
+    #[inline]
+    fn get(&self) -> &AlignedBuffer {
+        match self {
+            Self::Owned(b) => b,
+            Self::Shared(p, i) => &p[*i],
+        }
+    }
+}
+
 /// A single 2D image plane with 64-byte cache-line-aligned base pointer,
 /// cache-set-staggered row stride, and 64-byte zeroed tail padding.
 #[derive(Clone, Debug)]
 pub struct Plane {
-    buf: AlignedBuffer,
+    buf: PlaneBuf,
     width: usize,
     height: usize,
     row_bytes: usize,
@@ -242,10 +263,10 @@ impl Plane {
         let row_bytes = width.saturating_mul(bytes_per_sample);
         let stride = optimal_plane_stride(row_bytes);
         Self {
-            buf: AlignedBuffer::from_rows(stride, height, |y| {
+            buf: PlaneBuf::Owned(AlignedBuffer::from_rows(stride, height, |y| {
                 let r = row(y);
                 &r[..r.len().min(row_bytes)]
-            }),
+            })),
             width,
             height,
             row_bytes,
@@ -259,12 +280,56 @@ impl Plane {
         let stride = optimal_plane_stride(row_bytes);
         let total_bytes = stride.saturating_mul(height);
         Self {
-            buf: AlignedBuffer::new_zeroed(total_bytes),
+            buf: PlaneBuf::Owned(AlignedBuffer::new_zeroed(total_bytes)),
             width,
             height,
             row_bytes,
             stride,
             bytes_per_sample,
+        }
+    }
+
+    /// A plane over plane `idx` of `planes` (`height` rows of `stride` bytes from its start,
+    /// `width` samples used per row), read without copying. Mutable access copies the plane
+    /// into a buffer of its own first, so the producer's samples are never changed through it.
+    ///
+    /// # Panics
+    /// If the rows do not fit in the shared plane, `stride` is not a multiple of 64 or the
+    /// buffer is not 64-byte aligned.
+    pub fn shared(
+        planes: SharedPlanes,
+        idx: usize,
+        width: usize,
+        height: usize,
+        bytes_per_sample: usize,
+        stride: usize,
+    ) -> Self {
+        let row_bytes = width.saturating_mul(bytes_per_sample);
+        assert!(row_bytes <= stride && stride.is_multiple_of(CACHE_LINE_ALIGN));
+        assert!(stride * height <= planes[idx].len());
+        assert!((planes[idx].as_ptr() as usize).is_multiple_of(CACHE_LINE_ALIGN));
+        Self {
+            buf: PlaneBuf::Shared(planes, idx),
+            width,
+            height,
+            row_bytes,
+            stride,
+            bytes_per_sample,
+        }
+    }
+
+    /// The plane's own buffer, copying a shared plane's rows into one first.
+    fn owned_mut(&mut self) -> &mut AlignedBuffer {
+        if let PlaneBuf::Shared(p, i) = &self.buf {
+            let (src, stride) = (&p[*i], self.stride);
+            let own = AlignedBuffer::from_rows(stride, self.height, |y| {
+                &src.as_slice()[y * stride..y * stride + stride]
+            });
+            self.buf = PlaneBuf::Owned(own);
+        }
+        match &mut self.buf {
+            PlaneBuf::Owned(b) => b,
+            PlaneBuf::Shared(..) => unreachable!("plane made its own above"),
         }
     }
 
@@ -296,28 +361,31 @@ impl Plane {
     }
 
     #[inline]
-    pub const fn as_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
+    pub fn as_ptr(&self) -> *const u8 {
+        self.buf.get().as_ptr()
     }
 
     #[inline]
-    pub const fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.owned_mut().as_mut_ptr()
+    }
+
+    /// The plane's `stride * height` bytes.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.buf.get().as_slice()[..self.stride * self.height]
+    }
+
+    /// The buffer holding the plane; a shared plane's may hold more rows after its own.
+    #[inline]
+    pub fn buffer(&self) -> &AlignedBuffer {
+        self.buf.get()
     }
 
     #[inline]
-    pub const fn data(&self) -> &[u8] {
-        self.buf.as_slice()
-    }
-
-    #[inline]
-    pub const fn buffer(&self) -> &AlignedBuffer {
-        &self.buf
-    }
-
-    #[inline]
-    pub const fn data_mut(&mut self) -> &mut [u8] {
-        self.buf.as_mut_slice()
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        let n = self.stride * self.height;
+        &mut self.owned_mut().as_mut_slice()[..n]
     }
 
     /// Returns the active (unpadded) pixel bytes of scanline `y`.
@@ -325,7 +393,7 @@ impl Plane {
     pub fn row(&self, y: usize) -> &[u8] {
         debug_assert!(y < self.height);
         let start = y * self.stride;
-        &self.buf.as_slice()[start..start + self.row_bytes]
+        &self.buf.get().as_slice()[start..start + self.row_bytes]
     }
 
     /// Returns a mutable slice of the active (unpadded) pixel bytes of scanline `y`.
@@ -334,7 +402,7 @@ impl Plane {
         debug_assert!(y < self.height);
         let start = y * self.stride;
         let row_bytes = self.row_bytes;
-        &mut self.buf.as_mut_slice()[start..start + row_bytes]
+        &mut self.owned_mut().as_mut_slice()[start..start + row_bytes]
     }
 
     /// Returns the full 64-byte-aligned padded row of length `self.stride()` for SIMD vector loops.
@@ -342,7 +410,7 @@ impl Plane {
     pub fn row_padded(&self, y: usize) -> &[u8] {
         debug_assert!(y < self.height);
         let start = y * self.stride;
-        &self.buf.as_slice()[start..start + self.stride]
+        &self.buf.get().as_slice()[start..start + self.stride]
     }
 
     /// Returns a mutable full 64-byte-aligned padded row of length `self.stride()` for SIMD stores.
@@ -351,7 +419,7 @@ impl Plane {
         debug_assert!(y < self.height);
         let start = y * self.stride;
         let stride = self.stride;
-        &mut self.buf.as_mut_slice()[start..start + stride]
+        &mut self.owned_mut().as_mut_slice()[start..start + stride]
     }
 
     /// Replicates the rightmost active sample of every scanline into the right stride padding
@@ -492,6 +560,36 @@ impl VideoFrame {
         }
     }
 
+    /// A frame over existing planes, for example [`Plane::shared`] ones.
+    ///
+    /// # Panics
+    /// If `planes` does not hold `format`'s planes at their sizes for `width`x`height`.
+    pub fn from_planes(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        planes: Vec<Plane>,
+    ) -> Self {
+        assert_eq!(planes.len(), format.num_planes());
+        for (p, plane) in planes.iter().enumerate() {
+            assert_eq!(
+                (plane.width(), plane.height()),
+                format.plane_dimensions(width, height, p)
+            );
+        }
+        Self {
+            planes,
+            width,
+            height,
+            format,
+            colorimetry: Colorimetry::default(),
+            pts: Timestamp::default(),
+            duration: 0,
+            keyframe: true,
+            pict_type: PictureType::I,
+        }
+    }
+
     #[inline]
     pub fn plane(&self, idx: usize) -> &Plane {
         &self.planes[idx]
@@ -521,7 +619,7 @@ impl VideoFrame {
 
     /// Total physical bytes allocated across all aligned planes.
     pub fn allocated_bytes(&self) -> usize {
-        self.planes.iter().map(|p| p.buf.capacity()).sum()
+        self.planes.iter().map(|p| p.buf.get().capacity()).sum()
     }
 }
 
@@ -759,8 +857,8 @@ mod tests {
         }
         for p in 0..3 {
             assert_eq!(
-                f.plane(p).buf.as_padded_slice(),
-                reference.plane(p).buf.as_padded_slice(),
+                f.plane(p).buf.get().as_padded_slice(),
+                reference.plane(p).buf.get().as_padded_slice(),
                 "plane {p}"
             );
         }

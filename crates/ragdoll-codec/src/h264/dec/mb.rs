@@ -29,7 +29,7 @@ pub struct RefPic {
     pub poc: i32,
     pub long: bool,
     /// Samples of the frame, or of the field for a field reference.
-    pub planes: Arc<[Vec<u8>; 3]>,
+    pub planes: Arc<[ragdoll_core::AlignedBuffer; 3]>,
     /// Motion of the frame store, in frame layout.
     pub motion: Option<Arc<Motion>>,
     /// Field parity for a field reference.
