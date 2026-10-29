@@ -117,6 +117,10 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         st,
         ent,
         qp: sh.qp,
+        qpc: {
+            let o = cx.pps.chroma_qp_index_offset;
+            [chroma_qp(sh.qp, o[0]), chroma_qp(sh.qp, o[1])]
+        },
         last_dqp_nz: false,
         mb: MbPos {
             addr: 0,
@@ -229,6 +233,8 @@ struct Dec<'a, 'c> {
     st: &'c mut PicState,
     ent: Entropy<'a>,
     qp: i32,
+    /// Chroma QPs (Cb, Cr) of [`Self::qp`].
+    qpc: [u8; 2],
     last_dqp_nz: bool,
     mb: MbPos,
     /// The current macroblock is a field macroblock (field picture or MBAFF field pair).
@@ -407,6 +413,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// CABAC mb_skip_flag of the macroblock at decoding address `addr`.
+    #[inline(always)]
     fn decode_skip_flag(&mut self, addr: usize) -> bool {
         // MBAFF reads a pair's second skip flag before the first macroblock is decoded.
         let saved = (self.mb, self.nb);
@@ -817,7 +824,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.begin_mb(addr);
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.qpc[a] = self.qpc;
         self.st.cbp[a] = 0;
         self.st.t8x8[a] = false;
         self.last_dqp_nz = false;
@@ -1113,13 +1120,14 @@ impl<'a, 'c> Dec<'a, 'c> {
         }
         self.last_dqp_nz = d != 0;
         self.qp = (self.qp + d + 52) % 52;
+        self.qpc = self.chroma_qps(self.qp);
         Ok(())
     }
 
     fn set_qp(&mut self) {
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
-        self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.qpc[a] = self.qpc;
     }
 
     // ----- intra macroblocks ----------------------------------------------------------------
@@ -2662,7 +2670,39 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Motion-compensated prediction of the whole macroblock from the stored motion. Blocks with
     /// identical motion are predicted together; the result is the same for any grouping.
+    /// FFmpeg's `prefetch_motion`: starts loading the reference samples a macroblock four to
+    /// the right will likely read, from the motion of this one's first block in `list` (four
+    /// luma rows, staggered by column so that four macroblocks cover sixteen, and a chroma row).
+    #[inline]
+    fn prefetch_motion(&self, list: usize) {
+        let b = &self.st.blocks[self.st.b4(self.mb.x * 4, self.mb.y * 4)];
+        let r = b.ref_idx[list];
+        if r < 0 || !self.simple {
+            return;
+        }
+        let Some(rp) = self.cx.refs[list].get(r as usize) else {
+            return;
+        };
+        let w = self.st.width as isize;
+        let (x, y) = ((self.mb.x * 16) as isize, (self.mb.y * 16) as isize);
+        let mx = (b.mv[list][0] >> 2) as isize + x + 8;
+        let my = (b.mv[list][1] >> 2) as isize + y;
+        // Negative offsets wrap to huge ones, which the prefetch skips.
+        let luma = (my + (self.mb.x & 3) as isize * 4) * w + mx + 64;
+        ragdoll_simd::prefetch_rows::<4>(&rp.planes[0], luma as usize, w as usize);
+        let chroma = ((my >> 1) + (self.mb.x & 7) as isize) * (w / 2) + (mx >> 1) + 64;
+        ragdoll_simd::prefetch_rows::<1>(&rp.planes[1], chroma as usize, 0);
+        ragdoll_simd::prefetch_rows::<1>(&rp.planes[2], chroma as usize, 0);
+    }
+
     fn inter_predict_mb(&mut self) -> Result<()> {
+        self.prefetch_motion(0);
+        let r = self.inter_predict_parts();
+        self.prefetch_motion(1);
+        r
+    }
+
+    fn inter_predict_parts(&mut self) -> Result<()> {
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let key = |s: &PicState, bx: usize, by: usize| {
             let j = s.b4(mx4 + bx, my4 + by);

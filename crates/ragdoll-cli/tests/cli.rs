@@ -60,7 +60,8 @@ fn stderr(o: &Output) -> String {
 // ---------------------------------------------------------------------------------------------
 // Text snapshots
 
-/// Masks what varies between runs and machines: numbers followed by a time or rate unit,
+/// Masks what varies between runs and machines: numbers followed by a time or rate unit (and
+/// the padding before them),
 /// machine-chosen thread counts, and the SIMD / CPU lines of `--help` and `--version`.
 fn normalize(text: &str) -> String {
     let mut out = String::new();
@@ -99,6 +100,11 @@ fn mask_line(line: &str) -> String {
                 .take_while(|c| c.is_ascii_digit() || *c == b'.')
                 .count();
             if UNITS.iter().any(|u| line[i + len..].starts_with(u)) {
+                // Right-aligned values pad by their width: the padding is masked with them.
+                if out.ends_with(' ') {
+                    out.truncate(out.trim_end_matches(' ').len());
+                    out.push(' ');
+                }
                 out.push_str("<n>");
                 i += len;
                 continue;

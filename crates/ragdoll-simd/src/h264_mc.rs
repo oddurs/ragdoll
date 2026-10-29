@@ -351,6 +351,37 @@ pub fn h264_chroma_mc_in_plane(
     true
 }
 
+/// Asks the CPU to start loading `ROWS` rows of `buf`, the first at `off`, `stride` apart, into
+/// its caches (FFmpeg's `prefetch`); nothing happens when the last row lies past the end of
+/// `buf`. Results do not depend on it.
+///
+/// ```
+/// let buf = [0u8; 64];
+/// ragdoll_simd::prefetch_rows::<4>(&buf, 0, 16);
+/// ragdoll_simd::prefetch_rows::<4>(&buf, usize::MAX - 8, 16);
+/// ```
+#[inline(always)]
+pub fn prefetch_rows<const ROWS: usize>(buf: &[u8], off: usize, stride: usize) {
+    // `off` may be a wrapped negative offset: its last row then overflows and nothing is done.
+    #[cfg(target_arch = "x86_64")]
+    if off
+        .checked_add((ROWS - 1) * stride)
+        .is_some_and(|last| last < buf.len())
+    {
+        let p = buf.as_ptr();
+        for r in 0..ROWS {
+            // Safety: every row's address lies inside `buf` (checked above for the last); a
+            // prefetch only hints the cache.
+            unsafe {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                _mm_prefetch::<_MM_HINT_T0>(p.add(off + r * stride) as *const i8);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (buf, off, stride);
+}
+
 /// Writes the `w`x`h` chroma prediction at eighth-pel phase `(fx, fy)` (`0..=7`) for the block whose
 /// integer-sample origin is `src[off]`, into `dst` with stride `ds`.
 ///

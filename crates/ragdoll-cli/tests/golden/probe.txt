@@ -2,7 +2,7 @@
 │ RAGDOLL PROBE : v.mp4                                                        │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Container     : mp4/isobmff        File Size :         3779 B (0.00 MB)      │
-│ Probe Latency :   <n> µs         GOP Count :            2                 │
+│ Probe Latency : <n> µs         GOP Count :            2                 │
 │ H.264 Profile : Constrained Baseline (level 4.0)                             │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Track #0  [Video] codec=h264 160x90 @ <n> fps (30/1) fmt=yuv420p        │

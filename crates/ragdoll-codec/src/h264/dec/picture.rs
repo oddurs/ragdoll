@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use ragdoll_core::AlignedBuffer;
+use ragdoll_core::{AlignedBuffer, AlignedVec};
 
 use super::tables::Part;
 
@@ -45,7 +45,7 @@ pub enum Structure {
 #[derive(Clone, Debug)]
 pub struct Motion {
     /// Per 4x4 block.
-    pub blocks: Vec<BlockInfo>,
+    pub blocks: AlignedVec<BlockInfo>,
     /// Per macroblock.
     pub mb_intra: Vec<bool>,
     /// Per macroblock: one motion for all 16 blocks (see [`PicState::motion_edges`]).
@@ -64,7 +64,7 @@ impl Motion {
     pub fn new(mb_w: usize, mb_h: usize) -> Self {
         let b4 = mb_w * mb_h * 16;
         Self {
-            blocks: vec![NO_BLOCK; b4],
+            blocks: AlignedVec::from_elem(NO_BLOCK, b4),
             mb_intra: vec![true; mb_w * mb_h],
             mb_uniform: vec![false; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
@@ -343,7 +343,7 @@ pub struct PicState {
     pub nnz: Vec<u8>,
     pub intra_mode: Vec<i8>,
     /// Per 4x4 block: motion of both lists and coefficient and direct flags.
-    pub blocks: Vec<BlockInfo>,
+    pub blocks: AlignedVec<BlockInfo>,
     /// Reference tables of the picture's slices (see [`Motion::ref_tables`]).
     pub ref_tables: Vec<RefIds>,
     /// Per table: no picture appears in it twice, so that within it equal pictures are equal
@@ -391,7 +391,7 @@ impl PicState {
             cbf_dc: vec![0; mbs],
             nnz: vec![0; b4],
             intra_mode: vec![-1; b4],
-            blocks: vec![NO_BLOCK; b4],
+            blocks: AlignedVec::from_elem(NO_BLOCK, b4),
             ref_tables: Vec::new(),
             ref_unique: Vec::new(),
             mb_table: vec![0; mbs],

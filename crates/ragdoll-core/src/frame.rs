@@ -219,6 +219,86 @@ impl Drop for AlignedBuffer {
     }
 }
 
+/// A fixed-length heap array of `Copy` elements starting on a 64-byte boundary, so that runs of
+/// elements a cache line long (four 16-byte motion records, say) never straddle two lines, as
+/// they do in a `Vec` whose allocation starts 16 bytes into one.
+pub struct AlignedVec<T: Copy> {
+    ptr: NonNull<T>,
+    len: usize,
+}
+
+// Safety: AlignedVec owns its elements exclusively, like a Vec.
+unsafe impl<T: Copy + Send> Send for AlignedVec<T> {}
+unsafe impl<T: Copy + Sync> Sync for AlignedVec<T> {}
+
+impl<T: Copy> AlignedVec<T> {
+    fn layout(len: usize) -> Layout {
+        assert!(size_of::<T>() > 0, "AlignedVec of a zero-sized type");
+        let size = size_of::<T>()
+            .checked_mul(len.max(1))
+            .expect("AlignedVec size");
+        Layout::from_size_align(size, CACHE_LINE_ALIGN.max(align_of::<T>()))
+            .expect("valid AlignedVec layout")
+    }
+
+    /// `len` copies of `value`.
+    pub fn from_elem(value: T, len: usize) -> Self {
+        let layout = Self::layout(len);
+        // Safety: the layout's size is nonzero.
+        let raw = unsafe { alloc::alloc(layout) } as *mut T;
+        let Some(ptr) = NonNull::new(raw) else {
+            alloc::handle_alloc_error(layout);
+        };
+        for i in 0..len {
+            // Safety: element `i` lies within the allocation of `len` elements.
+            unsafe { raw.add(i).write(value) };
+        }
+        Self { ptr, len }
+    }
+}
+
+impl<T: Copy> Deref for AlignedVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // Safety: `len` initialised elements live at `ptr`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T: Copy> DerefMut for AlignedVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // Safety: `len` initialised elements live at `ptr`, owned exclusively.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T: Copy> Clone for AlignedVec<T> {
+    fn clone(&self) -> Self {
+        let layout = Self::layout(self.len);
+        // Safety: the layout's size is nonzero.
+        let raw = unsafe { alloc::alloc(layout) } as *mut T;
+        let Some(ptr) = NonNull::new(raw) else {
+            alloc::handle_alloc_error(layout);
+        };
+        // Safety: both regions hold `len` elements and do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw, self.len) };
+        Self { ptr, len: self.len }
+    }
+}
+
+impl<T: Copy + std::fmt::Debug> std::fmt::Debug for AlignedVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: Copy> Drop for AlignedVec<T> {
+    fn drop(&mut self) {
+        // Safety: allocated with this layout by `from_elem` or `clone`; `T: Copy` needs no drop.
+        unsafe { alloc::dealloc(self.ptr.as_ptr() as *mut u8, Self::layout(self.len)) };
+    }
+}
+
 /// Three planes of one picture shared between a producer and the frames it hands out (a
 /// decoder's reference picture, for example); see [`Plane::shared`].
 pub type SharedPlanes = Arc<[AlignedBuffer; 3]>;
@@ -861,6 +941,27 @@ mod tests {
                 reference.plane(p).buf.get().as_padded_slice(),
                 "plane {p}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod aligned_vec_tests {
+    use super::AlignedVec;
+
+    #[test]
+    fn starts_on_a_cache_line_and_holds_its_elements() {
+        for len in [0usize, 1, 3, 1000, 1 << 18] {
+            let mut v = AlignedVec::from_elem([7u16; 8], len);
+            assert_eq!(v.len(), len);
+            assert_eq!(v.as_ptr() as usize % 64, 0);
+            assert!(v.iter().all(|e| *e == [7; 8]));
+            if len > 2 {
+                v[2] = [1; 8];
+            }
+            let w = v.clone();
+            assert_eq!(&*w, &*v);
+            assert_eq!(w.as_ptr() as usize % 64, 0);
         }
     }
 }
