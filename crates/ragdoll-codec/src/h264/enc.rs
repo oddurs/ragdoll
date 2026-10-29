@@ -12,10 +12,10 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, chroma_mc_8x8_x2, dequant_4x4_x4, h264_chroma_deblock, h264_luma_deblock,
-    h264_luma_mc, hadamard4x4_16x4, hpel_hv_16x16, hpel_window, hpel_window_centre,
-    intra_pred_plane, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16,
-    pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
-    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
+    h264_luma_mc, hadamard4x4_16x4, hpel_16x16, hpel_window, hpel_window_centre, intra_pred_plane,
+    intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8,
+    pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
+    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -956,8 +956,10 @@ impl MotionSearch<'_> {
     }
 
     /// Half-pel refinement of [`H264Speed::Fast`]: on each axis only the half sample toward the
-    /// cheaper full-pel neighbour (`nb`: costs above, left, right and below the full-pel best)
-    /// is tried, both from one kernel call that also leaves the winner's prediction.
+    /// cheaper full-pel neighbour (`nb`: costs above, left, right and below the full-pel best) is
+    /// a candidate. Each is first estimated by the SAD against the average of its two integer
+    /// neighbours; only the better estimate, if it beats the full-pel cost, is interpolated and
+    /// measured. Leaves the winner's prediction in `pred`.
     #[inline(always)]
     fn half_pel_toward(
         &self,
@@ -969,27 +971,33 @@ impl MotionSearch<'_> {
         let center = [full[0] * 4, full[1] * 4];
         let (up, left) = (nb[0] < nb[3], nb[1] < nb[2]);
         let off = self.full_off(full[0], full[1]);
-        let (mut hb, mut vb) = ([0u8; 256], [0u8; 256]);
-        hpel_hv_16x16(&self.r.buf, off, self.r.stride, left, up, &mut hb, &mut vb);
-        let mut best = (center, full_cost, None);
-        let cands = [
-            ([center[0], center[1] + if up { -2 } else { 2 }], &vb),
-            ([center[0] + if left { -2 } else { 2 }, center[1]], &hb),
-        ];
-        for (mv, block) in cands {
+        let (r, st) = (&self.r.buf, self.r.stride);
+        let estimate = |mv: [i32; 2], other: usize| {
             if self.bounds.clamp(mv) != mv {
-                continue;
+                return u32::MAX;
             }
-            let cost = pixel_sad_16x16(self.src, 16, block, 16) + self.mv_cost(mv);
-            if cost < best.1 {
-                best = (mv, cost, Some(block));
+            pixel_sad_avg_16x16(self.src, &r[off..], st, &r[other..], st) + self.mv_cost(mv)
+        };
+        let mv_v = [center[0], center[1] + if up { -2 } else { 2 }];
+        let mv_h = [center[0] + if left { -2 } else { 2 }, center[1]];
+        let est_v = estimate(mv_v, if up { off - st } else { off + st });
+        let est_h = estimate(mv_h, if left { off - 1 } else { off + 1 });
+        let (mv, vertical, back, est) = if est_v <= est_h {
+            (mv_v, true, up, est_v)
+        } else {
+            (mv_h, false, left, est_h)
+        };
+        if est < full_cost {
+            let mut block = [0u8; 256];
+            hpel_16x16(r, off, st, vertical, back, &mut block);
+            let cost = pixel_sad_16x16(self.src, 16, &block, 16) + self.mv_cost(mv);
+            if cost < full_cost {
+                *pred = block;
+                return ([mv[0] as i16, mv[1] as i16], cost);
             }
         }
-        match best.2 {
-            Some(block) => *pred = *block,
-            None => self.r.load::<16>(off, pred),
-        }
-        ([best.0[0] as i16, best.0[1] as i16], best.1)
+        self.r.load::<16>(off, pred);
+        ([center[0] as i16, center[1] as i16], full_cost)
     }
 
     /// The block or pair of blocks whose (rounded) average is the prediction at quarter-pel

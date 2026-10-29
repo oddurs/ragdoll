@@ -946,16 +946,73 @@ pub fn hpel_hv_16x16(
     #[cfg(target_arch = "aarch64")]
     if ragdoll_core::dispatch::neon() {
         // Safety: bounds checked above; NEON is baseline on aarch64.
-        unsafe { hv_neon(src.as_ptr(), h0, v0, ss, out_h, out_v) };
+        unsafe { hv_neon(src.as_ptr(), h0, v0, ss, Some(out_h), Some(out_v)) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { hv_avx2(src.as_ptr(), h0, v0, ss, out_h, out_v) };
+        unsafe { hv_avx2(src.as_ptr(), h0, v0, ss, Some(out_h), Some(out_v)) };
         return;
     }
     hpel_hv_16x16_scalar(src, off, ss, left, up, out_h, out_v);
+}
+
+/// One of the two predictions of [`hpel_hv_16x16`]: the `h` samples (`vertical`) or the `b`
+/// samples, half a sample before (`back`: up or left) or after the block at `src[off]`.
+///
+/// # Panics
+/// If `src` lacks the margins of [`hpel_hv_16x16`].
+#[inline]
+pub fn hpel_16x16(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    vertical: bool,
+    back: bool,
+    out: &mut [u8; 256],
+) {
+    assert!(off >= 3 * ss + 3 && off + 18 * ss + 19 <= src.len());
+    let o = off - usize::from(back) * if vertical { ss } else { 1 };
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            match vertical {
+                true => hv_neon(src.as_ptr(), o, o, ss, None, Some(out)),
+                false => hv_neon(src.as_ptr(), o, o, ss, Some(out), None),
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            match vertical {
+                true => hv_avx2(src.as_ptr(), o, o, ss, None, Some(out)),
+                false => hv_avx2(src.as_ptr(), o, o, ss, Some(out), None),
+            }
+        }
+        return;
+    }
+    hpel_16x16_scalar(src, off, ss, vertical, back, out);
+}
+
+/// Scalar reference for [`hpel_16x16`].
+pub fn hpel_16x16_scalar(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    vertical: bool,
+    back: bool,
+    out: &mut [u8; 256],
+) {
+    let mut other = [0u8; 256];
+    match vertical {
+        true => hpel_hv_16x16_scalar(src, off, ss, back, back, &mut other, out),
+        false => hpel_hv_16x16_scalar(src, off, ss, back, back, out, &mut other),
+    }
 }
 
 /// Scalar reference for [`hpel_hv_16x16`].
@@ -1991,8 +2048,8 @@ unsafe fn hv_avx2(
     h0: usize,
     v0: usize,
     ss: usize,
-    out_h: &mut [u8; 256],
-    out_v: &mut [u8; 256],
+    out_h: Option<&mut [u8; 256]>,
+    out_v: Option<&mut [u8; 256]>,
 ) {
     use std::arch::x86_64::*;
     unsafe {
@@ -2003,30 +2060,34 @@ unsafe fn hv_avx2(
             let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
             _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(packed));
         };
-        for r in 0..16 {
-            let q = p.add(h0 + r * ss);
-            let h = tap6_epi16([
-                at(q.sub(2)),
-                at(q.sub(1)),
-                at(q),
-                at(q.add(1)),
-                at(q.add(2)),
-                at(q.add(3)),
-            ]);
-            store(out_h.as_mut_ptr().add(r * 16), h);
-        }
-        // The vertical taps slide down six rows held in registers.
-        let mut rows: [__m256i; 6] = std::array::from_fn(|k| {
-            if k < 5 {
-                at(p.add(v0 + k * ss - 2 * ss))
-            } else {
-                _mm256_setzero_si256()
+        if let Some(out_h) = out_h {
+            for r in 0..16 {
+                let q = p.add(h0 + r * ss);
+                let h = tap6_epi16([
+                    at(q.sub(2)),
+                    at(q.sub(1)),
+                    at(q),
+                    at(q.add(1)),
+                    at(q.add(2)),
+                    at(q.add(3)),
+                ]);
+                store(out_h.as_mut_ptr().add(r * 16), h);
             }
-        });
-        for r in 0..16 {
-            rows[5] = at(p.add(v0 + (r + 3) * ss));
-            store(out_v.as_mut_ptr().add(r * 16), tap6_epi16(rows));
-            rows = [rows[1], rows[2], rows[3], rows[4], rows[5], rows[5]];
+        }
+        if let Some(out_v) = out_v {
+            // The vertical taps slide down six rows held in registers.
+            let mut rows: [__m256i; 6] = std::array::from_fn(|k| {
+                if k < 5 {
+                    at(p.add(v0 + k * ss - 2 * ss))
+                } else {
+                    _mm256_setzero_si256()
+                }
+            });
+            for r in 0..16 {
+                rows[5] = at(p.add(v0 + (r + 3) * ss));
+                store(out_v.as_mut_ptr().add(r * 16), tap6_epi16(rows));
+                rows = [rows[1], rows[2], rows[3], rows[4], rows[5], rows[5]];
+            }
         }
     }
 }
@@ -2240,8 +2301,8 @@ unsafe fn hv_neon(
     h0: usize,
     v0: usize,
     ss: usize,
-    out_h: &mut [u8; 256],
-    out_v: &mut [u8; 256],
+    mut out_h: Option<&mut [u8; 256]>,
+    mut out_v: Option<&mut [u8; 256]>,
 ) {
     use std::arch::aarch64::*;
     fn tap6(t: [int16x8_t; 6]) -> int16x8_t {
@@ -2258,18 +2319,22 @@ unsafe fn hv_neon(
         let at = |q: *const u8| vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q)));
         for half in 0..2 {
             for r in 0..16 {
-                let q = p.add(h0 + r * ss + half * 8);
-                let h = tap6(std::array::from_fn(|k| at(q.add(k).sub(2))));
-                vst1_u8(
-                    out_h.as_mut_ptr().add(r * 16 + half * 8),
-                    vqrshrun_n_s16::<5>(h),
-                );
-                let q = p.add(v0 + r * ss + half * 8);
-                let v = tap6(std::array::from_fn(|k| at(q.add(k * ss).sub(2 * ss))));
-                vst1_u8(
-                    out_v.as_mut_ptr().add(r * 16 + half * 8),
-                    vqrshrun_n_s16::<5>(v),
-                );
+                if let Some(out_h) = out_h.as_deref_mut() {
+                    let q = p.add(h0 + r * ss + half * 8);
+                    let h = tap6(std::array::from_fn(|k| at(q.add(k).sub(2))));
+                    vst1_u8(
+                        out_h.as_mut_ptr().add(r * 16 + half * 8),
+                        vqrshrun_n_s16::<5>(h),
+                    );
+                }
+                if let Some(out_v) = out_v.as_deref_mut() {
+                    let q = p.add(v0 + r * ss + half * 8);
+                    let v = tap6(std::array::from_fn(|k| at(q.add(k * ss).sub(2 * ss))));
+                    vst1_u8(
+                        out_v.as_mut_ptr().add(r * 16 + half * 8),
+                        vqrshrun_n_s16::<5>(v),
+                    );
+                }
             }
         }
     }
@@ -2902,6 +2967,12 @@ mod tests {
                     hpel_hv_16x16(&src, off, pw, left, up, &mut a, &mut b);
                     hpel_hv_16x16_scalar(&src, off, pw, left, up, &mut c, &mut d);
                     assert_eq!((a, b), (c, d), "({x}, {y}) {left} {up}");
+                    for (vertical, back, want) in [(false, left, &a), (true, up, &b)] {
+                        let (mut e, mut f) = ([0u8; 256], [0u8; 256]);
+                        hpel_16x16(&src, off, pw, vertical, back, &mut e);
+                        hpel_16x16_scalar(&src, off, pw, vertical, back, &mut f);
+                        assert_eq!((&e, &f), (want, want), "({x}, {y}) {vertical} {back}");
+                    }
                     // The window starts one sample up and left of the block.
                     for r in 0..16 {
                         for k in 0..16 {
