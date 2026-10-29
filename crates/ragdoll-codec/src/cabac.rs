@@ -1434,9 +1434,14 @@ impl<'a> CabacDecoder<'a> {
         field: bool,
         out: &mut ResidualCoeffs,
     ) -> usize {
-        // On a local copy the engine state stays in registers across the block.
+        // On a local copy the engine state stays in registers across the block. The common frame
+        // 4x4 block kinds get their own copies with the context bases and sizes as constants.
         let mut d = self.clone();
-        let n = d.residual_coeffs(ctxs, cat, cbf_cond, max_coeff, field, out);
+        let n = match (cat, max_coeff, field) {
+            (2, 16, false) => d.residual_coeffs(ctxs, 2, cbf_cond, 16, false, out),
+            (4, 15, false) => d.residual_coeffs(ctxs, 4, cbf_cond, 15, false, out),
+            _ => d.residual_coeffs(ctxs, cat, cbf_cond, max_coeff, field, out),
+        };
         *self = d;
         n
     }
