@@ -245,11 +245,8 @@ impl<'a> BitReader<'a> {
     /// Decodes an H.264 / HEVC Unsigned Exp-Golomb code `ue(v)` using hardware `CLZ`.
     #[inline]
     pub fn read_ue(&mut self) -> Result<u64> {
-        if self.bits_in_buf < 32 {
-            self.refill();
-        }
-        // Codes of up to 31 bits (values below 65535) come straight from the register: their
-        // top `2 * lz + 1` bits are `value + 1`.
+        // A code of up to 31 bits (a value below 65535) already in the register: its top
+        // `2 * lz + 1` bits are `value + 1`. Small enough to inline everywhere.
         let lz = self.bit_buf.leading_zeros();
         let n = 2 * lz + 1;
         if lz < 16 && n <= self.bits_in_buf {
@@ -258,17 +255,24 @@ impl<'a> BitReader<'a> {
             self.bits_in_buf -= n;
             return Ok(code - 1);
         }
-        self.read_ue_long()
+        self.read_ue_refill()
     }
 
-    /// [`Self::read_ue`] for long codes and the end of the data.
+    /// [`Self::read_ue`] after a refill, for long codes and the end of the data.
     #[inline(never)]
-    fn read_ue_long(&mut self) -> Result<u64> {
-        if self.bits_in_buf == 0 {
-            return Err(RagdollError::BitstreamEndOfData);
+    fn read_ue_refill(&mut self) -> Result<u64> {
+        if self.bits_in_buf < 32 {
+            self.refill();
         }
         let lz = self.bit_buf.leading_zeros();
-        if lz >= self.bits_in_buf {
+        let n = 2 * lz + 1;
+        if lz < 16 && n <= self.bits_in_buf {
+            let code = self.bit_buf >> (64 - n);
+            self.bit_buf <<= n;
+            self.bits_in_buf -= n;
+            return Ok(code - 1);
+        }
+        if self.bits_in_buf == 0 || lz >= self.bits_in_buf {
             return Err(RagdollError::BitstreamEndOfData);
         }
         if lz > 32 {
