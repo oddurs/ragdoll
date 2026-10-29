@@ -58,6 +58,12 @@ enum Entropy<'a> {
     Cabac(CabacDecoder<'a>, Box<[CabacContext; NUM_CABAC_CONTEXTS]>),
 }
 
+/// [`Dec::nb`] bits.
+const NB_L: u8 = 1;
+const NB_T: u8 = 2;
+const NB_TR: u8 = 4;
+const NB_TL: u8 = 8;
+
 fn bad(msg: &'static str) -> RagdollError {
     RagdollError::InvalidSyntax(msg)
 }
@@ -111,6 +117,9 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
             && matches!(st_structure, Structure::Frame)
             && cx.sps.chroma_array_type() == 1
             && cx.sh.weights.is_none(),
+        nb: 0,
+        nb_addr: usize::MAX,
+        whole: cx.slice_num == 0 && cx.sh.first_mb == 0,
         res: None,
     };
     d.run(first, total)
@@ -205,6 +214,14 @@ struct Dec<'a, 'c> {
     /// Progressive 4:2:0 frame without MBAFF or explicit weights: inter prediction takes
     /// [`Self::mc_rect_simple`].
     simple: bool,
+    /// Without MBAFF: which of the current MB's left, top, top-right and top-left neighbours
+    /// are available ([`NB_L`] .. [`NB_TL`]), found once per macroblock.
+    nb: u8,
+    /// The address [`Self::nb`] was found for.
+    nb_addr: usize,
+    /// The slice is the picture's first and starts at its first macroblock: every macroblock
+    /// before the current one belongs to it.
+    whole: bool,
     /// Residual blocks, kept zeroed between macroblocks: the inverse transforms clear what they
     /// read, so only coded coefficients are ever written.
     res: Option<Box<Residual>>,
@@ -357,8 +374,9 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// CABAC mb_skip_flag of the macroblock at decoding address `addr`.
     fn decode_skip_flag(&mut self, addr: usize) -> bool {
-        let saved = self.mb;
-        self.mb = self.pos(addr);
+        // MBAFF reads a pair's second skip flag before the first macroblock is decoded.
+        let saved = (self.mb, self.nb);
+        self.set_mb(addr);
         let a = self
             .mb_left()
             .filter(|&m| !self.st.mb_type[m].is_skip())
@@ -367,7 +385,9 @@ impl<'a, 'c> Dec<'a, 'c> {
             .mb_top()
             .filter(|&m| !self.st.mb_type[m].is_skip())
             .is_some() as u8;
-        self.mb = saved;
+        if self.st.mbaff {
+            (self.mb, self.nb) = saved;
+        }
         let is_b = self.cx.sh.slice_type.is_b();
         let (cd, ctxs) = self.cabac();
         if is_b {
@@ -444,8 +464,45 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     // ----- neighbourhood -------------------------------------------------------------------
 
-    fn begin_mb(&mut self, addr: usize) {
+    /// Makes `addr` the current macroblock, finding its neighbours' availability.
+    fn set_mb(&mut self, addr: usize) {
         self.mb = self.pos(addr);
+        if self.st.mbaff {
+            return;
+        }
+        let (x, y, w, a) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
+        self.nb_addr = addr;
+        if self.whole {
+            let (l, t, r) = (x > 0, y > 0, x + 1 < w);
+            self.nb = (l as u8 * NB_L)
+                | (t as u8 * NB_T)
+                | ((t && r) as u8 * NB_TR)
+                | ((t && l) as u8 * NB_TL);
+            return;
+        }
+        let (sn, cur) = (&self.st.slice_num, self.cx.slice_num);
+        let mut nb = 0;
+        if x > 0 && sn[a - 1] == cur {
+            nb |= NB_L;
+        }
+        if y > 0 {
+            if sn[a - w] == cur {
+                nb |= NB_T;
+            }
+            if x + 1 < w && sn[a - w + 1] == cur {
+                nb |= NB_TR;
+            }
+            if x > 0 && sn[a - w - 1] == cur {
+                nb |= NB_TL;
+            }
+        }
+        self.nb = nb;
+    }
+
+    fn begin_mb(&mut self, addr: usize) {
+        if self.st.mbaff || self.nb_addr != addr {
+            self.set_mb(addr);
+        }
         let a = self.mb.addr;
         // Every macroblock type writes all of its blocks' motion (see `reset_blocks`).
         if self.st.recycled {
@@ -572,8 +629,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if self.st.mbaff {
             return self.mb_nb(-1, 0);
         }
-        let a = self.mb.addr;
-        (self.mb.x > 0 && self.st.slice_num[a - 1] == self.cx.slice_num).then(|| a - 1)
+        (self.nb & NB_L != 0).then(|| self.mb.addr - 1)
     }
 
     /// The available macroblock above the current one.
@@ -582,8 +638,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         if self.st.mbaff {
             return self.mb_nb(0, -1);
         }
-        let (a, w) = (self.mb.addr, self.st.mb_w);
-        (self.mb.y > 0 && self.st.slice_num[a - w] == self.cx.slice_num).then(|| a - w)
+        (self.nb & NB_T != 0).then(|| self.mb.addr - self.st.mb_w)
     }
 
     /// The available 4x4 block covering luma `(xn, yn)`: `(macroblock, 4x4 index)`. Blocks of the
@@ -606,8 +661,15 @@ impl<'a, 'c> Dec<'a, 'c> {
                 if done & (1 << BLK4_AT[(py & 15) >> 2][(px & 15) >> 2]) == 0 {
                     return None;
                 }
-            } else if !self.mb_avail(a) {
-                return None;
+            } else {
+                // Neighbour MB by offset `(dx + 1, dy + 1)`: only those above or to the left
+                // precede the current one in decoding order.
+                let (dx, dy) = ((px >> 4) + 1 - self.mb.x, (py >> 4) + 1 - self.mb.y);
+                const NB_AT: [[u8; 3]; 3] = [[NB_TL, NB_T, NB_TR], [NB_L, 0, 0], [0, 0, 0]];
+                let bit = NB_AT.get(dy).and_then(|r| r.get(dx)).copied().unwrap_or(0);
+                if self.nb & bit == 0 {
+                    return None;
+                }
             }
             return Some((a, self.st.b4(px >> 2, py >> 2)));
         }
@@ -1710,7 +1772,7 @@ impl<'a, 'c> Dec<'a, 'c> {
             return [[a[0], b[0], c[0]], [a[1], b[1], c[1]]];
         }
         // Without MBAFF the neighbours are the adjacent macroblocks' corner blocks.
-        let (x, y, w, addr) = (self.mb.x, self.mb.y, self.st.mb_w, self.mb.addr);
+        let (x, y, w) = (self.mb.x, self.mb.y, self.st.mb_w);
         let i = self.st.b4(x * 4, y * 4);
         let s = w * 4;
         let st = &*self.st;
@@ -1719,27 +1781,15 @@ impl<'a, 'c> Dec<'a, 'c> {
             [0, 1].map(|l| Some((b.ref_idx[l], b.mv[l])))
         };
         let none = [None, None];
-        let a = if x > 0 && self.mb_avail(addr - 1) {
-            at(i - 1)
+        let nb = self.nb;
+        let a = if nb & NB_L != 0 { at(i - 1) } else { none };
+        let b = if nb & NB_T != 0 { at(i - s) } else { none };
+        let c = if nb & NB_TR != 0 {
+            at(i - s + 4)
+        } else if nb & NB_TL != 0 {
+            at(i - s - 1)
         } else {
             none
-        };
-        let (b, c) = if y > 0 {
-            let b = if self.mb_avail(addr - w) {
-                at(i - s)
-            } else {
-                none
-            };
-            let c = if x + 1 < w && self.mb_avail(addr - w + 1) {
-                at(i - s + 4)
-            } else if x > 0 && self.mb_avail(addr - w - 1) {
-                at(i - s - 1)
-            } else {
-                none
-            };
-            (b, c)
-        } else {
-            (none, none)
         };
         [[a[0], b[0], c[0]], [a[1], b[1], c[1]]]
     }
