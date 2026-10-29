@@ -73,6 +73,16 @@ impl Plane {
         (y + self.pad) * self.stride + x + self.pad
     }
 
+    /// The `N` samples of column `x` from row `y` down.
+    #[inline(always)]
+    fn column<const N: usize>(&self, x: usize, y: usize) -> [u8; N] {
+        let (o, s) = (self.idx(x, y), self.stride);
+        let last = s.checked_mul(N - 1).and_then(|d| d.checked_add(o));
+        assert!(last.is_some_and(|l| l < self.buf.len()));
+        // Safety: the assertion bounds the last (largest) index.
+        std::array::from_fn(|r| unsafe { *self.buf.get_unchecked(o + r * s) })
+    }
+
     /// Writes the `N`x`N` block `src` (stride `N`) with its top-left sample at `(x0, y0)`.
     #[inline(always)]
     fn store<const N: usize>(&mut self, x0: usize, y0: usize, src: &[u8]) {
@@ -1033,10 +1043,7 @@ fn i16_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 16]>, Option<[
         let o = p.idx(x0, y0 - 1);
         p.buf[o..o + 16].try_into().unwrap()
     });
-    let left = (mb_x > 0).then(|| {
-        let col = &p.buf[p.idx(x0 - 1, y0)..][..15 * p.stride + 1];
-        std::array::from_fn(|r| col[r * p.stride])
-    });
+    let left = (mb_x > 0).then(|| p.column::<16>(x0 - 1, y0));
     let tl = if mb_x > 0 && mb_y > 0 {
         p.buf[p.idx(x0 - 1, y0 - 1)]
     } else {
@@ -1053,7 +1060,7 @@ fn chroma_edges(p: &Plane, mb_x: usize, mb_y: usize) -> (Option<[u8; 8]>, Option
         let o = p.idx(x0, y0 - 1);
         p.buf[o..o + 8].try_into().unwrap()
     });
-    let left = (mb_x > 0).then(|| std::array::from_fn(|r| p.buf[p.idx(x0 - 1, y0 + r)]));
+    let left = (mb_x > 0).then(|| p.column::<8>(x0 - 1, y0));
     let tl = if mb_x > 0 && mb_y > 0 {
         p.buf[p.idx(x0 - 1, y0 - 1)]
     } else {
@@ -1085,7 +1092,7 @@ fn i4_edges(
         }
         t
     });
-    let left = (px > 0).then(|| std::array::from_fn(|r| p.buf[p.idx(px - 1, py + r)]));
+    let left = (px > 0).then(|| p.column::<4>(px - 1, py));
     let tl = if px > 0 && py > 0 {
         p.buf[p.idx(px - 1, py - 1)]
     } else {
@@ -1463,6 +1470,21 @@ fn quant_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, intra: bool)
         out.dc[p] = quantize_chroma_dc2x2(&dc_raw, qpc);
     }
     out
+}
+
+/// [`quantize_luma_dc4x4`] in 32-bit arithmetic: the DC of a residual block is at most
+/// `16 * 255` in magnitude, so its Hadamard transform stays within 16 bits and the products
+/// within 31.
+#[inline(always)]
+fn quant_luma_dc(dc: &[i16; 16], qp: u8) -> [i16; 16] {
+    let qp = qp.min(51) as usize;
+    let qbits = 16 + (qp / 6) as u32;
+    let mf = QUANT4_MF[qp % 6][0];
+    let f = (1i32 << qbits) / 3;
+    hadamard4x4(dc).map(|c| {
+        let l = ((c as i32).abs() * mf + f) >> qbits;
+        (if c < 0 { -l } else { l }) as i16
+    })
 }
 
 #[inline(always)]
@@ -2776,7 +2798,7 @@ impl EncState {
             }
         }
         let any_ac = ac_masks.iter().any(|&m| m != 0);
-        let dc_q = quantize_luma_dc4x4(&dc_raw, eff_qp);
+        let dc_q = quant_luma_dc(&dc_raw, eff_qp);
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
         let c = quant_chroma(src, &pu, &pv, eff_qpc, true);
