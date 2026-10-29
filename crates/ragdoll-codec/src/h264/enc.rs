@@ -334,6 +334,23 @@ fn se_bits(d: i32) -> u32 {
     2 * (32 - (v + 1).leading_zeros()) - 1
 }
 
+/// Set bits of a mask of at most 16 bits. The crate targets baseline x86-64, which has no
+/// `popcnt`: two table lookups beat the bit-twiddling fallback of `count_ones`.
+#[inline(always)]
+fn pop16(mask: u32) -> u8 {
+    static POP8: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0;
+        while i < 256 {
+            t[i] = (i as u32).count_ones() as u8;
+            i += 1;
+        }
+        t
+    };
+    debug_assert!(mask < 1 << 16);
+    POP8[(mask & 0xFF) as usize] + POP8[(mask >> 8 & 0xFF) as usize]
+}
+
 /// `x264_decimate_score`: 9 when a level exceeds 1, else a weight that falls with the zero runs.
 fn decimate_score(scanned: &[i16]) -> u32 {
     let table: &[u8] = if scanned.len() == 64 {
@@ -493,7 +510,7 @@ fn write_cavlc_masked<const N: usize>(w: &mut Bits, coeffs: &[i16], nc: u8, mask
         w.put32(token_bits[0] as u32, token_len[0] as u32);
         return;
     }
-    let n = mask.count_ones() as usize;
+    let n = pop16(mask) as usize;
     let top = 31 - mask.leading_zeros();
     let total_zeros = top as usize + 1 - n;
 
@@ -616,7 +633,7 @@ fn write_cavlc_residuals(
                 let nc = predict_luma_nc(luma_nnz, g_stride, mb_x * 4 + bx, mb_y * 4 + by);
                 write_cavlc_masked::<16>(w, zz, nc, mask);
             }
-            luma_nnz[g] = mask.count_ones() as u8;
+            luma_nnz[g] = pop16(mask);
         }
     }
     write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, chroma, chroma_nnz);
@@ -644,7 +661,7 @@ fn write_cavlc_chroma(
                 let (cgx, cgy) = (mb_x * 2 + (b & 1), mb_y * 2 + (b >> 1));
                 let nc = predict_chroma_nc(nnz, cg_stride, cgx, cgy);
                 write_cavlc_masked::<15>(w, ac, nc, mask);
-                nnz[cgy * cg_stride + cgx] = mask.count_ones() as u8;
+                nnz[cgy * cg_stride + cgx] = pop16(mask);
             }
         }
     }
@@ -2743,7 +2760,7 @@ impl EncState {
                         };
                         let inc = cabac_cbf_ctx_inc(nb(true), nb(false), true);
                         ce.encode_residual_block_cat(ctxs, 1, inc, scanned);
-                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
+                        self.luma_nnz[gy * g_stride + gx] = pop16(ac_masks[b]);
                     }
                 }
                 encode_cabac_chroma_residuals(
@@ -2776,7 +2793,7 @@ impl EncState {
                         let (gx, gy) = (mb_x * 4 + bx, mb_y * 4 + by);
                         let nc = predict_luma_nc(&self.luma_nnz, g_stride, gx, gy);
                         write_cavlc_masked::<15>(w, &zz[1..], nc, ac_masks[b]);
-                        self.luma_nnz[gy * g_stride + gx] = ac_masks[b].count_ones() as u8;
+                        self.luma_nnz[gy * g_stride + gx] = pop16(ac_masks[b]);
                     }
                 }
                 write_cavlc_chroma(w, mb_x, mb_y, mb_w, cbp_chroma, &c, &mut self.chroma_nnz);
