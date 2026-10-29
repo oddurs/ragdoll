@@ -28,14 +28,42 @@ pub fn h264_luma_deblock(
     tc0: [i8; 4],
     strong: bool,
 ) {
+    match (xstride, ystride, strong) {
+        (1, s, false) => h264_luma_deblock_edge::<false, false>(buf, q0, s, alpha, beta, tc0),
+        (1, s, true) => h264_luma_deblock_edge::<false, true>(buf, q0, s, alpha, beta, tc0),
+        (s, 1, false) => h264_luma_deblock_edge::<true, false>(buf, q0, s, alpha, beta, tc0),
+        (s, 1, true) => h264_luma_deblock_edge::<true, true>(buf, q0, s, alpha, beta, tc0),
+        _ => {
+            assert!(q0 >= 4 * xstride && q0 + 3 * xstride + 15 * ystride < buf.len());
+            h264_luma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, strong);
+        }
+    }
+}
+
+/// [`h264_luma_deblock`] of a vertical edge (`HORIZONTAL == false`: samples across it step by 1,
+/// lines by `stride`) or a horizontal one (the other way round), with the bS 4 filter when
+/// `STRONG`. The edge kind and filter are known at compile time.
+///
+/// # Panics
+/// If `buf` does not hold all 16 lines of samples `p3..q3`.
+#[inline]
+pub fn h264_luma_deblock_edge<const HORIZONTAL: bool, const STRONG: bool>(
+    buf: &mut [u8],
+    q0: usize,
+    stride: usize,
+    alpha: i32,
+    beta: i32,
+    tc0: [i8; 4],
+) {
+    let (xstride, ystride) = if HORIZONTAL { (stride, 1) } else { (1, stride) };
     assert!(q0 >= 4 * xstride && q0 + 3 * xstride + 15 * ystride < buf.len());
     #[cfg(target_arch = "x86_64")]
-    if ragdoll_core::dispatch::avx2() && (xstride == 1 || ystride == 1) {
+    if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { luma_avx2(buf, q0, xstride, ystride, alpha, beta, tc0, strong) };
+        unsafe { luma_avx2::<HORIZONTAL, STRONG>(buf, q0, xstride, ystride, alpha, beta, tc0) };
         return;
     }
-    h264_luma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, strong);
+    h264_luma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, STRONG);
 }
 
 /// Scalar reference for [`h264_luma_deblock`].
@@ -117,14 +145,41 @@ pub fn h264_chroma_deblock(
     tc0: [i8; 4],
     strong: bool,
 ) {
+    match (xstride, ystride, strong) {
+        (1, s, false) => h264_chroma_deblock_edge::<false, false>(buf, q0, s, alpha, beta, tc0),
+        (1, s, true) => h264_chroma_deblock_edge::<false, true>(buf, q0, s, alpha, beta, tc0),
+        (s, 1, false) => h264_chroma_deblock_edge::<true, false>(buf, q0, s, alpha, beta, tc0),
+        (s, 1, true) => h264_chroma_deblock_edge::<true, true>(buf, q0, s, alpha, beta, tc0),
+        _ => {
+            assert!(q0 >= 2 * xstride && q0 + xstride + 7 * ystride < buf.len());
+            h264_chroma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, strong);
+        }
+    }
+}
+
+/// [`h264_chroma_deblock`] with the edge kind and filter known at compile time, as for
+/// [`h264_luma_deblock_edge`].
+///
+/// # Panics
+/// If `buf` does not hold all 8 lines of samples `p1..q1`.
+#[inline]
+pub fn h264_chroma_deblock_edge<const HORIZONTAL: bool, const STRONG: bool>(
+    buf: &mut [u8],
+    q0: usize,
+    stride: usize,
+    alpha: i32,
+    beta: i32,
+    tc0: [i8; 4],
+) {
+    let (xstride, ystride) = if HORIZONTAL { (stride, 1) } else { (1, stride) };
     assert!(q0 >= 2 * xstride && q0 + xstride + 7 * ystride < buf.len());
     #[cfg(target_arch = "x86_64")]
-    if ragdoll_core::dispatch::avx2() && (xstride == 1 || ystride == 1) {
+    if ragdoll_core::dispatch::avx2() {
         // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
-        unsafe { chroma_avx2(buf, q0, xstride, ystride, alpha, beta, tc0, strong) };
+        unsafe { chroma_avx2::<HORIZONTAL, STRONG>(buf, q0, xstride, ystride, alpha, beta, tc0) };
         return;
     }
-    h264_chroma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, strong);
+    h264_chroma_deblock_scalar(buf, q0, xstride, ystride, alpha, beta, tc0, STRONG);
 }
 
 /// Scalar reference for [`h264_chroma_deblock`].
@@ -165,7 +220,7 @@ pub fn h264_chroma_deblock_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn chroma_avx2(
+unsafe fn chroma_avx2<const HORIZONTAL: bool, const STRONG: bool>(
     buf: &mut [u8],
     q0: usize,
     xstride: usize,
@@ -173,13 +228,12 @@ unsafe fn chroma_avx2(
     alpha: i32,
     beta: i32,
     tc0: [i8; 4],
-    strong: bool,
 ) {
     use std::arch::x86_64::*;
     let base = unsafe { buf.as_mut_ptr().add(q0) };
     // p1, p0, q0, q1 of the 8 lines, 8 bytes each in the low halves.
     let (p1, p0, q0v, q1);
-    if ystride == 1 {
+    if HORIZONTAL {
         let ld = |i: isize| unsafe {
             _mm_loadl_epi64(base.offset(i * xstride as isize) as *const __m128i)
         };
@@ -208,7 +262,7 @@ unsafe fn chroma_avx2(
         _mm_and_si128(lt(absd(wp1, wp0), vb), lt(absd(wq1, wq0), vb)),
     );
     let two = _mm_set1_epi16(2);
-    let (np0, nq0) = if strong {
+    let (np0, nq0) = if STRONG {
         (
             _mm_srai_epi16::<2>(_mm_add_epi16(
                 _mm_add_epi16(_mm_slli_epi16::<1>(wp1), wp0),
@@ -237,7 +291,7 @@ unsafe fn chroma_avx2(
     // packus clips to 0..=255 (the strong results are already in range).
     let np0 = _mm_packus_epi16(_mm_blendv_epi8(wp0, np0, mask), zero);
     let nq0 = _mm_packus_epi16(_mm_blendv_epi8(wq0, nq0, mask), zero);
-    if ystride == 1 {
+    if HORIZONTAL {
         unsafe {
             _mm_storel_epi64(base.sub(xstride) as *mut __m128i, np0);
             _mm_storel_epi64(base as *mut __m128i, nq0);
@@ -340,7 +394,7 @@ unsafe fn transpose_8x16(c: &[std::arch::x86_64::__m128i; 8]) -> [std::arch::x86
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn luma_avx2(
+unsafe fn luma_avx2<const HORIZONTAL: bool, const STRONG: bool>(
     buf: &mut [u8],
     q0: usize,
     xstride: usize,
@@ -348,13 +402,12 @@ unsafe fn luma_avx2(
     alpha: i32,
     beta: i32,
     tc0: [i8; 4],
-    strong: bool,
 ) {
     use std::arch::x86_64::*;
     let base = unsafe { buf.as_mut_ptr().add(q0) };
     // s[i] = samples p3, p2, p1, p0, q0, q1, q2, q3 of the 16 lines, as bytes.
     let mut s = [_mm_setzero_si128(); 8];
-    if ystride == 1 {
+    if HORIZONTAL {
         for (i, v) in s.iter_mut().enumerate() {
             *v = unsafe {
                 _mm_loadu_si128(base.sub(4 * xstride).add(i * xstride) as *const __m128i)
@@ -385,7 +438,7 @@ unsafe fn luma_avx2(
     let add = _mm256_add_epi16;
     let sel = |m: __m256i, new: __m256i, old: __m256i| _mm256_blendv_epi8(old, new, m);
     let (np2, np1, np0, nq0, nq1, nq2);
-    if strong {
+    if STRONG {
         let small = lt(d_pq, _mm256_set1_epi16(((alpha >> 2) + 2) as i16));
         let pq = add(p0, q0v);
         // p side
@@ -470,7 +523,7 @@ unsafe fn luma_avx2(
     s[4] = out(nq0, q0v);
     s[5] = out(nq1, q1);
     s[6] = out(nq2, q2);
-    if ystride == 1 {
+    if HORIZONTAL {
         // Rows p2..q2 (an iterator adaptor here is not inlined into this target_feature function).
         #[allow(clippy::needless_range_loop)]
         for i in 1..7 {

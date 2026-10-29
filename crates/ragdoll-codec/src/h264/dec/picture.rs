@@ -54,6 +54,10 @@ pub struct Motion {
     pub mb_field: Vec<bool>,
     /// Decoded as an MBAFF frame (rather than as a frame or two field pictures).
     pub mbaff: bool,
+    /// The referenced pictures' ids by list and reference index, per [`Motion::mb_table`] entry.
+    pub ref_tables: Vec<RefIds>,
+    /// Per macroblock: its entry of [`Motion::ref_tables`].
+    pub mb_table: Vec<u16>,
 }
 
 impl Motion {
@@ -65,18 +69,56 @@ impl Motion {
             mb_uniform: vec![false; mb_w * mb_h],
             mb_field: vec![false; mb_w * mb_h],
             mbaff: false,
+            ref_tables: Vec::new(),
+            mb_table: vec![0; mb_w * mb_h],
         }
+    }
+
+    /// Id of the picture block `blk` of macroblock `mb` refers to in `list`, or [`NO_PIC`].
+    #[inline]
+    pub fn ref_pic(&self, mb: usize, blk: usize, list: usize) -> u32 {
+        ref_pic_in(
+            &self.ref_tables,
+            &self.mb_table,
+            &self.blocks,
+            mb,
+            blk,
+            list,
+        )
     }
 }
 
-/// What later blocks read of one 4x4 block. Per list: the vector, the referenced picture id
-/// (see [`FrameStore::frame_ref_id`], or [`NO_PIC`]), the reference index (`-1` unused) and, for
-/// CABAC contexts, the absolute mvd components. Then whether its transform block has nonzero
-/// coefficients (deblocking, CABAC cbf) and whether it was direct-predicted (CABAC ref_idx).
+/// Ids of the pictures a slice's reference indices refer to, by list and index (up to 32 each,
+/// as field reference lists allow); [`NO_PIC`] beyond the lists.
+pub type RefIds = [[u32; 32]; 2];
+
+/// [`Motion::ref_pic`] over the parts of a picture's state.
+#[inline]
+fn ref_pic_in(
+    tables: &[RefIds],
+    mb_table: &[u16],
+    blocks: &[BlockInfo],
+    mb: usize,
+    blk: usize,
+    list: usize,
+) -> u32 {
+    let r = blocks[blk].ref_idx[list];
+    if r < 0 {
+        return NO_PIC;
+    }
+    tables
+        .get(mb_table[mb] as usize)
+        .map_or(NO_PIC, |t| t[list][r as usize & 31])
+}
+
+/// What later blocks read of one 4x4 block, in 16 bytes. Per list: the vector, the reference
+/// index (`-1` unused; the referenced picture follows from the macroblock's reference table, see
+/// [`PicState::ref_pic`]) and, for CABAC contexts, the absolute mvd components. Then whether its
+/// transform block has nonzero coefficients (deblocking, CABAC cbf) and whether it was
+/// direct-predicted (CABAC ref_idx).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockInfo {
     pub mv: [[i16; 2]; 2],
-    pub ref_pic: [u32; 2],
     pub ref_idx: [i8; 2],
     pub mvd: [[u8; 2]; 2],
     pub nz: bool,
@@ -86,7 +128,6 @@ pub struct BlockInfo {
 /// [`BlockInfo`] of a block with no prediction (intra, or not yet decoded).
 pub const NO_BLOCK: BlockInfo = BlockInfo {
     mv: [[0; 2]; 2],
-    ref_pic: [NO_PIC; 2],
     ref_idx: [-1; 2],
     mvd: [[0; 2]; 2],
     nz: false,
@@ -207,6 +248,8 @@ impl FrameStore {
             m.mb_intra.fill(true);
             m.mb_uniform.fill(false);
             m.mb_field.fill(false);
+            m.ref_tables.clear();
+            m.mb_table.fill(0);
             debug_assert_eq!(m.mb_intra.len(), n);
         }
         Arc::make_mut(&mut self.motion).mbaff = false;
@@ -301,6 +344,13 @@ pub struct PicState {
     pub intra_mode: Vec<i8>,
     /// Per 4x4 block: motion of both lists and coefficient and direct flags.
     pub blocks: Vec<BlockInfo>,
+    /// Reference tables of the picture's slices (see [`Motion::ref_tables`]).
+    pub ref_tables: Vec<RefIds>,
+    /// Per table: no picture appears in it twice, so that within it equal pictures are equal
+    /// (list, index) pairs.
+    pub ref_unique: Vec<bool>,
+    /// Per macroblock: its entry of [`PicState::ref_tables`].
+    pub mb_table: Vec<u16>,
     /// Per macroblock: the inner luma edges (bit `4 * dir + edge`, `edge` 1..=3) across which
     /// motion may differ; `0` when inter prediction used one motion for all 16 blocks.
     pub motion_edges: Vec<u8>,
@@ -342,6 +392,9 @@ impl PicState {
             nnz: vec![0; b4],
             intra_mode: vec![-1; b4],
             blocks: vec![NO_BLOCK; b4],
+            ref_tables: Vec::new(),
+            ref_unique: Vec::new(),
+            mb_table: vec![0; mbs],
             motion_edges: vec![ANY_INNER_EDGE; mbs],
             nnz_c: [vec![0; c4], vec![0; c4]],
             recycled: false,
@@ -364,11 +417,42 @@ impl PicState {
                 st.slice_num.fill(u32::MAX);
                 st.mb_type.fill(MbType::None);
                 st.mb_field.fill(matches!(structure, Structure::Field(_)));
+                st.ref_tables.clear();
+                st.ref_unique.clear();
                 st.recycled = true;
                 st
             }
             _ => Self::new(structure, mb_w, mb_h, mbaff),
         }
+    }
+
+    /// Id of the picture block `blk` of macroblock `mb` refers to in `list`, or [`NO_PIC`].
+    #[inline]
+    pub fn ref_pic(&self, mb: usize, blk: usize, list: usize) -> u32 {
+        ref_pic_in(
+            &self.ref_tables,
+            &self.mb_table,
+            &self.blocks,
+            mb,
+            blk,
+            list,
+        )
+    }
+
+    /// Adds a slice's reference table.
+    pub fn push_ref_table(&mut self, t: RefIds) {
+        let ids = || t.iter().flatten().filter(|&&id| id != NO_PIC);
+        let unique = ids()
+            .enumerate()
+            .all(|(i, a)| ids().skip(i + 1).all(|b| a != b));
+        self.ref_tables.push(t);
+        self.ref_unique.push(unique);
+    }
+
+    /// [`Self::ref_pic`] for both lists.
+    #[inline]
+    pub fn ref_pics(&self, mb: usize, blk: usize) -> [u32; 2] {
+        [self.ref_pic(mb, blk, 0), self.ref_pic(mb, blk, 1)]
     }
 
     /// Restores the coding state (all but availability) of macroblock `addr`, at column `x` and
@@ -490,6 +574,8 @@ impl PicState {
         let stride = self.mb_w * 4;
         if parity.is_none() && m.blocks.len() == self.blocks.len() {
             std::mem::swap(&mut m.blocks, &mut self.blocks);
+            std::mem::swap(&mut m.ref_tables, &mut self.ref_tables);
+            std::mem::swap(&mut m.mb_table, &mut self.mb_table);
             for (i, t) in self.mb_type.iter().enumerate() {
                 m.mb_intra[i] = t.is_intra();
                 m.mb_uniform[i] = self.motion_edges[i] == 0;
@@ -497,6 +583,12 @@ impl PicState {
             m.mb_field.copy_from_slice(&self.mb_field);
             return;
         }
+        // A field appends its slices' tables to the other field's.
+        if parity.is_none() {
+            m.ref_tables.clear();
+        }
+        let base = m.ref_tables.len() as u16;
+        m.ref_tables.extend_from_slice(&self.ref_tables);
         for mby in 0..self.mb_h {
             let fy = match parity {
                 None => mby,
@@ -508,6 +600,7 @@ impl PicState {
                 m.mb_intra[dst_mb] = self.mb_type[src_mb].is_intra();
                 m.mb_uniform[dst_mb] = self.motion_edges[src_mb] == 0;
                 m.mb_field[dst_mb] = self.mb_field[src_mb];
+                m.mb_table[dst_mb] = base + self.mb_table[src_mb];
                 for r in 0..4 {
                     let s = (mby * 4 + r) * stride + mbx * 4;
                     let d = (fy * 4 + r) * stride + mbx * 4;

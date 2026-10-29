@@ -59,3 +59,7 @@ Round 4: CABAC engine with one-base tables, a refill marker bit and node-state l
 ## 2026-10-29
 
 Round 4, merged: CAVLC residual decoding from compile-time tables with a register-resident reader, paired level/run_before lookups and an inlinable read_ue (720p Baseline CAVLC residual 151 M -> 57 M instructions). Totals: 1080p High 1.385 G, 720p Baseline 0.825 G instructions (FFmpeg 1.12 G and 0.68 G).
+
+## 2026-10-29
+
+Round 5: deblocking kernels take edge direction and strong/normal filter as const generics (h264_luma_deblock_edge::<HORIZONTAL,STRONG>); bS intra/motion conditions computed without short-circuit branches; BlockInfo shrunk to 16 B by dropping ref_pic in favour of per-slice RefIds tables (mb_table index per MB; deblock compares (list,idx) when one table without duplicates covers both MBs). The diet costs ~+25M Ir in strengths but cuts D1 misses ~15%: wall 1080p 152.4 -> 148.4 ms (FFmpeg 120), 720p 76.4 -> 77.3 ms (FFmpeg 54.5). Conformance: 166 JVT streams identical.

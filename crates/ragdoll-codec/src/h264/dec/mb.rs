@@ -13,7 +13,7 @@ use crate::h264::{decode_cavlc_block, decode_cavlc_coeffs};
 
 use super::cabac_se;
 use super::intra;
-use super::picture::{MbType, Motion, NO_BLOCK, NO_PIC, PicState, Structure, fill_rect};
+use super::picture::{MbType, Motion, NO_BLOCK, NO_PIC, PicState, RefIds, Structure, fill_rect};
 use super::ps::{Pps, Sps};
 use super::recon::{self, Dequant, Weighting};
 use super::slice::{SliceHeader, SliceType};
@@ -97,6 +97,21 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
         None => [Vec::new(), Vec::new()],
     };
     let (st_mbaff, st_structure) = (st.mbaff, st.structure);
+    let ids = |lists: &[Vec<RefPic>; 2]| -> RefIds {
+        let mut t = [[NO_PIC; 32]; 2];
+        for (row, list) in t.iter_mut().zip(lists) {
+            for (id, r) in row.iter_mut().zip(list) {
+                *id = r.id;
+            }
+        }
+        t
+    };
+    let table_base = st.ref_tables.len() as u16;
+    st.push_ref_table(ids(&cx.refs));
+    if let Some(f) = &cx.field_refs {
+        st.push_ref_table(ids(&f[0]));
+        st.push_ref_table(ids(&f[1]));
+    }
     let mut d = Dec {
         cx,
         st,
@@ -119,6 +134,7 @@ pub fn decode_slice(cx: &SliceCtx<'_>, st: &mut PicState, rbsp: &[u8]) -> Result
             && cx.sh.weights.is_none(),
         nb: 0,
         nb_addr: usize::MAX,
+        table_base,
         whole: cx.slice_num == 0 && cx.sh.first_mb == 0,
         res: None,
     };
@@ -219,6 +235,9 @@ struct Dec<'a, 'c> {
     nb: u8,
     /// The address [`Self::nb`] was found for.
     nb_addr: usize,
+    /// This slice's first entry of [`PicState::ref_tables`]: its frame lists, then (MBAFF) its
+    /// top and bottom field lists.
+    table_base: u16,
     /// The slice is the picture's first and starts at its first macroblock: every macroblock
     /// before the current one belongs to it.
     whole: bool,
@@ -509,6 +528,12 @@ impl<'a, 'c> Dec<'a, 'c> {
             self.st.clear_mb_state(a, self.mb.x, self.mb.y);
         }
         self.partial_motion = false;
+        // The reference lists `refs` reads, as a table of `st.ref_tables`.
+        self.st.mb_table[a] = self.table_base
+            + match &self.cx.field_refs {
+                Some(_) if self.field => 1 + (self.mb.y & 1) as u16,
+                _ => 0,
+            };
         self.st.slice_num[a] = self.cx.slice_num;
         self.st.mb_field[a] = self.field;
     }
@@ -785,8 +810,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         } else {
             self.st.mb_type[a] = MbType::PSkip;
             let mv = self.p_skip_mv();
-            let id = self.ref_id(0, 0)?;
-            self.fill_blocks(0, 0, 4, 4, 0, (0, mv), id, [0, 0]);
+            self.check_ref(0, 0)?;
+            self.fill_blocks(0, 0, 4, 4, 0, (0, mv), [0, 0]);
         }
         self.inter_predict_mb()?;
         Ok(())
@@ -1665,14 +1690,13 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     // ----- inter macroblocks ----------------------------------------------------------------
 
-    fn ref_id(&self, list: usize, idx: i8) -> Result<u32> {
-        if idx < 0 {
-            return Ok(NO_PIC);
+    /// Fails when a used reference index lies beyond its list.
+    #[inline]
+    fn check_ref(&self, list: usize, idx: i8) -> Result<()> {
+        if idx >= 0 && idx as usize >= self.refs(list).len() {
+            return Err(bad("H.264 ref_idx beyond the reference list"));
         }
-        self.refs(list)
-            .get(idx as usize)
-            .map(|r| r.id)
-            .ok_or_else(|| bad("H.264 ref_idx beyond the reference list"))
+        Ok(())
     }
 
     /// Resets the current macroblock's blocks to no motion, no coefficients.
@@ -1691,13 +1715,11 @@ impl<'a, 'c> Dec<'a, 'c> {
         h: usize,
         list: usize,
         m: Mv,
-        pic: u32,
         mvd: [u8; 2],
     ) {
         let mut b = NO_BLOCK;
         b.ref_idx[list] = m.0;
         b.mv[list] = m.1;
-        b.ref_pic[list] = pic;
         b.mvd[list] = mvd;
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
         let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
@@ -1720,7 +1742,6 @@ impl<'a, 'c> Dec<'a, 'c> {
         h: usize,
         list: usize,
         m: Mv,
-        pic: u32,
         mvd: [u8; 2],
     ) {
         // Fixed-size stores per width: a slice fill of a few elements becomes a memset call.
@@ -1731,7 +1752,6 @@ impl<'a, 'c> Dec<'a, 'c> {
             i: usize,
             h: usize,
             m: Mv,
-            pic: u32,
             mvd: [u8; 2],
         ) {
             let s = st.mb_w * 4;
@@ -1740,7 +1760,6 @@ impl<'a, 'c> Dec<'a, 'c> {
                 for b in &mut rows[r * s..r * s + N] {
                     b.ref_idx[list] = m.0;
                     b.mv[list] = m.1;
-                    b.ref_pic[list] = pic;
                     b.mvd[list] = mvd;
                 }
             }
@@ -1748,10 +1767,10 @@ impl<'a, 'c> Dec<'a, 'c> {
         self.partial_motion |= (bx, by, w, h) != (0, 0, 4, 4);
         let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
         match w {
-            1 => rect::<1>(self.st, list, i, h, m, pic, mvd),
-            2 => rect::<2>(self.st, list, i, h, m, pic, mvd),
-            3 => rect::<3>(self.st, list, i, h, m, pic, mvd),
-            _ => rect::<4>(self.st, list, i, h, m, pic, mvd),
+            1 => rect::<1>(self.st, list, i, h, m, mvd),
+            2 => rect::<2>(self.st, list, i, h, m, mvd),
+            3 => rect::<3>(self.st, list, i, h, m, mvd),
+            _ => rect::<4>(self.st, list, i, h, m, mvd),
         }
     }
 
@@ -2062,11 +2081,11 @@ impl<'a, 'c> Dec<'a, 'c> {
                     };
                     let mvp = self.mvp(list, bx, by, w, r, shape, done);
                     let mv = [mvp[0].wrapping_add(mvd[0]), mvp[1].wrapping_add(mvd[1])];
-                    let id = self.ref_id(list, r)?;
+                    self.check_ref(list, r)?;
                     if l0_only {
-                        self.fill_blocks(bx, by, w, h, list, (r, mv), id, amvd);
+                        self.fill_blocks(bx, by, w, h, list, (r, mv), amvd);
                     } else {
-                        self.fill_motion(bx, by, w, h, list, (r, mv), id, amvd);
+                        self.fill_motion(bx, by, w, h, list, (r, mv), amvd);
                     }
                 }
                 // An unused list keeps the macroblock's reset motion (no reference).
@@ -2122,8 +2141,8 @@ impl<'a, 'c> Dec<'a, 'c> {
                         let r = refs[i][list];
                         let mvp = self.mvp(list, x, y, w, r, None, done);
                         let mv = [mvp[0].wrapping_add(mvd[0]), mvp[1].wrapping_add(mvd[1])];
-                        let id = self.ref_id(list, r)?;
-                        self.fill_motion(x, y, w, h, list, (r, mv), id, amvd);
+                        self.check_ref(list, r)?;
+                        self.fill_motion(x, y, w, h, list, (r, mv), amvd);
                     }
                     done |= rect_mask(x, y, w, h);
                 }
@@ -2302,7 +2321,7 @@ impl<'a, 'c> Dec<'a, 'c> {
                 b.ref_idx[list] = refs[list];
                 b.mv[list] = mvs[list];
             }
-            b.ref_pic[list] = self.ref_id(list, b.ref_idx[list])?;
+            self.check_ref(list, b.ref_idx[list])?;
         }
         self.partial_motion |= n != 4;
         let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
@@ -2840,7 +2859,7 @@ impl ColMb<'_> {
         let i = (row * 4 + by) * self.mb_w * 4 + self.mbx * 4 + cbx;
         let b = &m.blocks[i];
         let l = if b.ref_idx[0] >= 0 { 0 } else { 1 };
-        (b.ref_idx[l], b.mv[l], b.ref_pic[l], vscale)
+        (b.ref_idx[l], b.mv[l], m.ref_pic(mb, i, l), vscale)
     }
 }
 
