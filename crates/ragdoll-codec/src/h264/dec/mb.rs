@@ -525,7 +525,7 @@ impl<'a, 'c> Dec<'a, 'c> {
         let a = self.mb.addr;
         // Every macroblock type writes all of its blocks' motion (see `reset_blocks`).
         if self.st.recycled {
-            self.st.clear_mb_state(a, self.mb.x, self.mb.y);
+            self.st.clear_mb_state(self.mb.x, self.mb.y);
         }
         self.partial_motion = false;
         // The reference lists `refs` reads, as a table of `st.ref_tables`.
@@ -803,6 +803,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let a = self.mb.addr;
         self.st.qp[a] = self.qp as u8;
         self.st.qpc[a] = self.chroma_qps(self.qp);
+        self.st.cbp[a] = 0;
+        self.st.t8x8[a] = false;
         self.last_dqp_nz = false;
         if self.cx.sh.slice_type.is_b() {
             self.st.mb_type[a] = MbType::BSkip;
@@ -1090,6 +1092,7 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     fn decode_intra_mb(&mut self, t: u32) -> Result<()> {
         let a = self.mb.addr;
+        self.st.t8x8[a] = false;
         if t == 25 {
             return self.decode_pcm();
         }
@@ -1510,6 +1513,8 @@ impl<'a, 'c> Dec<'a, 'c> {
         let (mx4, my4) = (self.mb.x * 4, self.mb.y * 4);
         let lst = if intra { 0 } else { 3 };
         let cabac = CABAC;
+        // DC coded_block_flags are set below as DC blocks are read.
+        self.st.cbf_dc[a] = 0;
         let dq = self.cx.dq;
         let mut coeffs = ResidualCoeffs::new();
 
