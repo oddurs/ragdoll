@@ -77,6 +77,22 @@ pub const AVAIL8: [[u8; 16]; 4] = {
     t
 };
 
+/// Marks an Intra4x4/Intra8x8 prediction mode neighbour as unavailable (8.3.1.1).
+pub const NO_MODE: i8 = i8::MIN;
+
+/// Predicted Intra4x4/Intra8x8 mode (8.3.1.1) of the block whose top-left 4x4 is at MB-relative
+/// `(bx, by)`, from `grid[1 + y][1 + x]` holding the mode of 4x4 block `(x, y)` (row and column 0
+/// the neighbouring macroblocks', [`NO_MODE`] where unavailable).
+#[inline]
+pub fn predicted_mode(grid: &[[i8; 5]; 5], bx: usize, by: usize) -> u8 {
+    let (a, b) = (grid[1 + by][bx], grid[by][1 + bx]);
+    if a == NO_MODE || b == NO_MODE {
+        2
+    } else {
+        a.min(b) as u8
+    }
+}
+
 /// Whether a 16x16 / chroma mode (V=0, H=1, DC=2, Plane=3) only reads available samples.
 pub fn block_mode_ok(mode: u8, has_left: bool, has_top: bool, has_tl: bool) -> bool {
     match mode {

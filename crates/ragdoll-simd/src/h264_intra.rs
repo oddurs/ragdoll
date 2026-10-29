@@ -353,7 +353,8 @@ fn predict_nxn(plane: &mut [u8], off: usize, stride: usize, n: usize, mode: u8, 
 pub fn h264_pred4x4(plane: &mut [u8], off: usize, stride: usize, mode: u8, avail: u8) {
     check_block(plane.len(), off, stride, 4, avail);
     if mode < 3 {
-        pred4x4_fill(plane, off, stride, mode, avail);
+        // Safety: bounds checked above.
+        unsafe { pred4x4_fill(plane, off, stride, mode, avail) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -379,41 +380,42 @@ pub fn h264_pred4x4_scalar(plane: &mut [u8], off: usize, stride: usize, mode: u8
 }
 
 /// Vertical, horizontal and DC Intra_4x4 prediction, a row at a time.
+///
+/// # Safety
+/// [`check_block`] must hold for the block at `off` of `plane` and `avail`.
 #[inline(always)]
-fn pred4x4_fill(plane: &mut [u8], off: usize, stride: usize, mode: u8, avail: u8) {
+unsafe fn pred4x4_fill(plane: &mut [u8], off: usize, stride: usize, mode: u8, avail: u8) {
     let has_top = avail & INTRA_TOP != 0;
     let has_left = avail & INTRA_LEFT != 0;
+    let p = plane.as_mut_ptr();
+    // Safety (all accesses): the block and its flagged neighbours lie in `plane`.
     let top = if has_top {
-        u32::from_le_bytes(plane[off - stride..off - stride + 4].try_into().unwrap())
+        unsafe { (p.add(off - stride) as *const u32).read_unaligned() }
     } else {
         0
     };
-    let left = |plane: &[u8], r: usize| {
+    let left = |r: usize| {
         if has_left {
-            plane[off + r * stride - 1] as u32
+            unsafe { *p.add(off + r * stride - 1) as u32 }
         } else {
             0
         }
     };
-    let row = |plane: &mut [u8], r: usize, v: u32| {
-        plane[off + r * stride..off + r * stride + 4].copy_from_slice(&v.to_le_bytes());
-    };
+    let row =
+        |r: usize, v: u32| unsafe { (p.add(off + r * stride) as *mut u32).write_unaligned(v) };
     match mode {
-        0 => (0..4).for_each(|r| row(plane, r, top)),
-        1 => (0..4).for_each(|r| {
-            let v = left(plane, r) * 0x0101_0101;
-            row(plane, r, v);
-        }),
+        0 => (0..4).for_each(|r| row(r, top)),
+        1 => (0..4).for_each(|r| row(r, left(r) * 0x0101_0101)),
         _ => {
             let st = top.to_le_bytes().iter().map(|&v| v as u32).sum::<u32>();
-            let sl = (0..4).map(|r| left(plane, r)).sum::<u32>();
+            let sl = (0..4).map(left).sum::<u32>();
             let dc = match (has_top, has_left) {
                 (true, true) => (st + sl + 4) >> 3,
                 (false, true) => (sl + 2) >> 2,
                 (true, false) => (st + 2) >> 2,
                 (false, false) => 128,
             };
-            (0..4).for_each(|r| row(plane, r, dc * 0x0101_0101));
+            (0..4).for_each(|r| row(r, dc * 0x0101_0101));
         }
     }
 }
@@ -455,16 +457,21 @@ pub fn h264_pred8x8l_scalar(plane: &mut [u8], off: usize, stride: usize, mode: u
 /// `p[-1, -1]`. Unavailable left samples repeat `p[-1, -1]` (giving its filter
 /// `(3 p[-1,-1] + p[0,-1] + 2) >> 2`); an unavailable `p[-1, -1]` repeats `p[0, -1]` (or
 /// `p[-1, 0]`), which filters `p[0, -1]` as `(3 p[0,-1] + p[1,-1] + 2) >> 2`.
+///
+/// # Safety
+/// [`check_block`] must hold for the block at `off` of `plane` and `avail`.
 #[inline(always)]
-fn edge8_left(plane: &[u8], off: usize, stride: usize, avail: u8) -> (u64, u8, u8) {
+unsafe fn edge8_left(plane: &[u8], off: usize, stride: usize, avail: u8) -> (u64, u8, u8) {
+    let p = plane.as_ptr();
+    // Safety (all reads): the block and its flagged neighbours lie in `plane`.
     let tl = if avail & INTRA_TOP_LEFT != 0 {
-        plane[off - stride - 1]
+        unsafe { *p.add(off - stride - 1) }
     } else {
         0
     };
     let left = if avail & INTRA_LEFT != 0 {
         (0..8).fold(0u64, |v, i| {
-            v | (plane[off + i * stride - 1] as u64) << (56 - 8 * i)
+            v | (unsafe { *p.add(off + i * stride - 1) } as u64) << (56 - 8 * i)
         })
     } else {
         tl as u64 * 0x0101_0101_0101_0101
@@ -472,7 +479,7 @@ fn edge8_left(plane: &[u8], off: usize, stride: usize, avail: u8) -> (u64, u8, u
     let tl_slot = if avail & INTRA_TOP_LEFT != 0 {
         tl
     } else if avail & INTRA_TOP != 0 {
-        plane[off - stride]
+        unsafe { *p.add(off - stride) }
     } else {
         (left >> 56) as u8
     };
@@ -657,7 +664,8 @@ unsafe fn pred8x8l_avx2(plane: &mut [u8], off: usize, stride: usize, mode: u8, a
     use std::arch::x86_64::*;
     use x86::*;
     let mode = mode.min(8) as usize;
-    let (left, tl_slot, tl) = edge8_left(plane, off, stride, avail);
+    // Safety: the caller checked the bounds.
+    let (left, tl_slot, tl) = unsafe { edge8_left(plane, off, stride, avail) };
     let p = plane.as_mut_ptr();
     unsafe {
         let top = if avail & INTRA_TOP != 0 {
@@ -836,7 +844,8 @@ unsafe fn pred8x8l_neon(plane: &mut [u8], off: usize, stride: usize, mode: u8, a
     use arm::*;
     use std::arch::aarch64::*;
     let mode = mode.min(8) as usize;
-    let (left, tl_slot, tl) = edge8_left(plane, off, stride, avail);
+    // Safety: the caller checked the bounds.
+    let (left, tl_slot, tl) = unsafe { edge8_left(plane, off, stride, avail) };
     let p = plane.as_mut_ptr();
     unsafe {
         let top = if avail & INTRA_TOP != 0 {
@@ -993,35 +1002,33 @@ pub fn h264_pred_chroma_scalar(plane: &mut [u8], off: usize, stride: usize, mode
 /// row at a time.
 #[inline(always)]
 fn fill_block<const N: usize>(plane: &mut [u8], off: usize, stride: usize, mode: u8, avail: u8) {
+    let has_top = mode == 0 || (mode == 2 && avail & INTRA_TOP != 0);
+    let has_left = mode == 1 || (mode == 2 && avail & INTRA_LEFT != 0);
+    // The rows the mode reads and writes lie in `plane`.
     assert!(stride >= N && off + (N - 1) * stride + N <= plane.len());
-    let left = |plane: &[u8], r: usize| plane[off + r * stride - 1];
+    assert!((!has_top || off >= stride) && (!has_left || off >= 1));
+    let p = plane.as_mut_ptr();
+    // Safety (all accesses): checked above.
+    let left = |r: usize| unsafe { *p.add(off + r * stride - 1) };
+    let fill = |r: usize, v: u8| unsafe { p.add(off + r * stride).write_bytes(v, N) };
     match mode {
         0 => {
-            let top: [u8; N] = plane[off - stride..off - stride + N].try_into().unwrap();
+            let top = unsafe { (p.add(off - stride) as *const [u8; N]).read_unaligned() };
             for r in 0..N {
-                plane[off + r * stride..off + r * stride + N].copy_from_slice(&top);
+                unsafe { (p.add(off + r * stride) as *mut [u8; N]).write_unaligned(top) };
             }
         }
-        1 => {
-            for r in 0..N {
-                let v = left(plane, r);
-                plane[off + r * stride..off + r * stride + N].fill(v);
-            }
-        }
+        1 => (0..N).for_each(|r| fill(r, left(r))),
         _ => {
             // Luma DC (8.3.3.3).
-            let has_top = avail & INTRA_TOP != 0;
-            let has_left = avail & INTRA_LEFT != 0;
             let st: u32 = if has_top {
-                plane[off - stride..off - stride + N]
-                    .iter()
-                    .map(|&v| v as u32)
-                    .sum()
+                let top = unsafe { (p.add(off - stride) as *const [u8; N]).read_unaligned() };
+                top.iter().map(|&v| v as u32).sum()
             } else {
                 0
             };
             let sl: u32 = if has_left {
-                (0..N).map(|r| left(plane, r) as u32).sum()
+                (0..N).map(|r| left(r) as u32).sum()
             } else {
                 0
             };
@@ -1031,9 +1038,7 @@ fn fill_block<const N: usize>(plane: &mut [u8], off: usize, stride: usize, mode:
                 (true, false) => (st + 8) >> 4,
                 (false, false) => 128,
             } as u8;
-            for r in 0..N {
-                plane[off + r * stride..off + r * stride + N].fill(v);
-            }
+            (0..N).for_each(|r| fill(r, v));
         }
     }
 }
@@ -1041,19 +1046,25 @@ fn fill_block<const N: usize>(plane: &mut [u8], off: usize, stride: usize, mode:
 /// Chroma DC prediction (8.3.4.1 - 8.3.4.3): each 4x4 block from its own top and left sums.
 #[inline(always)]
 fn chroma_dc(plane: &mut [u8], off: usize, stride: usize, avail: u8) {
-    assert!(stride >= 8 && off + 7 * stride + 8 <= plane.len());
     let has_top = avail & INTRA_TOP != 0;
+    let has_left = [avail & INTRA_LEFT != 0, avail & INTRA_LEFT_LOWER != 0];
+    // The rows read and written lie in `plane`.
+    assert!(stride >= 8 && off + 7 * stride + 8 <= plane.len());
+    assert!((!has_top || off >= stride) && (!(has_left[0] || has_left[1]) || off >= 1));
+    let p = plane.as_mut_ptr();
     let (mut st, mut sl) = ([0u32; 2], [0u32; 2]);
     if has_top {
-        for (i, &v) in plane[off - stride..off - stride + 8].iter().enumerate() {
+        // Safety: checked above.
+        let top = unsafe { (p.add(off - stride) as *const [u8; 8]).read_unaligned() };
+        for (i, &v) in top.iter().enumerate() {
             st[i >> 2] += v as u32;
         }
     }
-    let has_left = [avail & INTRA_LEFT != 0, avail & INTRA_LEFT_LOWER != 0];
     for h in 0..2 {
         if has_left[h] {
+            // Safety: checked above.
             sl[h] = (0..4)
-                .map(|r| plane[off + (4 * h + r) * stride - 1] as u32)
+                .map(|r| unsafe { *p.add(off + (4 * h + r) * stride - 1) } as u32)
                 .sum();
         }
     }
@@ -1076,8 +1087,8 @@ fn chroma_dc(plane: &mut [u8], off: usize, stride: usize, avail: u8) {
             row[4 * bx..4 * bx + 4].fill(v as u8);
         }
         for r in 0..4 {
-            let o = off + (4 * by + r) * stride;
-            plane[o..o + 8].copy_from_slice(&row);
+            // Safety: checked above.
+            unsafe { (p.add(off + (4 * by + r) * stride) as *mut [u8; 8]).write_unaligned(row) };
         }
     }
 }

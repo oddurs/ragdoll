@@ -24,6 +24,12 @@ pub fn h264_idct4_add(dst: &mut [u8], stride: usize, d: &[i32; 16]) {
         unsafe { idct4_add_avx2(dst, stride, d) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; neon() is true only when the CPU supports NEON.
+        unsafe { idct4_add_neon(dst, stride, d) };
+        return;
+    }
     h264_idct4_add_scalar(dst, stride, d);
 }
 
@@ -108,13 +114,86 @@ unsafe fn idct4_add_avx2(dst: &mut [u8], stride: usize, d: &[i32; 16]) {
         // f[j] lane i = f[i][j]; transpose back so lane j is column j, then the column transform.
         let h = butterfly(transpose(f));
         let r32 = _mm_set1_epi32(32);
-        let zero = _mm_setzero_si128();
-        for (i, v) in h.iter().enumerate() {
-            let q = dst.as_mut_ptr().add(i * stride);
-            let px = _mm_cvtepu8_epi32(_mm_cvtsi32_si128((q as *const i32).read_unaligned()));
-            let s = _mm_add_epi32(px, _mm_srai_epi32::<6>(_mm_add_epi32(*v, r32)));
-            let s = _mm_packus_epi16(_mm_packs_epi32(s, zero), zero);
-            (q as *mut i32).write_unaligned(_mm_cvtsi128_si32(s));
+        let v = h.map(|v| _mm_srai_epi32::<6>(_mm_add_epi32(v, r32)));
+        let q: [*mut u8; 4] = std::array::from_fn(|i| dst.as_mut_ptr().add(i * stride));
+        let px = |a: usize| {
+            let row = |i: usize| _mm_cvtsi32_si128((q[i] as *const i32).read_unaligned());
+            _mm_cvtepu8_epi16(_mm_unpacklo_epi32(row(a), row(a + 1)))
+        };
+        // Saturating to i16 first keeps clip(p + v): |v| > 32767 clips either way.
+        let s01 = _mm_adds_epi16(_mm_packs_epi32(v[0], v[1]), px(0));
+        let s23 = _mm_adds_epi16(_mm_packs_epi32(v[2], v[3]), px(2));
+        let s = _mm_packus_epi16(s01, s23);
+        (q[0] as *mut i32).write_unaligned(_mm_cvtsi128_si32(s));
+        (q[1] as *mut i32).write_unaligned(_mm_extract_epi32::<1>(s));
+        (q[2] as *mut i32).write_unaligned(_mm_extract_epi32::<2>(s));
+        (q[3] as *mut i32).write_unaligned(_mm_extract_epi32::<3>(s));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn idct4_add_neon(dst: &mut [u8], stride: usize, d: &[i32; 16]) {
+    use std::arch::aarch64::*;
+    /// Transposes the 4x4 block held in `r`.
+    #[inline(always)]
+    unsafe fn transpose(r: [int32x4_t; 4]) -> [int32x4_t; 4] {
+        unsafe {
+            let a = vreinterpretq_s64_s32(vtrn1q_s32(r[0], r[1]));
+            let b = vreinterpretq_s64_s32(vtrn2q_s32(r[0], r[1]));
+            let c = vreinterpretq_s64_s32(vtrn1q_s32(r[2], r[3]));
+            let e = vreinterpretq_s64_s32(vtrn2q_s32(r[2], r[3]));
+            [
+                vreinterpretq_s32_s64(vtrn1q_s64(a, c)),
+                vreinterpretq_s32_s64(vtrn1q_s64(b, e)),
+                vreinterpretq_s32_s64(vtrn2q_s64(a, c)),
+                vreinterpretq_s32_s64(vtrn2q_s64(b, e)),
+            ]
+        }
+    }
+    /// The 1-D transform of 8.5.12.2 on four lanes at once: `x[k]` holds element `k`.
+    #[inline(always)]
+    unsafe fn butterfly(x: [int32x4_t; 4]) -> [int32x4_t; 4] {
+        unsafe {
+            let e0 = vaddq_s32(x[0], x[2]);
+            let e1 = vsubq_s32(x[0], x[2]);
+            let e2 = vsubq_s32(vshrq_n_s32::<1>(x[1]), x[3]);
+            let e3 = vaddq_s32(x[1], vshrq_n_s32::<1>(x[3]));
+            [
+                vaddq_s32(e0, e3),
+                vaddq_s32(e1, e2),
+                vsubq_s32(e1, e2),
+                vsubq_s32(e0, e3),
+            ]
+        }
+    }
+    unsafe {
+        let p = d.as_ptr();
+        let rows = [
+            vld1q_s32(p),
+            vld1q_s32(p.add(4)),
+            vld1q_s32(p.add(8)),
+            vld1q_s32(p.add(12)),
+        ];
+        let h = butterfly(transpose(butterfly(transpose(rows))));
+        let r32 = vdupq_n_s32(32);
+        let v = h.map(|v| vqmovn_s32(vshrq_n_s32::<6>(vaddq_s32(v, r32))));
+        let q: [*mut u8; 4] = std::array::from_fn(|i| dst.as_mut_ptr().add(i * stride));
+        for k in 0..2 {
+            let (q0, q1) = (q[2 * k], q[2 * k + 1]);
+            // Saturating to i16 first keeps clip(p + v): |v| > 32767 clips either way.
+            let row = |q: *mut u8| {
+                vreinterpret_s16_u16(vget_low_u16(vmovl_u8(vcreate_u8(
+                    (q as *const u32).read_unaligned() as u64,
+                ))))
+            };
+            let s = vqaddq_s16(
+                vcombine_s16(v[2 * k], v[2 * k + 1]),
+                vcombine_s16(row(q0), row(q1)),
+            );
+            let o = vreinterpret_u32_u8(vqmovun_s16(s));
+            (q0 as *mut u32).write_unaligned(vget_lane_u32::<0>(o));
+            (q1 as *mut u32).write_unaligned(vget_lane_u32::<1>(o));
         }
     }
 }
@@ -432,9 +511,13 @@ mod tests {
             x
         };
         for round in 0..2000 {
-            // Mostly the conforming range, sometimes far beyond it.
+            // Mostly the conforming range, sometimes far beyond it or at the i32 extremes.
             let span = if round % 10 == 0 { 1 << 20 } else { 4096 };
-            let d: [i32; 16] = std::array::from_fn(|_| (next() % (2 * span)) as i32 - span as i32);
+            let d: [i32; 16] = std::array::from_fn(|_| match round % 10 {
+                5 => [i32::MIN, i32::MAX, 0, -1][(next() & 3) as usize],
+                7 => next() as i32,
+                _ => (next() % (2 * span)) as i32 - span as i32,
+            });
             let pix: Vec<u8> = (0..4 * 7).map(|_| next() as u8).collect();
             let (mut a, mut b) = (pix.clone(), pix.clone());
             h264_idct4_add(&mut a, 7, &d);

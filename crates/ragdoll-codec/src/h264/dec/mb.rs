@@ -921,28 +921,6 @@ impl<'a, 'c> Dec<'a, 'c> {
 
     /// Predicted Intra4x4/Intra8x8 mode for the block whose top-left 4x4 is at MB-relative `(bx, by)` (8.3.1.1).
     fn predicted_intra_mode(&self, bx: usize, by: usize) -> u8 {
-        if !self.st.mbaff {
-            // Neighbours A and B are the 4x4 blocks left of and above this one.
-            let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
-            let mode = |inside: bool, mb: fn(&Self) -> Option<usize>, j: usize| -> Option<i8> {
-                if !inside {
-                    let t = self.st.mb_type[mb(self)?];
-                    if !t.is_intra() && self.cx.pps.constrained_intra_pred {
-                        return None;
-                    }
-                    if !matches!(t, MbType::I4x4 | MbType::I8x8) {
-                        return Some(2);
-                    }
-                }
-                Some(self.st.intra_mode[j])
-            };
-            let a = mode(bx > 0, Self::mb_left, i.wrapping_sub(1));
-            let b = mode(by > 0, Self::mb_top, i.wrapping_sub(self.st.mb_w * 4));
-            return match (a, b) {
-                (Some(a), Some(b)) => a.min(b) as u8,
-                _ => 2,
-            };
-        }
         let (x, y) = ((bx * 4) as isize, (by * 4) as isize);
         let fetch = |xn: isize, yn: isize| -> Option<i8> {
             let (addr, xw, yw) = self.locate(xn, yn, false)?;
@@ -964,6 +942,39 @@ impl<'a, 'c> Dec<'a, 'c> {
             (Some(a), Some(b)) => a.min(b) as u8,
             _ => 2,
         }
+    }
+
+    /// Without MBAFF: the Intra4x4/Intra8x8 prediction modes around the current macroblock for
+    /// [`intra::predicted_mode`], row 0 those of the 4x4 blocks above it and column 0 those left
+    /// of it; [`intra::NO_MODE`] where a neighbour is unavailable and 2 where it is not coded in
+    /// Intra_4x4 or Intra_8x8 (8.3.1.1).
+    fn intra_mode_grid(&self) -> Option<[[i8; 5]; 5]> {
+        if self.st.mbaff {
+            return None;
+        }
+        let w4 = self.st.mb_w * 4;
+        let i = self.st.b4(self.mb.x * 4, self.mb.y * 4);
+        let modes = |mb: Option<usize>, j: usize, step: usize| -> [i8; 4] {
+            let Some(a) = mb else {
+                return [intra::NO_MODE; 4];
+            };
+            let t = self.st.mb_type[a];
+            if !t.is_intra() && self.cx.pps.constrained_intra_pred {
+                [intra::NO_MODE; 4]
+            } else if !matches!(t, MbType::I4x4 | MbType::I8x8) {
+                [2; 4]
+            } else {
+                std::array::from_fn(|k| self.st.intra_mode[j + k * step])
+            }
+        };
+        let left = modes(self.mb_left(), i.wrapping_sub(1), w4);
+        let top = modes(self.mb_top(), i.wrapping_sub(w4), 1);
+        let mut g = [[0; 5]; 5];
+        g[0][1..].copy_from_slice(&top);
+        for (row, l) in g[1..].iter_mut().zip(left) {
+            row[0] = l;
+        }
+        Some(g)
     }
 
     fn read_cbp(&mut self, intra: bool) -> Result<u8> {
@@ -1065,25 +1076,38 @@ impl<'a, 'c> Dec<'a, 'c> {
             }
             self.st.t8x8[a] = t8;
             self.st.mb_type[a] = if t8 { MbType::I8x8 } else { MbType::I4x4 };
+            let mut grid = self.intra_mode_grid();
             if t8 {
                 for b8 in 0..4 {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-                    let pred = self.predicted_intra_mode(bx, by);
+                    let pred = match &grid {
+                        Some(g) => intra::predicted_mode(g, bx, by),
+                        None => self.predicted_intra_mode(bx, by),
+                    };
                     let m = self.read_pred_mode(pred)?;
                     modes[b8] = m;
                     for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                         let i = self.st.b4(self.mb.x * 4 + bx + dx, self.mb.y * 4 + by + dy);
                         self.st.intra_mode[i] = m as i8;
+                        if let Some(g) = &mut grid {
+                            g[1 + by + dy][1 + bx + dx] = m as i8;
+                        }
                     }
                 }
             } else {
                 for (blk, slot) in modes.iter_mut().enumerate() {
                     let (bx, by) = BLK4_XY[blk];
-                    let pred = self.predicted_intra_mode(bx, by);
+                    let pred = match &grid {
+                        Some(g) => intra::predicted_mode(g, bx, by),
+                        None => self.predicted_intra_mode(bx, by),
+                    };
                     let m = self.read_pred_mode(pred)?;
                     *slot = m;
                     let i = self.st.b4(self.mb.x * 4 + bx, self.mb.y * 4 + by);
                     self.st.intra_mode[i] = m as i8;
+                    if let Some(g) = &mut grid {
+                        g[1 + by][1 + bx] = m as i8;
+                    }
                 }
             }
             let chroma = if self.cx.sps.chroma_array_type() != 0 {
