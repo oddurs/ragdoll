@@ -12,10 +12,10 @@ use crate::cabac::NUM_CABAC_CONTEXTS;
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, dequant_4x4_x4, h264_chroma_deblock, h264_chroma_mc, h264_luma_deblock,
-    h264_luma_mc, hadamard4x4_16x4, hpel_window, hpel_window_centre, intra_pred_plane,
-    intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16, pixel_sad_8x8,
-    pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4, pixel_satd_16x16,
-    pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
+    h264_luma_mc, hadamard4x4_16x4, hpel_hv_16x16, hpel_window, hpel_window_centre,
+    intra_pred_plane, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4, pixel_avg_16x16,
+    pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16, pixel_satd_4x4,
+    pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, sub_dct4x4_16x4, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -755,7 +755,7 @@ impl MotionSearch<'_> {
 
     /// Integer-pel diamond search seeded by the best of `cands` (quarter-pel); returns the
     /// full-pel vector and its cost.
-    fn full_pel(&self, cands: &[[i16; 2]]) -> ([i32; 2], u32) {
+    fn full_pel(&self, cands: &[[i16; 2]]) -> ([i32; 2], u32, [u32; 4]) {
         let int_min = [(self.bounds.min[0] + 3) >> 2, (self.bounds.min[1] + 3) >> 2];
         let int_max = [self.bounds.max[0] >> 2, self.bounds.max[1] >> 2];
         let cost_at = |m: [i32; 2]| {
@@ -781,6 +781,7 @@ impl MotionSearch<'_> {
                 best = m;
             }
         }
+        let mut nb = [u32::MAX; 4];
         for _ in 0..16 {
             let pts = [
                 [best[0], best[1] - 1],
@@ -800,19 +801,22 @@ impl MotionSearch<'_> {
                     pts.map(|p| self.full_off(p[0], p[1])),
                     self.r.stride,
                 );
-                for (p, sad) in pts.iter().zip(sads) {
+                for (k, (p, sad)) in pts.iter().zip(sads).enumerate() {
                     let cost = sad + self.mv_cost([p[0] * 4, p[1] * 4]);
+                    nb[k] = cost;
                     if cost < best_cost {
                         best_cost = cost;
                         moved = Some(*p);
                     }
                 }
             } else {
-                for p in pts {
+                nb = [u32::MAX; 4];
+                for (k, p) in pts.into_iter().enumerate() {
                     if (int_min[0]..=int_max[0]).contains(&p[0])
                         && (int_min[1]..=int_max[1]).contains(&p[1])
                     {
                         let cost = cost_at(p);
+                        nb[k] = cost;
                         if cost < best_cost {
                             best_cost = cost;
                             moved = Some(p);
@@ -825,7 +829,7 @@ impl MotionSearch<'_> {
                 None => break,
             }
         }
-        (best, best_cost)
+        (best, best_cost, nb)
     }
 
     /// Half-pel then quarter-pel refinement around a full-pel vector; leaves the winning
@@ -838,9 +842,13 @@ impl MotionSearch<'_> {
         &self,
         full: [i32; 2],
         full_cost: u32,
+        nb: [u32; 4],
         win: &mut HpelWindow,
         pred: &mut [u8; 256],
     ) -> ([i16; 2], u32) {
+        if self.qpel_iters == 0 {
+            return self.half_pel_toward(full, full_cost, nb, pred);
+        }
         let center = [full[0] * 4, full[1] * 4];
         let (bx, by) = (
             self.x0 as isize + full[0] as isize,
@@ -886,6 +894,42 @@ impl MotionSearch<'_> {
         }
         self.window_pred(win, bx, by, best, pred);
         ([best[0] as i16, best[1] as i16], best_cost)
+    }
+
+    /// Half-pel refinement of [`H264Speed::Fast`]: on each axis only the half sample toward the
+    /// cheaper full-pel neighbour (`nb`: costs above, left, right and below the full-pel best)
+    /// is tried, both from one kernel call that also leaves the winner's prediction.
+    fn half_pel_toward(
+        &self,
+        full: [i32; 2],
+        full_cost: u32,
+        nb: [u32; 4],
+        pred: &mut [u8; 256],
+    ) -> ([i16; 2], u32) {
+        let center = [full[0] * 4, full[1] * 4];
+        let (up, left) = (nb[0] < nb[3], nb[1] < nb[2]);
+        let off = self.full_off(full[0], full[1]);
+        let (mut hb, mut vb) = ([0u8; 256], [0u8; 256]);
+        hpel_hv_16x16(&self.r.buf, off, self.r.stride, left, up, &mut hb, &mut vb);
+        let mut best = (center, full_cost, None);
+        let cands = [
+            ([center[0], center[1] + if up { -2 } else { 2 }], &vb),
+            ([center[0] + if left { -2 } else { 2 }, center[1]], &hb),
+        ];
+        for (mv, block) in cands {
+            if self.bounds.clamp(mv) != mv {
+                continue;
+            }
+            let cost = pixel_sad_16x16(self.src, 16, block, 16) + self.mv_cost(mv);
+            if cost < best.1 {
+                best = (mv, cost, Some(block));
+            }
+        }
+        match best.2 {
+            Some(block) => *pred = *block,
+            None => self.r.load::<16>(off, pred),
+        }
+        ([best.0[0] as i16, best.0[1] as i16], best.1)
     }
 
     /// The block or pair of blocks whose (rounded) average is the prediction at quarter-pel
@@ -2140,7 +2184,7 @@ impl EncState {
             bounds,
             qpel_iters: if sl.fast { 0 } else { 2 },
         };
-        let (full, full_cost) = ms.full_pel(&cands[..n]);
+        let (full, full_cost, nb) = ms.full_pel(&cands[..n]);
         // A full-pel match whose luma residual already quantizes to nothing needs no refinement.
         let full_mv = [full[0] * 4, full[1] * 4];
         let mv = if full_cost - ms.mv_cost(full_mv) <= sl.skip_bounds.luma {
@@ -2148,7 +2192,7 @@ impl EncState {
             r.load::<16>(ms.full_off(full[0], full[1]), &mut py);
             [full_mv[0] as i16, full_mv[1] as i16]
         } else {
-            ms.sub_pel(full, full_cost, &mut self.win, &mut py).0
+            ms.sub_pel(full, full_cost, nb, &mut self.win, &mut py).0
         };
         let inter_satd = pixel_satd_16x16(&src.y, 16, &py, 16);
         let inter_cost = inter_satd

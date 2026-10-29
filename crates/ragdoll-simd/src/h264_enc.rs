@@ -830,6 +830,64 @@ pub fn intra4x4_pred_dir_scalar(top: &[u8; 8], left: &[u8; 4], tl: u8) -> [[u8; 
     })
 }
 
+/// The two half-sample $16\times16$ predictions next to the block whose top-left integer sample
+/// is `src[off]` (stride `ss`): `out_h` the `b` samples half a sample left (`left`) or right of
+/// it, `out_v` the `h` samples half a sample above (`up`) or below it (ITU-T H.264 8.4.2.2.1).
+/// Reads rows and columns `-3..=18` around the block.
+///
+/// # Panics
+/// If `src` lacks those margins.
+#[inline]
+pub fn hpel_hv_16x16(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    left: bool,
+    up: bool,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    assert!(off >= 3 * ss + 3 && off + 18 * ss + 19 <= src.len());
+    let (h0, v0) = (off - usize::from(left), off - usize::from(up) * ss);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe { hv_neon(src.as_ptr(), h0, v0, ss, out_h, out_v) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe { hv_avx2(src.as_ptr(), h0, v0, ss, out_h, out_v) };
+        return;
+    }
+    hpel_hv_16x16_scalar(src, off, ss, left, up, out_h, out_v);
+}
+
+/// Scalar reference for [`hpel_hv_16x16`].
+pub fn hpel_hv_16x16_scalar(
+    src: &[u8],
+    off: usize,
+    ss: usize,
+    left: bool,
+    up: bool,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    let (h0, v0) = (off - usize::from(left), off - usize::from(up) * ss);
+    let tap = |o: usize, step: usize| {
+        let p = |k: usize| src[o + k * step - 2 * step] as i32;
+        let v = p(0) - 5 * p(1) + 20 * p(2) + 20 * p(3) - 5 * p(4) + p(5);
+        ((v + 16) >> 5).clamp(0, 255) as u8
+    };
+    for r in 0..16 {
+        for c in 0..16 {
+            out_h[r * 16 + c] = tap(h0 + r * ss + c, 1);
+            out_v[r * 16 + c] = tap(v0 + r * ss + c, ss);
+        }
+    }
+}
+
 /// SAD of the contiguous $16\times16$ block `src` against `(a + b + 1) >> 1` of the strided
 /// blocks `a` and `b`, without storing the average (`x264` `pixel_avg` then `sad`).
 ///
@@ -1697,6 +1755,53 @@ unsafe fn pred4_dir_neon(edge: &[u8; 16]) -> [[u8; 16]; 6] {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hv_avx2(
+    p: *const u8,
+    h0: usize,
+    v0: usize,
+    ss: usize,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let r16 = _mm256_set1_epi16(16);
+        let at = |q: *const u8| _mm256_cvtepu8_epi16(_mm_loadu_si128(q as *const __m128i));
+        let store = |dst: *mut u8, x: __m256i| {
+            let x = _mm256_srai_epi16::<5>(_mm256_add_epi16(x, r16));
+            let packed = _mm256_permute4x64_epi64::<0b00_00_10_00>(_mm256_packus_epi16(x, x));
+            _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(packed));
+        };
+        for r in 0..16 {
+            let q = p.add(h0 + r * ss);
+            let h = tap6_epi16([
+                at(q.sub(2)),
+                at(q.sub(1)),
+                at(q),
+                at(q.add(1)),
+                at(q.add(2)),
+                at(q.add(3)),
+            ]);
+            store(out_h.as_mut_ptr().add(r * 16), h);
+        }
+        // The vertical taps slide down six rows held in registers.
+        let mut rows: [__m256i; 6] = std::array::from_fn(|k| {
+            if k < 5 {
+                at(p.add(v0 + k * ss - 2 * ss))
+            } else {
+                _mm256_setzero_si256()
+            }
+        });
+        for r in 0..16 {
+            rows[5] = at(p.add(v0 + (r + 3) * ss));
+            store(out_v.as_mut_ptr().add(r * 16), tap6_epi16(rows));
+            rows = [rows[1], rows[2], rows[3], rows[4], rows[5], rows[5]];
+        }
+    }
+}
+
 /// Rows of the second (packed) half of an AVX2 window pass.
 #[cfg(target_arch = "x86_64")]
 const HPEL_HALF: usize = HPEL_WIN_H / 2;
@@ -1868,6 +1973,48 @@ unsafe fn hpel_neon(p: *const u8, ss: usize, out: &mut HpelWindow) {
                 let o = r * HPEL_WIN_W + chunk * 8;
                 let v = tap6([sr[r], sr[r + 1], sr[r + 2], sr[r + 3], sr[r + 4], sr[r + 5]]);
                 vst1_u8(out.v.as_mut_ptr().add(o), vqrshrun_n_s16::<5>(v));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hv_neon(
+    p: *const u8,
+    h0: usize,
+    v0: usize,
+    ss: usize,
+    out_h: &mut [u8; 256],
+    out_v: &mut [u8; 256],
+) {
+    use std::arch::aarch64::*;
+    fn tap6(t: [int16x8_t; 6]) -> int16x8_t {
+        // Safety: NEON is baseline on aarch64.
+        unsafe {
+            let s0 = vaddq_s16(t[0], t[5]);
+            let s1 = vaddq_s16(t[1], t[4]);
+            let s2 = vaddq_s16(t[2], t[3]);
+            let k = vsubq_s16(vshlq_n_s16::<2>(s2), s1);
+            vaddq_s16(s0, vaddq_s16(k, vshlq_n_s16::<2>(k)))
+        }
+    }
+    unsafe {
+        let at = |q: *const u8| vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q)));
+        for half in 0..2 {
+            for r in 0..16 {
+                let q = p.add(h0 + r * ss + half * 8);
+                let h = tap6(std::array::from_fn(|k| at(q.add(k).sub(2))));
+                vst1_u8(
+                    out_h.as_mut_ptr().add(r * 16 + half * 8),
+                    vqrshrun_n_s16::<5>(h),
+                );
+                let q = p.add(v0 + r * ss + half * 8);
+                let v = tap6(std::array::from_fn(|k| at(q.add(k * ss).sub(2 * ss))));
+                vst1_u8(
+                    out_v.as_mut_ptr().add(r * 16 + half * 8),
+                    vqrshrun_n_s16::<5>(v),
+                );
             }
         }
     }
@@ -2398,6 +2545,40 @@ mod tests {
             add_idct4x4_8x8(&mut p, ds, &a);
             add_idct4x4_8x8_scalar(&mut q, ds, &a);
             assert_eq!(p, q, "round {round}");
+        }
+    }
+
+    #[test]
+    fn half_pel_blocks_match_scalar_and_the_window() {
+        let (pw, ph) = (64usize, 48usize);
+        for seed in [61u32, 62] {
+            let mut src = plane(pw, ph, seed);
+            if seed == 62 {
+                for (i, s) in src.iter_mut().enumerate() {
+                    *s = if (i / 2) % 2 == 0 { 0 } else { 255 };
+                }
+            }
+            for (x, y) in [(3usize, 3usize), (7, 5), (26, 21)] {
+                let off = y * pw + x;
+                let mut win = HpelWindow::default();
+                hpel_window_scalar(&src, off - pw - 1, pw, &mut win);
+                for (left, up) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let (mut a, mut b, mut c, mut d) =
+                        ([0u8; 256], [0u8; 256], [0u8; 256], [0u8; 256]);
+                    hpel_hv_16x16(&src, off, pw, left, up, &mut a, &mut b);
+                    hpel_hv_16x16_scalar(&src, off, pw, left, up, &mut c, &mut d);
+                    assert_eq!((a, b), (c, d), "({x}, {y}) {left} {up}");
+                    // The window starts one sample up and left of the block.
+                    for r in 0..16 {
+                        for k in 0..16 {
+                            let hx = k + usize::from(!left);
+                            assert_eq!(a[r * 16 + k], win.h[(r + 1) * HPEL_WIN_W + hx]);
+                            let vy = r + usize::from(!up);
+                            assert_eq!(b[r * 16 + k], win.v[vy * HPEL_WIN_W + k + 1]);
+                        }
+                    }
+                }
+            }
         }
     }
 
