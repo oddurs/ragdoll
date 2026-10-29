@@ -139,7 +139,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i16]) -> i32 {
                 let q = *u.add(k + 1);
                 s = -((i >= q) as i32);
                 i -= q & s as u32;
-                kn = pulse_count::<8, 1>(u, k, i);
+                kn = pulse_count::<7, 1>(u, k, i);
                 p = *u.add(kn);
             } else {
                 let u = t.add(U_PAD * U_STRIDE + U_PAD + n);
