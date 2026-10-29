@@ -407,6 +407,7 @@ impl<'a, 'c> Dec<'a, 'c> {
     }
 
     /// CABAC mb_skip_flag of the macroblock at decoding address `addr`.
+    #[inline(always)]
     fn decode_skip_flag(&mut self, addr: usize) -> bool {
         // MBAFF reads a pair's second skip flag before the first macroblock is decoded.
         let saved = (self.mb, self.nb);
