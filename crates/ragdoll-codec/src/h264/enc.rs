@@ -2538,10 +2538,11 @@ impl EncState {
             }
         }
 
-        // 2. Motion search from the median, skip, zero, neighbouring and co-located vectors.
+        // 2. Motion search from the median, zero, neighbouring and co-located vectors.
         let mb_idx = mb_y * mb_w + mb_x;
-        let mut cands = [mvp, pskip_mv, [0, 0], [0, 0], [0, 0], [0, 0]];
-        let mut n = 3;
+        // The skip vector is the median predictor or zero, both already candidates.
+        let mut cands = [mvp, [0, 0], [0, 0], [0, 0], [0, 0]];
+        let mut n = 2;
         if mb_x > 0 {
             cands[n] = self.mv_grid[gy0 * g_stride + gx0 - 1];
             n += 1;
