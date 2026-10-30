@@ -188,10 +188,21 @@ impl DerefMut for AlignedBuffer {
 
 impl Clone for AlignedBuffer {
     fn clone(&self) -> Self {
-        let mut out = Self::new_zeroed(self.len);
-        out.as_padded_mut_slice()
-            .copy_from_slice(self.as_padded_slice());
-        out
+        let layout = Layout::from_size_align(self.cap, CACHE_LINE_ALIGN)
+            .expect("valid 64-byte aligned allocation layout");
+        // Safety: cap >= 64 > 0 and align is 64 (power of two).
+        let raw = unsafe { alloc::alloc(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
+            alloc::handle_alloc_error(layout);
+        };
+        // Safety: the whole allocation, tail padding included, is copied from `self` before
+        // the buffer is read, without zero-filling it first.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw, self.cap) };
+        Self {
+            ptr,
+            len: self.len,
+            cap: self.cap,
+        }
     }
 }
 

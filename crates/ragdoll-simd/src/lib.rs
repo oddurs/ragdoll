@@ -23,6 +23,7 @@ pub mod h264_enc;
 pub mod h264_idct;
 pub mod h264_intra;
 pub mod h264_mc;
+pub mod h264_me;
 pub mod metrics;
 pub mod scan;
 
@@ -63,10 +64,11 @@ pub use h264_dsp::{
     put_h264_qpel8_mc_u8, put_h264_qpel16_mc_u8, put_h264_qpel16_mc_u8_scalar,
 };
 pub use h264_enc::{
-    HPEL_WIN_H, HPEL_WIN_W, HpelWindow, Quant4x4, add_idct4x4_8x8, add_idct4x4_8x8_scalar,
-    chroma_mc_8x8_x2, chroma_mc_8x8_x2_scalar, dequant_4x4_x4, dequant_4x4_x4_scalar,
-    hadamard4x4_16x4, hadamard4x4_16x4_scalar, hpel_16x16, hpel_16x16_scalar, hpel_hv_16x16,
-    hpel_hv_16x16_scalar, hpel_window, hpel_window_centre, hpel_window_centre_scalar,
+    HPEL_COLS, HPEL_WIN_H, HPEL_WIN_W, HpelWindow, Quant4x4, add_idct4x4_8x8,
+    add_idct4x4_8x8_scalar, chroma_mc_8x8_x2, chroma_mc_8x8_x2_scalar, dequant_4x4_x4,
+    dequant_4x4_x4_scalar, downscale_2x_row, downscale_2x_row_scalar, hadamard4x4_16x4,
+    hadamard4x4_16x4_scalar, hpel_16x16, hpel_16x16_scalar, hpel_hv_16x16, hpel_hv_16x16_scalar,
+    hpel_planes, hpel_planes_scalar, hpel_window, hpel_window_centre, hpel_window_centre_scalar,
     hpel_window_scalar, intra_pred_plane, intra_pred_plane_scalar, intra_sad_x3_16x16,
     intra_sad_x3_16x16_scalar, intra_satd_x3_16x16, intra_satd_x3_16x16_scalar, intra4x4_pred_dir,
     intra4x4_pred_dir_scalar, nonzero_mask_4x4_x4, nonzero_mask_4x4_x4_scalar, pixel_avg_16x16,
@@ -89,6 +91,11 @@ pub use h264_mc::{
     h264_chroma_pair_mc_in_plane, h264_luma_mc, h264_luma_mc_avg, h264_luma_mc_avg_scalar,
     h264_luma_mc_in_plane, h264_luma_mc_scalar, h264_weight_bi, h264_weight_bi_scalar,
     h264_weight_uni, h264_weight_uni_scalar, luma_mc_cols, prefetch_rows,
+};
+pub use h264_me::{
+    pixel_avg_wxh, pixel_avg_wxh_scalar, pixel_sa8d_16x16, pixel_sa8d_16x16_scalar,
+    pixel_sad_avg_wxh, pixel_sad_avg_wxh_scalar, pixel_sad_wxh, pixel_sad_wxh_scalar,
+    pixel_sad_x4_wxh, pixel_sad_x4_wxh_scalar, pixel_satd_wxh, pixel_satd_wxh_scalar,
 };
 pub use metrics::{
     SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, flac_eval_fixed_orders_l1,
