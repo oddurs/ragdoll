@@ -279,6 +279,12 @@ pub(super) struct PartSearch<'a> {
     pub(super) mv_costs: &'a [u16],
     /// Bounds of the macroblock's vectors.
     pub(super) bounds: MvBounds,
+    /// P pictures: a square of eight full-pel points after the hexagon and the predictor at its
+    /// own sub-pel position before the half-pel diamond. B pictures, whose two lists' searches
+    /// start from more candidates, take a diamond of four points and skip the predictor: those
+    /// cost them more time than their bits are worth (`SIMD-0089`: park -3.8% instructions for
+    /// +0.5% BD-rate).
+    pub(super) thorough: bool,
 }
 
 /// Result of a [`PartSearch`]: quarter-pel vector, SATD and motion vector cost.
@@ -500,8 +506,10 @@ impl<'a> FullPel<'a> {
     }
 
     /// Measures four vectors allowed and takes them in order, the first of equal costs
-    /// winning as a sequential search would pick it; returns the last that improved.
-    #[inline(always)]
+    /// winning as a sequential search would pick it; returns the last that improved. Out of
+    /// line: inlined at each of its seven calls it made the search 17 KB, half the instruction
+    /// cache.
+    #[inline(never)]
     fn take(&mut self, pts: [[i32; 2]; 4]) -> Option<usize> {
         let off = |m: [i32; 2]| (self.base + m[1] as isize * self.stride + m[0] as isize) as usize;
         // Safety: the kernels are those `Kernels::get` chose for the CPU.
@@ -560,7 +568,8 @@ impl PartSearch<'_> {
     }
 
     /// The best of `cands` (quarter-pel, rounded to full-pel) and zero, a radius-2 hexagon walked
-    /// for up to `range / 2` steps and a square refinement (`x264 --me hex`), then sub-pel
+    /// for up to `range / 2` steps and a square (diamond: see [`Self::thorough`]) refinement
+    /// (`x264 --me hex`), then sub-pel
     /// refinement from the half-sample planes: a half-pel diamond by SAD and quarter-pel diamonds
     /// by SATD (`x264` subme 2).
     pub(super) fn search(&self, cands: &[[i16; 2]], range: i32) -> MeResult {
@@ -621,14 +630,19 @@ impl PartSearch<'_> {
             sq([[-1, -1], [0, -1], [1, -1], [-1, 0]]),
             sq([[1, 0], [-1, 1], [0, 1], [1, 1]]),
         );
-        fp.take(a);
-        fp.take(b);
+        if self.thorough {
+            fp.take(a);
+            fp.take(b);
+        } else {
+            fp.take(sq([[0, -1], [-1, 0], [1, 0], [0, 1]]));
+        }
         let (best, best_cost) = (fp.best, fp.best_cost);
         self.refine(&k, [best[0] * 4, best[1] * 4], best_cost, qpel)
     }
 
     /// Sub-pel refinement around full-pel `start` (quarter-pel units) whose SAD cost is
-    /// `start_cost`: the predictor at its sub-pel position and a half-pel diamond by SAD (`x264`
+    /// `start_cost`: the predictor at its sub-pel position (see [`Self::thorough`]) and a
+    /// half-pel diamond by SAD (`x264`
     /// `refine_subpel` at subme 2), then quarter-pel diamonds by SATD, which `x264` leaves to
     /// the partitions it picks but which pay here on every candidate partition.
     fn refine(&self, k: &Kernels, start: [i32; 2], start_cost: u32, qpel: i32) -> MeResult {
@@ -638,7 +652,7 @@ impl PartSearch<'_> {
         // The predictor at its own sub-pel position may beat the full-pel winner (`x264`
         // subme below 3).
         let mvp = [self.mvp[0] as i32, self.mvp[1] as i32];
-        if mvp != best && self.bounds.clamp(mvp) == mvp {
+        if self.thorough && mvp != best && self.bounds.clamp(mvp) == mvp {
             let cost = self.cost(k, mvp, false) + self.mv_cost(mvp);
             if cost < best_cost {
                 best_cost = cost;

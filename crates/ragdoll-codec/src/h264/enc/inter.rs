@@ -453,6 +453,27 @@ impl EncState {
         mode: u8,
     ));
 
+    out_of_line_v3!(fn code_i4_p / code_i4_p_v3 => code_i4(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        i4: I4Choice,
+    ));
+
+    out_of_line_v3!(fn analyse_i4_p / analyse_i4_p_v3 => analyse_i4(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        budget: u32,
+    ) -> Option<I4Choice>);
+
     out_of_line_v3!(pub(super) fn code_inter_p / code_inter_p_v3 => code_inter_p_body(
         &mut self,
         sl: &mut SliceState,
@@ -470,8 +491,8 @@ impl EncState {
 
     /// Analyses and codes one macroblock of a P slice with the Compact preset: `P_Skip` probe,
     /// $16\times16$ motion search, then $8\times8$ partitions when they promise to pay
-    /// (`x264_mb_analyse_inter_p8x8`), intra $16\times16$, and the transform size by SA8D
-    /// against SATD (`x264_mb_analyse_transform`).
+    /// (`x264_mb_analyse_inter_p8x8`), intra $16\times16$ and $4\times4$, and the transform
+    /// size by SA8D against SATD (`x264_mb_analyse_transform`).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn code_p_mb_body(
@@ -491,7 +512,7 @@ impl EncState {
         let mb_idx = mb_y * mb_w + mb_x;
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
         let bounds = MvBounds::new(x0, y0, self.refp.y.w, self.refp.y.h);
-        let lambda = LAMBDA[qp as usize] as u32;
+        let lambda = LAMBDA_COMPACT[qp as usize] as u32;
 
         let mvp = self.mvp_part(0, mb_x, mb_y, Shape::S16x16, 0, 0);
         let pskip_mv = {
@@ -561,8 +582,8 @@ impl EncState {
         if mb_y + 1 < self.mb_h {
             push(tp[mb_idx + mb_w]);
         }
-        self.mv_costs(qp);
-        let mv_costs = &self.mv_cost_tabs[qp as usize];
+        self.mv_costs(qp, true);
+        let mv_costs = &self.mv_cost_tabs[compact_costs(qp)];
         let rl = RefLuma {
             f: &self.refp.y,
             hp: &self.hp,
@@ -579,6 +600,7 @@ impl EncState {
             lambda,
             mv_costs,
             bounds,
+            thorough: true,
         };
         let me =
             |px: usize, py_: usize, w_: usize, h_: usize, mvp: [i16; 2], cands: &[[i16; 2]]| {
@@ -597,7 +619,7 @@ impl EncState {
         {
             return;
         }
-        let mv_costs = &self.mv_cost_tabs[qp as usize];
+        let mv_costs = &self.mv_cost_tabs[compact_costs(qp)];
         let rl = RefLuma {
             f: &self.refp.y,
             hp: &self.hp,
@@ -613,6 +635,7 @@ impl EncState {
             lambda,
             mv_costs,
             bounds,
+            thorough: true,
         };
         let me =
             |px: usize, py_: usize, w_: usize, h_: usize, mvp: [i16; 2], cands: &[[i16; 2]]| {
@@ -669,13 +692,22 @@ impl EncState {
             }
         }
 
-        // 3. Intra 16x16 against the best inter cost.
+        // 3. Intra 16x16 and 4x4 against the best inter cost.
         let edges = i16_edges(&self.cur.y, mb_x, mb_y);
         let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, true);
         let i16_cost = i16_satd + lambda * 4;
         if i16_cost < best_cost {
             self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
             self.code_i16_p(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
+            return;
+        }
+        // Intra 4x4 when intra 16x16 comes close (`x264` `mb_analyse_intra` thresholds).
+        if i16_cost.min(best_cost) > lambda * 40
+            && i16_cost * 2 < best_cost * 3
+            && let Some(i4) = self.analyse_i4_p(mb_x, mb_y, qp, src, i16_cost.min(best_cost))
+        {
+            self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
+            self.code_i4_p(sl, w, cabac, mb_x, mb_y, qp, src, i4);
             return;
         }
 
@@ -705,7 +737,11 @@ impl EncState {
             res.luma_q8 = Some(&q8_store);
             res.cbp_luma = cbp8;
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, true);
+        // Trailing chroma levels that do not pay are dropped by their CABAC rate. Luma levels
+        // are left alone: dropping them as well gains about 1% BD-rate but codes ~0.4 dB less
+        // luma PSNR at a QP (`SIMD-0089`).
+        let rdo = cabac.as_ref().map(|(_, ctxs)| &ctxs[..]);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, true, rdo);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0
             && res.cbp_chroma == 0

@@ -58,16 +58,16 @@ pub enum H264Speed {
     /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
     Fast,
     /// Compression first, like `x264 --preset veryfast`: $16\times16$ and $8\times8$ partitions
-    /// searched by hexagon and refined to quarter samples by SATD, the transform size chosen per
-    /// macroblock and, with CABAC (`Main` and `High`), up to three B pictures between anchors,
-    /// placed by a half-resolution lookahead, the middle one a reference. Inter residuals round
-    /// like intra ones, chroma one quantizer step coarser than luma, and every picture one step
-    /// coarser than the QP asked for, which puts its PSNR near `x264` veryfast's at the same QP.
+    /// searched by hexagon and refined to quarter samples by SATD, intra $16\times16$ and
+    /// $4\times4$, the transform size chosen per macroblock and, with CABAC (`Main` and `High`),
+    /// up to three B pictures between anchors, placed by a half-resolution lookahead, the middle
+    /// one a reference. Inter residuals round like intra ones, trailing chroma levels are dropped
+    /// when their CABAC rate exceeds their distortion, and chroma is one quantizer step coarser
+    /// than luma, so at the same QP it codes about a step's worth more PSNR than `x264` veryfast.
     /// Smaller than `x264` veryfast at equal PSNR (luma and average) on the clips measured for
-    /// `SIMD-0089`, faster on 720p video and up to a seventh slower on detailed motion. B
-    /// pictures pay over long GOPs (`x264` uses a
-    /// keyint of 250). Frames wait for their anchor: see [`H264Encoder::encode_frame`] and
-    /// [`H264Encoder::flush`].
+    /// `SIMD-0089`; at equal PSNR faster on 720p video and CIF, and up to 5% slower on detailed
+    /// 720p motion. B pictures pay over long GOPs (`x264` uses a keyint of 250). Frames wait for
+    /// their anchor: see [`H264Encoder::encode_frame`] and [`H264Encoder::flush`].
     Compact,
 }
 
