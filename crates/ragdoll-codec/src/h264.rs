@@ -57,13 +57,15 @@ pub enum H264Speed {
     /// macroblocks coded as $16\times16$ and plane modes skipped, deblocking disabled. Still smaller than `x264`
     /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
     Fast,
-    /// Compression first, like `x264 --preset veryfast`: partitions down to $8\times8$ searched
-    /// by hexagon and refined to quarter samples by SATD, the transform size chosen per
+    /// Compression first, like `x264 --preset veryfast`: $16\times16$ and $8\times8$ partitions
+    /// searched by hexagon and refined to quarter samples by SATD, the transform size chosen per
     /// macroblock and, with CABAC (`Main` and `High`), up to three B pictures between anchors,
-    /// placed by a half-resolution lookahead, the middle one a reference; chroma one quantizer
-    /// step coarser than luma. Smaller than `x264` veryfast at equal PSNR (luma and average) on
-    /// the clips measured for `SIMD-0089`, slightly faster on 720p video and up to a fifth
-    /// slower on detailed motion. B pictures pay over long GOPs (`x264` uses a
+    /// placed by a half-resolution lookahead, the middle one a reference. Inter residuals round
+    /// like intra ones, chroma one quantizer step coarser than luma, and every picture one step
+    /// coarser than the QP asked for, which puts its PSNR near `x264` veryfast's at the same QP.
+    /// Smaller than `x264` veryfast at equal PSNR (luma and average) on the clips measured for
+    /// `SIMD-0089`, faster on 720p video and up to a seventh slower on detailed motion. B
+    /// pictures pay over long GOPs (`x264` uses a
     /// keyint of 250). Frames wait for their anchor: see [`H264Encoder::encode_frame`] and
     /// [`H264Encoder::flush`].
     Compact,

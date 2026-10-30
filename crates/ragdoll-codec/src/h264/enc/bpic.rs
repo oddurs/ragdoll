@@ -256,7 +256,7 @@ impl EncState {
         let mut direct_cost = u32::MAX;
         if direct_ok {
             Self::predict_inter(refs, mb_x, mb_y, &dq, &mut py, &mut pu, &mut pv);
-            if probe_skip_luma(src, &py, qp) && probe_skip_chroma(src, &pu, &pv, qpc) {
+            if probe_skip_luma(src, &py, qp, true) && probe_skip_chroma(src, &pu, &pv, qpc, true) {
                 for l in 0..2 {
                     self.mvr[l][mb_idx] = if dq[0].r[l] >= 0 { dq[0].mv[l] } else { [0, 0] };
                 }
@@ -650,19 +650,19 @@ impl EncState {
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
-        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4, true);
         res.cbp_luma = cbp4;
         let q8_store;
         if sl.t8x8
             && cbp4 != 0
             && sa8d_16x16(&src.y, 16, &py, 16) < pixel_satd_16x16(&src.y, 16, &py, 16)
         {
-            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
+            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp, true);
             q8_store = q8;
             res.luma_q8 = Some(&q8_store);
             res.cbp_luma = cbp8;
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, true);
         res.cbp_chroma = res.chroma.cbp();
         if best.shape == Shape::S16x16
             && best.dir[0] == 0

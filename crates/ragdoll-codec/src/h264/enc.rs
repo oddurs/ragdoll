@@ -480,6 +480,8 @@ struct SliceState {
     cur_qp: i32,
     prev_qp_delta_nz: bool,
     skip_bounds: SkipBounds,
+    /// Inter residuals round like intra ones (`f = 2^qbits / 3`): the Compact preset.
+    fine_quant: bool,
 }
 
 /// Column and row of $4\times4$ block `b` (decoding order) in its macroblock.
@@ -1718,9 +1720,15 @@ fn group4(blocks: &mut [[i16; 16]; 16], i8x8: usize) -> &mut [[i16; 16]; 4] {
 /// Quantizes the luma residual with $4\times4$ transforms and decimates nearly empty $8\times8$
 /// blocks; returns the levels and the coded block pattern.
 #[inline(always)]
-fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8, q4: &mut [[i16; 16]; 16]) -> u8 {
+fn quant_luma_4x4_inter(
+    src: &[u8; 256],
+    pred: &[u8; 256],
+    qp: u8,
+    q4: &mut [[i16; 16]; 16],
+    fine: bool,
+) -> u8 {
     dct_luma(src, pred, q4);
-    let q = quant4(qp, false);
+    let q = quant4(qp, fine);
     let mut cbp = 0u8;
     let mut total = 0u32;
     for i8x8 in 0..4 {
@@ -1913,14 +1921,19 @@ fn recon_chroma(
 }
 
 /// $8\times8$-transform counterpart of [`quant_luma_4x4_inter`].
-fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64]; 4], u8, u32) {
+fn quant_luma_8x8_inter(
+    src: &[u8; 256],
+    pred: &[u8; 256],
+    qp: u8,
+    fine: bool,
+) -> ([[i16; 64]; 4], u8, u32) {
     let mut q8 = [[0i16; 64]; 4];
     let mut cbp = 0u8;
     let mut total = 0u32;
     for (i8x8, slot) in q8.iter_mut().enumerate() {
         let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
         let dct = sub8x8_dct_u8(&src[o..], 16, &pred[o..], 16);
-        let q = quantize_block8x8(&dct, qp, false);
+        let q = quantize_block8x8(&dct, qp, fine);
         if q.iter().any(|&c| c != 0) {
             let score = decimate_score(&zigzag64(&q));
             total += score;
@@ -1940,8 +1953,15 @@ fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64
 /// Quantizes the chroma residual of an inter macroblock, dropping a plane's AC levels when they
 /// are nearly empty.
 #[inline(always)]
-fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, c: &mut ChromaLevels) {
-    quant_chroma(src, pu, pv, qpc, false, c);
+fn quant_chroma_inter(
+    src: &MbSrc,
+    pu: &[u8; 64],
+    pv: &[u8; 64],
+    qpc: u8,
+    c: &mut ChromaLevels,
+    fine: bool,
+) {
+    quant_chroma(src, pu, pv, qpc, fine, c);
     for p in 0..2 {
         if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
             c.ac[p] = [[0; 15]; 4];
@@ -1983,9 +2003,9 @@ fn zero_ssd_bound(q: &Quant4x4) -> u32 {
 }
 
 impl SkipBounds {
-    fn new(qp: u8, qpc: u8) -> Self {
-        let q = quant4(qp, false);
-        let qc = quant4(qpc, false);
+    fn new(qp: u8, qpc: u8, fine: bool) -> Self {
+        let q = quant4(qp, fine);
+        let qc = quant4(qpc, fine);
         // The chroma DC Hadamard sums the plane's residual, at most 8 sqrt(SSD) in magnitude; it
         // quantizes with qbits + 1 and an intra-style f = 2^qbits / 3 (`quantize_chroma_dc2x2`).
         let dc_shift = 16 + (qpc as u32 / 6);
@@ -2011,10 +2031,10 @@ impl SkipBounds {
 /// `x264_macroblock_probe_pskip`, luma part: whether the luma residual against the skip
 /// prediction would be decimated to nothing.
 #[inline(always)]
-fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
+fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8, fine: bool) -> bool {
     let mut c = [[0i16; 16]; 16];
     dct_luma(&src.y, py, &mut c);
-    let q = quant4(qp, false);
+    let q = quant4(qp, fine);
     let mut total = 0u32;
     for i8x8 in 0..4 {
         let group = group4(&mut c, i8x8);
@@ -2038,9 +2058,9 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
 
 /// `x264_macroblock_probe_pskip`, chroma part: no DC level, and AC levels decimated per plane.
 #[inline(always)]
-fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool {
+fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, fine: bool) -> bool {
     let mut c = ChromaLevels::ZERO;
-    quant_chroma(src, pu, pv, qpc, false, &mut c);
+    quant_chroma(src, pu, pv, qpc, fine, &mut c);
     if c.dc.iter().flatten().any(|&l| l != 0) {
         return false;
     }
@@ -2146,12 +2166,15 @@ impl H264Encoder {
         let mut slice_qp = self.frame_slice_qp(is_idr, total_mbs, fps);
         if compact && matches!(self.rate_control, RateControlMode::FixedQp(_)) {
             // `x264 --ipratio 1.4`; B pictures one step coarser than its `--pbratio 1.3`, which
-            // pays on the clips measured for `SIMD-0089`, and the reference ones between.
+            // pays on the clips measured for `SIMD-0089`, and the reference ones between. All
+            // one step coarser than the QP asked for: rounding inter residuals like intra ones
+            // (`SliceState::fine_quant`) gains about that much PSNR, and so the preset lands
+            // near `x264 --preset veryfast`'s PSNR at the same QP.
             let offset = match plan.kind {
-                PicKind::Idr => -3,
-                PicKind::P => 0,
-                PicKind::B if plan.b_ref => 2,
-                PicKind::B => 3,
+                PicKind::Idr => -2,
+                PicKind::P => 1,
+                PicKind::B if plan.b_ref => 3,
+                PicKind::B => 4,
             };
             slice_qp = (slice_qp as i32 + offset).clamp(0, 51) as u8;
         }
@@ -2220,7 +2243,9 @@ impl H264Encoder {
             skip_bounds: SkipBounds::new(
                 slice_qp,
                 chroma_qp(slice_qp as i32, self.pps.chroma_qp_index_offset as i32),
+                compact,
             ),
+            fine_quant: compact,
         };
         let mut src = MbSrc {
             y: [0; 256],
@@ -2803,7 +2828,7 @@ impl EncState {
                     if int_y {
                         ry.load::<16>(yo, &mut *py);
                     }
-                    luma_zero = probe_skip_luma(src, &*py, qp);
+                    luma_zero = probe_skip_luma(src, &*py, qp, sl.fine_quant);
                 }
                 if luma_zero {
                     if !int_c {
@@ -2826,7 +2851,7 @@ impl EncState {
                             ru.load::<8>(co, &mut *pu);
                             rv.load::<8>(co, &mut *pv);
                         }
-                        chroma_zero = probe_skip_chroma(src, &*pu, &*pv, qpc);
+                        chroma_zero = probe_skip_chroma(src, &*pu, &*pv, qpc, sl.fine_quant);
                     }
                     if chroma_zero {
                         self.code_skip(sl, cabac, mb_x, mb_y, pskip_mv);
@@ -2900,7 +2925,7 @@ impl EncState {
         // sub-pel refinement); elsewhere a vanishing residual at the skip vector is still caught
         // after the motion search.
         if sl.skip_bounds.qp != qp {
-            sl.skip_bounds = SkipBounds::new(qp, qpc);
+            sl.skip_bounds = SkipBounds::new(qp, qpc, sl.fine_quant);
         }
         let probe = !sl.fast || {
             let (skip, i) = (&self.mb_is_skip, mb_y * mb_w + mb_x);
@@ -3013,11 +3038,11 @@ impl EncState {
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
-        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4, sl.fine_quant);
         res.cbp_luma = cbp4;
         let q8_store;
         if sl.t8x8 && sl.use_cabac && cbp4 != 0 {
-            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
+            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp, sl.fine_quant);
             let nnz4: usize = res.luma_q4.iter().flatten().filter(|&&c| c != 0).count();
             let nnz8: usize = q8.iter().flatten().filter(|&&c| c != 0).count();
             if nnz8 <= nnz4 {
@@ -3026,7 +3051,7 @@ impl EncState {
                 res.cbp_luma = cbp8;
             }
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, sl.fine_quant);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);

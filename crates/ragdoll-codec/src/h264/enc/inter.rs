@@ -453,27 +453,6 @@ impl EncState {
         mode: u8,
     ));
 
-    out_of_line_v3!(fn code_i4_p / code_i4_p_v3 => code_i4(
-        &mut self,
-        sl: &mut SliceState,
-        w: &mut Bits,
-        cabac: &mut Cabac,
-        mb_x: usize,
-        mb_y: usize,
-        qp: u8,
-        src: &MbSrc,
-        i4: I4Choice,
-    ));
-
-    out_of_line_v3!(fn analyse_i4_p / analyse_i4_p_v3 => analyse_i4(
-        &mut self,
-        mb_x: usize,
-        mb_y: usize,
-        qp: u8,
-        src: &MbSrc,
-        budget: u32,
-    ) -> Option<I4Choice>);
-
     out_of_line_v3!(pub(super) fn code_inter_p / code_inter_p_v3 => code_inter_p_body(
         &mut self,
         sl: &mut SliceState,
@@ -490,9 +469,9 @@ impl EncState {
     ));
 
     /// Analyses and codes one macroblock of a P slice with the Compact preset: `P_Skip` probe,
-    /// $16\times16$ motion search, then $8\times8$, $16\times8$ and $8\times16$ partitions when
-    /// they promise to pay (`x264_mb_analyse_inter_p8x8` and following), intra $16\times16$, and
-    /// the transform size by SA8D against SATD (`x264_mb_analyse_transform`).
+    /// $16\times16$ motion search, then $8\times8$ partitions when they promise to pay
+    /// (`x264_mb_analyse_inter_p8x8`), intra $16\times16$, and the transform size by SA8D
+    /// against SATD (`x264_mb_analyse_transform`).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn code_p_mb_body(
@@ -532,7 +511,7 @@ impl EncState {
         let mut pu = [0u8; 64];
         let mut pv = [0u8; 64];
         if sl.skip_bounds.qp != qp {
-            sl.skip_bounds = SkipBounds::new(qp, qpc);
+            sl.skip_bounds = SkipBounds::new(qp, qpc, true);
         }
         // The skip probe only next to a skipped macroblock (`x264` fast P_Skip detection).
         let probe = bounds.contains(pskip_mv) && {
@@ -646,8 +625,8 @@ impl EncState {
         let mut best_cost = m16.cost();
         let mut best_me = [m16; 4];
 
-        // 2. Partitions: four 8x8 searches seeded by the 16x16 vector, then 16x8 and 8x16 when
-        // the 8x8 cost comes within the motion cost of two of them.
+        // 2. Partitions: four 8x8 searches seeded by the 16x16 vector. 16x8 and 8x16 cost more
+        // time than their bits are worth once the residual rounds finely (`SIMD-0089`).
         if best_cost > lambda * P8X8_GATE {
             let mut m8 = [m16; 4];
             let mut cands8 = [m16.mv; 5];
@@ -662,59 +641,11 @@ impl EncState {
             }
             let cost8: u32 = m8.iter().map(|m| m.cost()).sum();
             if cost8 < best_cost {
-                best_cost = cost8;
                 best = InterMb {
                     shape: Shape::S8x8,
                     q: m8.map(|m| Quad::l0(m.mv)),
                 };
                 best_me = m8;
-            }
-            let thresh = m8[1].mv_cost + m8[2].mv_cost;
-            if cost8 < m16.cost() + thresh {
-                for shape in [Shape::S16x8, Shape::S8x16] {
-                    let mut mp = [m16; 2];
-                    let mut total = 0;
-                    for (p, &(bx, by, w4, h4)) in shape.parts().iter().enumerate() {
-                        let (qa, qb) = if shape == Shape::S16x8 {
-                            (2 * p, 2 * p + 1)
-                        } else {
-                            (p, p + 2)
-                        };
-                        let mvpp = self.mvp_part(0, mb_x, mb_y, shape, p, 0);
-                        let c = [m16.mv, m8[qa].mv, m8[qb].mv];
-                        mp[p] = me(bx * 4, by * 4, w4 * 4, h4 * 4, mvpp, &c);
-                        total += mp[p].cost();
-                        // The first partition and the second's estimate from its 8x8 blocks
-                        // already lose (`x264_mb_analyse_inter_p16x8`).
-                        if p == 0 {
-                            let (a, b) = if shape == Shape::S16x8 {
-                                (2, 3)
-                            } else {
-                                (1, 3)
-                            };
-                            let est = m8[a].satd
-                                + m8[b].satd
-                                + (m8[a].mv_cost + m8[b].mv_cost).div_ceil(2);
-                            if total + est > best_cost {
-                                total = u32::MAX;
-                                break;
-                            }
-                        }
-                        let (gx, gy) = (gx0 + bx, gy0 + by);
-                        fill_grid_4x4(&mut self.ref_grid, g_stride, gx, gy, w4, h4, 0);
-                        fill_grid_4x4(&mut self.mv_grid, g_stride, gx, gy, w4, h4, mp[p].mv);
-                    }
-                    if total < best_cost {
-                        best_cost = total;
-                        let mut q = [Quad::default(); 4];
-                        for (i, qq) in q.iter_mut().enumerate() {
-                            let p = if shape == Shape::S16x8 { i >> 1 } else { i & 1 };
-                            *qq = Quad::l0(mp[p].mv);
-                        }
-                        best = InterMb { shape, q };
-                        best_me = [mp[0], mp[1], mp[0], mp[1]];
-                    }
-                }
             }
         }
 
@@ -742,15 +673,6 @@ impl EncState {
         let edges = i16_edges(&self.cur.y, mb_x, mb_y);
         let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, true);
         let i16_cost = i16_satd + lambda * 4;
-        // Intra 4x4 when intra 16x16 comes close (`x264` `mb_analyse_intra` thresholds).
-        if i16_cost.min(best_cost) > lambda * 40
-            && i16_cost * 2 < best_cost * 3
-            && let Some(i4) = self.analyse_i4_p(mb_x, mb_y, qp, src, i16_cost.min(best_cost))
-        {
-            self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
-            self.code_i4_p(sl, w, cabac, mb_x, mb_y, qp, src, i4);
-            return;
-        }
         if i16_cost < best_cost {
             self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
             self.code_i16_p(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
@@ -771,19 +693,19 @@ impl EncState {
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
-        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4, true);
         res.cbp_luma = cbp4;
         let q8_store;
         if sl.t8x8
             && cbp4 != 0
             && sa8d_16x16(&src.y, 16, &py, 16) < pixel_satd_16x16(&src.y, 16, &py, 16)
         {
-            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
+            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp, true);
             q8_store = q8;
             res.luma_q8 = Some(&q8_store);
             res.cbp_luma = cbp8;
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, true);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0
             && res.cbp_chroma == 0
