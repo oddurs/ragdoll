@@ -85,3 +85,18 @@ Speed, QP 28, pinned, 9 interleaved rounds, ours / veryfast median: src720 0.97,
 Dropped (measured): branchless significance/level coding (+4% instructions, -0.5M mispredicts: net worse), deblocking offsets +-1 (mixed, foreman +1.3%), no P 16x8/8x16 (src720 +1.2%, foreman +2.5%), no intra 4x4 in P (park +1.5..2%, foreman +2.4%), tighter intra 4x4 gate, no quarter-pel in B 16x16 search, sub-partition range 4, lookahead range 8, kernels not inlined (slower), non-inlined MB functions without v3 copies.
 
 Left: per search point ~30 instructions of bookkeeping around the kernels; indirect-call mispredicts from the kernel tables (2.4M on park16); CABAC residual ~11% of park; the lookahead's path search (13 searches per 4 frames, 11-13%). Park needs ~17% more; foreman ~6%.
+
+## 2026-10-30
+
+Round 5 (branch worktree-agent-a8d288051031e9368, no code change kept on top of 5883343): goal was Compact faster than veryfast on park (needs ~17%) and foreman (~6%) with BD <= 0. Not reached; every measured attempt was neutral or worse, so nothing was committed.
+
+Cycle model from cachegrind (Ir/3 + 12 I1 misses + 10 D1 misses + 16 mispredicts + 100 LL misses; it tracked the measured ratios within a few percent) on park16 QP 28: ours 1.890G vs x264 1.608G. The gap is +0.126G from instructions (2.818G vs 2.439G), +0.139G from I1 misses (32.9M vs 21.3M) and +0.071G from mispredicts (16.9M vs 12.6M); D1/LL misses favour us by 0.05G. Even at x264's I1 misses and mispredicts we would stay about 8% slower on park from instructions alone; closing it needs ~15% fewer instructions with no compression loss, and the measured speed/compression trades cost more BD than park's and src720's average-PSNR margins (-1.85%, -1.14%) allow. foreman16..40 model: 0.417G vs 0.412G (I1 7.9M vs 5.4M, mispredicts 3.6M vs 2.9M); measured 1.06x.
+
+Attempts (all output-identical unless noted):
+- Search generic over the block size (one out-of-line instance per size, kernels still out of line) to remove the 2.3M indirect mispredicts of the kernel tables: I1 misses 32.9M -> 41.7M, mispredicts 16.9M -> 17.7M, model +6% on park. Dropped.
+- Branchless point selection (costs packed with their index, x264 COPY1_IF_LT): +66M instructions, mispredicts unchanged (the compare branch predicts well). Dropped.
+- Branchless bypass bins: no change (already a conditional move). Dropped.
+- Earlier this session: branchless significance/level coding (+4% instructions for -0.5M mispredicts), x264 b-adapt 1 decision (+2.6..5.8% BD for halving the lookahead), lookahead early exits (+0.7..1.3% BD on src720), P rect removal (+1.2% src720, +2.5% foreman), no P intra 4x4 (+1.5..2.6%).
+- Lookahead early-out on path costs: analysed, not implemented: B wins most decisions on park, so the side computed second rarely gets cut, and an exact early-out must still run the searches whose vectors seed the full-resolution search.
+
+Remaining gap on park, by size: CABAC residual (sig/levels ~11% of instructions, 3.3M of the mispredicts are its significance and loop branches, 0.8M the byte-output test), the partition search (~13% of instructions; ~30 instructions of bookkeeping per point, 2.3M indirect mispredicts), B/P macroblock analysis code (6.3M + 2.1M I1 misses), lookahead (~9%).
