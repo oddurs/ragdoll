@@ -67,3 +67,21 @@ Speed trade-offs taken (BD cost measured on all three clips): lookahead keeps ze
 Tried and dropped: x264 b-adapt 1 fast decision (+2.6..5.8%), lookahead early exit after candidates (+0.7..1.25% src720), P 16x8/8x16 early termination (+0.27% foreman for -1.2%), only the better-estimated B rect shape (+0.25..0.76% for -3..4.6%), quarter-pel gate on small SATD (no effect), final qpel refine 1 iteration, fixed-4 point batching in PartSearch (no gain).
 
 Left on the table: per search op we still spend ~1.3x x264's instructions (bounds checks, mv cost lookups and dispatch around 8x8 SAD/SATD kernels); CABAC residual is ~7% on park; a SIMD lowres window search (mpsadbw) for the lookahead; a SIMD 8x8 forward DCT. Not closing: the speed half of the target is met only on src720.
+
+## 2026-10-30
+
+Round 4 (branch worktree-agent-a8d288051031e9368, commits 2fe5270 and 6fdd7db on top of f2f92b6): target was Compact faster than x264 veryfast on all three clips with BD-rate <= 0 on each (Y and average PSNR). Met on src720 only.
+
+Finding: at equal instructions the gap was instruction-cache misses and mispredicted branches. Cachegrind on park16 (QP 28): I1 misses 48.2M -> 33.1M (x264 21.3M), mispredicts 21.4M -> 17.1M (x264 12.6M); instructions are unchanged (full clips: src720 9.85G vs x264 9.88G, park60 11.75G vs 9.85G, foreman150 2.45G vs 2.13G).
+
+Changes: partition search compiled once for all sizes, calling per-size tables of x86-64-v3 kernel shims (four inlined copies made a 47 KB search); full-pel search context (precomputed block offset, bounds, motion vector cost rows); new pixel_sad_x4_wxh_at (AVX2/NEON/scalar, differential test); P/B macroblock coding and its intra and residual paths out of line through x86-64-v3 copies, list/quadrant loops kept rolled; branchless CABAC decision; lookahead on the offset SAD kernel. Output of all presets unchanged by these.
+
+Trades (measured on all three clips): chroma_qp_index_offset 1 for Compact (shifts BD from average to luma: src720 Y -0.94 -> -5.38, avg -1.56 -> -1.42; park Y -1.04 -> -2.63, avg -2.18 -> -1.98); no quarter-pel in B 16x8/8x16 searches plus P 16x8/8x16 early termination (x264_mb_analyse_inter_p16x8): +0.13..0.64% for -1.4..2.7% instructions.
+
+Final BD-rate (piecewise cubic, QP 20-36, keyint 250) vs veryfast, Y / avg: src720 -5.17 / -1.14, park -2.50 / -1.85, foreman -3.68 / -4.20. vs ultrafast: -34.9 / -31.5, -46.2 / -45.6, -69.8 / -69.8. All streams decode identically in Ragdoll and FFmpeg.
+
+Speed, QP 28, pinned, 9 interleaved rounds, ours / veryfast median: src720 0.97, foreman 1.06, park 1.20 (runs vary up to 10%). ultrafast is 4.5-6x faster.
+
+Dropped (measured): branchless significance/level coding (+4% instructions, -0.5M mispredicts: net worse), deblocking offsets +-1 (mixed, foreman +1.3%), no P 16x8/8x16 (src720 +1.2%, foreman +2.5%), no intra 4x4 in P (park +1.5..2%, foreman +2.4%), tighter intra 4x4 gate, no quarter-pel in B 16x16 search, sub-partition range 4, lookahead range 8, kernels not inlined (slower), non-inlined MB functions without v3 copies.
+
+Left: per search point ~30 instructions of bookkeeping around the kernels; indirect-call mispredicts from the kernel tables (2.4M on park16); CABAC residual ~11% of park; the lookahead's path search (13 searches per 4 frames, 11-13%). Park needs ~17% more; foreman ~6%.
