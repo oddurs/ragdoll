@@ -4,7 +4,7 @@
 //! `slicetype.c`).
 
 use super::*;
-use ragdoll_simd::{downscale_2x_row, pixel_sad_x4_wxh_at, pixel_satd_wxh};
+use ragdoll_simd::{downscale_2x_row, intra_satd_x3_8x8, pixel_sad_x4_wxh_at, pixel_satd_wxh};
 
 /// Padding of a half-resolution plane: the search moves an $8\times8$ block at most
 /// [`LA_RANGE`] samples past the picture edge.
@@ -30,7 +30,7 @@ pub(in crate::h264) struct Lowres {
     intra: Vec<u32>,
     /// Per reference frame (display index): the vector of each block, in half-resolution
     /// samples, and its cost.
-    me: Vec<(u32, Vec<[i16; 2]>, Vec<u32>)>,
+    me: Vec<Motion>,
 }
 
 impl Lowres {
@@ -89,17 +89,8 @@ fn intra_costs(f: &Lowres) -> Vec<u32> {
             let top: [u8; 8] = std::array::from_fn(|i| p.buf[o - p.stride + i]);
             let left: [u8; 8] = std::array::from_fn(|i| p.buf[o + i * p.stride - 1]);
             let dc = ((top.iter().chain(&left).map(|&v| v as u32).sum::<u32>() + 8) >> 4) as u8;
-            let mut pred = [[0u8; 64]; 3];
-            for y in 0..8 {
-                for x in 0..8 {
-                    pred[0][y * 8 + x] = dc;
-                    pred[1][y * 8 + x] = left[y];
-                    pred[2][y * 8 + x] = top[x];
-                }
-            }
-            let best = pred
-                .iter()
-                .map(|q| satd8(&p.buf[o..], p.stride, q, 8))
+            let best = intra_satd_x3_8x8(&p.buf[o..], p.stride, &top, &left, dc)
+                .into_iter()
                 .min()
                 .unwrap_or(0);
             out.push(best + 5 * LA_LAMBDA + 4);
@@ -151,11 +142,24 @@ impl BlockSearch<'_> {
     /// Measures four points, in order, the first of equal costs winning as a sequential search
     /// would pick it; returns the last one that improved. Points outside the range are replaced
     /// by one already measured, which then cannot win.
+    /// With `V3`, the CPU runs the x86-64-v3 copy of the search.
     #[inline(always)]
-    fn take(&mut self, pts: [[i32; 2]; 4]) -> Option<usize> {
+    fn take<const V3: bool>(&mut self, pts: [[i32; 2]; 4]) -> Option<usize> {
         let off = |m: [i32; 2]| (self.base + m[1] as isize * self.qs + m[0] as isize) as usize;
-        let sads =
-            pixel_sad_x4_wxh_at::<8, 8>(self.src, self.ps, self.q, pts.map(off), self.qs as usize);
+        let (offs, qs) = (pts.map(off), self.qs as usize);
+        #[cfg(target_arch = "x86_64")]
+        let sads = if V3 {
+            // Safety: AVX2 is present, and the points stay inside the padded plane (`lim`).
+            unsafe {
+                ragdoll_simd::h264_me::avx2_unchecked::sad_x4_at::<8, 8>(
+                    self.src, self.ps, self.q, offs, qs,
+                )
+            }
+        } else {
+            pixel_sad_x4_wxh_at::<8, 8>(self.src, self.ps, self.q, offs, qs)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let sads = pixel_sad_x4_wxh_at::<8, 8>(self.src, self.ps, self.q, offs, qs);
         let mut moved = None;
         for k in 0..4 {
             let cost = sads[k] + self.mvc(pts[k]);
@@ -178,18 +182,18 @@ fn search(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
         // Safety: the CPU supports every feature the copy is compiled for.
         return unsafe { search_v3(f, r) };
     }
-    search_body(f, r)
+    search_body::<false>(f, r)
 }
 
 /// [`search`] compiled for x86-64-v3, like the frame coder.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn search_v3(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
-    search_body(f, r)
+    search_body::<true>(f, r)
 }
 
 #[inline(always)]
-fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
+fn search_body<const V3: bool>(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
     let (p, q) = (&f.plane, &r.plane);
     let (bw, bh) = (p.w / 8, p.h / 8);
     let (ps, qs) = (p.stride, q.stride as isize);
@@ -273,9 +277,9 @@ fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
                     np += 1;
                 }
             }
-            bs.take([pts[0], pts[1], pts[2], pts[3]]);
+            bs.take::<V3>([pts[0], pts[1], pts[2], pts[3]]);
             if np > 4 {
-                bs.take([pts[4]; 4]);
+                bs.take::<V3>([pts[4]; 4]);
             }
             // Hexagon of radius 2 in circular order: after a step toward point `d` only the
             // three points around it are new, taken in this order.
@@ -295,8 +299,8 @@ fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
             let mut dir = {
                 let from = bs.best;
                 let pts = HEX.map(|d| at(from, d));
-                let a = bs.take([pts[0], pts[1], pts[2], pts[3]]);
-                let b = bs.take([pts[4], pts[5], from, from]);
+                let a = bs.take::<V3>([pts[0], pts[1], pts[2], pts[3]]);
+                let b = bs.take::<V3>([pts[4], pts[5], from, from]);
                 b.map(|k| k + 4).or(a)
             };
             for _ in 1..LA_RANGE / 2 {
@@ -304,7 +308,7 @@ fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
                 let from = bs.best;
                 let ks = NEXT[d];
                 dir = bs
-                    .take([
+                    .take::<V3>([
                         at(from, HEX[ks[0]]),
                         at(from, HEX[ks[1]]),
                         at(from, HEX[ks[2]]),
@@ -313,7 +317,7 @@ fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
                     .map(|i| ks[i]);
             }
             let from = bs.best;
-            bs.take([[0, -1], [-1, 0], [1, 0], [0, 1]].map(|d| at(from, d)));
+            bs.take::<V3>([[0, -1], [-1, 0], [1, 0], [0, 1]].map(|d| at(from, d)));
             let best = bs.best;
             let mut cost = satd8(src, ps, bs.blk(best), qs as usize);
             if best != [0, 0] {
@@ -324,6 +328,89 @@ fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
         }
     }
     (mvs, costs)
+}
+
+/// The motion found for a frame against one reference: its display index, the vectors and
+/// their costs.
+type Motion = (u32, Vec<[i16; 2]>, Vec<u32>);
+
+/// Sum over the blocks of `f` inside its border of the cheapest of `m0`'s cost and, for a B
+/// frame (`refs`: the list 1 motion and the two reference planes), list 1's and the
+/// bi-prediction's, or else the intra cost, each plus 4.
+fn block_costs(f: &Lowres, m0: &Motion, refs: Option<(&Motion, &Plane, &Plane)>) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if super::v3() {
+        // Safety: the CPU supports every feature the copy is compiled for.
+        return unsafe { block_costs_v3(f, m0, refs) };
+    }
+    block_costs_body::<false>(f, m0, refs)
+}
+
+/// [`block_costs`] compiled for x86-64-v3.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn block_costs_v3(f: &Lowres, m0: &Motion, refs: Option<(&Motion, &Plane, &Plane)>) -> u64 {
+    block_costs_body::<true>(f, m0, refs)
+}
+
+/// With `V3`, the CPU runs the x86-64-v3 copy.
+#[inline(always)]
+fn block_costs_body<const V3: bool>(
+    f: &Lowres,
+    m0: &Motion,
+    refs: Option<(&Motion, &Plane, &Plane)>,
+) -> u64 {
+    let (bw, bh) = (f.plane.w / 8, f.plane.h / 8);
+    let border = bw > 2 && bh > 2;
+    let mut total = 0u64;
+    for by in 0..bh {
+        for bx in 0..bw {
+            if border && (bx == 0 || by == 0 || bx + 1 == bw || by + 1 == bh) {
+                continue;
+            }
+            let i = by * bw + bx;
+            let mut cost = m0.2[i];
+            if let Some((m1, r0, r1)) = refs {
+                cost = cost.min(m1.2[i]);
+                // Bi-prediction from the two vectors.
+                let (v0, v1) = (m0.1[i], m1.1[i]);
+                let o0 = r0.at(
+                    (bx * 8) as isize + v0[0] as isize,
+                    (by * 8) as isize + v0[1] as isize,
+                );
+                let o1 = r1.at(
+                    (bx * 8) as isize + v1[0] as isize,
+                    (by * 8) as isize + v1[1] as isize,
+                );
+                let so = f.plane.idx(bx * 8, by * 8);
+                let (src, a, b) = (&f.plane.buf[so..], &r0.buf[o0..], &r1.buf[o1..]);
+                let ss = f.plane.stride;
+                #[cfg(target_arch = "x86_64")]
+                let satd = if V3 {
+                    // Safety: AVX2 is present, and the searches keep the vectors' blocks inside
+                    // the padded planes.
+                    unsafe {
+                        ragdoll_simd::h264_me::avx2_unchecked::satd::<8, 8>(
+                            src,
+                            ss,
+                            a,
+                            r0.stride,
+                            Some((b, r1.stride)),
+                        )
+                    }
+                } else {
+                    pixel_satd_wxh::<8, 8>(src, ss, a, r0.stride, Some((b, r1.stride)))
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let satd = pixel_satd_wxh::<8, 8>(src, ss, a, r0.stride, Some((b, r1.stride)));
+                cost = cost.min(satd + 5 * LA_LAMBDA);
+            } else {
+                cost = cost.min(f.intra[i]);
+            }
+            total += (cost + 4) as u64;
+        }
+    }
+    total
 }
 
 /// Frames of the lookahead and the costs computed between them.
@@ -371,46 +458,10 @@ impl Lookahead {
         }
         let (ib, i0, i1) = (self.pos(b), self.pos(p0), self.pos(p1));
         let f = &self.frames[ib];
-        let (bw, bh) = (f.plane.w / 8, f.plane.h / 8);
-        let border = bw > 2 && bh > 2;
         let m0 = f.me.iter().find(|e| e.0 == p0).unwrap();
         let m1 = f.me.iter().find(|e| e.0 == p1).unwrap_or(m0);
-        let mut total = 0u64;
-        for by in 0..bh {
-            for bx in 0..bw {
-                if border && (bx == 0 || by == 0 || bx + 1 == bw || by + 1 == bh) {
-                    continue;
-                }
-                let i = by * bw + bx;
-                let mut cost = m0.2[i];
-                if bidir {
-                    cost = cost.min(m1.2[i]);
-                    // Bi-prediction from the two vectors.
-                    let (r0, r1) = (&self.frames[i0].plane, &self.frames[i1].plane);
-                    let (v0, v1) = (m0.1[i], m1.1[i]);
-                    let o0 = r0.at(
-                        (bx * 8) as isize + v0[0] as isize,
-                        (by * 8) as isize + v0[1] as isize,
-                    );
-                    let o1 = r1.at(
-                        (bx * 8) as isize + v1[0] as isize,
-                        (by * 8) as isize + v1[1] as isize,
-                    );
-                    let so = f.plane.idx(bx * 8, by * 8);
-                    let bi = pixel_satd_wxh::<8, 8>(
-                        &f.plane.buf[so..],
-                        f.plane.stride,
-                        &r0.buf[o0..],
-                        r0.stride,
-                        Some((&r1.buf[o1..], r1.stride)),
-                    ) + 5 * LA_LAMBDA;
-                    cost = cost.min(bi);
-                } else {
-                    cost = cost.min(f.intra[i]);
-                }
-                total += (cost + 4) as u64;
-            }
-        }
+        let refs = bidir.then(|| (m1, &self.frames[i0].plane, &self.frames[i1].plane));
+        let mut total = block_costs(f, m0, refs);
         if bidir {
             total = total * 100 / B_COST_SCALE;
         }

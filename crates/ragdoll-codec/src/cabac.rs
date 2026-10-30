@@ -396,30 +396,28 @@ static DEC_TAB: [u8; 1280] = {
 const DEC_LPS: usize = 512;
 const DEC_NEXT: usize = 1024;
 
-/// `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed context`, for the encoder.
-static ENC_LPS: [u8; 512] = {
-    let mut t = [0u8; 512];
+/// The encoder's tables in one array, so that a decision needs a single base address:
+///
+/// - `[0, 512)`: `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed context`;
+/// - `[ENC_NEXT, +256)`: the packed context after a decision (Table 9-45), indexed by the
+///   packed context after the most probable symbol and by `255 - context` after the other.
+static ENC_TAB: [u8; 768] = {
+    let mut t = [0u8; 768];
     let mut i = 0;
     while i < 512 {
         t[i] = CABAC_RANGE_TAB_LPS[(i & 127) >> 1][i >> 7];
         i += 1;
     }
-    t
-};
-
-/// The packed context after a decision (Table 9-45), as `DEC_TAB[DEC_NEXT..]`: indexed by the
-/// packed context after the most probable symbol and by `255 - context` after the other.
-static ENC_NEXT: [u8; 256] = {
-    let mut t = [0u8; 256];
     let mut s = 0;
     while s < 128 {
         let (st, mps) = (s >> 1, (s & 1) as u8);
-        t[s] = (CABAC_TRANS_IDX_MPS[st] << 1) | mps;
-        t[255 - s] = (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8);
+        t[ENC_NEXT + s] = (CABAC_TRANS_IDX_MPS[st] << 1) | mps;
+        t[ENC_NEXT + 255 - s] = (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8);
         s += 1;
     }
     t
 };
+const ENC_NEXT: usize = 512;
 
 /// Standard 460-context CABAC context bank for H.264 Main/High 4:2:0 slice syntax and DCT residuals.
 pub const NUM_CABAC_CONTEXTS: usize = 460;
@@ -441,6 +439,64 @@ pub fn init_cabac_contexts(
         *slot = CabacContext::from_mn_qp(m, n, slice_qp);
     }
     ctxs
+}
+
+/// The arithmetic coder's registers over a run of bins ([`CabacEncoder::encode_decision`] and
+/// [`CabacEncoder::encode_bypass`]): kept in locals, they are not stored and reloaded around
+/// every bin of a residual block.
+struct Arith {
+    low: u32,
+    range: u32,
+    queue: i32,
+}
+
+impl Arith {
+    #[inline(always)]
+    fn of(e: &CabacEncoder) -> Self {
+        Self {
+            low: e.low,
+            range: e.range,
+            queue: e.queue,
+        }
+    }
+
+    #[inline(always)]
+    fn store(self, e: &mut CabacEncoder) {
+        e.low = self.low;
+        e.range = self.range;
+        e.queue = self.queue;
+    }
+
+    #[inline(always)]
+    fn decision(&mut self, e: &mut CabacEncoder, ctx: &mut CabacContext, bin: u8) {
+        let packed = ctx.0 as usize & 127;
+        let r_lps = ENC_TAB[((self.range as usize >> 6) & 3) << 7 | packed] as u32;
+        let lps = 0u32.wrapping_sub(((bin ^ ctx.0) & 1) as u32);
+        let mps_range = self.range - r_lps;
+        self.low += mps_range & lps;
+        self.range = (mps_range & !lps) | (r_lps & lps);
+        ctx.0 = ENC_TAB[ENC_NEXT + (packed ^ (lps as usize & 255))];
+        // The range stays below 512 (9.3.3.2.1), so the shift is not negative.
+        let shift = self.range.leading_zeros() - 23;
+        self.range <<= shift;
+        self.low <<= shift;
+        self.queue += shift as i32;
+        if self.queue >= 0 {
+            (self.low, self.queue) = e.put_from(self.low, self.queue);
+        }
+    }
+
+    #[inline(always)]
+    fn bypass(&mut self, e: &mut CabacEncoder, bin: u8) {
+        self.low <<= 1;
+        if (bin & 1) != 0 {
+            self.low += self.range;
+        }
+        self.queue += 1;
+        if self.queue >= 0 {
+            (self.low, self.queue) = e.put_from(self.low, self.queue);
+        }
+    }
 }
 
 /// ITU-T H.264 9.3.3.2 CABAC Binary Arithmetic Encoder (`M`-Coder, `x264` bit-exact state machine).
@@ -491,7 +547,8 @@ impl CabacEncoder {
     /// the shift is at most 8, after which one byte at most is complete.
     #[inline(always)]
     fn renormalize(&mut self) {
-        let shift = self.range.leading_zeros().saturating_sub(23);
+        // The range stays below 512 (9.3.3.2.1), so the shift is not negative.
+        let shift = self.range.leading_zeros() - 23;
         self.range <<= shift;
         self.low <<= shift;
         self.queue += shift as i32;
@@ -504,7 +561,7 @@ impl CabacEncoder {
     #[inline(always)]
     pub fn encode_decision(&mut self, ctx: &mut CabacContext, bin: u8) {
         let packed = ctx.0 as usize & 127;
-        let r_lps = ENC_LPS[((self.range as usize >> 6) & 3) << 7 | packed] as u32;
+        let r_lps = ENC_TAB[((self.range as usize >> 6) & 3) << 7 | packed] as u32;
         // Without branches on the symbol, which is not predictable (`x264` does the same with
         // conditional moves): all ones when it is the least probable one.
         let lps = 0u32.wrapping_sub(((bin ^ ctx.0) & 1) as u32);
@@ -512,7 +569,7 @@ impl CabacEncoder {
         self.low += mps_range & lps;
         self.range = (mps_range & !lps) | (r_lps & lps);
         // The next state of an LPS is at `255 - packed`, `packed ^ 255` as `packed < 128`.
-        ctx.0 = ENC_NEXT[packed ^ (lps as usize & 255)];
+        ctx.0 = ENC_TAB[ENC_NEXT + (packed ^ (lps as usize & 255))];
         self.renormalize();
     }
 
@@ -981,69 +1038,105 @@ impl CabacEncoder {
         last_idx: usize,
         coeffs: &[i16],
     ) {
-        let mut sig_positions = [0u8; 64];
-        let mut sig_count = 0usize;
-
-        for (i, &c) in coeffs.iter().enumerate().take(last_idx + 1) {
-            if i < max_coeff - 1 {
-                let sig_off = if cat == 5 {
-                    SIG_COEFF_OFFSET_8X8[i] as usize
-                } else {
-                    i
-                };
-                if c == 0 {
-                    self.encode_decision(&mut ctxs[sig_base + sig_off], 0);
-                    continue;
-                }
-                self.encode_decision(&mut ctxs[sig_base + sig_off], 1);
-                let last_off = if cat == 5 {
-                    LAST_COEFF_OFFSET_8X8[i] as usize
-                } else {
-                    i
-                };
-                self.encode_decision(&mut ctxs[last_base + last_off], u8::from(i == last_idx));
-            }
-            sig_positions[sig_count] = i as u8;
-            sig_count += 1;
+        // The last position of a block carries no flags: it is significant when reached.
+        let flagged = &coeffs[..=last_idx.min(max_coeff - 2)];
+        if cat == 5 {
+            self.sig_map::<true>(ctxs, sig_base, last_base, last_idx, flagged);
+        } else {
+            self.sig_map::<false>(ctxs, sig_base, last_base, last_idx, flagged);
         }
+        let gt_max = if cat == 3 { 3 } else { 4 };
+        self.levels(
+            &mut ctxs[lvl_base..lvl_base + 10],
+            gt_max,
+            &coeffs[..=last_idx],
+        );
+    }
 
+    /// `significant_coeff_flag` and `last_significant_coeff_flag` of the positions `flagged`
+    /// (9.3.3.1.3), with the arithmetic coder's registers in locals.
+    #[inline(always)]
+    fn sig_map<const EIGHT: bool>(
+        &mut self,
+        ctxs: &mut [CabacContext],
+        sig_base: usize,
+        last_base: usize,
+        last_idx: usize,
+        flagged: &[i16],
+    ) {
+        let mut a = Arith::of(self);
+        for (i, &c) in flagged.iter().enumerate() {
+            let (so, lo) = if EIGHT {
+                (
+                    SIG_COEFF_OFFSET_8X8[i] as usize,
+                    LAST_COEFF_OFFSET_8X8[i] as usize,
+                )
+            } else {
+                (i, i)
+            };
+            if c == 0 {
+                a.decision(self, &mut ctxs[sig_base + so], 0);
+            } else {
+                a.decision(self, &mut ctxs[sig_base + so], 1);
+                a.decision(self, &mut ctxs[last_base + lo], u8::from(i == last_idx));
+            }
+        }
+        a.store(self);
+    }
+
+    /// `coeff_abs_level_minus1` and `coeff_sign_flag` of the non-zero levels of `coeffs`, last
+    /// first, with the level contexts `lvl` (9.3.2.3, 9.3.3.1.3).
+    #[inline(always)]
+    fn levels(&mut self, lvl: &mut [CabacContext], gt_max: usize, coeffs: &[i16]) {
+        let mut a = Arith::of(self);
         let mut num_eq1 = 0usize;
         let mut num_gt1 = 0usize;
-        let gt_max = if cat == 3 { 3 } else { 4 };
-
-        for &pos in sig_positions[..sig_count].iter().rev() {
-            let c = coeffs[pos as usize];
+        for &c in coeffs.iter().rev() {
+            if c == 0 {
+                continue;
+            }
             let abs_m1 = (c.unsigned_abs() as u32) - 1;
             let c0 = if num_gt1 > 0 { 0 } else { (1 + num_eq1).min(4) };
             if abs_m1 == 0 {
-                self.encode_decision(&mut ctxs[lvl_base + c0], 0);
+                a.decision(self, &mut lvl[c0], 0);
                 num_eq1 += 1;
             } else {
-                self.encode_decision(&mut ctxs[lvl_base + c0], 1);
+                a.decision(self, &mut lvl[c0], 1);
                 let c1 = 5 + num_gt1.min(gt_max);
                 let prefix = abs_m1.min(14);
                 for _ in 1..prefix {
-                    self.encode_decision(&mut ctxs[lvl_base + c1], 1);
+                    a.decision(self, &mut lvl[c1], 1);
                 }
                 if abs_m1 < 14 {
-                    self.encode_decision(&mut ctxs[lvl_base + c1], 0);
+                    a.decision(self, &mut lvl[c1], 0);
                 } else {
                     let mut rem = abs_m1 - 14;
                     let mut k = 0u32;
                     while rem >= (1 << k) {
-                        self.encode_bypass(1);
+                        a.bypass(self, 1);
                         rem -= 1 << k;
                         k += 1;
                     }
-                    self.encode_bypass(0);
+                    a.bypass(self, 0);
                     for bit in (0..k).rev() {
-                        self.encode_bypass(((rem >> bit) & 1) as u8);
+                        a.bypass(self, ((rem >> bit) & 1) as u8);
                     }
                 }
                 num_gt1 += 1;
             }
-            self.encode_bypass(u8::from(c < 0));
+            a.bypass(self, u8::from(c < 0));
         }
+        a.store(self);
+    }
+
+    /// [`Self::putbyte`] from the registers of an [`Arith`], out of line; returns their new
+    /// `low` and `queue`.
+    #[inline(never)]
+    fn put_from(&mut self, low: u32, queue: i32) -> (u32, i32) {
+        self.low = low;
+        self.queue = queue;
+        self.putbyte();
+        (self.low, self.queue)
     }
 
     pub fn into_bytes(self) -> Vec<u8> {

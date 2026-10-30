@@ -420,7 +420,7 @@ impl EncState {
             for (i8x8, q8) in luma_q8.iter().enumerate() {
                 if cbp_luma & (1 << i8x8) != 0 {
                     let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
-                    add8x8_idct_u8(&mut py[o..], 16, &dequantize_block8x8(q8, eff_qp));
+                    recon_8x8(&mut py[o..], q8, eff_qp);
                 }
             }
         } else {

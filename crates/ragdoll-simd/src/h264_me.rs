@@ -845,6 +845,153 @@ mod neon {
     }
 }
 
+/// The AVX2 kernels behind the functions above without their checks, for a motion search that
+/// already holds every block inside its padded planes and runs where AVX2 is known to be
+/// present: the bounds and dispatch checks were ~2% of an encode's instructions (`SIMD-0089`).
+/// Debug builds still check.
+#[cfg(target_arch = "x86_64")]
+pub mod avx2_unchecked {
+    use super::{check, x86};
+
+    /// [`super::pixel_sad_wxh`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of [`super::pixel_sad_wxh`].
+    #[inline(always)]
+    pub unsafe fn sad<const W: usize, const H: usize>(
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) -> u32 {
+        if cfg!(debug_assertions) {
+            check::<W, H>(a, sa);
+            check::<W, H>(b, sb);
+        }
+        // Safety: the caller's contract.
+        unsafe { x86::sad::<W, H, false>(a.as_ptr(), sa, b.as_ptr(), sb, b.as_ptr(), sb) }
+    }
+
+    /// [`super::pixel_sad_avg_wxh`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of
+    /// [`super::pixel_sad_avg_wxh`].
+    #[inline(always)]
+    pub unsafe fn sad_avg<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) -> u32 {
+        if cfg!(debug_assertions) {
+            check::<W, H>(src, ss);
+            check::<W, H>(a, sa);
+            check::<W, H>(b, sb);
+        }
+        // Safety: the caller's contract.
+        unsafe { x86::sad::<W, H, true>(src.as_ptr(), ss, a.as_ptr(), sa, b.as_ptr(), sb) }
+    }
+
+    /// [`super::pixel_satd_wxh`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of [`super::pixel_satd_wxh`].
+    #[inline(always)]
+    pub unsafe fn satd<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        a: &[u8],
+        sa: usize,
+        b: Option<(&[u8], usize)>,
+    ) -> u32 {
+        if cfg!(debug_assertions) {
+            check::<W, H>(src, ss);
+            check::<W, H>(a, sa);
+            if let Some((b, sb)) = b {
+                check::<W, H>(b, sb);
+            }
+        }
+        // Safety: the caller's contract.
+        unsafe {
+            match b {
+                Some((b, sb)) => {
+                    x86::satd::<W, H, true>(src.as_ptr(), ss, a.as_ptr(), sa, b.as_ptr(), sb)
+                }
+                None => x86::satd::<W, H, false>(src.as_ptr(), ss, a.as_ptr(), sa, a.as_ptr(), sa),
+            }
+        }
+    }
+
+    /// [`super::pixel_sad_x4_wxh`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of [`super::pixel_sad_x4_wxh`].
+    #[inline(always)]
+    pub unsafe fn sad_x4<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        refs: [&[u8]; 4],
+        rs: usize,
+    ) -> [u32; 4] {
+        if cfg!(debug_assertions) {
+            check::<W, H>(src, ss);
+            for r in refs {
+                check::<W, H>(r, rs);
+            }
+        }
+        // Safety: the caller's contract.
+        unsafe { x86::sad_x4::<W, H>(src.as_ptr(), ss, refs.map(|r| r.as_ptr()), rs) }
+    }
+
+    /// [`super::pixel_sad_x4_wxh_at`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of
+    /// [`super::pixel_sad_x4_wxh_at`].
+    #[inline(always)]
+    pub unsafe fn sad_x4_at<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        plane: &[u8],
+        offs: [usize; 4],
+        rs: usize,
+    ) -> [u32; 4] {
+        if cfg!(debug_assertions) {
+            check::<W, H>(src, ss);
+            for o in offs {
+                check::<W, H>(&plane[o..], rs);
+            }
+        }
+        // Safety: the caller's contract.
+        unsafe { x86::sad_x4::<W, H>(src.as_ptr(), ss, offs.map(|o| plane.as_ptr().add(o)), rs) }
+    }
+
+    /// [`super::pixel_avg_wxh`].
+    ///
+    /// # Safety
+    /// The CPU supports AVX2 and the arguments pass the checks of [`super::pixel_avg_wxh`].
+    #[inline(always)]
+    pub unsafe fn avg<const W: usize, const H: usize>(
+        dst: &mut [u8],
+        ds: usize,
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) {
+        if cfg!(debug_assertions) {
+            check::<W, H>(dst, ds);
+            check::<W, H>(a, sa);
+            check::<W, H>(b, sb);
+        }
+        // Safety: the caller's contract.
+        unsafe { x86::avg::<W, H>(dst.as_mut_ptr(), ds, a.as_ptr(), sa, b.as_ptr(), sb) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,6 +1072,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The unchecked entry points give what the checked ones do.
+    #[cfg(target_arch = "x86_64")]
+    fn check_unchecked<const W: usize, const H: usize>() {
+        if !ragdoll_core::dispatch::avx2() {
+            return;
+        }
+        let pw = 53usize;
+        let (p, q, r) = (plane(pw, 41, 5), plane(pw, 41, 17), plane(pw, 41, 29));
+        let offs = [0, 1, pw + 3, 2 * pw + 5];
+        let refs = offs.map(|o| &q[o..]);
+        // Safety: AVX2 is present and every block lies inside its plane.
+        unsafe {
+            use avx2_unchecked as u;
+            assert_eq!(
+                u::sad::<W, H>(&p, pw, &q, pw),
+                pixel_sad_wxh::<W, H>(&p, pw, &q, pw)
+            );
+            assert_eq!(
+                u::sad_avg::<W, H>(&p, pw, &q, pw, &r, pw),
+                pixel_sad_avg_wxh::<W, H>(&p, pw, &q, pw, &r, pw)
+            );
+            for b in [None, Some((&r[..], pw))] {
+                assert_eq!(
+                    u::satd::<W, H>(&p, pw, &q, pw, b),
+                    pixel_satd_wxh::<W, H>(&p, pw, &q, pw, b)
+                );
+            }
+            assert_eq!(
+                u::sad_x4::<W, H>(&p, pw, refs, pw),
+                pixel_sad_x4_wxh::<W, H>(&p, pw, refs, pw)
+            );
+            assert_eq!(
+                u::sad_x4_at::<W, H>(&p, pw, &q, offs, pw),
+                pixel_sad_x4_wxh_at::<W, H>(&p, pw, &q, offs, pw)
+            );
+            let (mut d1, mut d2) = (vec![1u8; 16 * 21], vec![1u8; 16 * 21]);
+            u::avg::<W, H>(&mut d1[5..], 21, &q, pw, &r, pw);
+            pixel_avg_wxh::<W, H>(&mut d2[5..], 21, &q, pw, &r, pw);
+            assert_eq!(d1, d2);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn unchecked_kernels_match_the_checked_ones() {
+        check_unchecked::<8, 8>();
+        check_unchecked::<16, 8>();
+        check_unchecked::<8, 16>();
+        check_unchecked::<16, 16>();
     }
 
     #[test]

@@ -376,7 +376,10 @@ impl Kernels {
 /// The block cost kernels compiled for x86-64-v3, which they then inline.
 #[cfg(target_arch = "x86_64")]
 mod v3k {
-    use ragdoll_simd::*;
+    use ragdoll_simd::h264_me::avx2_unchecked as u;
+
+    // Safety of each: the search holds every block inside its padded plane, and the shims are
+    // used only where `super::super::v3` holds, so AVX2 is present.
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     pub(super) unsafe fn sad4<const W: usize, const H: usize>(
@@ -386,7 +389,7 @@ mod v3k {
         offs: [usize; 4],
         rs: usize,
     ) -> [u32; 4] {
-        pixel_sad_x4_wxh_at::<W, H>(src, ss, plane, offs, rs)
+        unsafe { u::sad_x4_at::<W, H>(src, ss, plane, offs, rs) }
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -396,7 +399,7 @@ mod v3k {
         refs: [&[u8]; 4],
         rs: usize,
     ) -> [u32; 4] {
-        pixel_sad_x4_wxh::<W, H>(src, ss, refs, rs)
+        unsafe { u::sad_x4::<W, H>(src, ss, refs, rs) }
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -406,7 +409,7 @@ mod v3k {
         b: &[u8],
         sb: usize,
     ) -> u32 {
-        pixel_sad_wxh::<W, H>(a, sa, b, sb)
+        unsafe { u::sad::<W, H>(a, sa, b, sb) }
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -418,7 +421,7 @@ mod v3k {
         b: &[u8],
         sb: usize,
     ) -> u32 {
-        pixel_sad_avg_wxh::<W, H>(src, ss, a, sa, b, sb)
+        unsafe { u::sad_avg::<W, H>(src, ss, a, sa, b, sb) }
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -430,7 +433,7 @@ mod v3k {
         b: &[u8],
         sb: usize,
     ) {
-        pixel_avg_wxh::<W, H>(dst, ds, a, sa, b, sb)
+        unsafe { u::avg::<W, H>(dst, ds, a, sa, b, sb) }
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -441,7 +444,7 @@ mod v3k {
         sa: usize,
         b: Option<(&[u8], usize)>,
     ) -> u32 {
-        pixel_satd_wxh::<W, H>(src, ss, a, sa, b)
+        unsafe { u::satd::<W, H>(src, ss, a, sa, b) }
     }
 }
 
