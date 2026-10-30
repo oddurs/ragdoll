@@ -100,3 +100,15 @@ Attempts (all output-identical unless noted):
 - Lookahead early-out on path costs: analysed, not implemented: B wins most decisions on park, so the side computed second rarely gets cut, and an exact early-out must still run the searches whose vectors seed the full-resolution search.
 
 Remaining gap on park, by size: CABAC residual (sig/levels ~11% of instructions, 3.3M of the mispredicts are its significance and loop branches, 0.8M the byte-output test), the partition search (~13% of instructions; ~30 instructions of bookkeeping per point, 2.3M indirect mispredicts), B/P macroblock analysis code (6.3M + 2.1M I1 misses), lookahead (~9%).
+
+## 2026-10-30
+
+Round 6 (branch worktree-agent-a8d288051031e9368): earn compression cheaply, spend it on speed. Park and foreman still not under 1.0.
+
+Earned: x264 veryfast uses the inter deadzone f = 1/6 (trellis 0); rounding inter residuals with f = 1/3 like intra ones (luma 4x4/8x8, chroma AC, skip probes and bounds; Compact only) gains on every clip vs veryfast, Y / avg: src720 -5.17/-1.14 -> -5.46/-2.59, park -2.50/-1.85 -> -7.34/-6.02, foreman -3.68/-4.20 -> -6.50/-5.98. Measured alternatives: inter f = 1/7 (+0.4..1.0% worse), 1/5, 1/4, 2/7 (in between), intra f = 0.4 or 0.29 (+0.5..0.8% worse), chroma at 1/6 (src720 avg +1.4% worse), chroma above 1/3 (worse avg), deblocking offsets -1/+1 (mixed). The finer rounding codes ~0.9 dB more at a given QP (park QP 28 35.08 dB vs x264's 34.18), so at the timing protocol's fixed QP it is ~7% slower; every Compact picture is now coded one QP step coarser than asked, so that its PSNR at a QP matches veryfast's (park QP 28: 3,012,029 B / 34.25 dB vs 3,141,391 B / 34.18 dB; foreman 211,142 B / 36.54 vs 208,030 / 36.48; src720 1,727,472 B / 45.23 vs 1,764,455 / 45.14).
+
+Spent (measured on all clips): no P 16x8/8x16 and no intra 4x4 analysis in P macroblocks (park -7.5%, foreman -7.5% instructions). Not taken: x264 b-adapt 1 (only -1.7% instructions on park and +0.8% on foreman once more P frames are coded, and +3..6% BD), lookahead early exits (src720 only).
+
+Final, BD vs veryfast Y / avg: src720 -2.54 / -0.35, park -5.99 / -4.92, foreman -2.12 / -1.59 (vs ultrafast -32.8/-30.5, -47.1/-46.2, -69.2/-68.8). Pinned interleaved 9 rounds, ours / veryfast at QP 28: src720 0.87, foreman 1.04, park 1.14. Instructions, full clips: src720 9.56G vs 9.88G, park60 11.03G vs 9.85G, foreman150 2.33G vs 2.13G.
+
+Remaining gap: park ~12%, foreman ~4%, with the binding BD margin now src720's average PSNR (-0.35%) and foreman's (-1.59%); further trades measured so far each cost more than that. A stronger quantizer (RD-optimized zero-out of trailing +-1 levels, per-position rounding) is the next lever for margin; per-position rounding needs a quant kernel with a bias per coefficient.
