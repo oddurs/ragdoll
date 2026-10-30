@@ -486,20 +486,15 @@ impl CabacEncoder {
     pub fn encode_decision(&mut self, ctx: &mut CabacContext, bin: u8) {
         let packed = ctx.0 as usize & 127;
         let r_lps = ENC_LPS[((self.range as usize >> 6) & 3) << 7 | packed] as u32;
-        self.range -= r_lps;
-        if (bin & 1) != (ctx.0 & 1) {
-            self.low += self.range;
-            self.range = r_lps;
-            ctx.0 = ENC_NEXT[255 - packed];
-            self.renormalize();
-        } else {
-            ctx.0 = ENC_NEXT[packed];
-            // After a most probable symbol the range is at least 256 - 2 * 2^6 >= 128: one
-            // doubling at most.
-            if self.range < 256 {
-                self.renormalize();
-            }
-        }
+        // Without branches on the symbol, which is not predictable (`x264` does the same with
+        // conditional moves): all ones when it is the least probable one.
+        let lps = 0u32.wrapping_sub(((bin ^ ctx.0) & 1) as u32);
+        let mps_range = self.range - r_lps;
+        self.low += mps_range & lps;
+        self.range = (mps_range & !lps) | (r_lps & lps);
+        // The next state of an LPS is at `255 - packed`, `packed ^ 255` as `packed < 128`.
+        ctx.0 = ENC_NEXT[packed ^ (lps as usize & 255)];
+        self.renormalize();
     }
 
     /// Encodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).

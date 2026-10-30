@@ -6,7 +6,7 @@
 use super::compact::{
     ME_RANGE, MeResult, PartSearch, QPEL_REFINE, RefLuma, block_cost, block_satd_avg, sa8d_16x16,
 };
-use super::inter::{Quad, Shape, mvp_from, neighbours, quad_of};
+use super::inter::{Quad, Shape, mvp_from, neighbours, quad_of, rolled};
 use super::*;
 
 /// `MinPositive` of 8.4.1.2.2.
@@ -164,13 +164,50 @@ impl EncState {
         sl.prev_qp_delta_nz = false;
     }
 
+    out_of_line_v3!(pub(super) fn code_b_mb_compact / code_b_mb_v3 => code_b_mb_body(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+    ));
+
+    out_of_line_v3!(fn code_i16_b / code_i16_b_v3 => code_i16(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        mode: u8,
+    ));
+
+    out_of_line_v3!(fn code_inter_b / code_inter_b_v3 => code_inter_b_body(
+        &mut self,
+        sl: &mut SliceState,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        mb: &BMb,
+        res: &InterResidual,
+        py: &mut [u8; 256],
+        pu: &mut [u8; 64],
+        pv: &mut [u8; 64],
+    ));
+
     /// Analyses and codes one macroblock of a B picture: `B_Skip` when the direct prediction's
     /// residual decimates to nothing, else the cheapest by SATD and motion cost of direct, list
     /// 0, list 1 and bi-predicted $16\times16$, the $8\times8$, $16\times8$ and $8\times16$
     /// partitions when they promise to pay, and intra $16\times16$ (`x264` with `subme` 2).
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    pub(super) fn code_b_mb_compact(
+    #[allow(clippy::too_many_arguments)]
+    fn code_b_mb_body(
         &mut self,
         sl: &mut SliceState,
         w: &mut Bits,
@@ -251,7 +288,14 @@ impl EncState {
                 mv_costs,
                 bounds,
             };
-        let m16: [MeResult; 2] = std::array::from_fn(|l| {
+        // Loops over lists and quadrants are kept rolled (`rolled`): unrolled, a macroblock's
+        // analysis runs through more code than the instruction cache holds.
+        let mut m16 = [MeResult {
+            mv: [0; 2],
+            satd: 0,
+            mv_cost: 0,
+        }; 2];
+        for (l, m) in m16.iter_mut().enumerate().take(rolled(2)) {
             let mvp = self.mvp_part(l, mb_x, mb_y, Shape::S16x16, 0, 0);
             let mut cands = [[0i16; 2]; 9];
             let mut n = 0;
@@ -276,8 +320,8 @@ impl EncState {
                     push(r[mb_idx - mb_w + 1]);
                 }
             }
-            part(l, 0, 0, 16, 16, mvp).search(&cands[..n], range)
-        });
+            *m = part(l, 0, 0, 16, 16, mvp).search(&cands[..n], range);
+        }
         self.mvr[0][mb_idx] = m16[0].mv;
         self.mvr[1][mb_idx] = m16[1].mv;
         // SATD of the bi-prediction from vectors `v` over the `w`x`h` block at `(px, py)`.
@@ -354,9 +398,9 @@ impl EncState {
                 std::cmp::Ordering::Greater => 0,
                 std::cmp::Ordering::Equal => 2,
             };
-            for i in 0..4 {
+            for i in 0..rolled(4) {
                 let (bx, by) = ((i & 1) * 2, (i >> 1) * 2);
-                for l in 0..2 {
+                for l in 0..rolled(2) {
                     let mvp = self.mvp_part(l, mb_x, mb_y, Shape::S8x8, i, 0);
                     let ps = part(l, bx * 4, by * 4, 8, 8, mvp);
                     m8[l][i] = if l == weak {
@@ -485,7 +529,9 @@ impl EncState {
                     for l in 0..2 {
                         let mvp = self.mvp_part(l, mb_x, mb_y, shape, p, 0);
                         let c = [m16[l].mv, m8[l][a].mv, m8[l][b].mv];
-                        mp[l] = part(l, bx * 4, by * 4, w4 * 4, h4 * 4, mvp).search(&c, range);
+                        // Quarter-pel vectors only for the partitions chosen.
+                        mp[l] =
+                            part(l, bx * 4, by * 4, w4 * 4, h4 * 4, mvp).search_qpel(&c, range, 0);
                     }
                     let v = [mp[0].mv, mp[1].mv];
                     mes[2 * p] = mp[0];
@@ -543,7 +589,7 @@ impl EncState {
         // by partition as they are written, each list's vector by its own SATD.
         let qref = QPEL_REFINE;
         if !(best.shape == Shape::S16x16 && best.dir[0] == 0) {
-            for l in 0..2 {
+            for l in 0..rolled(2) {
                 for (p, &(bx, by, w4, h4)) in best.shape.parts().iter().enumerate() {
                     let qi = quad_of(bx, by);
                     let (gx, gy) = (gx0 + bx, gy0 + by);
@@ -586,7 +632,7 @@ impl EncState {
         let (i16_satd, i16_mode) = analyse_i16_edges(edges, src, true);
         if i16_satd + lambda * 13 < best_cost {
             self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
-            self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
+            self.code_i16_b(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
             self.set_motion(1, mb_x, mb_y, 0, 0, 4, 4, -1, [0, 0]);
             return;
         }
@@ -638,7 +684,8 @@ impl EncState {
     /// partition by partition, each predicted from the motion stored before it (7.3.5.1).
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    fn code_inter_b(
+    #[allow(clippy::too_many_arguments)]
+    fn code_inter_b_body(
         &mut self,
         sl: &mut SliceState,
         cabac: &mut Cabac,
