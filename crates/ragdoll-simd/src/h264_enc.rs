@@ -785,6 +785,304 @@ pub fn hpel_window_centre_scalar(out: &mut HpelWindow) {
     }
 }
 
+/// The three half-sample planes of ITU-T H.264 8.4.2.2.1 over `rows` rows of `width` samples of
+/// a picture, as [`hpel_window`] and [`hpel_window_centre`] compute them: with
+/// `o = start + r * stride + x`, `h[o]` takes `b` at `(x + 1/2, r)`, `v[o]` takes `h` at
+/// `(x, r + 1/2)` and `c[o]` takes `j` at `(x + 1/2, r + 1/2)`, relative to the integer sample
+/// `src[o]`; the planes share `src`'s layout. Reads rows `-2..rows + 3` and columns
+/// `-2..width + 3` around the region (`x264_hpel_filter`).
+///
+/// # Panics
+/// If `src` lacks those margins, a plane is shorter than the region, or `width < 16`.
+#[allow(clippy::too_many_arguments)]
+pub fn hpel_planes(
+    src: &[u8],
+    h: &mut [u8],
+    v: &mut [u8],
+    c: &mut [u8],
+    stride: usize,
+    start: usize,
+    width: usize,
+    rows: usize,
+) {
+    check_hpel_planes(src, [&*h, &*v, &*c], stride, start, width, rows);
+    // Unrounded vertical taps of a row's columns `-2..width + 3`.
+    let mut taps = vec![0i16; width + 5];
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        unsafe {
+            hpel_planes_neon(
+                src.as_ptr(),
+                [h, v, c].map(|p| p.as_mut_ptr()),
+                stride,
+                start,
+                width,
+                rows,
+                &mut taps,
+            )
+        };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        unsafe {
+            hpel_planes_avx2(
+                src.as_ptr(),
+                [h, v, c].map(|p| p.as_mut_ptr()),
+                stride,
+                start,
+                width,
+                rows,
+                &mut taps,
+            )
+        };
+        return;
+    }
+    hpel_planes_scalar(src, h, v, c, stride, start, width, rows);
+}
+
+fn check_hpel_planes(
+    src: &[u8],
+    dst: [&[u8]; 3],
+    stride: usize,
+    start: usize,
+    width: usize,
+    rows: usize,
+) {
+    assert!(width >= 16 && rows > 0 && width + 3 <= stride);
+    assert!(start >= 2 * stride + 2 && start + (rows + 2) * stride + width + 3 <= src.len());
+    for d in dst {
+        assert!(start + (rows - 1) * stride + width <= d.len());
+    }
+}
+
+/// Scalar reference for [`hpel_planes`].
+#[allow(clippy::too_many_arguments)]
+pub fn hpel_planes_scalar(
+    src: &[u8],
+    h: &mut [u8],
+    v: &mut [u8],
+    c: &mut [u8],
+    stride: usize,
+    start: usize,
+    width: usize,
+    rows: usize,
+) {
+    check_hpel_planes(src, [&*h, &*v, &*c], stride, start, width, rows);
+    let tap6 = |t: [i32; 6]| t[0] - 5 * t[1] + 20 * t[2] + 20 * t[3] - 5 * t[4] + t[5];
+    let clip = |x: i32| x.clamp(0, 255) as u8;
+    let mut taps = vec![0i32; width + 5];
+    for r in 0..rows {
+        let row = start + r * stride;
+        for (k, t) in taps.iter_mut().enumerate() {
+            let o = row + k - 2;
+            *t = tap6(std::array::from_fn(|i| {
+                src[o + i * stride - 2 * stride] as i32
+            }));
+        }
+        for x in 0..width {
+            let o = row + x;
+            h[o] = clip((tap6(std::array::from_fn(|i| src[o + i - 2] as i32)) + 16) >> 5);
+            v[o] = clip((taps[x + 2] + 16) >> 5);
+            c[o] = clip((tap6(std::array::from_fn(|i| taps[x + i])) + 512) >> 10);
+        }
+    }
+}
+
+/// Starts of the 16-sample chunks covering `0..len` (`len >= 16`), the last one overlapping.
+#[inline(always)]
+fn chunks16(len: usize, step: usize) -> impl Iterator<Item = usize> {
+    (0..len.div_ceil(step)).map(move |i| (i * step).min(len - step))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn hpel_planes_avx2(
+    src: *const u8,
+    dst: [*mut u8; 3],
+    s: usize,
+    start: usize,
+    width: usize,
+    rows: usize,
+    taps: &mut [i16],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let r16 = _mm256_set1_epi16(16);
+        let r512 = _mm256_set1_epi32(512);
+        let (one, m5, p20) = (
+            _mm256_set1_epi16(1),
+            _mm256_set1_epi16(-5),
+            _mm256_set1_epi16(20),
+        );
+        let t = taps.as_mut_ptr();
+        let wide = |p: *const u8| _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i));
+        // Sixteen 16-bit values, in order, clipped to bytes.
+        let store = |d: *mut u8, x: __m256i| {
+            let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(x, x));
+            _mm_storeu_si128(d as *mut __m128i, _mm256_castsi256_si128(p));
+        };
+        for r in 0..rows {
+            let row = start + r * s;
+            for k in chunks16(width + 5, 16) {
+                let p = src.add(row + k - 2 - 2 * s);
+                let v = tap6_epi16(std::array::from_fn(|i| wide(p.add(i * s))));
+                _mm256_storeu_si256(t.add(k) as *mut __m256i, v);
+            }
+            for x in chunks16(width, 16) {
+                let o = row + x;
+                let p = src.add(o - 2);
+                let hv = tap6_epi16(std::array::from_fn(|i| wide(p.add(i))));
+                store(
+                    dst[0].add(o),
+                    _mm256_srai_epi16::<5>(_mm256_add_epi16(hv, r16)),
+                );
+                let q: [__m256i; 6] =
+                    std::array::from_fn(|i| _mm256_loadu_si256(t.add(x + i) as *const __m256i));
+                store(
+                    dst[1].add(o),
+                    _mm256_srai_epi16::<5>(_mm256_add_epi16(q[2], r16)),
+                );
+                // The horizontal tap on the unrounded vertical ones needs 32 bits: multiply-add
+                // the symmetric pairs, interleaved per 128-bit lane (packs restores the order).
+                let pairs = [(q[0], q[5], one), (q[1], q[4], m5), (q[2], q[3], p20)];
+                let (mut lo, mut hi) = (r512, r512);
+                for (a, b, k) in pairs {
+                    lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), k));
+                    hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), k));
+                }
+                let j = packs_epi32_avx2(_mm256_srai_epi32::<10>(lo), _mm256_srai_epi32::<10>(hi));
+                store(dst[2].add(o), j);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn hpel_planes_neon(
+    src: *const u8,
+    dst: [*mut u8; 3],
+    s: usize,
+    start: usize,
+    width: usize,
+    rows: usize,
+    taps: &mut [i16],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let t = taps.as_mut_ptr();
+        let wide = |p: *const u8| vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p)));
+        let tap6 = |x: [int16x8_t; 6]| {
+            let (s0, s1, s2) = (
+                vaddq_s16(x[0], x[5]),
+                vaddq_s16(x[1], x[4]),
+                vaddq_s16(x[2], x[3]),
+            );
+            let k = vsubq_s16(vshlq_n_s16::<2>(s2), s1);
+            vaddq_s16(s0, vaddq_s16(k, vshlq_n_s16::<2>(k)))
+        };
+        for r in 0..rows {
+            let row = start + r * s;
+            for k in chunks16(width + 5, 8) {
+                let p = src.add(row + k - 2 - 2 * s);
+                vst1q_s16(t.add(k), tap6(std::array::from_fn(|i| wide(p.add(i * s)))));
+            }
+            for x in chunks16(width, 8) {
+                let o = row + x;
+                let hv = tap6(std::array::from_fn(|i| wide(src.add(o - 2 + i))));
+                vst1_u8(dst[0].add(o), vqrshrun_n_s16::<5>(hv));
+                let q: [int16x8_t; 6] = std::array::from_fn(|i| vld1q_s16(t.add(x + i)));
+                vst1_u8(dst[1].add(o), vqrshrun_n_s16::<5>(q[2]));
+                let j = |lo: bool| {
+                    let half = |x: int16x8_t| {
+                        if lo {
+                            vget_low_s16(x)
+                        } else {
+                            vget_high_s16(x)
+                        }
+                    };
+                    let s0 = vaddl_s16(half(q[0]), half(q[5]));
+                    let s1 = vaddl_s16(half(q[1]), half(q[4]));
+                    let s2 = vaddl_s16(half(q[2]), half(q[3]));
+                    vqrshrn_n_s32::<10>(vmlaq_n_s32(vmlaq_n_s32(s0, s1, -5), s2, 20))
+                };
+                vst1_u8(dst[2].add(o), vqmovun_s16(vcombine_s16(j(true), j(false))));
+            }
+        }
+    }
+}
+
+/// Halves two rows into one (`x264_frame_init_lowres`): `dst[x]` is the rounded average of
+/// the rounded averages of columns `2x` and `2x + 1` of `r0` and `r1`.
+///
+/// # Panics
+/// If a row is shorter than `2 * dst.len()`.
+pub fn downscale_2x_row(r0: &[u8], r1: &[u8], dst: &mut [u8]) {
+    let n = dst.len();
+    assert!(r0.len() >= 2 * n && r1.len() >= 2 * n);
+    let mut done = 0;
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        done = unsafe { downscale_neon(r0.as_ptr(), r1.as_ptr(), dst.as_mut_ptr(), n) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        done = unsafe { downscale_avx2(r0.as_ptr(), r1.as_ptr(), dst.as_mut_ptr(), n) };
+    }
+    downscale_2x_row_scalar(&r0[2 * done..], &r1[2 * done..], &mut dst[done..]);
+}
+
+/// Scalar reference for [`downscale_2x_row`].
+pub fn downscale_2x_row_scalar(r0: &[u8], r1: &[u8], dst: &mut [u8]) {
+    let avg = |a: u8, b: u8| (a as u16 + b as u16 + 1) >> 1;
+    for (x, d) in dst.iter_mut().enumerate() {
+        let (l, r) = (avg(r0[2 * x], r1[2 * x]), avg(r0[2 * x + 1], r1[2 * x + 1]));
+        *d = ((l + r + 1) >> 1) as u8;
+    }
+}
+
+/// [`downscale_2x_row`] of the first `n / 16 * 16` columns; returns their number.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn downscale_avx2(r0: *const u8, r1: *const u8, dst: *mut u8, n: usize) -> usize {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ones = _mm256_set1_epi8(1);
+        let one = _mm256_set1_epi16(1);
+        for x in (0..n / 16).map(|i| i * 16) {
+            let a = _mm256_loadu_si256(r0.add(2 * x) as *const __m256i);
+            let b = _mm256_loadu_si256(r1.add(2 * x) as *const __m256i);
+            // Pairs of the vertical averages summed to 16 bits, then halved with rounding.
+            let pairs = _mm256_maddubs_epi16(_mm256_avg_epu8(a, b), ones);
+            let h = _mm256_srli_epi16::<1>(_mm256_add_epi16(pairs, one));
+            let p = _mm256_permute4x64_epi64::<0b00_00_10_00>(packus_epi16_avx2(h, h));
+            _mm_storeu_si128(dst.add(x) as *mut __m128i, _mm256_castsi256_si128(p));
+        }
+        n / 16 * 16
+    }
+}
+
+/// [`downscale_2x_row`] of the first `n / 8 * 8` columns; returns their number.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn downscale_neon(r0: *const u8, r1: *const u8, dst: *mut u8, n: usize) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        for x in (0..n / 8).map(|i| i * 8) {
+            let v = vrhaddq_u8(vld1q_u8(r0.add(2 * x)), vld1q_u8(r1.add(2 * x)));
+            vst1_u8(dst.add(x), vrshrn_n_u16::<1>(vpaddlq_u8(v)));
+        }
+        n / 8 * 8
+    }
+}
+
 /// `dst = (a + b + 1) >> 1` over a $16\times16$ block (stride 16), from strided sources.
 ///
 /// # Panics
@@ -3130,6 +3428,59 @@ mod tests {
                             let vy = r + usize::from(!up);
                             assert_eq!(b[r * 16 + k], win.v[vy * HPEL_WIN_W + k + 1]);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn downscale_matches_scalar() {
+        for n in [0usize, 7, 16, 37, 64] {
+            let (r0, r1) = (plane(2 * n + 3, 1, 51), plane(2 * n + 3, 1, 52));
+            let (mut a, mut b) = (vec![9u8; n], vec![9u8; n]);
+            downscale_2x_row(&r0, &r1, &mut a);
+            downscale_2x_row_scalar(&r0, &r1, &mut b);
+            assert_eq!(a, b, "{n}");
+            let (zero, full) = (vec![0u8; 2 * n], vec![255u8; 2 * n]);
+            downscale_2x_row(&full, &full, &mut a);
+            assert!(a.iter().all(|&v| v == 255));
+            downscale_2x_row(&zero, &full, &mut a);
+            downscale_2x_row_scalar(&zero, &full, &mut b);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn hpel_planes_match_scalar_and_the_window() {
+        let (pw, ph) = (61usize, 29usize);
+        for (seed, flat) in [(41u32, None), (42, Some(0u8)), (43, Some(255u8))] {
+            let mut src = plane(pw, ph, seed);
+            if let Some(v) = flat {
+                for (i, s) in src.iter_mut().enumerate() {
+                    *s = if (i / 3) % 2 == 0 { v } else { 255 - v };
+                }
+            }
+            for (start, width, rows) in [
+                (2 * pw + 2, 16, 1),
+                (2 * pw + 3, 37, 20),
+                (3 * pw + 2, 56, 23),
+            ] {
+                let mut a = [vec![7u8; pw * ph], vec![7u8; pw * ph], vec![7u8; pw * ph]];
+                let mut b = a.clone();
+                let [ah, av, ac] = &mut a;
+                hpel_planes(&src, ah, av, ac, pw, start, width, rows);
+                let [bh, bv, bc] = &mut b;
+                hpel_planes_scalar(&src, bh, bv, bc, pw, start, width, rows);
+                assert_eq!(a, b, "seed {seed} start {start}");
+                // The window's planes at its top-left integer sample `start`.
+                let mut win = HpelWindow::default();
+                hpel_window_scalar(&src, start, pw, &mut win);
+                hpel_window_centre_scalar(&mut win);
+                for r in 0..rows.min(HPEL_WIN_H) {
+                    for x in 0..width.min(HPEL_COLS) {
+                        let (o, w) = (start + r * pw + x, r * HPEL_WIN_W + x);
+                        assert_eq!([a[0][o], a[1][o], a[2][o]], [win.h[w], win.v[w], win.c[w]]);
                     }
                 }
             }

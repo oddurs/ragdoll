@@ -377,6 +377,31 @@ static DEC_TAB: [u8; 1280] = {
 const DEC_LPS: usize = 512;
 const DEC_NEXT: usize = 1024;
 
+/// `rangeTabLPS` (Table 9-44) indexed by `qCodIRangeIdx << 7 | packed context`, for the encoder.
+static ENC_LPS: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut i = 0;
+    while i < 512 {
+        t[i] = CABAC_RANGE_TAB_LPS[(i & 127) >> 1][i >> 7];
+        i += 1;
+    }
+    t
+};
+
+/// The packed context after a decision (Table 9-45), as `DEC_TAB[DEC_NEXT..]`: indexed by the
+/// packed context after the most probable symbol and by `255 - context` after the other.
+static ENC_NEXT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut s = 0;
+    while s < 128 {
+        let (st, mps) = (s >> 1, (s & 1) as u8);
+        t[s] = (CABAC_TRANS_IDX_MPS[st] << 1) | mps;
+        t[255 - s] = (CABAC_TRANS_IDX_LPS[st] << 1) | (mps ^ (st == 0) as u8);
+        s += 1;
+    }
+    t
+};
+
 /// Standard 460-context CABAC context bank for H.264 Main/High 4:2:0 slice syntax and DCT residuals.
 pub const NUM_CABAC_CONTEXTS: usize = 460;
 
@@ -443,35 +468,38 @@ impl CabacEncoder {
         }
     }
 
-    #[inline]
+    /// Doubles the range until it is at least 256, in one shift (`x264_cabac_encode_renorm`):
+    /// the shift is at most 8, after which one byte at most is complete.
+    #[inline(always)]
     fn renormalize(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.low <<= 1;
-            self.queue += 1;
-            if self.queue >= 0 {
-                self.putbyte();
-            }
+        let shift = self.range.leading_zeros().saturating_sub(23);
+        self.range <<= shift;
+        self.low <<= shift;
+        self.queue += shift as i32;
+        if self.queue >= 0 {
+            self.putbyte();
         }
     }
 
     /// Encodes a single binary decision `bin` (`0` or `1`) using `ctx` (ITU-T H.264 9.3.3.2.1).
-    #[inline]
+    #[inline(always)]
     pub fn encode_decision(&mut self, ctx: &mut CabacContext, bin: u8) {
-        let b = bin & 1;
-        let q_idx = ((self.range >> 6) & 3) as usize;
-        let st = ctx.state() as usize;
-        let r_lps = CABAC_RANGE_TAB_LPS[st][q_idx] as u32;
+        let packed = ctx.0 as usize & 127;
+        let r_lps = ENC_LPS[((self.range as usize >> 6) & 3) << 7 | packed] as u32;
         self.range -= r_lps;
-
-        if b != ctx.mps() {
+        if (bin & 1) != (ctx.0 & 1) {
             self.low += self.range;
             self.range = r_lps;
-            *ctx = CabacContext::new(CABAC_TRANS_IDX_LPS[st], ctx.mps() ^ (st == 0) as u8);
+            ctx.0 = ENC_NEXT[255 - packed];
+            self.renormalize();
         } else {
-            *ctx = CabacContext::new(CABAC_TRANS_IDX_MPS[st], ctx.mps());
+            ctx.0 = ENC_NEXT[packed];
+            // After a most probable symbol the range is at least 256 - 2 * 2^6 >= 128: one
+            // doubling at most.
+            if self.range < 256 {
+                self.renormalize();
+            }
         }
-        self.renormalize();
     }
 
     /// Encodes an equiprobable bypass bin (`0` or `1`, ITU-T H.264 9.3.3.2.3).
@@ -520,6 +548,92 @@ impl CabacEncoder {
     ) {
         let ctx_idx = 11 + ((cond_a + cond_b) as usize);
         self.encode_decision(&mut ctxs[ctx_idx], u8::from(is_skip));
+    }
+
+    /// Encodes `mb_skip_flag` in a B-slice (`ctx 24..26`, `cond_a / cond_b` as for
+    /// [`Self::encode_p_skip`]).
+    #[inline]
+    pub fn encode_b_skip(
+        &mut self,
+        ctxs: &mut [CabacContext],
+        cond_a: u8,
+        cond_b: u8,
+        is_skip: bool,
+    ) {
+        let ctx_idx = 24 + ((cond_a + cond_b) as usize);
+        self.encode_decision(&mut ctxs[ctx_idx], u8::from(is_skip));
+    }
+
+    /// Encodes a B-slice `mb_type` (`0 = B_Direct_16x16`, `1..=22` inter, `23..=48` intra as
+    /// `23 +` the I-slice type), where `cond_a / cond_b` is `1` when the neighbour is available
+    /// and neither `B_Skip` nor `B_Direct_16x16` (ITU-T H.264 Table 9-37, ctxIdxOffset 27 and the
+    /// intra suffix at 32).
+    pub fn encode_b_mb_type(
+        &mut self,
+        ctxs: &mut [CabacContext],
+        cond_a: u8,
+        cond_b: u8,
+        mb_type: u32,
+    ) {
+        let c0 = 27 + ((cond_a + cond_b) as usize);
+        if mb_type == 0 {
+            self.encode_decision(&mut ctxs[c0], 0);
+            return;
+        }
+        self.encode_decision(&mut ctxs[c0], 1);
+        if mb_type <= 2 {
+            self.encode_decision(&mut ctxs[30], 0);
+            self.encode_decision(&mut ctxs[32], (mb_type - 1) as u8);
+            return;
+        }
+        self.encode_decision(&mut ctxs[30], 1);
+        // Four bins (the first at ctxIdx 31), then one more for types 12 to 21.
+        let (bits, extra) = match mb_type {
+            3..=10 => (mb_type - 3, None),
+            11 => (14, None),
+            12..=21 => ((mb_type + 4) >> 1, Some((mb_type + 4) & 1)),
+            22 => (15, None),
+            _ => (13, None),
+        };
+        self.encode_decision(&mut ctxs[31], (bits >> 3) as u8);
+        for k in (0..3).rev() {
+            self.encode_decision(&mut ctxs[32], ((bits >> k) & 1) as u8);
+        }
+        if let Some(b) = extra {
+            self.encode_decision(&mut ctxs[32], b as u8);
+        }
+        if mb_type >= 23 {
+            self.encode_intra_mb_type(ctxs, 32, 0, 0, mb_type - 23);
+        }
+    }
+
+    /// Encodes a B-slice `sub_mb_type` (`0..=12`, `ctx 36..39`).
+    pub fn encode_b_sub_mb_type(&mut self, ctxs: &mut [CabacContext], t: u8) {
+        if t == 0 {
+            self.encode_decision(&mut ctxs[36], 0);
+            return;
+        }
+        self.encode_decision(&mut ctxs[36], 1);
+        if t <= 2 {
+            self.encode_decision(&mut ctxs[37], 0);
+            self.encode_decision(&mut ctxs[39], t - 1);
+            return;
+        }
+        self.encode_decision(&mut ctxs[37], 1);
+        if t <= 6 {
+            self.encode_decision(&mut ctxs[38], 0);
+            self.encode_decision(&mut ctxs[39], (t - 3) >> 1);
+            self.encode_decision(&mut ctxs[39], (t - 3) & 1);
+        } else if t <= 10 {
+            self.encode_decision(&mut ctxs[38], 1);
+            self.encode_decision(&mut ctxs[39], 0);
+            self.encode_decision(&mut ctxs[39], (t - 7) >> 1);
+            self.encode_decision(&mut ctxs[39], (t - 7) & 1);
+        } else {
+            self.encode_decision(&mut ctxs[38], 1);
+            self.encode_decision(&mut ctxs[39], 1);
+            self.encode_decision(&mut ctxs[39], t - 11);
+        }
     }
 
     /// Appends a raw `I_PCM` byte to the byte-aligned output stream.
@@ -853,7 +967,7 @@ impl CabacEncoder {
         last_idx: usize,
         coeffs: &[i16],
     ) {
-        let mut sig_positions = [0usize; 64];
+        let mut sig_positions = [0u8; 64];
         let mut sig_count = 0usize;
 
         for (i, &c) in coeffs.iter().enumerate().take(last_idx + 1) {
@@ -875,7 +989,7 @@ impl CabacEncoder {
                 };
                 self.encode_decision(&mut ctxs[last_base + last_off], u8::from(i == last_idx));
             }
-            sig_positions[sig_count] = i;
+            sig_positions[sig_count] = i as u8;
             sig_count += 1;
         }
 
@@ -884,7 +998,7 @@ impl CabacEncoder {
         let gt_max = if cat == 3 { 3 } else { 4 };
 
         for &pos in sig_positions[..sig_count].iter().rev() {
-            let c = coeffs[pos];
+            let c = coeffs[pos as usize];
             let abs_m1 = (c.unsigned_abs() as u32) - 1;
             let c0 = if num_gt1 > 0 { 0 } else { (1 + num_eq1).min(4) };
             if abs_m1 == 0 {
@@ -1180,45 +1294,17 @@ impl<'a> CabacDecoder<'a> {
         if self.decode_decision(&mut ctxs[30]) == 0 {
             return 1 + (self.decode_decision(&mut ctxs[32]) as u32);
         }
-        if self.decode_decision(&mut ctxs[31]) == 0 {
-            let b3 = self.decode_decision(&mut ctxs[32]) as u32;
-            let b4 = self.decode_decision(&mut ctxs[32]) as u32;
-            let b5 = self.decode_decision(&mut ctxs[32]) as u32;
-            return 3 + (b3 << 2) + (b4 << 1) + b5;
+        let mut bits = (self.decode_decision(&mut ctxs[31]) as u32) << 3;
+        for k in (0..3).rev() {
+            bits |= (self.decode_decision(&mut ctxs[32]) as u32) << k;
         }
-        if self.decode_decision(&mut ctxs[32]) == 0 {
-            let b4 = self.decode_decision(&mut ctxs[32]) as u32;
-            let b5 = self.decode_decision(&mut ctxs[32]) as u32;
-            let b6 = self.decode_decision(&mut ctxs[32]) as u32;
-            return 11 + (b4 << 2) + (b5 << 1) + b6;
+        match bits {
+            0..=7 => bits + 3,
+            13 => 23 + self.decode_intra_mb_type(ctxs, 32, 0, 0),
+            14 => 11,
+            15 => 22,
+            _ => ((bits << 1) | self.decode_decision(&mut ctxs[32]) as u32) - 4,
         }
-        if self.decode_decision(&mut ctxs[32]) == 0 {
-            if self.decode_decision(&mut ctxs[32]) == 0 {
-                return 19 + (self.decode_decision(&mut ctxs[32]) as u32);
-            } else {
-                return 21 + (self.decode_decision(&mut ctxs[32]) as u32);
-            }
-        }
-        // Intra in B-slice (`ctx_base = 32`, but first bin of intra_mb_type is already the next decision at ctx 32!)
-        if self.decode_decision(&mut ctxs[32]) == 0 {
-            return 23; // I_NxN in B-slice
-        }
-        if self.decode_terminate() != 0 {
-            return 23 + 25; // I_PCM in B-slice
-        }
-        let b1 = self.decode_decision(&mut ctxs[33]) as u32;
-        let b2 = self.decode_decision(&mut ctxs[34]);
-        let cbp_c = if b2 == 0 {
-            0
-        } else if self.decode_decision(&mut ctxs[34]) == 0 {
-            1
-        } else {
-            2
-        };
-        let b4 = self.decode_decision(&mut ctxs[35]) as u32;
-        let b5 = self.decode_decision(&mut ctxs[35]) as u32;
-        let luma_mode = (b4 << 1) | b5;
-        23 + 1 + luma_mode + 4 * cbp_c + 12 * b1
     }
 
     /// Decodes `sub_mb_type` in `P_8x8` (`0..=3`, `ctx 21..23`).
@@ -1582,5 +1668,37 @@ impl ResidualCoeffs {
 impl Default for ResidualCoeffs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b_slice_types_round_trip() {
+        let mut e = CabacEncoder::new();
+        let mut ctxs = init_cabac_contexts(26, false, 0);
+        // I_PCM (48) ends the arithmetic code, so it is left out.
+        let types: Vec<u32> = (0..48).collect();
+        for &t in &types {
+            e.encode_b_mb_type(&mut ctxs, (t % 3 == 0) as u8, (t % 2) as u8, t);
+        }
+        for t in 0..=12u8 {
+            e.encode_b_sub_mb_type(&mut ctxs, t);
+        }
+        e.encode_terminate(1);
+        let bytes = e.finish();
+        let mut d = CabacDecoder::new(&bytes).unwrap();
+        let mut ctxs = init_cabac_contexts(26, false, 0);
+        for &t in &types {
+            assert_eq!(
+                d.decode_b_mb_type(&mut ctxs, (t % 3 == 0) as u8, (t % 2) as u8),
+                t
+            );
+        }
+        for t in 0..=12u8 {
+            assert_eq!(d.decode_b_sub_mb_type(&mut ctxs), t);
+        }
     }
 }

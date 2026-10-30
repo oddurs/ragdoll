@@ -30,3 +30,29 @@ pub fn b_mb_type(cd: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext], inc: usiz
 pub fn transform_8x8(cd: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext], inc: usize) -> bool {
     cd.decode_decision(&mut ctxs[399 + inc]) != 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cabac::{CabacEncoder, init_cabac_contexts};
+
+    /// Every B `mb_type` but I_PCM, as the encoder writes it, reads back (Table 9-37).
+    #[test]
+    fn b_mb_types_from_the_encoder_read_back() {
+        let conds = |t: u32| (t.is_multiple_of(3) as u8, (t % 2) as u8);
+        let mut e = CabacEncoder::new();
+        let mut ctxs = init_cabac_contexts(26, false, 0);
+        for t in 0..48 {
+            let (a, b) = conds(t);
+            e.encode_b_mb_type(&mut ctxs, a, b, t);
+        }
+        e.encode_terminate(1);
+        let bytes = e.finish();
+        let mut d = CabacDecoder::new(&bytes).unwrap();
+        let mut ctxs = init_cabac_contexts(26, false, 0);
+        for t in 0..48 {
+            let (a, b) = conds(t);
+            assert_eq!(b_mb_type(&mut d, &mut ctxs, (a + b) as usize), t);
+        }
+    }
+}

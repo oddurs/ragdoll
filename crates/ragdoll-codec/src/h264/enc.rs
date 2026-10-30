@@ -7,8 +7,15 @@
 //! planes padded by edge replication, so motion search and compensation of the next frame read
 //! reference samples without clamping.
 
+mod bpic;
+mod compact;
+mod inter;
+mod lookahead;
+
 use super::*;
 use crate::cabac::NUM_CABAC_CONTEXTS;
+use compact::HpelPlanes;
+pub(super) use lookahead::{Lookahead, Lowres};
 use ragdoll_simd::{
     H264_DEBLOCK_ALPHA, H264_DEBLOCK_BETA, H264_DEBLOCK_TC0, HPEL_WIN_W, HpelWindow, Quant4x4,
     add_idct4x4_8x8, chroma_mc_8x8_x2, dequant_4x4_x4, h264_chroma_deblock, h264_luma_deblock,
@@ -170,6 +177,10 @@ pub(super) struct EncState {
     ref_grid: Vec<i8>,
     mv_grid: Vec<[i16; 2]>,
     mvd_grid: Vec<[i16; 2]>,
+    /// The list 1 counterparts of `ref_grid`, `mv_grid` and `mvd_grid` (Compact preset).
+    ref1_grid: Vec<i8>,
+    mv1_grid: Vec<[i16; 2]>,
+    mvd1_grid: Vec<[i16; 2]>,
     prev_mb_mv: Vec<[i16; 2]>,
     mb_is_intra: Vec<bool>,
     mb_is_i16x16: Vec<bool>,
@@ -180,10 +191,35 @@ pub(super) struct EncState {
     mb_luma_dc_cbf: Vec<bool>,
     mb_chroma_dc_cbf: [Vec<bool>; 2],
     mb_8x8_flag: Vec<bool>,
+    /// `B_Direct_16x16` macroblocks (B slices).
+    mb_is_direct: Vec<bool>,
     mb_qps: Vec<u8>,
     mb_vars: Vec<f32>,
     bits_buf: Vec<u8>,
     win: Box<HpelWindow>,
+    /// Half-sample planes of `refp` (Compact preset).
+    hp: HpelPlanes,
+    /// The anchor before `refp`, list 0 of the B pictures between them, with its half-sample
+    /// planes (Compact preset).
+    refp2: Pic,
+    hp2: HpelPlanes,
+    /// The reference B picture in the middle of a pyramid, with its half-sample planes and
+    /// co-located motion (Compact preset).
+    refb: Pic,
+    hpb: HpelPlanes,
+    colb_ref: Vec<i8>,
+    colb_mv: Vec<[i16; 2]>,
+    /// List 0 reference indices and vectors of `refp`, the co-located picture of direct
+    /// prediction in B pictures (Compact preset).
+    col_ref: Vec<i8>,
+    col_mv: Vec<[i16; 2]>,
+    /// The 16x16 search result of each macroblock of the picture being coded, per list, and of
+    /// the latest anchor (list 0): candidates of later searches (`x264` `mvr`).
+    mvr: [Vec<[i16; 2]>; 2],
+    prev_mvr: Vec<[i16; 2]>,
+    /// The lookahead's half-resolution vectors of the picture being coded against its list 0
+    /// and list 1 references, one per macroblock (Compact preset).
+    la_mv: [Option<Vec<[i16; 2]>>; 2],
     /// Motion vector costs by QP (see [`EncState::mv_costs`]), built on first use.
     mv_cost_tabs: Vec<Vec<u16>>,
 }
@@ -215,8 +251,12 @@ impl EncState {
                 mb_h,
                 cur: Pic::alloc(mb_w * 16, mb_h * 16),
                 refp: Pic::alloc(mb_w * 16, mb_h * 16),
+                refp2: Pic::alloc(mb_w * 16, mb_h * 16),
+                refb: Pic::alloc(mb_w * 16, mb_h * 16),
                 ref_grid: vec![-2; n4],
                 mv_grid: vec![[0; 2]; n4],
+                ref1_grid: vec![-2; n4],
+                mv1_grid: vec![[0; 2]; n4],
                 prev_mb_mv: vec![[0; 2]; n],
                 ..Self::default()
             };
@@ -244,10 +284,20 @@ impl EncState {
         reset_b(&mut self.mb_chroma_dc_cbf[0]);
         reset_b(&mut self.mb_chroma_dc_cbf[1]);
         reset_b(&mut self.mb_8x8_flag);
+        reset_b(&mut self.mb_is_direct);
+        for m in &mut self.mvr {
+            m.clear();
+            m.resize(n, [0; 2]);
+        }
+        if self.prev_mvr.len() != n {
+            self.prev_mvr = vec![[0; 2]; n];
+        }
         // Only CABAC reads the neighbours' motion vector differences.
         if cabac {
             self.mvd_grid.clear();
             self.mvd_grid.resize(n4, [0; 2]);
+            self.mvd1_grid.clear();
+            self.mvd1_grid.resize(n4, [0; 2]);
         }
     }
 
@@ -331,6 +381,61 @@ fn copy_rows<const N: usize>(
     }
 }
 
+/// Most B pictures between two anchors of the Compact preset (`x264 --bframes 3`).
+pub(super) const B_FRAMES: u32 = 3;
+
+/// Type of a picture in the coding schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PicKind {
+    Idr,
+    P,
+    /// A non-reference B picture between the two latest anchors.
+    B,
+}
+
+/// Type and numbering of one picture of the coding schedule.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PicPlan {
+    pub(super) kind: PicKind,
+    pub(super) frame_num: u32,
+    /// `PicOrderCnt`: twice the display distance from the IDR picture.
+    pub(super) poc: u32,
+    pub(super) idr_pic_id: u32,
+    /// A B picture kept for reference: the middle of a pyramid.
+    pub(super) b_ref: bool,
+    /// The references of a B picture in list 0 and list 1.
+    pub(super) refs: [RefSel; 2],
+    /// A P picture after a pyramid: list 0 starts with the anchor before it, and the reference
+    /// B picture between them is dropped once it is decoded.
+    pub(super) after_pyramid: bool,
+}
+
+/// A reference picture of the Compact preset's schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RefSel {
+    /// The anchor before the latest one (`refp2`).
+    Prev,
+    /// The latest anchor (`refp`).
+    Next,
+    /// The reference B picture between them (`refb`).
+    Mid,
+}
+
+impl PicPlan {
+    /// A plan of picture `kind` with the default references.
+    pub(super) fn new(kind: PicKind, frame_num: u32, poc: u32, idr_pic_id: u32) -> Self {
+        Self {
+            kind,
+            frame_num,
+            poc,
+            idr_pic_id,
+            b_ref: false,
+            refs: [RefSel::Prev, RefSel::Next],
+            after_pyramid: false,
+        }
+    }
+}
+
 /// Entropy coder of the slice being written.
 type Cabac = Option<(CabacEncoder, [CabacContext; NUM_CABAC_CONTEXTS])>;
 
@@ -339,6 +444,10 @@ struct SliceState {
     is_idr: bool,
     /// [`H264Speed::Fast`]: half-pel motion and intra 16x16 only.
     fast: bool,
+    /// A B slice (Compact preset).
+    b_slice: bool,
+    /// The references of a B slice's lists.
+    b_refs: [RefSel; 2],
     use_cabac: bool,
     t8x8: bool,
     chroma_qp_offset: i32,
@@ -1916,12 +2025,22 @@ fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool
 impl H264Encoder {
     /// Codes one frame; see [`H264Encoder::encode_frame`].
     pub(super) fn encode_frame_impl(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
+        self.encode_picture(frame, None)
+    }
+
+    /// Codes one picture, as `plan` schedules it or else in input order (`I` every `keyint`
+    /// frames, `P` between).
+    pub(super) fn encode_picture(
+        &mut self,
+        frame: &VideoFrame,
+        plan: Option<PicPlan>,
+    ) -> Result<Vec<u8>> {
         #[cfg(target_arch = "x86_64")]
         if ragdoll_core::dispatch::avx2() && x86_v3() {
             // Safety: the CPU supports every feature the copy is compiled for.
-            return unsafe { self.encode_frame_v3(frame) };
+            return unsafe { self.encode_frame_v3(frame, plan) };
         }
-        self.encode_frame_body(frame)
+        self.encode_frame_body(frame, plan)
     }
 
     /// [`Self::encode_frame_body`] compiled for x86-64-v3 (`AVX2`, `BMI1/2`, `LZCNT`,
@@ -1929,12 +2048,16 @@ impl H264Encoder {
     /// masks, mode decisions) use the newer instructions too. Output is identical.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-    unsafe fn encode_frame_v3(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
-        self.encode_frame_body(frame)
+    unsafe fn encode_frame_v3(
+        &mut self,
+        frame: &VideoFrame,
+        plan: Option<PicPlan>,
+    ) -> Result<Vec<u8>> {
+        self.encode_frame_body(frame, plan)
     }
 
     #[inline(always)]
-    fn encode_frame_body(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
+    fn encode_frame_body(&mut self, frame: &VideoFrame, plan: Option<PicPlan>) -> Result<Vec<u8>> {
         if frame.format != PixelFormat::Yuv420p {
             return Err(RagdollError::Unsupported(format!(
                 "H264Encoder requires Yuv420p input, got {}",
@@ -1944,18 +2067,34 @@ impl H264Encoder {
         let mb_w = self.sps.pic_width_in_mbs as usize;
         let mb_h = self.sps.pic_height_in_map_units as usize;
         let total_mbs = mb_w * mb_h;
-        let is_idr = self.frame_count.is_multiple_of(self.keyint) || !self.state.has_ref;
+        let gop_frame_idx = self.frame_count % self.keyint.max(1);
+        let plan = plan.unwrap_or_else(|| {
+            let is_idr = self.frame_count.is_multiple_of(self.keyint) || !self.state.has_ref;
+            PicPlan::new(
+                if is_idr { PicKind::Idr } else { PicKind::P },
+                gop_frame_idx,
+                gop_frame_idx * 2,
+                self.frame_count / self.keyint.max(1),
+            )
+        });
+        let is_idr = plan.kind == PicKind::Idr;
+        let is_b = plan.kind == PicKind::B;
         let nal_type = if is_idr {
             NalUnitType::IdrSlice
         } else {
             NalUnitType::NonIdrSlice
         };
         let nal_header = NalHeader {
-            nal_ref_idc: 3,
+            nal_ref_idc: match (is_b, plan.b_ref) {
+                (false, _) => 3,
+                (true, true) => 2,
+                (true, false) => 0,
+            },
             nal_unit_type: nal_type,
         };
         let fps = self.sps.fps.unwrap_or(Rational64::FPS_30).as_f64().max(1.0);
         let fast = self.speed == H264Speed::Fast;
+        let compact = self.speed == H264Speed::Compact;
 
         // Per-MB spatial variance and its geometric mean drive CRF variance-adaptive quantization.
         let mut avg_log_var = 0.0f32;
@@ -1979,27 +2118,39 @@ impl H264Encoder {
             avg_log_var = sum_log_var / (total_mbs.max(1) as f32);
         }
 
-        let slice_qp = self.frame_slice_qp(is_idr, total_mbs, fps);
-        let gop_frame_idx = self.frame_count % self.keyint.max(1);
+        let mut slice_qp = self.frame_slice_qp(is_idr, total_mbs, fps);
+        if compact && matches!(self.rate_control, RateControlMode::FixedQp(_)) {
+            // `x264 --ipratio 1.4`; B pictures one step coarser than its `--pbratio 1.3`, which
+            // pays on the clips measured for `SIMD-0089`, and the reference ones between.
+            let offset = match plan.kind {
+                PicKind::Idr => -3,
+                PicKind::P => 0,
+                PicKind::B if plan.b_ref => 2,
+                PicKind::B => 3,
+            };
+            slice_qp = (slice_qp as i32 + offset).clamp(0, 51) as u8;
+        }
         let slice_qp_delta = (slice_qp as i32) - (26 + (self.pps.pic_init_qp_minus26 as i32));
         let slice_header = SliceHeader {
             first_mb_in_slice: 0,
-            slice_type: if is_idr { 7 } else { 5 },
-            pict_type: if is_idr {
-                PictureType::I
-            } else {
-                PictureType::P
+            slice_type: match plan.kind {
+                PicKind::Idr => 7,
+                PicKind::P => 5,
+                PicKind::B => 6,
+            },
+            pict_type: match plan.kind {
+                PicKind::Idr => PictureType::I,
+                PicKind::P => PictureType::P,
+                PicKind::B => PictureType::B,
             },
             pps_id: 0,
-            frame_num: (gop_frame_idx & ((1 << self.sps.log2_max_frame_num) - 1)) as u16,
+            frame_num: (plan.frame_num & ((1 << self.sps.log2_max_frame_num) - 1)) as u16,
             idr_pic_id: if is_idr {
-                Some((self.frame_count / self.keyint.max(1)) as u16)
+                Some(plan.idr_pic_id as u16)
             } else {
                 None
             },
-            pic_order_cnt_lsb: ((gop_frame_idx * 2)
-                & ((1 << self.sps.log2_max_pic_order_cnt_lsb) - 1))
-                as u16,
+            pic_order_cnt_lsb: (plan.poc & ((1 << self.sps.log2_max_pic_order_cnt_lsb) - 1)) as u16,
             direct_spatial_mv_pred_flag: true,
             num_ref_idx_l0_active_minus1: 0,
             num_ref_idx_l1_active_minus1: 0,
@@ -2009,6 +2160,8 @@ impl H264Encoder {
             disable_deblocking_filter_idc: if slice_qp == 0 || fast { 1 } else { 0 },
             slice_alpha_c0_offset_div2: 0,
             slice_beta_offset_div2: 0,
+            ref_list_mod_l0: plan.after_pyramid.then_some(1),
+            mmco_unref: plan.after_pyramid.then_some(0),
         };
 
         let mut hw = BitWriter::with_capacity(64);
@@ -2031,6 +2184,8 @@ impl H264Encoder {
         let mut sl = SliceState {
             is_idr,
             fast,
+            b_slice: is_b,
+            b_refs: plan.refs,
             use_cabac,
             t8x8: self.pps.transform_8x8_mode_flag,
             chroma_qp_offset: self.pps.chroma_qp_index_offset as i32,
@@ -2089,6 +2244,10 @@ impl H264Encoder {
                     st.code_pcm(&mut sl, &mut w, &mut cabac, mb_x, mb_y, &src);
                 } else if is_idr {
                     st.code_intra(&mut sl, &mut w, &mut cabac, mb_x, mb_y, qp, &src);
+                } else if is_b {
+                    st.code_b_mb_compact(&mut sl, &mut w, &mut cabac, mb_x, mb_y, qp, &src);
+                } else if compact {
+                    st.code_p_mb_compact(&mut sl, &mut w, &mut cabac, mb_x, mb_y, qp, &src);
                 } else {
                     st.code_p_mb(&mut sl, &mut w, &mut cabac, mb_x, mb_y, qp, &src);
                 }
@@ -2111,18 +2270,59 @@ impl H264Encoder {
             w.finish()
         };
 
-        if slice_header.disable_deblocking_filter_idc != 1 {
-            self.state.deblock(sl.chroma_qp_offset);
-        }
-        let st = &mut self.state;
-        st.cur.y.extend_borders();
-        st.cur.u.extend_borders();
-        st.cur.v.extend_borders();
-        std::mem::swap(&mut st.cur, &mut st.refp);
-        st.has_ref = true;
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                st.prev_mb_mv[mb_y * mb_w + mb_x] = st.mv_grid[(mb_y * 4) * mb_w * 4 + mb_x * 4];
+        // A B picture is no reference: the decoder filters it for display only.
+        if is_b && plan.b_ref {
+            // The middle of a pyramid: a reference for the B pictures on either side of it.
+            if slice_header.disable_deblocking_filter_idc != 1 {
+                self.state.deblock_parts(sl.chroma_qp_offset, true);
+            }
+            let st = &mut self.state;
+            st.cur.y.extend_borders();
+            st.cur.u.extend_borders();
+            st.cur.v.extend_borders();
+            std::mem::swap(&mut st.cur, &mut st.refb);
+            st.hpb.build(&st.refb.y);
+            // Co-located motion: list 0 where used, else list 1.
+            st.colb_ref.clone_from(&st.ref_grid);
+            st.colb_mv.clone_from(&st.mv_grid);
+            for i in 0..st.colb_ref.len() {
+                if st.colb_ref[i] < 0 && st.ref1_grid[i] >= 0 {
+                    st.colb_ref[i] = st.ref1_grid[i];
+                    st.colb_mv[i] = st.mv1_grid[i];
+                }
+            }
+        } else if !is_b {
+            if slice_header.disable_deblocking_filter_idc != 1 {
+                if compact {
+                    self.state.deblock_parts(sl.chroma_qp_offset, false);
+                } else {
+                    self.state.deblock(sl.chroma_qp_offset);
+                }
+            }
+            let st = &mut self.state;
+            st.cur.y.extend_borders();
+            st.cur.u.extend_borders();
+            st.cur.v.extend_borders();
+            if compact {
+                // The previous anchor stays as list 0 of the B pictures before the new one.
+                std::mem::swap(&mut st.refp, &mut st.refp2);
+                std::mem::swap(&mut st.hp, &mut st.hp2);
+                st.col_ref.clone_from(&st.ref_grid);
+                st.col_mv.clone_from(&st.mv_grid);
+            }
+            std::mem::swap(&mut st.cur, &mut st.refp);
+            st.has_ref = true;
+            if compact {
+                st.hp.build(&st.refp.y);
+            }
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    st.prev_mb_mv[mb_y * mb_w + mb_x] =
+                        st.mv_grid[(mb_y * 4) * mb_w * 4 + mb_x * 4];
+                }
+            }
+            if compact {
+                std::mem::swap(&mut st.prev_mvr, &mut st.mvr[0]);
             }
         }
 
@@ -2135,6 +2335,103 @@ impl H264Encoder {
         self.state.bits_buf = slice_rbsp;
         self.finish_frame_rate_control(&mut out, fps);
         Ok(out)
+    }
+}
+
+impl H264Encoder {
+    /// Queues `frame` for the B-picture schedule.
+    pub(super) fn queue_frame(&mut self, frame: &VideoFrame) {
+        let disp = self.sched.next + self.sched.pending.len() as u32;
+        let mb_w = self.sps.pic_width_in_mbs as usize;
+        let mb_h = self.sps.pic_height_in_map_units as usize;
+        self.sched
+            .la
+            .frames
+            .push(Lowres::new(frame, disp, mb_w, mb_h));
+        self.sched.pending.push(frame.clone());
+    }
+
+    /// Codes the waiting frames that can be: an IDR picture on its own, else B pictures and
+    /// the anchor after them (coded first), as many as the lookahead places, at most
+    /// [`Self::b_frames`] and never across an IDR picture; with `flush` the last group ends the
+    /// stream.
+    pub(super) fn drain(&mut self, flush: bool) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let keyint = self.keyint.max(1);
+        while !self.sched.pending.is_empty() {
+            let d0 = self.sched.next;
+            if d0.is_multiple_of(keyint) || !self.state.has_ref {
+                let plan = PicPlan::new(PicKind::Idr, 0, 0, self.sched.idr_count);
+                self.sched.idr = d0;
+                self.sched.idr_count += 1;
+                self.sched.ref_frame_num = 0;
+                self.sched.after_pyramid = false;
+                let f = self.sched.pending.remove(0);
+                self.state.la_mv = [None, None];
+                out.extend(self.encode_picture(&f, Some(plan))?);
+                self.sched.next += 1;
+                self.sched.la.retire_before(d0);
+                continue;
+            }
+            let next_idr = (d0 / keyint + 1) * keyint;
+            let max_group = (self.b_frames() + 1).min(next_idr - d0) as usize;
+            let n = self.sched.pending.len();
+            let Some(group) = self.sched.la.decide(max_group, n, flush) else {
+                break;
+            };
+            let a = d0 - 1;
+            let p1 = d0 + group as u32 - 1;
+            let idr = self.sched.idr;
+            let poc = |d: u32| 2 * (d - idr);
+            // The anchor first, then (with two B pictures or more) the middle one as a reference
+            // for those on either side (`x264 --b-pyramid normal`).
+            let frame_num = self.sched.ref_frame_num + 1;
+            let mut plan = PicPlan::new(PicKind::P, frame_num, poc(p1), 0);
+            plan.after_pyramid = self.sched.after_pyramid;
+            let anchor = self.sched.pending.remove(group - 1);
+            self.state.la_mv = [self.lowres_motion(p1, a), None];
+            out.extend(self.encode_picture(&anchor, Some(plan))?);
+            let mut frame_num = frame_num;
+            let bs: Vec<VideoFrame> = self.sched.pending.drain(..group - 1).collect();
+            let pyramid = bs.len() >= 2;
+            let mid = a + (p1 - a) / 2;
+            if pyramid {
+                let mut plan = PicPlan::new(PicKind::B, frame_num + 1, poc(mid), 0);
+                plan.b_ref = true;
+                self.state.la_mv = [self.lowres_motion(mid, a), self.lowres_motion(mid, p1)];
+                out.extend(self.encode_picture(&bs[(mid - d0) as usize], Some(plan))?);
+                frame_num += 1;
+            }
+            for (k, f) in bs.iter().enumerate() {
+                let b = d0 + k as u32;
+                if pyramid && b == mid {
+                    continue;
+                }
+                let mut plan = PicPlan::new(PicKind::B, frame_num + 1, poc(b), 0);
+                let (r0, r1) = if !pyramid {
+                    (a, p1)
+                } else if b < mid {
+                    plan.refs = [RefSel::Prev, RefSel::Mid];
+                    (a, mid)
+                } else {
+                    plan.refs = [RefSel::Mid, RefSel::Next];
+                    (mid, p1)
+                };
+                self.state.la_mv = [self.lowres_motion(b, r0), self.lowres_motion(b, r1)];
+                out.extend(self.encode_picture(f, Some(plan))?);
+            }
+            self.sched.ref_frame_num = frame_num;
+            self.sched.after_pyramid = pyramid;
+            self.sched.next += group as u32;
+            self.sched.la.retire_before(p1);
+        }
+        Ok(out)
+    }
+
+    /// The lookahead's vectors of frame `b` against frame `r` (display indices), when searched.
+    fn lowres_motion(&self, b: u32, r: u32) -> Option<Vec<[i16; 2]>> {
+        let f = self.sched.la.frames.iter().find(|f| f.disp == b)?;
+        f.motion(r).map(|m| m.to_vec())
     }
 }
 
@@ -2302,7 +2599,11 @@ impl EncState {
                 let mb_idx = mb_y * self.mb_w + mb_x;
                 let l = u8::from(mb_x > 0 && !self.mb_is_skip[mb_idx - 1]);
                 let t = u8::from(mb_y > 0 && !self.mb_is_skip[mb_idx - self.mb_w]);
-                ce.encode_p_skip(ctxs, l, t, false);
+                if sl.b_slice {
+                    ce.encode_b_skip(ctxs, l, t, false);
+                } else {
+                    ce.encode_p_skip(ctxs, l, t, false);
+                }
             }
             None => {
                 w.write_ue(sl.skip_run as u64);
@@ -2327,7 +2628,10 @@ impl EncState {
         self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
         match cabac {
             Some((ce, ctxs)) => {
-                if !sl.is_idr {
+                if sl.b_slice {
+                    let (a, b) = self.b_type_conds(mb_x, mb_y);
+                    ce.encode_b_mb_type(ctxs, a, b, 23 + 25);
+                } else if !sl.is_idr {
                     ce.encode_p_mb_type(ctxs, 30); // I_PCM in a P slice (5 + 25)
                 } else {
                     let l = u8::from(mb_x > 0 && self.mb_is_i16x16[mb_idx - 1]);
@@ -2400,6 +2704,114 @@ impl EncState {
         sl.prev_qp_delta_nz = false;
     }
 
+    /// `x264_macroblock_probe_pskip`: codes macroblock `(mb_x, mb_y)` of a P slice as `P_Skip`
+    /// when `probe` is set and the residual of the skip prediction at `pskip_mv` would decimate to
+    /// nothing, storing its reconstruction; returns whether it did. `py`, `pu` and `pv` may be left
+    /// holding parts of the skip prediction.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn try_p_skip(
+        &mut self,
+        sl: &mut SliceState,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        qpc: u8,
+        src: &MbSrc,
+        pskip_mv: [i16; 2],
+        probe: bool,
+        py: &mut [u8; 256],
+        pu: &mut [u8; 64],
+        pv: &mut [u8; 64],
+    ) -> bool {
+        let (x0, y0) = (mb_x * 16, mb_y * 16);
+        if probe {
+            // Whole-sample vectors are measured on the reference planes in place, and the
+            // prediction is copied only when a probe or the reconstruction needs it.
+            let int_y = (pskip_mv[0] | pskip_mv[1]) & 3 == 0;
+            let int_c = (pskip_mv[0] | pskip_mv[1]) & 7 == 0;
+            let (ry, ru, rv) = (&self.refp.y, &self.refp.u, &self.refp.v);
+            let yo = ry.at(
+                x0 as isize + (pskip_mv[0] >> 2) as isize,
+                y0 as isize + (pskip_mv[1] >> 2) as isize,
+            );
+            let co = ru.at(
+                (mb_x * 8) as isize + (pskip_mv[0] >> 3) as isize,
+                (mb_y * 8) as isize + (pskip_mv[1] >> 3) as isize,
+            );
+            let sad = if int_y {
+                pixel_sad_16x16(&src.y, 16, &ry.buf[yo..], ry.stride)
+            } else {
+                mc_luma(ry, x0, y0, pskip_mv, &mut *py);
+                pixel_sad_16x16(&src.y, 16, &*py, 16)
+            };
+            let zero = &sl.skip_bounds;
+            if sad < zero.probe {
+                let mut luma_zero = SkipBounds::certain(
+                    sad,
+                    zero.luma,
+                    || match int_y {
+                        true => pixel_ssd::<16>(&src.y, 16, &ry.buf[yo..], ry.stride),
+                        false => pixel_ssd::<16>(&src.y, 16, &*py, 16),
+                    },
+                    zero.luma_ssd,
+                );
+                if !luma_zero {
+                    if int_y {
+                        ry.load::<16>(yo, &mut *py);
+                    }
+                    luma_zero = probe_skip_luma(src, &*py, qp);
+                }
+                if luma_zero {
+                    if !int_c {
+                        mc_chroma(&self.refp, mb_x * 8, mb_y * 8, pskip_mv, &mut *pu, &mut *pv);
+                    }
+                    let plane_zero = |s: &[u8; 64], r: &Plane, p: &[u8; 64]| {
+                        let (b, o, st) = if int_c {
+                            (&r.buf[..], co, r.stride)
+                        } else {
+                            (&p[..], 0, 8)
+                        };
+                        let sad = pixel_sad_8x8(s, 8, &b[o..], st);
+                        let ssd = || pixel_ssd::<8>(s, 8, &b[o..], st);
+                        SkipBounds::certain(sad, zero.chroma, ssd, zero.chroma_ssd)
+                    };
+                    let mut chroma_zero =
+                        plane_zero(&src.u, ru, &*pu) && plane_zero(&src.v, rv, &*pv);
+                    if !chroma_zero {
+                        if int_c {
+                            ru.load::<8>(co, &mut *pu);
+                            rv.load::<8>(co, &mut *pv);
+                        }
+                        chroma_zero = probe_skip_chroma(src, &*pu, &*pv, qpc);
+                    }
+                    if chroma_zero {
+                        self.code_skip(sl, cabac, mb_x, mb_y, pskip_mv);
+                        let (cur, refp) = (&mut self.cur, &self.refp);
+                        let (cx, cy) = (mb_x * 8, mb_y * 8);
+                        match int_y {
+                            true => cur.y.copy_from::<16>(&refp.y, yo, x0, y0),
+                            false => cur.y.store::<16>(x0, y0, &*py),
+                        }
+                        match int_c {
+                            true => {
+                                cur.u.copy_from::<8>(&refp.u, co, cx, cy);
+                                cur.v.copy_from::<8>(&refp.v, co, cx, cy);
+                            }
+                            false => {
+                                cur.u.store::<8>(cx, cy, &*pu);
+                                cur.v.store::<8>(cx, cy, &*pv);
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Analyses and codes one macroblock of a P slice.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
@@ -2456,88 +2868,21 @@ impl EncState {
                         || (mb_x > 0 && skip[i - mb_w - 1])
                         || (mb_x + 1 < mb_w && skip[i - mb_w + 1])))
         };
-        if probe && bounds.contains(pskip_mv) {
-            // Whole-sample vectors are measured on the reference planes in place, and the
-            // prediction is copied only when a probe or the reconstruction needs it.
-            let int_y = (pskip_mv[0] | pskip_mv[1]) & 3 == 0;
-            let int_c = (pskip_mv[0] | pskip_mv[1]) & 7 == 0;
-            let (ry, ru, rv) = (&self.refp.y, &self.refp.u, &self.refp.v);
-            let yo = ry.at(
-                x0 as isize + (pskip_mv[0] >> 2) as isize,
-                y0 as isize + (pskip_mv[1] >> 2) as isize,
-            );
-            let co = ru.at(
-                (mb_x * 8) as isize + (pskip_mv[0] >> 3) as isize,
-                (mb_y * 8) as isize + (pskip_mv[1] >> 3) as isize,
-            );
-            let sad = if int_y {
-                pixel_sad_16x16(&src.y, 16, &ry.buf[yo..], ry.stride)
-            } else {
-                mc_luma(ry, x0, y0, pskip_mv, &mut py);
-                pixel_sad_16x16(&src.y, 16, &py, 16)
-            };
-            let zero = &sl.skip_bounds;
-            if sad < zero.probe {
-                let mut luma_zero = SkipBounds::certain(
-                    sad,
-                    zero.luma,
-                    || match int_y {
-                        true => pixel_ssd::<16>(&src.y, 16, &ry.buf[yo..], ry.stride),
-                        false => pixel_ssd::<16>(&src.y, 16, &py, 16),
-                    },
-                    zero.luma_ssd,
-                );
-                if !luma_zero {
-                    if int_y {
-                        ry.load::<16>(yo, &mut py);
-                    }
-                    luma_zero = probe_skip_luma(src, &py, qp);
-                }
-                if luma_zero {
-                    if !int_c {
-                        mc_chroma(&self.refp, mb_x * 8, mb_y * 8, pskip_mv, &mut pu, &mut pv);
-                    }
-                    let plane_zero = |s: &[u8; 64], r: &Plane, p: &[u8; 64]| {
-                        let (b, o, st) = if int_c {
-                            (&r.buf[..], co, r.stride)
-                        } else {
-                            (&p[..], 0, 8)
-                        };
-                        let sad = pixel_sad_8x8(s, 8, &b[o..], st);
-                        let ssd = || pixel_ssd::<8>(s, 8, &b[o..], st);
-                        SkipBounds::certain(sad, zero.chroma, ssd, zero.chroma_ssd)
-                    };
-                    let mut chroma_zero =
-                        plane_zero(&src.u, ru, &pu) && plane_zero(&src.v, rv, &pv);
-                    if !chroma_zero {
-                        if int_c {
-                            ru.load::<8>(co, &mut pu);
-                            rv.load::<8>(co, &mut pv);
-                        }
-                        chroma_zero = probe_skip_chroma(src, &pu, &pv, qpc);
-                    }
-                    if chroma_zero {
-                        self.code_skip(sl, cabac, mb_x, mb_y, pskip_mv);
-                        let (cur, refp) = (&mut self.cur, &self.refp);
-                        let (cx, cy) = (mb_x * 8, mb_y * 8);
-                        match int_y {
-                            true => cur.y.copy_from::<16>(&refp.y, yo, x0, y0),
-                            false => cur.y.store::<16>(x0, y0, &py),
-                        }
-                        match int_c {
-                            true => {
-                                cur.u.copy_from::<8>(&refp.u, co, cx, cy);
-                                cur.v.copy_from::<8>(&refp.v, co, cx, cy);
-                            }
-                            false => {
-                                cur.u.store::<8>(cx, cy, &pu);
-                                cur.v.store::<8>(cx, cy, &pv);
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
+        if self.try_p_skip(
+            sl,
+            cabac,
+            mb_x,
+            mb_y,
+            qp,
+            qpc,
+            src,
+            pskip_mv,
+            probe && bounds.contains(pskip_mv),
+            &mut py,
+            &mut pu,
+            &mut pv,
+        ) {
+            return;
         }
 
         // 2. Motion search from the median, zero, neighbouring and co-located vectors.
@@ -2936,7 +3281,10 @@ impl EncState {
         }
         match cabac {
             Some((ce, ctxs)) => {
-                if !sl.is_idr {
+                if sl.b_slice {
+                    let (a, b) = self.b_type_conds(mb_x, mb_y);
+                    ce.encode_b_mb_type(ctxs, a, b, 23);
+                } else if !sl.is_idr {
                     ce.encode_p_mb_type(ctxs, 5); // I_NxN in a P slice
                 } else {
                     let l = u8::from(mb_x > 0 && self.mb_is_i16x16[mb_idx - 1]);
@@ -3118,7 +3466,10 @@ impl EncState {
 
         match cabac {
             Some((ce, ctxs)) => {
-                if !sl.is_idr {
+                if sl.b_slice {
+                    let (a, b) = self.b_type_conds(mb_x, mb_y);
+                    ce.encode_b_mb_type(ctxs, a, b, 23 + mb_type);
+                } else if !sl.is_idr {
                     ce.encode_p_mb_type(ctxs, 5 + mb_type);
                 } else {
                     let l = u8::from(mb_x > 0 && self.mb_is_i16x16[mb_idx - 1]);

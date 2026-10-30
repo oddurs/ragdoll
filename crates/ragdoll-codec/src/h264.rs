@@ -57,6 +57,15 @@ pub enum H264Speed {
     /// macroblocks coded as $16\times16$ and plane modes skipped, deblocking disabled. Still smaller than `x264`
     /// ultrafast at equal PSNR on the clips measured for `SIMD-0089`.
     Fast,
+    /// Compression first, like `x264 --preset veryfast`: partitions down to $8\times8$ searched
+    /// by hexagon and refined to quarter samples by SATD, the transform size chosen per
+    /// macroblock and, with CABAC (`Main` and `High`), up to three B pictures between anchors,
+    /// placed by a half-resolution lookahead, the middle one a reference. Smaller than `x264`
+    /// veryfast at equal PSNR on the clips measured for `SIMD-0089`, as fast on 720p video and
+    /// up to a quarter slower on detailed motion. B pictures pay over long GOPs (`x264` uses a
+    /// keyint of 250). Frames wait for their anchor: see [`H264Encoder::encode_frame`] and
+    /// [`H264Encoder::flush`].
+    Compact,
 }
 
 /// Rate control mode for [`H264Encoder`] (`0041`).
@@ -213,6 +222,8 @@ pub struct Sps {
     pub sar: Rational64,
     pub fps: Option<Rational64>,
     pub colorimetry: Colorimetry,
+    /// VUI `max_num_reorder_frames`, written with a `bitstream_restriction` when set.
+    pub max_num_reorder_frames: Option<u8>,
 }
 
 impl Sps {
@@ -258,6 +269,7 @@ impl Sps {
             sar: Rational64::ONE,
             fps: Some(fps),
             colorimetry: Colorimetry::bt709_limited(),
+            max_num_reorder_frames: None,
         }
     }
 
@@ -424,6 +436,7 @@ impl Sps {
         let mut sar = Rational64::ONE;
         let mut fps = None;
         let mut colorimetry = Colorimetry::bt709_limited();
+        let mut max_num_reorder_frames = None;
 
         if r.bits_remaining() > 0 && r.read_bit()? {
             // VUI parameters
@@ -482,7 +495,8 @@ impl Sps {
                 let _chroma_loc_top = r.read_ue()?;
                 let _chroma_loc_bottom = r.read_ue()?;
             }
-            if r.bits_remaining() >= 66 && r.read_bit()? {
+            let timing_read = r.bits_remaining() >= 66;
+            if timing_read && r.read_bit()? {
                 let num_units_in_tick = r.read_bits(32)?;
                 let time_scale = r.read_bits(32)?;
                 let _fixed_frame_rate = r.read_bit()?;
@@ -492,6 +506,20 @@ impl Sps {
                         (num_units_in_tick * 2) as i64,
                     ));
                 }
+            }
+            // Without HRD parameters the bitstream restriction follows directly.
+            if timing_read
+                && r.bits_remaining() >= 4
+                && !r.read_bit()?
+                && !r.read_bit()?
+                && !r.read_bit()?
+                && r.read_bit()?
+            {
+                let _mv_over_boundaries = r.read_bit()?;
+                for _ in 0..4 {
+                    let _ = r.read_ue()?;
+                }
+                max_num_reorder_frames = Some(r.read_ue()?.min(16) as u8);
             }
         }
 
@@ -517,6 +545,7 @@ impl Sps {
             sar,
             fps,
             colorimetry,
+            max_num_reorder_frames,
         })
     }
 
@@ -603,7 +632,16 @@ impl Sps {
         w.write_bit(false); // nal_hrd_parameters_present_flag
         w.write_bit(false); // vcl_hrd_parameters_present_flag
         w.write_bit(false); // pic_struct_present_flag
-        w.write_bit(false); // bitstream_restriction_flag
+        w.write_bit(self.max_num_reorder_frames.is_some()); // bitstream_restriction_flag
+        if let Some(reorder) = self.max_num_reorder_frames {
+            w.write_bit(true); // motion_vectors_over_pic_boundaries_flag
+            w.write_ue(0); // max_bytes_per_pic_denom
+            w.write_ue(0); // max_bits_per_mb_denom
+            w.write_ue(16); // log2_max_mv_length_horizontal
+            w.write_ue(16); // log2_max_mv_length_vertical
+            w.write_ue(reorder as u64);
+            w.write_ue(self.max_num_ref_frames.max(reorder) as u64); // max_dec_frame_buffering
+        }
 
         w.write_rbsp_trailing_bits();
         w.finish()
@@ -825,6 +863,12 @@ pub struct SliceHeader {
     pub disable_deblocking_filter_idc: u8,
     pub slice_alpha_c0_offset_div2: i8,
     pub slice_beta_offset_div2: i8,
+    /// Written only: `abs_diff_pic_num_minus1` of a list 0 modification that moves the picture
+    /// that many (plus one) below the current picture number to the front.
+    pub ref_list_mod_l0: Option<u32>,
+    /// Written only: `difference_of_pic_nums_minus1` of a `memory_management_control_operation`
+    /// 1 that marks that picture unused for reference after this one.
+    pub mmco_unref: Option<u32>,
 }
 
 impl SliceHeader {
@@ -1016,6 +1060,8 @@ impl SliceHeader {
             disable_deblocking_filter_idc,
             slice_alpha_c0_offset_div2,
             slice_beta_offset_div2,
+            ref_list_mod_l0: None,
+            mmco_unref: None,
         })
     }
 
@@ -1038,7 +1084,12 @@ impl SliceHeader {
         }
         if matches!(self.pict_type, PictureType::P | PictureType::B) {
             w.write_bit(false); // num_ref_idx_active_override_flag
-            w.write_bit(false); // ref_pic_list_modification_flag_l0
+            w.write_bit(self.ref_list_mod_l0.is_some()); // ref_pic_list_modification_flag_l0
+            if let Some(d) = self.ref_list_mod_l0 {
+                w.write_ue(0); // modification_of_pic_nums_idc: subtract
+                w.write_ue(d as u64);
+                w.write_ue(3);
+            }
             if self.pict_type == PictureType::B {
                 w.write_bit(false); // ref_pic_list_modification_flag_l1
             }
@@ -1048,7 +1099,12 @@ impl SliceHeader {
                 w.write_bit(false); // no_output_of_prior_pics_flag
                 w.write_bit(false); // long_term_reference_flag
             } else {
-                w.write_bit(false); // adaptive_ref_pic_marking_mode_flag
+                w.write_bit(self.mmco_unref.is_some()); // adaptive_ref_pic_marking_mode_flag
+                if let Some(d) = self.mmco_unref {
+                    w.write_ue(1); // mark a short-term picture unused
+                    w.write_ue(d as u64);
+                    w.write_ue(0);
+                }
             }
         }
         if pps.entropy_coding_mode_flag && self.pict_type != PictureType::I {
@@ -1294,6 +1350,22 @@ const fn coeff8_pos_type(idx: usize) -> usize {
     }
 }
 
+/// [`QUANT8_MF`] and [`DEQUANT8_COEFF_INIT`] by `qp % 6` and raster position.
+const QUANT8_POS: ([[u32; 64]; 6], [[i32; 64]; 6]) = {
+    let (mut mf, mut dq) = ([[0u32; 64]; 6], [[0i32; 64]; 6]);
+    let mut r = 0;
+    while r < 6 {
+        let mut i = 0;
+        while i < 64 {
+            mf[r][i] = QUANT8_MF[r][coeff8_pos_type(i)] as u32;
+            dq[r][i] = DEQUANT8_COEFF_INIT[r][coeff8_pos_type(i)];
+            i += 1;
+        }
+        r += 1;
+    }
+    (mf, dq)
+};
+
 /// Fused $8\times8$ residual subtraction (`src - pred`) and forward $8\times8$ DCT (`0040`).
 #[inline]
 pub fn sub8x8_dct_u8(src: &[u8], src_stride: usize, pred: &[u8], pred_stride: usize) -> [i16; 64] {
@@ -1313,14 +1385,13 @@ pub fn quantize_block8x8(dct_coeffs: &[i16; 64], qp: u8, is_intra: bool) -> [i16
     let qp = qp.min(51) as usize;
     let qbits = 16 + (qp / 6);
     let rem = qp % 6;
-    let f = (1i64 << qbits) / if is_intra { 3 } else { 6 };
+    let f = (1u32 << qbits) / if is_intra { 3 } else { 6 };
+    let mf = &QUANT8_POS.0[rem];
     let mut out = [0i16; 64];
-    for i in 0..64 {
-        let c = dct_coeffs[i] as i64;
-        let sign = if c < 0 { -1 } else { 1 };
-        let mf = QUANT8_MF[rem][coeff8_pos_type(i)] as i64;
-        let level = ((c.abs() * mf + f) >> qbits) * sign;
-        out[i] = level.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+    // `|c| * mf + f` stays below 2^32: `|c| <= 2^15`, `mf < 2^15` and `f < 2^23`.
+    for ((o, &c), &m) in out.iter_mut().zip(dct_coeffs).zip(mf) {
+        let level = ((c.unsigned_abs() as u32 * m + f) >> qbits).min(i16::MAX as u32) as i16;
+        *o = if c < 0 { -level } else { level };
     }
     out
 }
@@ -1330,9 +1401,10 @@ pub fn dequantize_block8x8(levels: &[i16; 64], qp: u8) -> [i16; 64] {
     let qp = qp.min(51) as usize;
     let q_div = qp / 6;
     let rem = qp % 6;
+    let scale = &QUANT8_POS.1[rem];
     let mut out = [0i16; 64];
     for i in 0..64 {
-        let v = DEQUANT8_COEFF_INIT[rem][coeff8_pos_type(i)];
+        let v = scale[i];
         let d = if q_div >= 2 {
             (levels[i] as i32) * (v << (q_div - 2))
         } else {
@@ -2931,6 +3003,26 @@ pub struct H264Encoder {
     vbv_buffer_bits: f64,
     total_bits_emitted: u64,
     abr_qp_accum: f32,
+    /// B-picture schedule: frames waiting for their anchor (display order) and the numbering
+    /// of the pictures coded so far.
+    sched: Schedule,
+}
+
+/// Coding order of the B-picture schedule ([`H264Speed::Compact`]).
+#[derive(Clone, Debug, Default)]
+struct Schedule {
+    pending: Vec<VideoFrame>,
+    /// Display index of `pending[0]`.
+    next: u32,
+    /// Display index of the latest IDR picture.
+    idr: u32,
+    idr_count: u32,
+    /// `frame_num` of the latest reference picture.
+    ref_frame_num: u32,
+    /// The latest group was a pyramid, whose reference B picture the next anchor drops.
+    after_pyramid: bool,
+    /// Half-resolution copies of the latest anchor and of the frames waiting.
+    la: enc::Lookahead,
 }
 
 impl H264Encoder {
@@ -2952,6 +3044,7 @@ impl H264Encoder {
             vbv_buffer_bits: 0.0,
             total_bits_emitted: 0,
             abr_qp_accum: qp as f32,
+            sched: Schedule::default(),
         }
     }
 
@@ -2963,13 +3056,34 @@ impl H264Encoder {
         self.sps = Sps::new_profile(self.sps.width(), self.sps.height(), fps, profile);
         self.sps.colorimetry = c;
         self.pps = Pps::new_profile(self.qp, profile);
+        self.sync_reorder();
         self
     }
 
     /// Configures the encoder effort ([`H264Speed`]).
     pub fn with_speed(mut self, speed: H264Speed) -> Self {
         self.speed = speed;
+        self.sync_reorder();
         self
+    }
+
+    /// B pictures between consecutive anchors: [`H264Speed::Compact`] with CABAC (`Main` and
+    /// `High`) codes up to three.
+    fn b_frames(&self) -> u32 {
+        if self.speed == H264Speed::Compact && self.pps.entropy_coding_mode_flag {
+            enc::B_FRAMES
+        } else {
+            0
+        }
+    }
+
+    /// Signals the output delay of B pictures in the SPS (`max_num_reorder_frames`), and the
+    /// third reference picture of a pyramid.
+    fn sync_reorder(&mut self) {
+        let b = self.b_frames();
+        let pyramid = b >= 2;
+        self.sps.max_num_reorder_frames = (b > 0).then_some(if pyramid { 2 } else { 1 });
+        self.sps.max_num_ref_frames = if pyramid { 3 } else { 2 };
     }
 
     /// Configures perceptual CRF or target ABR / VBV rate control (`0041`).
@@ -3019,8 +3133,21 @@ impl H264Encoder {
     }
 
     /// Encodes a `Yuv420p` [`VideoFrame`] into an H.264 Annex-B packet (`SPS` + `PPS` + `IDR` on keyframes, or `P` slice).
+    ///
+    /// With B pictures ([`H264Speed::Compact`] in `Main` or `High`) a frame may wait for the
+    /// next anchor: the packet then holds every access unit that became ready, in decoding
+    /// order, possibly none; [`H264Encoder::flush`] codes the frames still waiting.
     pub fn encode_frame(&mut self, frame: &VideoFrame) -> Result<Vec<u8>> {
-        self.encode_frame_impl(frame)
+        if self.b_frames() == 0 && self.sched.pending.is_empty() {
+            return self.encode_frame_impl(frame);
+        }
+        self.queue_frame(frame);
+        self.drain(false)
+    }
+
+    /// Codes the frames still waiting for an anchor (see [`H264Encoder::encode_frame`]).
+    pub fn flush(&mut self) -> Result<Vec<u8>> {
+        self.drain(true)
     }
 
     /// Slice QP of the next frame under the configured [`RateControlMode`].
@@ -4121,6 +4248,65 @@ mod tests {
             }
         }
         f
+    }
+
+    /// The Compact preset's streams, B pictures and IDR pictures inside a group included,
+    /// decode to as many frames as were given, each nearest its own source, and the last
+    /// anchor equals the encoder's reconstruction.
+    #[test]
+    fn compact_streams_decode_in_display_order() {
+        let (w, h) = (64, 48);
+        let frames: Vec<VideoFrame> = (0..17).map(|t| moving_frame(w, h, t)).collect();
+        let sse = |a: &VideoFrame, b: &VideoFrame| -> u64 {
+            (0..h)
+                .flat_map(|y| a.plane(0).row(y)[..w].iter().zip(&b.plane(0).row(y)[..w]))
+                .map(|(&p, &q)| (p as i64 - q as i64).pow(2) as u64)
+                .sum()
+        };
+        for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+            for qp in [18u8, 26, 34] {
+                let mut enc = H264Encoder::new(w as u32, h as u32, Rational64::FPS_30, qp)
+                    .with_profile(profile)
+                    .with_speed(H264Speed::Compact);
+                enc.keyint = 7;
+                let mut stream = enc.headers_annex_b();
+                for f in &frames {
+                    stream.extend(enc.encode_frame(f).unwrap());
+                }
+                stream.extend(enc.flush().unwrap());
+                // CABAC streams carry non-reference (B) slices.
+                let non_ref = ragdoll_simd::split_annex_b_nals(&stream)
+                    .iter()
+                    .filter(|n| n[0] & 0x1f == 1 && n[0] & 0x60 == 0)
+                    .count();
+                assert_eq!(
+                    non_ref > 0,
+                    profile != H264Profile::Baseline,
+                    "{profile:?} qp {qp}"
+                );
+                let decoded = H264Decoder::new()
+                    .decode_stream_pts_ordered(&stream)
+                    .unwrap();
+                assert_eq!(decoded.len(), frames.len(), "{profile:?} qp {qp}");
+                for (t, d) in decoded.iter().enumerate() {
+                    let own = sse(d, &frames[t]);
+                    for (u, f) in frames.iter().enumerate().filter(|&(u, _)| u != t) {
+                        assert!(own < sse(d, f), "{profile:?} qp {qp}: frame {t} nearer {u}");
+                    }
+                }
+                let recon = enc.state.recon_frame();
+                for p in 0..3 {
+                    let (pw, ph) = if p == 0 { (w, h) } else { (w / 2, h / 2) };
+                    for y in 0..ph {
+                        assert_eq!(
+                            &decoded[frames.len() - 1].plane(p).row(y)[..pw],
+                            &recon.plane(p).row(y)[..pw],
+                            "{profile:?} qp {qp} plane {p} row {y}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
