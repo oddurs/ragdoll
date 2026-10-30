@@ -516,6 +516,48 @@ fn hadamard_edge(x: &[u8]) -> [i16; 4] {
     [s01 + s23, s01 - s23, d01 + d23, d01 - d23].map(|c| 4 * c)
 }
 
+/// SATDs, as `pixel_satd_wxh::<8, 8>`, of the $8\times8$ block at the start of `src` (stride
+/// `ss`) against its vertical, horizontal and DC predictions from the `top` and `left` edge
+/// samples and the DC value `dc` (one value for the whole block), in that order: the intra
+/// costs of a half-resolution lookahead block (`x264` `slicetype_mb_cost`). One Hadamard
+/// transform of the source serves all three, as in [`intra_satd_x3_16x16`].
+///
+/// # Panics
+/// If `src` is shorter than 8 rows of 8 samples at stride `ss`.
+#[inline]
+pub fn intra_satd_x3_8x8(src: &[u8], ss: usize, top: &[u8; 8], left: &[u8; 8], dc: u8) -> [u32; 3] {
+    check_block(src, ss, 8, 8);
+    let tv: [[i16; 4]; 2] = std::array::from_fn(|b| hadamard_edge(&top[b * 4..]));
+    let th: [[i16; 4]; 2] = std::array::from_fn(|b| hadamard_edge(&left[b * 4..]));
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        return unsafe { intra_satd_x3_8x8_neon(src.as_ptr(), ss, &tv, &th, 16 * dc as i16) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        return unsafe { intra_satd_x3_8x8_avx2(src.as_ptr(), ss, &tv, &th, 16 * dc as i16) };
+    }
+    intra_satd_x3_8x8_scalar(src, ss, top, left, dc)
+}
+
+/// Scalar reference for [`intra_satd_x3_8x8`]: the three predictions built and measured.
+pub fn intra_satd_x3_8x8_scalar(
+    src: &[u8],
+    ss: usize,
+    top: &[u8; 8],
+    left: &[u8; 8],
+    dc: u8,
+) -> [u32; 3] {
+    let preds: [[u8; 64]; 3] = [
+        std::array::from_fn(|i| top[i % 8]),
+        std::array::from_fn(|i| left[i / 8]),
+        [dc; 64],
+    ];
+    preds.map(|p| crate::pixel_satd_wxh_scalar::<8, 8>(src, ss, &p, 8, None))
+}
+
 /// SATDs, as [`pixel_satd_16x16`], of the $16\times16$ block `src` against its vertical,
 /// horizontal and DC intra predictions from the `top` and `left` edge samples and the DC value
 /// `dc`, in that order (`x264_intra_satd_x3_16x16`). One Hadamard transform of the source serves
@@ -1469,6 +1511,7 @@ pub fn nonzero_mask_4x4_x4_scalar(blocks: &[[i16; 16]; 4]) -> [u32; 4] {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn nonzero_mask_avx2(blocks: &[[i16; 16]; 4]) -> [u32; 4] {
     use std::arch::x86_64::*;
     unsafe {
@@ -1851,6 +1894,7 @@ unsafe fn intra_sad_x3_avx2(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn intra_satd_x3_avx2(
     src: &[u8; 256],
     tv: &[[i16; 4]; 4],
@@ -1911,6 +1955,60 @@ unsafe fn intra_satd_x3_avx2(
     }
 }
 
+/// [`intra_satd_x3_8x8`]: rows 0-3 in the low lanes and 4-7 in the high ones, so each 128-bit
+/// lane holds two $4\times4$ blocks and the registers after the transform hold one column of
+/// coefficients per block (`o[h]` lane `4 b + v`, blocks in raster order).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn intra_satd_x3_8x8_avx2(
+    src: *const u8,
+    ss: usize,
+    tv: &[[i16; 4]; 2],
+    th: &[[i16; 4]; 2],
+    dc16: i16,
+) -> [u32; 3] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let row = |k: usize| {
+            let lo = _mm_loadl_epi64(src.add(k * ss) as *const __m128i);
+            let hi = _mm_loadl_epi64(src.add((k + 4) * ss) as *const __m128i);
+            _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(lo, hi))
+        };
+        let v = hadamard4_butterfly_avx2([row(0), row(1), row(2), row(3)]);
+        let o = hadamard4_butterfly_avx2(transpose_4x4_epi16_avx2(v));
+        let pv: [__m256i; 4] = std::array::from_fn(|h| {
+            _mm256_setr_epi16(
+                tv[0][h], 0, 0, 0, tv[1][h], 0, 0, 0, tv[0][h], 0, 0, 0, tv[1][h], 0, 0, 0,
+            )
+        });
+        let (a, b) = (th[0], th[1]);
+        let ph = _mm256_setr_epi16(
+            a[0], a[1], a[2], a[3], a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], b[0], b[1],
+            b[2], b[3],
+        );
+        let pd = _mm256_setr_epi16(dc16, 0, 0, 0, dc16, 0, 0, 0, dc16, 0, 0, 0, dc16, 0, 0, 0);
+        let abs_sum = |x: __m256i| _mm256_madd_epi16(_mm256_abs_epi16(x), ones);
+        let rest = _mm256_add_epi32(
+            _mm256_add_epi32(abs_sum(o[1]), abs_sum(o[2])),
+            abs_sum(o[3]),
+        );
+        let acc_h = _mm256_add_epi32(rest, abs_sum(_mm256_sub_epi16(o[0], ph)));
+        let acc_d = _mm256_add_epi32(rest, abs_sum(_mm256_sub_epi16(o[0], pd)));
+        let mut acc_v = _mm256_setzero_si256();
+        for (&x, &p) in o.iter().zip(&pv) {
+            acc_v = _mm256_add_epi32(acc_v, abs_sum(_mm256_sub_epi16(x, p)));
+        }
+        let hsum = |a: __m256i| {
+            let s = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256::<1>(a));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
+            _mm_cvtsi128_si32(s) as u32
+        };
+        [hsum(acc_v) >> 1, hsum(acc_h) >> 1, hsum(acc_d) >> 1]
+    }
+}
+
 /// The $4\times4$ Hadamard butterfly of [`hadamard4x4_16x4`] applied element-wise across four
 /// registers.
 #[cfg(target_arch = "x86_64")]
@@ -1929,6 +2027,7 @@ fn hadamard4_butterfly_avx2(d: [std::arch::x86_64::__m256i; 4]) -> [std::arch::x
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn dct_strip_avx2<const HAD: bool>(
     src: *const u8,
     ss: usize,
@@ -1990,6 +2089,7 @@ unsafe fn dct_strip_avx2<const HAD: bool>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
     use std::arch::x86_64::*;
     unsafe {
@@ -2020,6 +2120,7 @@ unsafe fn quant_avx2(blocks: &mut [[i16; 16]; 4], q: &Quant4x4) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn dequant_avx2(blocks: &mut [[i16; 16]; 4], scale: &[i32; 16]) {
     use std::arch::x86_64::*;
     unsafe {
@@ -2413,6 +2514,7 @@ unsafe fn pred4_dir_neon(edge: &[u8; 16]) -> [[u8; 16]; 6] {
 /// sample pairs `(A, B)` meet their weights in one `pmaddubsw`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn chroma_mc_avx2(
     u: *const u8,
     v: *const u8,
@@ -2713,6 +2815,73 @@ unsafe fn chroma_mc_neon(src: *const u8, ss: usize, fx: u8, fy: u8, out: &mut [u
 }
 
 /// [`intra_sad_x3_16x16`].
+/// [`intra_satd_x3_8x8`]: each register a row of two $4\times4$ blocks, one strip of four rows
+/// at a time; after the transform `o[h]` lane `4 b + v` for the strip's blocks `b`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn intra_satd_x3_8x8_neon(
+    src: *const u8,
+    ss: usize,
+    tv: &[[i16; 4]; 2],
+    th: &[[i16; 4]; 2],
+    dc16: i16,
+) -> [u32; 3] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let bfly = |d: [int16x8_t; 4]| {
+            let (s01, d01) = (vaddq_s16(d[0], d[1]), vsubq_s16(d[0], d[1]));
+            let (s23, d23) = (vaddq_s16(d[2], d[3]), vsubq_s16(d[2], d[3]));
+            [
+                vaddq_s16(s01, s23),
+                vsubq_s16(s01, s23),
+                vaddq_s16(d01, d23),
+                vsubq_s16(d01, d23),
+            ]
+        };
+        let pair = |a: [i16; 4], b: [i16; 4]| {
+            let v = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
+            vld1q_s16(v.as_ptr())
+        };
+        let pv: [int16x8_t; 4] =
+            std::array::from_fn(|h| pair([tv[0][h], 0, 0, 0], [tv[1][h], 0, 0, 0]));
+        let pd = pair([dc16, 0, 0, 0], [dc16, 0, 0, 0]);
+        let mut acc = [vdupq_n_u32(0); 3];
+        for (strip, t) in th.iter().enumerate() {
+            let r: [int16x8_t; 4] = std::array::from_fn(|k| {
+                vreinterpretq_s16_u16(vmovl_u8(vld1_u8(src.add((4 * strip + k) * ss))))
+            });
+            let v = bfly(r);
+            // Transposes the 4x4 block in each half: register `h` becomes column `h`.
+            let (t0, t1) = (vtrn1q_s16(v[0], v[1]), vtrn2q_s16(v[0], v[1]));
+            let (t2, t3) = (vtrn1q_s16(v[2], v[3]), vtrn2q_s16(v[2], v[3]));
+            let w = |x: int16x8_t| vreinterpretq_s32_s16(x);
+            let n = |x: int32x4_t| vreinterpretq_s16_s32(x);
+            let c = [
+                n(vtrn1q_s32(w(t0), w(t2))),
+                n(vtrn1q_s32(w(t1), w(t3))),
+                n(vtrn2q_s32(w(t0), w(t2))),
+                n(vtrn2q_s32(w(t1), w(t3))),
+            ];
+            let o = bfly(c);
+            let ph = pair(*t, *t);
+            let abs_add = |a: uint32x4_t, x: int16x8_t, p: int16x8_t| {
+                vpadalq_u16(a, vreinterpretq_u16_s16(vabdq_s16(x, p)))
+            };
+            let zero = vdupq_n_s16(0);
+            for &x in &o[1..] {
+                acc[1] = abs_add(acc[1], x, zero);
+                acc[2] = abs_add(acc[2], x, zero);
+            }
+            acc[1] = abs_add(acc[1], o[0], ph);
+            acc[2] = abs_add(acc[2], o[0], pd);
+            for (&x, &p) in o.iter().zip(&pv) {
+                acc[0] = abs_add(acc[0], x, p);
+            }
+        }
+        acc.map(|a| vaddvq_u32(a) >> 1)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn intra_sad_x3_neon(src: &[u8; 256], top: &[u8; 16], left: &[u8; 16], dc: u8) -> [u32; 3] {
@@ -2810,6 +2979,7 @@ unsafe fn hpel_centre_neon(out: &mut HpelWindow) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn zigzag_avx2(blocks: &[[i16; 16]; 4]) -> [[i16; 16]; 4] {
     use std::arch::x86_64::*;
     // Byte shuffles of each 128-bit lane: from the lane itself, and from the other half of the
@@ -3146,6 +3316,35 @@ mod tests {
                 intra4x4_pred_dir(&[v; 8], &[255 - v; 4], v),
                 intra4x4_pred_dir_scalar(&[v; 8], &[255 - v; 4], v)
             );
+        }
+    }
+
+    #[test]
+    fn intra_satd_x3_8x8_matches_scalar() {
+        let (w, h) = (29usize, 23usize);
+        for seed in 0..60u32 {
+            let p = plane(w, h, seed);
+            let e = plane(16, 1, seed + 500);
+            let off = (seed as usize * 5) % (w - 8) + (seed as usize % (h - 8)) * w;
+            type Case = (Vec<u8>, [u8; 8], [u8; 8], u8);
+            let mut cases: Vec<Case> = vec![(
+                p[off..].to_vec(),
+                e[..8].try_into().unwrap(),
+                e[8..].try_into().unwrap(),
+                (seed * 37 % 256) as u8,
+            )];
+            if seed < 2 {
+                let (v, o) = if seed == 0 { (255, 0) } else { (0, 255) };
+                cases.push((vec![v; 64], [o; 8], [o; 8], o));
+            }
+            for (src, top, left, dc) in cases {
+                let ss = if src.len() == 64 { 8 } else { w };
+                assert_eq!(
+                    intra_satd_x3_8x8(&src, ss, &top, &left, dc),
+                    intra_satd_x3_8x8_scalar(&src, ss, &top, &left, dc),
+                    "seed {seed}"
+                );
+            }
         }
     }
 

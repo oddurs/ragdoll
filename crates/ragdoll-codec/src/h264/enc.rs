@@ -47,7 +47,8 @@ use ragdoll_simd::{
     h264_luma_mc, hadamard4x4_16x4, hpel_16x16, hpel_window, hpel_window_centre, intra_pred_plane,
     intra_sad_x3_16x16, intra_satd_x3_16x16, intra4x4_pred_dir, nonzero_mask_4x4_x4,
     pixel_avg_16x16, pixel_sad_8x8, pixel_sad_16x16, pixel_sad_avg_16x16, pixel_sad_x4_16x16,
-    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, sub_dct4x4_8x8, zigzag_4x4_x4,
+    pixel_satd_4x4, pixel_satd_16x16, pixel_ssd, quant_4x4_x4, quant_8x8, sub_dct4x4_8x8,
+    sub_dct8x8_x2, zigzag_4x4_x4,
 };
 
 /// Luma padding of reconstructed planes, in samples: the half-pel window of a block displaced
@@ -2013,26 +2014,59 @@ fn recon_chroma(
     }
 }
 
-/// $8\times8$-transform counterpart of [`quant_luma_4x4_inter`].
+/// Adds the dequantized $8\times8$ residual of levels `q8` at `qp` to `dst` (stride 16): the
+/// decoder's transform kernel, which computes 8.5.13.2 as [`add8x8_idct_u8`] does.
+#[inline(always)]
+fn recon_8x8(dst: &mut [u8], q8: &[i16; 64], qp: u8) {
+    ragdoll_simd::h264_idct8_add(dst, 16, &dequantize_block8x8(q8, qp).map(i32::from));
+}
+
+/// [`QUANT8_POS`]'s multipliers in 16 bits, for [`quant_8x8`].
+static QUANT8_MF16: [[u16; 64]; 6] = {
+    let mut t = [[0u16; 64]; 6];
+    let mut r = 0;
+    while r < 6 {
+        let mut i = 0;
+        while i < 64 {
+            t[r][i] = QUANT8_POS.0[r][i] as u16;
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+
+/// $8\times8$-transform counterpart of [`quant_luma_4x4_inter`] ([`quantize_block8x8`] of
+/// [`sub8x8_dct_u8`], two blocks transformed at a time).
 fn quant_luma_8x8_inter(
     src: &[u8; 256],
     pred: &[u8; 256],
     qp: u8,
     fine: bool,
 ) -> ([[i16; 64]; 4], u8, u32) {
+    let qp = qp.min(51) as usize;
+    let shift = 16 + (qp / 6) as u32;
+    let bias = (1u32 << shift) / if fine { 3 } else { 6 };
+    let mf = &QUANT8_MF16[qp % 6];
     let mut q8 = [[0i16; 64]; 4];
     let mut cbp = 0u8;
     let mut total = 0u32;
-    for (i8x8, slot) in q8.iter_mut().enumerate() {
-        let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
-        let dct = sub8x8_dct_u8(&src[o..], 16, &pred[o..], 16);
-        let q = quantize_block8x8(&dct, qp, fine);
-        if q.iter().any(|&c| c != 0) {
-            let score = decimate_score(&zigzag64(&q));
+    for half in 0..2 {
+        let pair: &mut [[i16; 64]; 2] = (&mut q8[2 * half..2 * half + 2]).try_into().unwrap();
+        sub_dct8x8_x2(&src[128 * half..], 16, &pred[128 * half..], 16, pair);
+        for (k, slot) in pair.iter_mut().enumerate() {
+            let nz = quant_8x8(slot, mf, bias, shift);
+            // A level above 1 scores 9 (`decimate_score`).
+            let score = match nz {
+                0 => 0,
+                1 => decimate_score(&zigzag64(slot)),
+                _ => 9,
+            };
             total += score;
             if score >= 4 {
-                cbp |= 1 << i8x8;
-                *slot = q;
+                cbp |= 1 << (2 * half + k);
+            } else {
+                *slot = [0; 64];
             }
         }
     }
@@ -3256,7 +3290,7 @@ impl EncState {
             for (i8x8, q8) in luma_q8.iter().enumerate() {
                 if cbp_luma & (1 << i8x8) != 0 {
                     let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
-                    add8x8_idct_u8(&mut py[o..], 16, &dequantize_block8x8(q8, eff_qp));
+                    recon_8x8(&mut py[o..], q8, eff_qp);
                 }
             }
         } else {
@@ -4078,6 +4112,43 @@ mod tests {
                 pred_chroma(mode, Some(&t8), Some(&l8), tl, &mut c);
                 predict_intra_chroma_8x8_scalar(mode, Some(&t8), Some(&l8), tl, &mut d, 8);
                 assert_eq!(c, d, "chroma mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn transform_8x8_paths_match_the_reference() {
+        // Residuals from noise against a flat prediction, at every QP: the two-block transform
+        // and 16-bit quantizer give the levels of `sub8x8_dct_u8` and `quantize_block8x8`, and
+        // the decoder's kernel reconstructs as `add8x8_idct_u8`.
+        let mut x = 0x2468_ace1_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for qp in 0..52u8 {
+            let src: [u8; 256] = std::array::from_fn(|_| match next() % 7 {
+                0 => 0,
+                1 => 255,
+                _ => next() as u8,
+            });
+            let pred: [u8; 256] = std::array::from_fn(|_| (next() % 256) as u8);
+            for fine in [false, true] {
+                let (q8, cbp, _) = quant_luma_8x8_inter(&src, &pred, qp, fine);
+                for (i8x8, q) in q8.iter().enumerate() {
+                    let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
+                    let want =
+                        quantize_block8x8(&sub8x8_dct_u8(&src[o..], 16, &pred[o..], 16), qp, fine);
+                    if cbp & (1 << i8x8) != 0 {
+                        assert_eq!(*q, want, "qp {qp} block {i8x8}");
+                    }
+                    let (mut a, mut b) = (pred, pred);
+                    recon_8x8(&mut a[o..], &want, qp);
+                    add8x8_idct_u8(&mut b[o..], 16, &dequantize_block8x8(&want, qp));
+                    assert_eq!(a, b, "qp {qp} block {i8x8}");
+                }
             }
         }
     }
