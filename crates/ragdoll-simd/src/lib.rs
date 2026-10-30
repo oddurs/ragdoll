@@ -95,7 +95,8 @@ pub use h264_mc::{
 pub use h264_me::{
     pixel_avg_wxh, pixel_avg_wxh_scalar, pixel_sa8d_16x16, pixel_sa8d_16x16_scalar,
     pixel_sad_avg_wxh, pixel_sad_avg_wxh_scalar, pixel_sad_wxh, pixel_sad_wxh_scalar,
-    pixel_sad_x4_wxh, pixel_sad_x4_wxh_scalar, pixel_satd_wxh, pixel_satd_wxh_scalar,
+    pixel_sad_x4_wxh, pixel_sad_x4_wxh_at, pixel_sad_x4_wxh_scalar, pixel_satd_wxh,
+    pixel_satd_wxh_scalar,
 };
 pub use metrics::{
     SSIM_C1_8BIT, SSIM_C2_8BIT, SsimWindowStats, flac_eval_fixed_orders_l1,

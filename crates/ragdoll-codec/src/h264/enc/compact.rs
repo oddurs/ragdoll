@@ -3,7 +3,8 @@
 
 use super::*;
 use ragdoll_simd::{
-    hpel_planes, pixel_avg_wxh, pixel_sad_avg_wxh, pixel_sad_wxh, pixel_sad_x4_wxh, pixel_satd_wxh,
+    hpel_planes, pixel_avg_wxh, pixel_sad_avg_wxh, pixel_sad_wxh, pixel_sad_x4_wxh,
+    pixel_sad_x4_wxh_at, pixel_satd_wxh,
 };
 
 /// The three half-sample planes of a reference picture's luma, laid out like the picture
@@ -176,17 +177,8 @@ impl<'a> RefLuma<'a> {
     }
 }
 
-/// Calls `$f::<W, H>($args)` for the partition size `($w, $h)` (8 or 16 each).
-macro_rules! by_size {
-    ($w:expr, $h:expr, $f:ident($($a:expr),*)) => {
-        match ($w, $h) {
-            (16, 16) => $f::<16, 16>($($a),*),
-            (16, 8) => $f::<16, 8>($($a),*),
-            (8, 16) => $f::<8, 16>($($a),*),
-            _ => $f::<8, 8>($($a),*),
-        }
-    };
-}
+// The block helpers below call through the kernel tables: inlined for every size at every call
+// site, the kernels would leave the analysis too large for the instruction cache.
 
 /// SAD or SATD of two `w`x`h` blocks, `w` and `h` 8 or 16.
 #[inline(always)]
@@ -199,10 +191,14 @@ pub(super) fn block_cost(
     h: usize,
     satd: bool,
 ) -> u32 {
-    if satd {
-        block_satd_avg(a, sa, b, sb, None, w, h)
-    } else {
-        by_size!(w, h, pixel_sad_wxh(a, sa, b, sb))
+    let k = Kernels::get(w, h);
+    // Safety: the kernels are those `Kernels::get` chose for the CPU.
+    unsafe {
+        if satd {
+            (k.satd)(a, sa, b, sb, None)
+        } else {
+            (k.sad)(a, sa, b, sb)
+        }
     }
 }
 
@@ -217,7 +213,8 @@ pub(super) fn block_satd_avg(
     w: usize,
     h: usize,
 ) -> u32 {
-    by_size!(w, h, pixel_satd_wxh(a, sa, p, sp, q))
+    // Safety: the kernels are those `Kernels::get` chose for the CPU.
+    unsafe { (Kernels::get(w, h).satd)(a, sa, p, sp, q) }
 }
 
 /// SAD of the `w`x`h` block `a` against the average of `p` and `q`.
@@ -233,7 +230,8 @@ fn block_sad_avg(
     w: usize,
     h: usize,
 ) -> u32 {
-    by_size!(w, h, pixel_sad_avg_wxh(a, sa, p, sp, q, sq))
+    // Safety: the kernels are those `Kernels::get` chose for the CPU.
+    unsafe { (Kernels::get(w, h).sad_avg)(a, sa, p, sp, q, sq) }
 }
 
 /// The average of the `w`x`h` blocks `p` and `q` into `dst`.
@@ -249,7 +247,8 @@ pub(super) fn block_avg(
     w: usize,
     h: usize,
 ) {
-    by_size!(w, h, pixel_avg_wxh(dst, ds, p, sp, q, sq))
+    // Safety: the kernels are those `Kernels::get` chose for the CPU.
+    unsafe { (Kernels::get(w, h).avg)(dst, ds, p, sp, q, sq) }
 }
 
 /// SATD of two $8\times8$ blocks.
@@ -297,6 +296,237 @@ impl MeResult {
     }
 }
 
+/// Block cost kernels of one partition size. The searches call them through these pointers,
+/// so that they are compiled once for all sizes and their code stays in the instruction cache.
+#[derive(Clone, Copy)]
+struct Kernels {
+    sad4: Sad4At,
+    sad4r: Sad4,
+    sad: unsafe fn(&[u8], usize, &[u8], usize) -> u32,
+    sad_avg: SadAvg,
+    satd: Satd,
+    avg: Avg,
+}
+
+/// [`ragdoll_simd::pixel_sad_x4_wxh_at`] of one size.
+type Sad4At = unsafe fn(&[u8], usize, &[u8], [usize; 4], usize) -> [u32; 4];
+/// [`ragdoll_simd::pixel_sad_x4_wxh`] of one size.
+type Sad4 = unsafe fn(&[u8], usize, [&[u8]; 4], usize) -> [u32; 4];
+/// [`ragdoll_simd::pixel_sad_avg_wxh`] of one size.
+type SadAvg = unsafe fn(&[u8], usize, &[u8], usize, &[u8], usize) -> u32;
+/// [`ragdoll_simd::pixel_satd_wxh`] of one size.
+type Satd = unsafe fn(&[u8], usize, &[u8], usize, Option<(&[u8], usize)>) -> u32;
+/// [`ragdoll_simd::pixel_avg_wxh`] of one size.
+type Avg = unsafe fn(&mut [u8], usize, &[u8], usize, &[u8], usize);
+
+impl Kernels {
+    const fn of<const W: usize, const H: usize>() -> Self {
+        Self {
+            sad4: pixel_sad_x4_wxh_at::<W, H>,
+            sad4r: pixel_sad_x4_wxh::<W, H>,
+            sad: pixel_sad_wxh::<W, H>,
+            sad_avg: pixel_sad_avg_wxh::<W, H>,
+            satd: pixel_satd_wxh::<W, H>,
+            avg: pixel_avg_wxh::<W, H>,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const fn of_v3<const W: usize, const H: usize>() -> Self {
+        Self {
+            sad4: v3k::sad4::<W, H>,
+            sad4r: v3k::sad4r::<W, H>,
+            sad: v3k::sad::<W, H>,
+            sad_avg: v3k::sad_avg::<W, H>,
+            satd: v3k::satd::<W, H>,
+            avg: v3k::avg::<W, H>,
+        }
+    }
+
+    /// The kernels of `w`x`h` blocks, compiled for x86-64-v3 when [`super::v3`] holds.
+    #[inline(always)]
+    fn get(w: usize, h: usize) -> Self {
+        const ALL: [Kernels; 4] = [
+            Kernels::of::<16, 16>(),
+            Kernels::of::<16, 8>(),
+            Kernels::of::<8, 16>(),
+            Kernels::of::<8, 8>(),
+        ];
+        let i = 2 * (w == 8) as usize + (h == 8) as usize;
+        #[cfg(target_arch = "x86_64")]
+        if super::v3() {
+            const ALL_V3: [Kernels; 4] = [
+                Kernels::of_v3::<16, 16>(),
+                Kernels::of_v3::<16, 8>(),
+                Kernels::of_v3::<8, 16>(),
+                Kernels::of_v3::<8, 8>(),
+            ];
+            return ALL_V3[i];
+        }
+        ALL[i]
+    }
+}
+
+/// The block cost kernels compiled for x86-64-v3, which they then inline.
+#[cfg(target_arch = "x86_64")]
+mod v3k {
+    use ragdoll_simd::*;
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn sad4<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        plane: &[u8],
+        offs: [usize; 4],
+        rs: usize,
+    ) -> [u32; 4] {
+        pixel_sad_x4_wxh_at::<W, H>(src, ss, plane, offs, rs)
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn sad4r<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        refs: [&[u8]; 4],
+        rs: usize,
+    ) -> [u32; 4] {
+        pixel_sad_x4_wxh::<W, H>(src, ss, refs, rs)
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn sad<const W: usize, const H: usize>(
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) -> u32 {
+        pixel_sad_wxh::<W, H>(a, sa, b, sb)
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn sad_avg<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) -> u32 {
+        pixel_sad_avg_wxh::<W, H>(src, ss, a, sa, b, sb)
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn avg<const W: usize, const H: usize>(
+        dst: &mut [u8],
+        ds: usize,
+        a: &[u8],
+        sa: usize,
+        b: &[u8],
+        sb: usize,
+    ) {
+        pixel_avg_wxh::<W, H>(dst, ds, a, sa, b, sb)
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn satd<const W: usize, const H: usize>(
+        src: &[u8],
+        ss: usize,
+        a: &[u8],
+        sa: usize,
+        b: Option<(&[u8], usize)>,
+    ) -> u32 {
+        pixel_satd_wxh::<W, H>(src, ss, a, sa, b)
+    }
+}
+
+/// Full-pel search of one partition: the vectors allowed, the block's offset in the reference
+/// plane, the predictor's motion vector cost rows and the best vector so far.
+struct FullPel<'a> {
+    ps: &'a PartSearch<'a>,
+    k: Kernels,
+    buf: &'a [u8],
+    stride: isize,
+    /// Offset of the block displaced by the zero vector.
+    base: isize,
+    lo: [i32; 2],
+    hi: [i32; 2],
+    /// Indices into the motion vector cost table of quarter-pel component `0`.
+    cost0: [i32; 2],
+    best: [i32; 2],
+    best_cost: u32,
+}
+
+impl<'a> FullPel<'a> {
+    #[inline(always)]
+    fn new(ps: &'a PartSearch<'a>, k: Kernels) -> Self {
+        let f = ps.rl.f;
+        let b = &ps.bounds;
+        Self {
+            ps,
+            k,
+            buf: &f.buf,
+            stride: f.stride as isize,
+            base: f.at(ps.x0 as isize, ps.y0 as isize) as isize,
+            lo: [(b.min[0] + 3) >> 2, (b.min[1] + 3) >> 2],
+            hi: [b.max[0] >> 2, b.max[1] >> 2],
+            cost0: [
+                MV_COST_RANGE - ps.mvp[0] as i32,
+                MV_COST_RANGE - ps.mvp[1] as i32,
+            ],
+            best: [0; 2],
+            best_cost: u32::MAX,
+        }
+    }
+
+    /// `from + d`, or `from` when that leaves the vectors allowed.
+    #[inline(always)]
+    fn at(&self, from: [i32; 2], d: [i32; 2]) -> [i32; 2] {
+        let m = [from[0] + d[0], from[1] + d[1]];
+        let ok = |i: usize| (m[i] - self.lo[i]) as u32 <= (self.hi[i] - self.lo[i]) as u32;
+        if ok(0) & ok(1) { m } else { from }
+    }
+
+    /// Motion vector cost of full-pel `m`.
+    #[inline(always)]
+    fn mv_cost(&self, m: [i32; 2]) -> u32 {
+        let t = self.ps.mv_costs;
+        match (
+            t.get((4 * m[0] + self.cost0[0]) as usize),
+            t.get((4 * m[1] + self.cost0[1]) as usize),
+        ) {
+            (Some(&x), Some(&y)) => x as u32 + y as u32,
+            _ => self.ps.mv_cost([4 * m[0], 4 * m[1]]),
+        }
+    }
+
+    /// Measures four vectors allowed and takes them in order, the first of equal costs
+    /// winning as a sequential search would pick it; returns the last that improved.
+    #[inline(always)]
+    fn take(&mut self, pts: [[i32; 2]; 4]) -> Option<usize> {
+        let off = |m: [i32; 2]| (self.base + m[1] as isize * self.stride + m[0] as isize) as usize;
+        // Safety: the kernels are those `Kernels::get` chose for the CPU.
+        let sads = unsafe {
+            (self.k.sad4)(
+                self.ps.src,
+                16,
+                self.buf,
+                pts.map(off),
+                self.stride as usize,
+            )
+        };
+        let mut moved = None;
+        for k in 0..4 {
+            let c = sads[k] + self.mv_cost(pts[k]);
+            if c < self.best_cost {
+                self.best_cost = c;
+                self.best = pts[k];
+                moved = Some(k);
+            }
+        }
+        moved
+    }
+}
+
 impl PartSearch<'_> {
     #[inline(always)]
     fn mvd_cost(&self, d: i32) -> u32 {
@@ -311,6 +541,24 @@ impl PartSearch<'_> {
         self.mvd_cost(mv[0] - self.mvp[0] as i32) + self.mvd_cost(mv[1] - self.mvp[1] as i32)
     }
 
+    /// SAD (or SATD with `satd`) of the partition against its prediction displaced by `mv`.
+    #[inline(always)]
+    fn cost(&self, k: &Kernels, mv: [i32; 2], satd: bool) -> u32 {
+        let s = self.rl.f.stride;
+        let src = self.src;
+        // Safety: the kernels are those `Kernels::get` chose for the CPU.
+        unsafe {
+            match self.rl.src(self.x0, self.y0, mv) {
+                (a, None, [pa, _]) if satd => (k.satd)(src, 16, &pa[a..], s, None),
+                (a, None, [pa, _]) => (k.sad)(src, 16, &pa[a..], s),
+                (a, Some(b), [pa, pb]) if satd => {
+                    (k.satd)(src, 16, &pa[a..], s, Some((&pb[b..], s)))
+                }
+                (a, Some(b), [pa, pb]) => (k.sad_avg)(src, 16, &pa[a..], s, &pb[b..], s),
+            }
+        }
+    }
+
     /// The best of `cands` (quarter-pel, rounded to full-pel) and zero, a radius-2 hexagon walked
     /// for up to `range / 2` steps and a square refinement (`x264 --me hex`), then sub-pel
     /// refinement from the half-sample planes: a half-pel diamond by SAD and quarter-pel diamonds
@@ -321,130 +569,69 @@ impl PartSearch<'_> {
 
     /// [`Self::search`] with `qpel` quarter-pel diamonds.
     pub(super) fn search_qpel(&self, cands: &[[i16; 2]], range: i32, qpel: i32) -> MeResult {
-        match (self.w, self.h) {
-            (16, 16) => self.search_wh::<16, 16>(cands, range, qpel),
-            (16, 8) => self.search_wh::<16, 8>(cands, range, qpel),
-            (8, 16) => self.search_wh::<8, 16>(cands, range, qpel),
-            _ => self.search_wh::<8, 8>(cands, range, qpel),
-        }
-    }
-
-    #[inline(always)]
-    fn search_wh<const W: usize, const H: usize>(
-        &self,
-        cands: &[[i16; 2]],
-        range: i32,
-        qpel: i32,
-    ) -> MeResult {
-        let int_min = [(self.bounds.min[0] + 3) >> 2, (self.bounds.min[1] + 3) >> 2];
-        let int_max = [self.bounds.max[0] >> 2, self.bounds.max[1] >> 2];
-        let inside = |m: [i32; 2]| {
-            (int_min[0]..=int_max[0]).contains(&m[0]) && (int_min[1]..=int_max[1]).contains(&m[1])
-        };
-        let f = self.rl.f;
-        let (buf, fs) = (&f.buf[..], f.stride as isize);
-        // Buffer offset of the block displaced by full-pel `m`.
-        let base = f.at(self.x0 as isize, self.y0 as isize) as isize;
-        let blk = |m: [i32; 2]| &buf[(base + m[1] as isize * fs + m[0] as isize) as usize..];
-        let mut best = [0i32; 2];
-        let mut best_cost = u32::MAX;
-        // Points are measured four at a time and taken in order, the first of equal costs
-        // winning as a sequential search would pick it.
-        let take = |pts: &[[i32; 2]], best: &mut [i32; 2], best_cost: &mut u32| {
-            let mut moved = None;
-            for (chunk_at, chunk) in pts.chunks(4).enumerate() {
-                let last = chunk[chunk.len() - 1];
-                let at = |k: usize| blk(*chunk.get(k).unwrap_or(&last));
-                let sads = pixel_sad_x4_wxh::<W, H>(
-                    self.src,
-                    16,
-                    [at(0), at(1), at(2), at(3)],
-                    fs as usize,
-                );
-                for (k, m) in chunk.iter().enumerate() {
-                    let c = sads[k] + self.mv_cost([m[0] * 4, m[1] * 4]);
-                    if c < *best_cost {
-                        *best_cost = c;
-                        *best = *m;
-                        moved = Some(chunk_at * 4 + k);
-                    }
-                }
-            }
-            moved
-        };
+        let k = Kernels::get(self.w, self.h);
+        let mut fp = FullPel::new(self, k);
         let mut pts = [[0i32; 2]; 12];
         let mut n = 1;
         for c in cands {
             let m = [
-                ((c[0] as i32 + 2) >> 2).clamp(int_min[0], int_max[0]),
-                ((c[1] as i32 + 2) >> 2).clamp(int_min[1], int_max[1]),
+                ((c[0] as i32 + 2) >> 2).clamp(fp.lo[0], fp.hi[0]),
+                ((c[1] as i32 + 2) >> 2).clamp(fp.lo[1], fp.hi[1]),
             ];
             if n < pts.len() && !pts[..n].contains(&m) {
                 pts[n] = m;
                 n += 1;
             }
         }
-        take(&pts[..n], &mut best, &mut best_cost);
+        // Zero and the candidates, four at a time; padding repeats the zero vector, already
+        // measured, which cannot win again.
+        for c in (0..n).step_by(4) {
+            let at = |k: usize| pts[if c + k < n { c + k } else { 0 }];
+            fp.take([at(0), at(1), at(2), at(3)]);
+        }
         // Hexagon of radius 2 in circular order: after a step toward point `d` only the three
-        // points around it are new (`x264` `hex2`).
+        // points around it are new, taken in this order (`x264` `hex2`).
         const HEX: [[i32; 2]; 6] = [[-2, 0], [-1, 2], [1, 2], [2, 0], [1, -2], [-1, -2]];
-        let mut dir: Option<usize> = None;
-        for _ in 0..range / 2 {
-            let from = best;
-            let mut idx = [0usize; 6];
-            let mut n = 0;
-            for (k, h) in HEX.iter().enumerate() {
-                if let Some(d) = dir
-                    && (k + 6 - d) % 6 > 1
-                    && (d + 6 - k) % 6 > 1
-                {
-                    continue;
-                }
-                let m = [from[0] + h[0], from[1] + h[1]];
-                if inside(m) {
-                    pts[n] = m;
-                    idx[n] = k;
-                    n += 1;
-                }
-            }
-            match take(&pts[..n], &mut best, &mut best_cost) {
-                Some(i) => dir = Some(idx[i]),
-                None => break,
-            }
+        const NEXT: [[usize; 3]; 6] = [
+            [0, 1, 5],
+            [0, 1, 2],
+            [1, 2, 3],
+            [2, 3, 4],
+            [3, 4, 5],
+            [0, 4, 5],
+        ];
+        let mut dir = None;
+        if range >= 2 {
+            let from = fp.best;
+            let p = HEX.map(|d| fp.at(from, d));
+            let a = fp.take([p[0], p[1], p[2], p[3]]);
+            let b = fp.take([p[4], p[5], from, from]);
+            dir = b.map(|k| k + 4).or(a);
         }
-        let from = best;
-        let mut n = 0;
-        for d in [
-            [-1, -1],
-            [0, -1],
-            [1, -1],
-            [-1, 0],
-            [1, 0],
-            [-1, 1],
-            [0, 1],
-            [1, 1],
-        ] {
-            let m = [from[0] + d[0], from[1] + d[1]];
-            if inside(m) {
-                pts[n] = m;
-                n += 1;
-            }
+        for _ in 1..range / 2 {
+            let Some(d) = dir else { break };
+            let from = fp.best;
+            let ks = NEXT[d];
+            let p = ks.map(|k| fp.at(from, HEX[k]));
+            dir = fp.take([p[0], p[1], p[2], from]).map(|i| ks[i]);
         }
-        take(&pts[..n], &mut best, &mut best_cost);
-        self.refine_wh::<W, H>([best[0] * 4, best[1] * 4], best_cost, qpel)
+        let from = fp.best;
+        let sq = |d: [[i32; 2]; 4]| d.map(|d| fp.at(from, d));
+        let (a, b) = (
+            sq([[-1, -1], [0, -1], [1, -1], [-1, 0]]),
+            sq([[1, 0], [-1, 1], [0, 1], [1, 1]]),
+        );
+        fp.take(a);
+        fp.take(b);
+        let (best, best_cost) = (fp.best, fp.best_cost);
+        self.refine(&k, [best[0] * 4, best[1] * 4], best_cost, qpel)
     }
 
     /// Sub-pel refinement around full-pel `start` (quarter-pel units) whose SAD cost is
     /// `start_cost`: the predictor at its sub-pel position and a half-pel diamond by SAD (`x264`
-    /// `refine_subpel` at subme 2), then a quarter-pel diamond by SATD, which `x264` leaves to
-    /// the partitions it picks but which pays here on every candidate partition.
-    #[inline(always)]
-    fn refine_wh<const W: usize, const H: usize>(
-        &self,
-        start: [i32; 2],
-        start_cost: u32,
-        qpel: i32,
-    ) -> MeResult {
+    /// `refine_subpel` at subme 2), then quarter-pel diamonds by SATD, which `x264` leaves to
+    /// the partitions it picks but which pay here on every candidate partition.
+    fn refine(&self, k: &Kernels, start: [i32; 2], start_cost: u32, qpel: i32) -> MeResult {
         let (x0, y0) = (self.x0, self.y0);
         let mut best = start;
         let mut best_cost = start_cost;
@@ -452,7 +639,7 @@ impl PartSearch<'_> {
         // subme below 3).
         let mvp = [self.mvp[0] as i32, self.mvp[1] as i32];
         if mvp != best && self.bounds.clamp(mvp) == mvp {
-            let cost = self.rl.cost(self.src, x0, y0, W, H, mvp, false) + self.mv_cost(mvp);
+            let cost = self.cost(k, mvp, false) + self.mv_cost(mvp);
             if cost < best_cost {
                 best_cost = cost;
                 best = mvp;
@@ -475,22 +662,23 @@ impl PartSearch<'_> {
                 );
                 let (h, v) = (&hp.h.buf[..], &hp.v.buf[..]);
                 let refs = [&v[o - s..], &h[o - 1..], &h[o..], &v[o..]];
-                let sads = pixel_sad_x4_wxh::<W, H>(self.src, 16, refs, s);
-                for (k, d) in DIRS.iter().enumerate() {
+                // Safety: the kernels are those `Kernels::get` chose for the CPU.
+                let sads = unsafe { (k.sad4r)(self.src, 16, refs, s) };
+                for (i, d) in DIRS.iter().enumerate() {
                     let mv = [from[0] + d[0], from[1] + d[1]];
-                    let cost = sads[k] + self.mv_cost(mv);
+                    let cost = sads[i] + self.mv_cost(mv);
                     if cost < best_cost {
                         best_cost = cost;
                         best = mv;
                     }
                 }
             } else {
-                for (k, d) in DIRS.iter().enumerate() {
-                    if !inb[k] {
+                for (i, d) in DIRS.iter().enumerate() {
+                    if !inb[i] {
                         continue;
                     }
                     let mv = [from[0] + d[0], from[1] + d[1]];
-                    let cost = self.rl.cost(self.src, x0, y0, W, H, mv, false) + self.mv_cost(mv);
+                    let cost = self.cost(k, mv, false) + self.mv_cost(mv);
                     if cost < best_cost {
                         best_cost = cost;
                         best = mv;
@@ -498,8 +686,9 @@ impl PartSearch<'_> {
                 }
             }
         }
-        let best_satd = self.rl.cost(self.src, x0, y0, W, H, best, true);
-        self.refine_qpel_wh::<W, H>(
+        let best_satd = self.cost(k, best, true);
+        self.refine_qpel_k(
+            k,
             MeResult {
                 mv: [best[0] as i16, best[1] as i16],
                 satd: best_satd,
@@ -511,17 +700,10 @@ impl PartSearch<'_> {
 
     /// Quarter-pel diamonds by SATD around `m`, at most `iters` (`x264_me_refine_qpel`).
     pub(super) fn refine_qpel(&self, m: MeResult, iters: i32) -> MeResult {
-        match (self.w, self.h) {
-            (16, 16) => self.refine_qpel_wh::<16, 16>(m, iters),
-            (16, 8) => self.refine_qpel_wh::<16, 8>(m, iters),
-            (8, 16) => self.refine_qpel_wh::<8, 16>(m, iters),
-            _ => self.refine_qpel_wh::<8, 8>(m, iters),
-        }
+        self.refine_qpel_k(&Kernels::get(self.w, self.h), m, iters)
     }
 
-    #[inline(always)]
-    fn refine_qpel_wh<const W: usize, const H: usize>(&self, m: MeResult, iters: i32) -> MeResult {
-        let (x0, y0, s) = (self.x0, self.y0, self.rl.f.stride);
+    fn refine_qpel_k(&self, k: &Kernels, m: MeResult, iters: i32) -> MeResult {
         let mut best = [m.mv[0] as i32, m.mv[1] as i32];
         let mut best_satd = m.satd;
         let mut best_cost = m.satd + self.mv_cost(best);
@@ -534,12 +716,7 @@ impl PartSearch<'_> {
                 if Some(mv) == prev || self.bounds.clamp(mv) != mv {
                     continue;
                 }
-                let satd = match self.rl.src(x0, y0, mv) {
-                    (a, None, [pa, _]) => pixel_satd_wxh::<W, H>(self.src, 16, &pa[a..], s, None),
-                    (a, Some(b), [pa, pb]) => {
-                        pixel_satd_wxh::<W, H>(self.src, 16, &pa[a..], s, Some((&pb[b..], s)))
-                    }
-                };
+                let satd = self.cost(k, mv, true);
                 let cost = satd + self.mv_cost(mv);
                 if cost < best_cost {
                     best_cost = cost;

@@ -7,6 +7,31 @@
 //! planes padded by edge replication, so motion search and compensation of the next frame read
 //! reference samples without clamping.
 
+/// Defines method `$name`, which runs `$body` out of line (keeping the code of the callers
+/// small enough for the instruction cache), through its copy `$v3` compiled for x86-64-v3 when
+/// [`v3`] holds, like the frame coder.
+macro_rules! out_of_line_v3 {
+    ($vis:vis fn $name:ident / $v3:ident => $body:ident (&mut self $(, $a:ident : $t:ty)* $(,)?) $(-> $r:ty)?) => {
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        $vis fn $name(&mut self $(, $a: $t)*) $(-> $r)? {
+            #[cfg(target_arch = "x86_64")]
+            if super::v3() {
+                // Safety: the CPU supports every feature the copy is compiled for.
+                return unsafe { self.$v3($($a),*) };
+            }
+            self.$body($($a),*)
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $v3(&mut self $(, $a: $t)*) $(-> $r)? {
+            self.$body($($a),*)
+        }
+    };
+}
+
 mod bpic;
 mod compact;
 mod inter;
@@ -2432,6 +2457,23 @@ impl H264Encoder {
     fn lowres_motion(&self, b: u32, r: u32) -> Option<Vec<[i16; 2]>> {
         let f = self.sched.la.frames.iter().find(|f| f.disp == b)?;
         f.motion(r).map(|m| m.to_vec())
+    }
+}
+
+/// Whether the x86-64-v3 copies of the frame coder and of the motion searches run: `AVX2` is
+/// enabled and the CPU has the scalar extensions of x86-64-v3 beside it. Checked once.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(super) fn v3() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static V3: AtomicU8 = AtomicU8::new(0);
+    match V3.load(Ordering::Relaxed) {
+        0 => {
+            let v = ragdoll_core::dispatch::avx2() && x86_v3();
+            V3.store(1 + v as u8, Ordering::Relaxed);
+            v
+        }
+        s => s == 2,
     }
 }
 

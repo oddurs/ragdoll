@@ -27,6 +27,12 @@ impl Quad {
     }
 }
 
+/// `n`, opaque to the optimizer so that a loop up to it stays rolled.
+#[inline(always)]
+pub(super) fn rolled(n: usize) -> usize {
+    std::hint::black_box(n)
+}
+
 /// Partitioning of an inter macroblock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Shape {
@@ -174,7 +180,7 @@ impl EncState {
 
     /// Motion vector predictor of list `l` for partition `p` of `shape` in macroblock
     /// `(mb_x, mb_y)`, from the grids as they stand.
-    #[inline(always)]
+    #[inline(never)]
     pub(super) fn mvp_part(
         &self,
         l: usize,
@@ -219,7 +225,7 @@ impl EncState {
 
     /// Motion compensation of `mb` into `py`, `pu` and `pv` from the references of both lists.
     #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
+    #[inline(never)]
     pub(super) fn predict_inter(
         refs: [(RefLuma, &Pic); 2],
         mb_x: usize,
@@ -283,7 +289,8 @@ impl EncState {
     /// prediction in `py`, `pu` and `pv`, and stores its motion.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    pub(super) fn code_inter_p(
+    #[allow(clippy::too_many_arguments)]
+    fn code_inter_p_body(
         &mut self,
         sl: &mut SliceState,
         w: &mut Bits,
@@ -423,13 +430,72 @@ impl EncState {
         self.cur.store_mb(mb_x, mb_y, py, pu, pv);
     }
 
+    out_of_line_v3!(pub(super) fn code_p_mb_compact / code_p_mb_v3 => code_p_mb_body(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+    ));
+
+    out_of_line_v3!(fn code_i16_p / code_i16_p_v3 => code_i16(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        mode: u8,
+    ));
+
+    out_of_line_v3!(fn code_i4_p / code_i4_p_v3 => code_i4(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        i4: I4Choice,
+    ));
+
+    out_of_line_v3!(fn analyse_i4_p / analyse_i4_p_v3 => analyse_i4(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        src: &MbSrc,
+        budget: u32,
+    ) -> Option<I4Choice>);
+
+    out_of_line_v3!(pub(super) fn code_inter_p / code_inter_p_v3 => code_inter_p_body(
+        &mut self,
+        sl: &mut SliceState,
+        w: &mut Bits,
+        cabac: &mut Cabac,
+        mb_x: usize,
+        mb_y: usize,
+        qp: u8,
+        mb: &InterMb,
+        res: &InterResidual,
+        py: &mut [u8; 256],
+        pu: &mut [u8; 64],
+        pv: &mut [u8; 64],
+    ));
+
     /// Analyses and codes one macroblock of a P slice with the Compact preset: `P_Skip` probe,
     /// $16\times16$ motion search, then $8\times8$, $16\times8$ and $8\times16$ partitions when
     /// they promise to pay (`x264_mb_analyse_inter_p8x8` and following), intra $16\times16$, and
     /// the transform size by SA8D against SATD (`x264_mb_analyse_transform`).
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    pub(super) fn code_p_mb_compact(
+    #[allow(clippy::too_many_arguments)]
+    fn code_p_mb_body(
         &mut self,
         sl: &mut SliceState,
         w: &mut Bits,
@@ -585,7 +651,7 @@ impl EncState {
         if best_cost > lambda * P8X8_GATE {
             let mut m8 = [m16; 4];
             let mut cands8 = [m16.mv; 5];
-            for i in 0..4 {
+            for i in 0..rolled(4) {
                 let (bx, by) = ((i & 1) * 2, (i >> 1) * 2);
                 let mvp8 = self.mvp_part(0, mb_x, mb_y, Shape::S8x8, i, 0);
                 m8[i] = me(bx * 4, by * 4, 8, 8, mvp8, &cands8[..i + 1]);
@@ -618,6 +684,22 @@ impl EncState {
                         let c = [m16.mv, m8[qa].mv, m8[qb].mv];
                         mp[p] = me(bx * 4, by * 4, w4 * 4, h4 * 4, mvpp, &c);
                         total += mp[p].cost();
+                        // The first partition and the second's estimate from its 8x8 blocks
+                        // already lose (`x264_mb_analyse_inter_p16x8`).
+                        if p == 0 {
+                            let (a, b) = if shape == Shape::S16x8 {
+                                (2, 3)
+                            } else {
+                                (1, 3)
+                            };
+                            let est = m8[a].satd
+                                + m8[b].satd
+                                + (m8[a].mv_cost + m8[b].mv_cost).div_ceil(2);
+                            if total + est > best_cost {
+                                total = u32::MAX;
+                                break;
+                            }
+                        }
                         let (gx, gy) = (gx0 + bx, gy0 + by);
                         fill_grid_4x4(&mut self.ref_grid, g_stride, gx, gy, w4, h4, 0);
                         fill_grid_4x4(&mut self.mv_grid, g_stride, gx, gy, w4, h4, mp[p].mv);
@@ -663,15 +745,15 @@ impl EncState {
         // Intra 4x4 when intra 16x16 comes close (`x264` `mb_analyse_intra` thresholds).
         if i16_cost.min(best_cost) > lambda * 40
             && i16_cost * 2 < best_cost * 3
-            && let Some(i4) = self.analyse_i4(mb_x, mb_y, qp, src, i16_cost.min(best_cost))
+            && let Some(i4) = self.analyse_i4_p(mb_x, mb_y, qp, src, i16_cost.min(best_cost))
         {
             self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
-            self.code_i4(sl, w, cabac, mb_x, mb_y, qp, src, i4);
+            self.code_i4_p(sl, w, cabac, mb_x, mb_y, qp, src, i4);
             return;
         }
         if i16_cost < best_cost {
             self.begin_coded_mb(sl, w, cabac, mb_x, mb_y);
-            self.code_i16(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
+            self.code_i16_p(sl, w, cabac, mb_x, mb_y, qp, src, i16_mode);
             return;
         }
 

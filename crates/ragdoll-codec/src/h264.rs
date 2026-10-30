@@ -60,9 +60,10 @@ pub enum H264Speed {
     /// Compression first, like `x264 --preset veryfast`: partitions down to $8\times8$ searched
     /// by hexagon and refined to quarter samples by SATD, the transform size chosen per
     /// macroblock and, with CABAC (`Main` and `High`), up to three B pictures between anchors,
-    /// placed by a half-resolution lookahead, the middle one a reference. Smaller than `x264`
-    /// veryfast at equal PSNR on the clips measured for `SIMD-0089`, as fast on 720p video and
-    /// up to a quarter slower on detailed motion. B pictures pay over long GOPs (`x264` uses a
+    /// placed by a half-resolution lookahead, the middle one a reference; chroma one quantizer
+    /// step coarser than luma. Smaller than `x264` veryfast at equal PSNR (luma and average) on
+    /// the clips measured for `SIMD-0089`, slightly faster on 720p video and up to a fifth
+    /// slower on detailed motion. B pictures pay over long GOPs (`x264` uses a
     /// keyint of 250). Frames wait for their anchor: see [`H264Encoder::encode_frame`] and
     /// [`H264Encoder::flush`].
     Compact,
@@ -3077,9 +3078,18 @@ impl H264Encoder {
         }
     }
 
-    /// Signals the output delay of B pictures in the SPS (`max_num_reorder_frames`), and the
-    /// third reference picture of a pyramid.
+    /// Signals the output delay of B pictures in the SPS (`max_num_reorder_frames`) and the
+    /// third reference picture of a pyramid, and sets the preset's chroma quantizer offset.
     fn sync_reorder(&mut self) {
+        // Compact moves chroma one quantizer step coarser: the bits buy more luma PSNR than they
+        // cost chroma on the clips measured for `SIMD-0089`.
+        let cqo = if self.speed == H264Speed::Compact {
+            1
+        } else {
+            0
+        };
+        self.pps.chroma_qp_index_offset = cqo;
+        self.pps.second_chroma_qp_index_offset = cqo;
         let b = self.b_frames();
         let pyramid = b >= 2;
         self.sps.max_num_reorder_frames = (b > 0).then_some(if pyramid { 2 } else { 1 });
@@ -3118,6 +3128,7 @@ impl H264Encoder {
             }
         }
         self.pps = Pps::new_profile(self.qp, self.profile);
+        self.sync_reorder();
         self
     }
 

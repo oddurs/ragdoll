@@ -4,7 +4,7 @@
 //! `slicetype.c`).
 
 use super::*;
-use ragdoll_simd::{downscale_2x_row, pixel_sad_x4_wxh, pixel_satd_wxh};
+use ragdoll_simd::{downscale_2x_row, pixel_sad_x4_wxh_at, pixel_satd_wxh};
 
 /// Padding of a half-resolution plane: the search moves an $8\times8$ block at most
 /// [`LA_RANGE`] samples past the picture edge.
@@ -153,12 +153,9 @@ impl BlockSearch<'_> {
     /// by one already measured, which then cannot win.
     #[inline(always)]
     fn take(&mut self, pts: [[i32; 2]; 4]) -> Option<usize> {
-        let sads = pixel_sad_x4_wxh::<8, 8>(
-            self.src,
-            self.ps,
-            pts.map(|m| self.blk(m)),
-            self.qs as usize,
-        );
+        let off = |m: [i32; 2]| (self.base + m[1] as isize * self.qs + m[0] as isize) as usize;
+        let sads =
+            pixel_sad_x4_wxh_at::<8, 8>(self.src, self.ps, self.q, pts.map(off), self.qs as usize);
         let mut moved = None;
         for k in 0..4 {
             let cost = sads[k] + self.mvc(pts[k]);
@@ -176,6 +173,23 @@ impl BlockSearch<'_> {
 /// right of and below a block seed its search (`x264_slicetype_mb_cost`); returns the vectors
 /// and their costs.
 fn search(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if super::v3() {
+        // Safety: the CPU supports every feature the copy is compiled for.
+        return unsafe { search_v3(f, r) };
+    }
+    search_body(f, r)
+}
+
+/// [`search`] compiled for x86-64-v3, like the frame coder.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn search_v3(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
+    search_body(f, r)
+}
+
+#[inline(always)]
+fn search_body(f: &Lowres, r: &Lowres) -> (Vec<[i16; 2]>, Vec<u32>) {
     let (p, q) = (&f.plane, &r.plane);
     let (bw, bh) = (p.w / 8, p.h / 8);
     let (ps, qs) = (p.stride, q.stride as isize);
