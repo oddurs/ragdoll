@@ -230,6 +230,47 @@ pub fn pixel_sad_x4_wxh<const W: usize, const H: usize>(
     pixel_sad_x4_wxh_scalar::<W, H>(src, ss, refs, rs)
 }
 
+/// [`pixel_sad_x4_wxh`] of the four blocks of `plane` at offsets `offs` (stride `rs`), the
+/// bounds checked once for all of them, as a motion search measures points of one window.
+///
+/// # Panics
+/// As [`pixel_sad_x4_wxh`].
+#[inline(always)]
+pub fn pixel_sad_x4_wxh_at<const W: usize, const H: usize>(
+    src: &[u8],
+    ss: usize,
+    plane: &[u8],
+    offs: [usize; 4],
+    rs: usize,
+) -> [u32; 4] {
+    check::<W, H>(src, ss);
+    let far = offs[0].max(offs[1]).max(offs[2].max(offs[3]));
+    assert!((W == 8 || W == 16) && (H == 8 || H == 16));
+    assert!(far <= plane.len() && (H - 1) * rs + W <= plane.len() - far);
+    #[cfg(target_arch = "aarch64")]
+    if ragdoll_core::dispatch::neon() {
+        // Safety: bounds checked above; NEON is baseline on aarch64.
+        return offs.map(|o| unsafe {
+            neon::sad::<W, H, false>(
+                src.as_ptr(),
+                ss,
+                plane.as_ptr().add(o),
+                rs,
+                src.as_ptr(),
+                ss,
+            )
+        });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ragdoll_core::dispatch::avx2() {
+        // Safety: bounds checked above; avx2() is true only when the CPU supports AVX2.
+        return unsafe {
+            x86::sad_x4::<W, H>(src.as_ptr(), ss, offs.map(|o| plane.as_ptr().add(o)), rs)
+        };
+    }
+    pixel_sad_x4_wxh_scalar::<W, H>(src, ss, offs.map(|o| &plane[o..]), rs)
+}
+
 /// Scalar reference for [`pixel_sad_x4_wxh`].
 pub fn pixel_sad_x4_wxh_scalar<const W: usize, const H: usize>(
     src: &[u8],
@@ -376,6 +417,7 @@ mod x86 {
     }
 
     /// SAD of `W`x`H` blocks `p` and `a` (or the average of `a` and `b` with `AVG`).
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn sad<const W: usize, const H: usize, const AVG: bool>(
         p: *const u8,
@@ -405,6 +447,7 @@ mod x86 {
     }
 
     /// [`sad`] of one source block against four blocks of one plane.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn sad_x4<const W: usize, const H: usize>(
         p: *const u8,
@@ -464,6 +507,7 @@ mod x86 {
 
     /// SATD of `W`x`H` blocks `p` and `a` (or the average of `a` and `b` with `AVG`): four
     /// $4\times4$ blocks per pass, one row of each per register.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn satd<const W: usize, const H: usize, const AVG: bool>(
         p: *const u8,
@@ -533,6 +577,7 @@ mod x86 {
     }
 
     /// `(a + b + 1) >> 1` of `W`x`H` blocks into `d`.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn avg<const W: usize, const H: usize>(
         d: *mut u8,
@@ -603,6 +648,7 @@ mod x86 {
 
     /// SA8D of $16\times16$ blocks: the left and right $8\times8$ blocks of eight rows side by
     /// side in the two lanes, a row per register.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn sa8d_16x16(a: *const u8, sa: usize, b: *const u8, sb: usize) -> u32 {
         unsafe {
@@ -847,6 +893,11 @@ mod tests {
                 assert_eq!(
                     pixel_sad_x4_wxh::<W, H>(p, pw, refs, pw),
                     pixel_sad_x4_wxh_scalar::<W, H>(p, pw, refs, pw)
+                );
+                let offs = [0, 1, pw + 3, 2 * pw + 5];
+                assert_eq!(
+                    pixel_sad_x4_wxh_at::<W, H>(p, pw, q, offs, pw),
+                    pixel_sad_x4_wxh_scalar::<W, H>(p, pw, offs.map(|o| &q[o..]), pw)
                 );
                 assert_eq!(
                     pixel_sad_avg_wxh::<W, H>(p, pw, q, pw, r, pw),
