@@ -1,7 +1,8 @@
 //! B pictures of the [`H264Speed::Compact`] preset (`SIMD-0089`): the pictures between the two
 //! latest anchors (the middle one of a group of two or more a reference for the others), with
 //! spatial direct prediction, `B_Skip`, and list 0, list 1 and bi-predicted partitions down to
-//! $8\times8$ (`x264` `mb_analyse_inter_b*`).
+//! $16\times8$ and $8\times16$, and $8\times8$ ones from one list or direct (`x264`
+//! `mb_analyse_inter_b*`).
 
 use super::compact::{
     ME_RANGE, MeResult, PartSearch, QPEL_REFINE, RefLuma, block_cost, block_satd_avg, sa8d_16x16,
@@ -19,8 +20,9 @@ fn min_positive(a: i8, b: i8) -> i8 {
 type Dir = u8;
 
 /// B macroblocks whose best 16x16 mode costs at most this many lambdas skip the 8x8
-/// partitions, which rarely pay below it on the clips measured for `SIMD-0089`.
-const B8X8_GATE: u32 = 80;
+/// partitions, which rarely pay below it on the clips measured for `SIMD-0089` (from 80:
+/// foreman -14%, park -6% instructions for +0.2..1.9% BD-rate).
+const B8X8_GATE: u32 = 300;
 
 /// `x264` `i_mb_b_cost_table` and friends: approximate bits of B macroblock and sub-macroblock
 /// types, by [`Dir`].
@@ -203,8 +205,9 @@ impl EncState {
 
     /// Analyses and codes one macroblock of a B picture: `B_Skip` when the direct prediction's
     /// residual decimates to nothing, else the cheapest by SATD and motion cost of direct, list
-    /// 0, list 1 and bi-predicted $16\times16$, the $8\times8$, $16\times8$ and $8\times16$
-    /// partitions when they promise to pay, and intra $16\times16$ (`x264` with `subme` 2).
+    /// 0, list 1 and bi-predicted $16\times16$, the $8\times8$ partitions and the better
+    /// estimated of $16\times8$ and $8\times16$ when they promise to pay, and intra
+    /// $16\times16$ (`x264` with `subme` 2).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn code_b_mb_body(
@@ -224,12 +227,12 @@ impl EncState {
         let mb_idx = mb_y * mb_w + mb_x;
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
         let bounds = MvBounds::new(x0, y0, self.refp.y.w, self.refp.y.h);
-        let lambda = LAMBDA[qp as usize] as u32;
+        let lambda = LAMBDA_COMPACT[qp as usize] as u32;
         let mut py = [0u8; 256];
         let mut pu = [0u8; 64];
         let mut pv = [0u8; 64];
 
-        self.mv_costs(qp);
+        self.mv_costs(qp, true);
         // 1. Direct prediction and the B_Skip probe.
         let dq = self.direct_motion(mb_x, mb_y, sl.b_refs[1] == RefSel::Mid);
         let direct_ok = dq
@@ -256,7 +259,7 @@ impl EncState {
         let mut direct_cost = u32::MAX;
         if direct_ok {
             Self::predict_inter(refs, mb_x, mb_y, &dq, &mut py, &mut pu, &mut pv);
-            if probe_skip_luma(src, &py, qp) && probe_skip_chroma(src, &pu, &pv, qpc) {
+            if probe_skip_luma(src, &py, qp, true) && probe_skip_chroma(src, &pu, &pv, qpc, true) {
                 for l in 0..2 {
                     self.mvr[l][mb_idx] = if dq[0].r[l] >= 0 { dq[0].mv[l] } else { [0, 0] };
                 }
@@ -273,7 +276,7 @@ impl EncState {
         let dpred = py;
 
         // 2. 16x16 motion search in each list, then bi-prediction from the two vectors.
-        let mv_costs = &self.mv_cost_tabs[qp as usize];
+        let mv_costs = &self.mv_cost_tabs[compact_costs(qp)];
         let range = ME_RANGE;
         let part =
             |l: usize, px: usize, py_: usize, w_: usize, h_: usize, mvp: [i16; 2]| PartSearch {
@@ -287,6 +290,7 @@ impl EncState {
                 lambda,
                 mv_costs,
                 bounds,
+                thorough: false,
             };
         // Loops over lists and quadrants are kept rolled (`rolled`): unrolled, a macroblock's
         // analysis runs through more code than the instruction cache holds.
@@ -386,10 +390,12 @@ impl EncState {
         let mut best_me8 = None;
         // 3. 8x8 partitions, unless the 16x16 modes already predict well: each quadrant searched
         // from the 16x16 vector in the list cheaper at 16x16, the other list keeping its 16x16
-        // vector, then the cheapest of list 0, list 1, bi-prediction and direct.
+        // vector, then the cheapest of list 0, list 1 and direct. Bi-predicted quadrants cost
+        // more time than their bits are worth (`SIMD-0089`: -2.5% instructions on park for
+        // +0.15..0.3% BD-rate).
         if best_cost > lambda * B8X8_GATE {
             let mut m8: [[MeResult; 4]; 2] = [[m16[0]; 4], [m16[1]; 4]];
-            let mut satd8 = [[0u32; 4]; 3];
+            let mut satd8 = [[0u32; 4]; 2];
             let mut dir8 = [0 as Dir; 4];
             let mut q8 = [Quad::default(); 4];
             let mut cost8 = lambda * 9;
@@ -429,17 +435,9 @@ impl EncState {
                     satd8[l][i] = m8[l][i].satd;
                 }
                 let v = [m8[0][i].mv, m8[1][i].mv];
-                satd8[2][i] = bi_satd(v, bx * 4, by * 4, 8, 8);
                 let mut c = (m8[0][i].cost() + lambda * TYPE_BITS_SUB[1], 1 as Dir);
                 for (cc, d) in [
                     (m8[1][i].cost() + lambda * TYPE_BITS_SUB[2], 2),
-                    (
-                        satd8[2][i]
-                            + m8[0][i].mv_cost
-                            + m8[1][i].mv_cost
-                            + lambda * TYPE_BITS_SUB[3],
-                        3,
-                    ),
                     (direct8[i].saturating_add(lambda * TYPE_BITS_SUB[0]), 0),
                 ] {
                     if cc < c.0 {
@@ -472,8 +470,9 @@ impl EncState {
                 best_me8 = Some(m8);
             }
 
-            // 16x8 and 8x16, when their cost estimated from the 8x8 SATDs promises to pay, the
-            // better estimate first (`x264` `mb_analyse_inter_b16x8`).
+            // 16x8 or 8x16, whichever the 8x8 SATDs estimate cheaper, when that estimate promises
+            // to pay (`x264` `mb_analyse_inter_b16x8`, which may try both: the second costs more
+            // time than its bits are worth, `SIMD-0089`).
             let estimate = |shape: Shape| {
                 let pair = |p: usize| {
                     if shape == Shape::S16x8 {
@@ -488,13 +487,9 @@ impl EncState {
                     let (a, b) = pair(p);
                     let mvc = |l: usize| (m8[l][a].mv_cost + m8[l][b].mv_cost).div_ceil(2);
                     let mut e = (satd8[0][a] + satd8[0][b] + mvc(0), 1);
-                    for (c, d) in [
-                        (satd8[1][a] + satd8[1][b] + mvc(1), 2),
-                        (satd8[2][a] + satd8[2][b] + mvc(0) + mvc(1), 3),
-                    ] {
-                        if c < e.0 {
-                            e = (c, d);
-                        }
+                    let c = satd8[1][a] + satd8[1][b] + mvc(1);
+                    if c < e.0 {
+                        e = (c, 2);
                     }
                     pest[p] = e.0;
                     dest[p] = e.1;
@@ -503,12 +498,12 @@ impl EncState {
                 pest
             };
             let ests = [Shape::S16x8, Shape::S8x16].map(|sh| (sh, estimate(sh)));
-            let order = if ests[1].1[0] + ests[1].1[1] < ests[0].1[0] + ests[0].1[1] {
-                [ests[1], ests[0]]
+            let (shape, pest) = if ests[1].1[0] + ests[1].1[1] < ests[0].1[0] + ests[0].1[1] {
+                ests[1]
             } else {
-                ests
+                ests[0]
             };
-            for (shape, pest) in order {
+            if pest[0] + pest[1] < best_cost {
                 let pair = |p: usize| {
                     if shape == Shape::S16x8 {
                         (2 * p, 2 * p + 1)
@@ -516,9 +511,6 @@ impl EncState {
                         (p, p + 2)
                     }
                 };
-                if pest[0] + pest[1] >= best_cost {
-                    continue;
-                }
                 let mut total = 0;
                 let mut dirs = [0 as Dir; 2];
                 let mut vs = [[[0i16; 2]; 2]; 2];
@@ -587,7 +579,9 @@ impl EncState {
 
         // Quarter-pel refinement of the vectors of the mode chosen, list by list and partition
         // by partition as they are written, each list's vector by its own SATD.
-        let qref = QPEL_REFINE;
+        // One diamond here, as `x264` subme 2's `x264_me_refine_qpel`: the second that P
+        // pictures take costs B pictures more time than its bits are worth (`SIMD-0089`).
+        let qref = QPEL_REFINE - 1;
         if !(best.shape == Shape::S16x16 && best.dir[0] == 0) {
             for l in 0..rolled(2) {
                 for (p, &(bx, by, w4, h4)) in best.shape.parts().iter().enumerate() {
@@ -650,19 +644,23 @@ impl EncState {
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
-        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4, true);
         res.cbp_luma = cbp4;
         let q8_store;
         if sl.t8x8
             && cbp4 != 0
             && sa8d_16x16(&src.y, 16, &py, 16) < pixel_satd_16x16(&src.y, 16, &py, 16)
         {
-            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
+            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp, true);
             q8_store = q8;
             res.luma_q8 = Some(&q8_store);
             res.cbp_luma = cbp8;
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
+        // Trailing chroma levels that do not pay are dropped by their CABAC rate. Luma levels
+        // are left alone: dropping them as well gains about 1% BD-rate but codes ~0.4 dB less
+        // luma PSNR at a QP (`SIMD-0089`).
+        let rdo = cabac.as_ref().map(|(_, ctxs)| &ctxs[..]);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, true, rdo);
         res.cbp_chroma = res.chroma.cbp();
         if best.shape == Shape::S16x16
             && best.dir[0] == 0

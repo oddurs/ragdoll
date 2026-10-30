@@ -65,6 +65,30 @@ const LAMBDA: [u16; 52] = [
     10, 11, 13, 14, 16, 18, 20, 23, 25, 29, 32, 36, 40, 45, 51, 57, 64, 72, 81, 91,
 ];
 
+/// The Compact preset's Lagrangian multipliers: four fifths of [`LAMBDA`], at least 1. Rounding
+/// inter residuals finely (`SliceState::fine_quant`) makes their bits cheaper next to motion and
+/// mode bits than `x264`'s deadzone does, and the lower multiplier pays on the clips measured
+/// for `SIMD-0089` (most on synthetic 720p video, -1% BD-rate).
+const LAMBDA_COMPACT: [u16; 52] = {
+    let mut t = [0u16; 52];
+    let mut i = 0;
+    while i < 52 {
+        t[i] = if LAMBDA[i] * 4 / 5 > 1 {
+            LAMBDA[i] * 4 / 5
+        } else {
+            1
+        };
+        i += 1;
+    }
+    t
+};
+
+/// Index of the Compact preset's motion vector costs at `qp` in `EncState::mv_cost_tabs`.
+#[inline(always)]
+fn compact_costs(qp: u8) -> usize {
+    52 + qp as usize
+}
+
 /// Coefficient decimation weights by preceding zero run (`x264_decimate_table4/8`).
 const DECIMATE4: [u8; 16] = [3, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const DECIMATE8: [u8; 64] = [
@@ -245,20 +269,28 @@ pub(super) struct EncState {
     /// The lookahead's half-resolution vectors of the picture being coded against its list 0
     /// and list 1 references, one per macroblock (Compact preset).
     la_mv: [Option<Vec<[i16; 2]>>; 2],
-    /// Motion vector costs by QP (see [`EncState::mv_costs`]), built on first use.
+    /// Motion vector costs by QP (see [`EncState::mv_costs`]), built on first use; the Compact
+    /// preset's from index [`compact_costs`].
     mv_cost_tabs: Vec<Vec<u16>>,
 }
 
 impl EncState {
-    /// `LAMBDA[qp]` times the bits of a motion vector difference component `d`, at index
-    /// `d + MV_COST_RANGE`, for `|d| <= MV_COST_RANGE` (`x264` `p_cost_mv`).
-    fn mv_costs(&mut self, qp: u8) -> &[u16] {
-        if self.mv_cost_tabs.len() <= qp as usize {
-            self.mv_cost_tabs.resize(qp as usize + 1, Vec::new());
+    /// `LAMBDA[qp]` (`LAMBDA_COMPACT[qp]` with `compact`) times the bits of a motion vector
+    /// difference component `d`, at index `d + MV_COST_RANGE`, for `|d| <= MV_COST_RANGE`
+    /// (`x264` `p_cost_mv`).
+    fn mv_costs(&mut self, qp: u8, compact: bool) -> &[u16] {
+        let slot = if compact {
+            compact_costs(qp)
+        } else {
+            qp as usize
+        };
+        if self.mv_cost_tabs.len() <= slot {
+            self.mv_cost_tabs.resize(slot + 1, Vec::new());
         }
-        let t = &mut self.mv_cost_tabs[qp as usize];
+        let t = &mut self.mv_cost_tabs[slot];
         if t.is_empty() {
-            let lambda = LAMBDA[qp as usize] as u32;
+            let table = if compact { &LAMBDA_COMPACT } else { &LAMBDA };
+            let lambda = table[qp as usize] as u32;
             *t = (-MV_COST_RANGE..=MV_COST_RANGE)
                 .map(|d| (lambda * se_bits(d)) as u16)
                 .collect();
@@ -480,6 +512,8 @@ struct SliceState {
     cur_qp: i32,
     prev_qp_delta_nz: bool,
     skip_bounds: SkipBounds,
+    /// Inter residuals round like intra ones (`f = 2^qbits / 3`): the Compact preset.
+    fine_quant: bool,
 }
 
 /// Column and row of $4\times4$ block `b` (decoding order) in its macroblock.
@@ -563,6 +597,60 @@ fn decimate_masked(scanned: &[i16], mask: u32) -> u32 {
         score += DECIMATE4[(p - below - 1) as usize] as u32;
     }
     score
+}
+
+/// Rate weight of [`rdo_trailing_ac`] in 1/256 per 1/256 bit: `x264`'s `lambda2`
+/// ($0.85 \cdot 2^{(QP-12)/3}$) over the squared quantizer step ($0.625 \cdot 2^{QP/6}$), which
+/// is $0.136$ at every QP.
+const RDO_LAMBDA: i64 = 35;
+
+/// Drops the trailing levels of magnitude 1 of a chroma AC block whose bits cost more than the
+/// distortion they remove, the cheap end of `x264_quant_*_trellis`: `lv` holds the levels and
+/// `c` the coefficients (raster order) of quantizer `q`, so `|c| mf / 2^shift` is a coefficient
+/// in quantizer steps and dropping a level of 1 adds `2 |c| mf / 2^shift - 1` squared steps.
+/// The bits saved (significance and last flags, the first level bin, the sign, the zero flags
+/// before it and the new last flag) come from the CABAC states `ctxs` (category 4, 9.3.3.1.3).
+#[inline(always)]
+fn rdo_trailing_ac(lv: &mut [i16; 16], c: &[i16; 16], q: &Quant4x4, ctxs: &[CabacContext]) {
+    const SIG: usize = 152;
+    const LAST: usize = 213;
+    const LEVEL: usize = 266;
+    // The AC positions in coding order; the DC slot is coded with the 2x2 DC transform.
+    let scan = &ZIGZAG_4X4[1..];
+    let n = scan.len();
+    let Some(mut last) = scan.iter().rposition(|&r| lv[r] != 0) else {
+        return;
+    };
+    while lv[scan[last]].unsigned_abs() == 1 {
+        let prev = scan[..last].iter().rposition(|&r| lv[r] != 0);
+        // The first level bin coded (in reverse) and the sign.
+        let mut rate = ctxs[LEVEL + 1].cost(0) as i64 + 256;
+        if last < n - 1 {
+            rate += (ctxs[SIG + last].cost(1) + ctxs[LAST + last].cost(1)) as i64;
+        }
+        match prev {
+            Some(p) => {
+                for j in p + 1..last {
+                    rate += ctxs[SIG + j].cost(0) as i64;
+                }
+                let lc = ctxs[LAST + p];
+                rate += lc.cost(0) as i64 - lc.cost(1) as i64;
+            }
+            // The block's coded_block_flag, about a bit.
+            None => rate += 256,
+        }
+        let r = scan[last];
+        let a = c[r].unsigned_abs() as i64 * q.mf[r] as i64;
+        let dist = 2 * a - (1i64 << q.shift);
+        if dist * 65536 >= RDO_LAMBDA * rate * (1i64 << q.shift) {
+            return;
+        }
+        lv[r] = 0;
+        match prev {
+            Some(p) => last = p,
+            None => return,
+        }
+    }
 }
 
 #[inline(always)]
@@ -1718,9 +1806,15 @@ fn group4(blocks: &mut [[i16; 16]; 16], i8x8: usize) -> &mut [[i16; 16]; 4] {
 /// Quantizes the luma residual with $4\times4$ transforms and decimates nearly empty $8\times8$
 /// blocks; returns the levels and the coded block pattern.
 #[inline(always)]
-fn quant_luma_4x4_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8, q4: &mut [[i16; 16]; 16]) -> u8 {
+fn quant_luma_4x4_inter(
+    src: &[u8; 256],
+    pred: &[u8; 256],
+    qp: u8,
+    q4: &mut [[i16; 16]; 16],
+    fine: bool,
+) -> u8 {
     dct_luma(src, pred, q4);
-    let q = quant4(qp, false);
+    let q = quant4(qp, fine);
     let mut cbp = 0u8;
     let mut total = 0u32;
     for i8x8 in 0..4 {
@@ -1807,6 +1901,7 @@ fn quant_chroma(
     pv: &[u8; 64],
     qpc: u8,
     intra: bool,
+    rdo: Option<&[CabacContext]>,
     out: &mut ChromaLevels,
 ) {
     let q = quant4(qpc, intra);
@@ -1814,7 +1909,13 @@ fn quant_chroma(
         let mut c = [[0i16; 16]; 4];
         sub_dct4x4_8x8(s, 8, pred, 8, &mut c);
         let dc_raw = [c[0][0], c[1][0], c[2][0], c[3][0]];
+        let raw = c;
         if quant_4x4_x4(&mut c, q) != 0 {
+            if let Some(ctxs) = rdo {
+                for (lv, r) in c.iter_mut().zip(&raw) {
+                    rdo_trailing_ac(lv, r, q, ctxs);
+                }
+            }
             let zz = zigzag_4x4_x4(&c);
             // Bit 0 is the block's DC slot, which the 2x2 DC transform codes instead.
             out.ac_masks[p] = nonzero_mask_4x4_x4(&zz).map(|m| m >> 1);
@@ -1913,14 +2014,19 @@ fn recon_chroma(
 }
 
 /// $8\times8$-transform counterpart of [`quant_luma_4x4_inter`].
-fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64]; 4], u8, u32) {
+fn quant_luma_8x8_inter(
+    src: &[u8; 256],
+    pred: &[u8; 256],
+    qp: u8,
+    fine: bool,
+) -> ([[i16; 64]; 4], u8, u32) {
     let mut q8 = [[0i16; 64]; 4];
     let mut cbp = 0u8;
     let mut total = 0u32;
     for (i8x8, slot) in q8.iter_mut().enumerate() {
         let o = (i8x8 >> 1) * 128 + (i8x8 & 1) * 8;
         let dct = sub8x8_dct_u8(&src[o..], 16, &pred[o..], 16);
-        let q = quantize_block8x8(&dct, qp, false);
+        let q = quantize_block8x8(&dct, qp, fine);
         if q.iter().any(|&c| c != 0) {
             let score = decimate_score(&zigzag64(&q));
             total += score;
@@ -1938,10 +2044,19 @@ fn quant_luma_8x8_inter(src: &[u8; 256], pred: &[u8; 256], qp: u8) -> ([[i16; 64
 }
 
 /// Quantizes the chroma residual of an inter macroblock, dropping a plane's AC levels when they
-/// are nearly empty.
+/// are nearly empty; with the CABAC states `rdo`, first the trailing AC levels that are not
+/// worth their bits ([`rdo_trailing_ac`]).
 #[inline(always)]
-fn quant_chroma_inter(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, c: &mut ChromaLevels) {
-    quant_chroma(src, pu, pv, qpc, false, c);
+fn quant_chroma_inter(
+    src: &MbSrc,
+    pu: &[u8; 64],
+    pv: &[u8; 64],
+    qpc: u8,
+    c: &mut ChromaLevels,
+    fine: bool,
+    rdo: Option<&[CabacContext]>,
+) {
+    quant_chroma(src, pu, pv, qpc, fine, rdo, c);
     for p in 0..2 {
         if c.ac_masks[p] != [0; 4] && c.ac_score(p) < 7 {
             c.ac[p] = [[0; 15]; 4];
@@ -1983,9 +2098,9 @@ fn zero_ssd_bound(q: &Quant4x4) -> u32 {
 }
 
 impl SkipBounds {
-    fn new(qp: u8, qpc: u8) -> Self {
-        let q = quant4(qp, false);
-        let qc = quant4(qpc, false);
+    fn new(qp: u8, qpc: u8, fine: bool) -> Self {
+        let q = quant4(qp, fine);
+        let qc = quant4(qpc, fine);
         // The chroma DC Hadamard sums the plane's residual, at most 8 sqrt(SSD) in magnitude; it
         // quantizes with qbits + 1 and an intra-style f = 2^qbits / 3 (`quantize_chroma_dc2x2`).
         let dc_shift = 16 + (qpc as u32 / 6);
@@ -2011,10 +2126,10 @@ impl SkipBounds {
 /// `x264_macroblock_probe_pskip`, luma part: whether the luma residual against the skip
 /// prediction would be decimated to nothing.
 #[inline(always)]
-fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
+fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8, fine: bool) -> bool {
     let mut c = [[0i16; 16]; 16];
     dct_luma(&src.y, py, &mut c);
-    let q = quant4(qp, false);
+    let q = quant4(qp, fine);
     let mut total = 0u32;
     for i8x8 in 0..4 {
         let group = group4(&mut c, i8x8);
@@ -2038,9 +2153,9 @@ fn probe_skip_luma(src: &MbSrc, py: &[u8; 256], qp: u8) -> bool {
 
 /// `x264_macroblock_probe_pskip`, chroma part: no DC level, and AC levels decimated per plane.
 #[inline(always)]
-fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8) -> bool {
+fn probe_skip_chroma(src: &MbSrc, pu: &[u8; 64], pv: &[u8; 64], qpc: u8, fine: bool) -> bool {
     let mut c = ChromaLevels::ZERO;
-    quant_chroma(src, pu, pv, qpc, false, &mut c);
+    quant_chroma(src, pu, pv, qpc, fine, None, &mut c);
     if c.dc.iter().flatten().any(|&l| l != 0) {
         return false;
     }
@@ -2220,7 +2335,9 @@ impl H264Encoder {
             skip_bounds: SkipBounds::new(
                 slice_qp,
                 chroma_qp(slice_qp as i32, self.pps.chroma_qp_index_offset as i32),
+                compact,
             ),
+            fine_quant: compact,
         };
         let mut src = MbSrc {
             y: [0; 256],
@@ -2803,7 +2920,7 @@ impl EncState {
                     if int_y {
                         ry.load::<16>(yo, &mut *py);
                     }
-                    luma_zero = probe_skip_luma(src, &*py, qp);
+                    luma_zero = probe_skip_luma(src, &*py, qp, sl.fine_quant);
                 }
                 if luma_zero {
                     if !int_c {
@@ -2826,7 +2943,7 @@ impl EncState {
                             ru.load::<8>(co, &mut *pu);
                             rv.load::<8>(co, &mut *pv);
                         }
-                        chroma_zero = probe_skip_chroma(src, &*pu, &*pv, qpc);
+                        chroma_zero = probe_skip_chroma(src, &*pu, &*pv, qpc, sl.fine_quant);
                     }
                     if chroma_zero {
                         self.code_skip(sl, cabac, mb_x, mb_y, pskip_mv);
@@ -2900,7 +3017,7 @@ impl EncState {
         // sub-pel refinement); elsewhere a vanishing residual at the skip vector is still caught
         // after the motion search.
         if sl.skip_bounds.qp != qp {
-            sl.skip_bounds = SkipBounds::new(qp, qpc);
+            sl.skip_bounds = SkipBounds::new(qp, qpc, sl.fine_quant);
         }
         let probe = !sl.fast || {
             let (skip, i) = (&self.mb_is_skip, mb_y * mb_w + mb_x);
@@ -2942,7 +3059,7 @@ impl EncState {
         }
         cands[n] = self.prev_mb_mv[mb_idx];
         n += 1;
-        self.mv_costs(qp);
+        self.mv_costs(qp, false);
         let ms = MotionSearch {
             r: &self.refp.y,
             src: &src.y,
@@ -3013,11 +3130,11 @@ impl EncState {
             chroma: ChromaLevels::ZERO,
             cbp_chroma: 0,
         };
-        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4);
+        let cbp4 = quant_luma_4x4_inter(&src.y, &py, qp, &mut res.luma_q4, sl.fine_quant);
         res.cbp_luma = cbp4;
         let q8_store;
         if sl.t8x8 && sl.use_cabac && cbp4 != 0 {
-            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp);
+            let (q8, cbp8, _) = quant_luma_8x8_inter(&src.y, &py, qp, sl.fine_quant);
             let nnz4: usize = res.luma_q4.iter().flatten().filter(|&&c| c != 0).count();
             let nnz8: usize = q8.iter().flatten().filter(|&&c| c != 0).count();
             if nnz8 <= nnz4 {
@@ -3026,7 +3143,7 @@ impl EncState {
                 res.cbp_luma = cbp8;
             }
         }
-        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma);
+        quant_chroma_inter(src, &pu, &pv, qpc, &mut res.chroma, sl.fine_quant, None);
         res.cbp_chroma = res.chroma.cbp();
         if res.cbp_luma == 0 && res.cbp_chroma == 0 && mv == pskip_mv {
             self.code_skip(sl, cabac, mb_x, mb_y, mv);
@@ -3306,7 +3423,7 @@ impl EncState {
             analyse_chroma_intra(&self.cur, mb_x, mb_y, src, !sl.fast);
         let qpc = chroma_qp(qp as i32, sl.chroma_qp_offset);
         let mut c = ChromaLevels::ZERO;
-        quant_chroma(src, &pu, &pv, qpc, true, &mut c);
+        quant_chroma(src, &pu, &pv, qpc, true, None, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let cbp = i4.cbp_luma | (cbp_chroma << 4);
@@ -3499,7 +3616,7 @@ impl EncState {
         let dc_scanned = zigzag16(&dc_q);
         let cbp_luma = if any_ac { 15u8 } else { 0 };
         let mut c = ChromaLevels::ZERO;
-        quant_chroma(src, &pu, &pv, eff_qpc, true, &mut c);
+        quant_chroma(src, &pu, &pv, eff_qpc, true, None, &mut c);
         let cbp_chroma = c.cbp();
         let (chroma_dc, chroma_ac) = (&c.dc, &c.ac);
         let mb_type = 1 + mode as u32 + 4 * cbp_chroma as u32 + if cbp_luma != 0 { 12 } else { 0 };
@@ -3963,6 +4080,39 @@ mod tests {
                 assert_eq!(c, d, "chroma mode {mode}");
             }
         }
+    }
+
+    #[test]
+    fn trailing_chroma_levels_drop_only_when_their_bits_cost_more() {
+        let ctxs = init_cabac_contexts(28, false, 0);
+        let q = quant4(28, true);
+        // A coefficient `x` quantizer steps large at the third AC position, after a level of 3
+        // at the first one.
+        let block = |x: f64| {
+            let r = ZIGZAG_4X4[3];
+            let mut c = [0i16; 16];
+            c[r] = (x * (1u64 << q.shift) as f64 / q.mf[r] as f64).round() as i16;
+            c[ZIGZAG_4X4[1]] = (3.0 * (1u64 << q.shift) as f64 / q.mf[ZIGZAG_4X4[1]] as f64) as i16;
+            let mut g = [c, [0; 16], [0; 16], [0; 16]];
+            ragdoll_simd::quant_4x4_x4_scalar(&mut g, q);
+            (c, g[0])
+        };
+        // Just above the rounding threshold of 2/3: worth a fraction of its bits.
+        let (c, mut lv) = block(0.7);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 1);
+        rdo_trailing_ac(&mut lv, &c, q, &ctxs);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 0);
+        assert_eq!(lv[ZIGZAG_4X4[1]], 3);
+        // Well inside the level: kept.
+        let (c, mut lv) = block(1.4);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 1);
+        rdo_trailing_ac(&mut lv, &c, q, &ctxs);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 1);
+        // Levels above 1 are never dropped.
+        let (c, mut lv) = block(2.0);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 2);
+        rdo_trailing_ac(&mut lv, &c, q, &ctxs);
+        assert_eq!(lv[ZIGZAG_4X4[3]], 2);
     }
 
     #[test]

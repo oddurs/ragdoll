@@ -305,6 +305,19 @@ pub const CABAC_CONTEXT_INIT: [[(i8, i8); 460]; 4] = [
     ],
 ];
 
+/// `-log2` of a bin's probability in 1/256 bits, indexed by `2 * pStateIdx + (bin != valMPS)`
+/// (`x264_cabac_entropy`): `pLPS = 0.5 a^pStateIdx` with `a = (0.01875 / 0.5)^(1/63)` (9.3.1.1).
+static BIN_COST: [u16; 128] = [
+    256, 256, 238, 275, 221, 294, 206, 314, 192, 333, 180, 352, 168, 371, 157, 391, //
+    148, 410, 139, 429, 130, 448, 122, 468, 115, 487, 108, 506, 102, 525, 96, 545, //
+    90, 564, 85, 583, 80, 602, 76, 622, 72, 641, 68, 660, 64, 679, 60, 699, //
+    57, 718, 54, 737, 51, 756, 48, 776, 46, 795, 43, 814, 41, 833, 39, 853, //
+    37, 872, 35, 891, 33, 910, 31, 930, 29, 949, 28, 968, 26, 987, 25, 1007, //
+    24, 1026, 22, 1045, 21, 1064, 20, 1084, 19, 1103, 18, 1122, 17, 1141, 16, 1161, //
+    15, 1180, 15, 1199, 14, 1218, 13, 1238, 12, 1257, 12, 1276, 11, 1295, 11, 1315, //
+    10, 1334, 10, 1353, 9, 1372, 9, 1392, 8, 1411, 8, 1430, 7, 1449, 7, 1469, //
+];
+
 /// A single CABAC context model: `pStateIdx` (`0..=63`) and `valMPS` (`0` or `1`), packed as
 /// `2 * state + mps` so that a decision reads and writes one byte.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -327,6 +340,12 @@ impl CabacContext {
     #[inline]
     pub fn mps(self) -> u8 {
         self.0 & 1
+    }
+
+    /// What a decision of `bin` costs in this context, in 1/256 bits.
+    #[inline(always)]
+    pub fn cost(self, bin: u8) -> u32 {
+        BIN_COST[(self.0 ^ (bin & 1)) as usize] as u32
     }
 
     /// Initializes a context model from `(m, n)` slope/offset parameters and `slice_qp` (`0..=51`)
@@ -1669,6 +1688,37 @@ impl Default for ResidualCoeffs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bin_costs_estimate_the_coded_size() {
+        // Bins drawn with a skewed probability through a few contexts: the costs summed before
+        // each decision must match the bits written to within a few percent.
+        let mut e = CabacEncoder::new();
+        let mut ctxs = init_cabac_contexts(26, false, 0);
+        let mut x = 0x9e37_79b9_u32;
+        let mut est = 0u64;
+        for i in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let k = 105 + i % 4;
+            let bin = u8::from(x % 100 < 8 + 20 * (i % 4) as u32);
+            est += ctxs[k].cost(bin) as u64;
+            e.encode_decision(&mut ctxs[k], bin);
+        }
+        e.encode_terminate(1);
+        let bits = 8 * e.into_bytes().len() as u64;
+        let est = est / 256;
+        assert!(
+            est.abs_diff(bits) * 50 < bits,
+            "estimated {est} bits, coded {bits}"
+        );
+        // Equiprobable states cost a bit either way; the most skewed state's MPS almost nothing.
+        assert_eq!(CabacContext::new(0, 1).cost(1), 256);
+        assert_eq!(CabacContext::new(0, 1).cost(0), 256);
+        assert!(CabacContext::new(62, 0).cost(0) < 16);
+        assert!(CabacContext::new(62, 0).cost(1) > 1400);
+    }
 
     #[test]
     fn b_slice_types_round_trip() {
