@@ -8,7 +8,7 @@ milestone: m11-validation
 assignee: Claude
 claimed: 2026-10-28
 created: 2026-10-28
-updated: 2026-10-29
+updated: 2026-10-30
 priority: p1
 ---
 
@@ -49,3 +49,21 @@ Single thread, best-of-5 wall clock over 5 interleaved rounds (machine shared, l
 Compression (Y PSNR, BD-rate against x264 ultrafast over 5 QPs): src720 Fast -1.8%, Balanced -7.6%; park Fast -17.2%, Balanced -31.4%. At QP30 on park Fast is 3,840,431 B / Y 32.87 dB vs ultrafast 4,415,543 B / 32.56 dB; on src720 Fast at QP26 is 2,936,895 B / 46.88 dB vs ultrafast 2,846,544 B / 46.28 dB (+0.30 dB at ultrafast's size by interpolation).
 
 Left: per P frame on park we are now at x264's instruction count (~26M); remaining cost is CAVLC (~20%, mostly per-level work and the bit writer), forward transform + quantizer (~13%), integer motion search (~10%) and half-pel (~7%). I-cache misses are ~20% above x264's per P frame (the frame coder is one ~180 KB function); splitting cold paths out of the v3 copy is the next lever. The pipeline test malformed_bitstream_zero_panic_corpus still fails (BUG-0097, decoder).
+
+## 2026-10-30
+
+Round 3 (branch worktree-agent-a8d288051031e9368, commits 2b8e292 and bed6bf0 on top of 555b0e9): target was an operating point beating x264 --preset veryfast on BD-rate and on single-thread wall clock. New opt-in preset H264Speed::Compact; the default (Balanced) and Fast/Baseline output are byte-identical to before (qa corpus synth: 5 of 5 verified, nothing re-blessed).
+
+Compact: P partitions 16x8/8x16/8x8, hexagon search range 16 seeded by the predictor, neighbours' and previous anchor's 16x16 results and the lookahead vectors, sub-pel from frame-level half-sample planes (predictor at sub-pel, half-pel diamond by SAD, quarter-pel diamonds by SATD), SA8D transform decision, intra 4x4 in P when intra 16x16 comes close; with CABAC up to three B pictures (middle one a reference: list modification + MMCO, max_num_reorder_frames in VUI), spatial direct, B_Skip, B partitions down to 8x8; half-resolution lookahead placing B pictures by path costs (slicetype_path_cost); QP offsets I -3 / Bref +2 / B +3. New kernels (AVX2 + NEON + scalar, differential tests): pixel_{sad,sad_avg,satd,avg,sad_x4}_wxh, pixel_sa8d_16x16, hpel_planes, downscale_2x_row.
+
+BD-rate (piecewise cubic on log-rate vs PSNR, QP 20/24/28/32/36, keyint 250, FFmpeg psnr filter), Y / average PSNR:
+- vs x264 veryfast: src720 -0.94% / -1.56%, park -1.04% / -2.18%, foreman -3.51% / -4.95%. (x264 with psy=0:aq-mode=0, i.e. --tune psnr, gives identical streams under -qp.)
+- vs x264 ultrafast: src720 -32.0% / -31.5%, park -45.4% / -45.5%, foreman -69.8% / -70.0%.
+
+Speed, QP 28, taskset one core, interleaved runs (machine noisy, +-10%): src720 at parity (x264/ours median ratio 0.999 and 1.016 in two runs of 9 and 7 rounds); park 1.24-1.33x slower than veryfast; foreman 1.17-1.39x slower. Instructions (callgrind, whole clip incl. input parsing): src720 9.886G vs 9.882G, park 11.74G vs 9.85G (1.19x), foreman 2.49G vs 2.13G (1.17x). x264 ultrafast is ~5x faster than Compact, so Compact stays an opt-in preset. Veryfast speed is NOT beaten on park and foreman.
+
+Speed trade-offs taken (BD cost measured on all three clips): lookahead keeps zero vectors below SATD 16 (+0.07% src720 only, -8% instructions there; x264's 64 cost +0.94%); B 8x8 searches without quarter-pel (+0.28..0.56%, -7.7% on park); B 8x8 searched only in the list cheaper at 16x16 (+0.5..0.8%, -7.4%); 8x8 analysis skipped below 80 (B) / 40 (P) lambdas (+0.21% src720, -7%). Bit-exact speedups: leaner lookahead search, SWAR then SIMD downscale, frame clone without memset, sad_x4 loads/reduction, SA8D kernel, deblock skips internal edges of uniform inter MBs, table-driven 8x8 quant, generic qpel refine skipping the previous centre, full-plane half-sample filter.
+
+Tried and dropped: x264 b-adapt 1 fast decision (+2.6..5.8%), lookahead early exit after candidates (+0.7..1.25% src720), P 16x8/8x16 early termination (+0.27% foreman for -1.2%), only the better-estimated B rect shape (+0.25..0.76% for -3..4.6%), quarter-pel gate on small SATD (no effect), final qpel refine 1 iteration, fixed-4 point batching in PartSearch (no gain).
+
+Left on the table: per search op we still spend ~1.3x x264's instructions (bounds checks, mv cost lookups and dispatch around 8x8 SAD/SATD kernels); CABAC residual is ~7% on park; a SIMD lowres window search (mpsadbw) for the lookahead; a SIMD 8x8 forward DCT. Not closing: the speed half of the target is met only on src720.
